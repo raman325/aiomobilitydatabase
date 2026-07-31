@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
+from http import HTTPStatus
 from types import TracebackType
 from typing import Any, Self
 
 import aiohttp
 
-from .const import DEFAULT_TIMEOUT_SECONDS, PROD_BASE_URL
+from .const import (
+    DEFAULT_TIMEOUT_SECONDS,
+    PROD_BASE_URL,
+    TOKEN_EXPIRY_SKEW_SECONDS,
+    TOKEN_PATH,
+)
+from .exceptions import (
+    MobilityDatabaseApiError,
+    MobilityDatabaseAuthenticationError,
+    MobilityDatabaseConnectionError,
+    MobilityDatabaseError,
+    MobilityDatabaseNotFoundError,
+    MobilityDatabaseRateLimitError,
+)
+from .models import AccessToken, Metadata
 
 
 def _encode_value(value: Any) -> str:
@@ -92,3 +107,104 @@ class MobilityDatabaseClient:
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
+
+    def _token_needs_refresh(self) -> bool:
+        """Return True if there is no token or it is at/near expiration."""
+        if self._access_token is None or self._token_expiration is None:
+            return True
+        skew = timedelta(seconds=TOKEN_EXPIRY_SKEW_SECONDS)
+        return datetime.now(UTC) >= self._token_expiration - skew
+
+    async def _async_ensure_token(self, *, force: bool = False) -> str:
+        """Return a valid access token, fetching or refreshing as needed.
+
+        Guarded by a lock so concurrent requests trigger exactly one token
+        request. NOTE: the live API returns HTTP 500 for an invalid refresh
+        token, so ANY non-200 here is treated as an authentication failure.
+        """
+        async with self._token_lock:
+            if not force and not self._token_needs_refresh():
+                assert self._access_token is not None  # guarded above
+                return self._access_token
+            session = self._get_session()
+            try:
+                async with session.post(
+                    f"{self._base_url}{TOKEN_PATH}",
+                    json={"refresh_token": self._refresh_token},
+                    timeout=self._timeout,
+                ) as resp:
+                    if resp.status != HTTPStatus.OK:
+                        body = await resp.text()
+                        raise MobilityDatabaseAuthenticationError(
+                            f"Unable to obtain access token ({resp.status}): {body}"
+                        )
+                    data = await resp.json()
+            except (TimeoutError, aiohttp.ClientError) as err:
+                raise MobilityDatabaseConnectionError(
+                    f"Error requesting access token: {err}"
+                ) from err
+            token = AccessToken.from_dict(data)
+            expiration = token.expiration_datetime_utc
+            if expiration.tzinfo is None:
+                expiration = expiration.replace(tzinfo=UTC)
+            self._access_token = token.access_token
+            self._token_expiration = expiration
+            return self._access_token
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        retry_on_auth_fail: bool = True,
+    ) -> Any:
+        """Perform an authenticated request and return the decoded JSON body."""
+        token = await self._async_ensure_token()
+        session = self._get_session()
+        try:
+            async with session.request(
+                method,
+                f"{self._base_url}{path}",
+                params=encode_params(params) if params else None,
+                json=json_body,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=self._timeout,
+            ) as resp:
+                if resp.status == HTTPStatus.UNAUTHORIZED:
+                    if retry_on_auth_fail:
+                        await self._async_ensure_token(force=True)
+                        return await self._request(
+                            method,
+                            path,
+                            params=params,
+                            json_body=json_body,
+                            retry_on_auth_fail=False,
+                        )
+                    raise MobilityDatabaseAuthenticationError(
+                        "Request unauthorized after token refresh"
+                    )
+                if resp.status == HTTPStatus.NOT_FOUND:
+                    raise MobilityDatabaseNotFoundError(f"Not found: {path}")
+                if resp.status == HTTPStatus.TOO_MANY_REQUESTS:
+                    raise MobilityDatabaseRateLimitError("API rate limit exceeded")
+                if resp.status >= HTTPStatus.BAD_REQUEST:
+                    raise MobilityDatabaseApiError(resp.status, await resp.text())
+                try:
+                    return await resp.json()
+                except (aiohttp.ContentTypeError, ValueError) as err:
+                    raise MobilityDatabaseConnectionError(
+                        "API returned invalid JSON"
+                    ) from err
+        except MobilityDatabaseError:
+            raise
+        except (TimeoutError, aiohttp.ClientError) as err:
+            raise MobilityDatabaseConnectionError(
+                f"Error communicating with API: {err}"
+            ) from err
+
+    async def get_metadata(self) -> Metadata:
+        """Get metadata about the API."""
+        data = await self._request("GET", "/v1/metadata")
+        return Metadata.from_dict(data)

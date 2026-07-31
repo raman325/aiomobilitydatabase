@@ -21,7 +21,10 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-  "aiohttp>=3.9",
+  # aiohttp<3.14 pending an aioresponses release compatible with aiohttp
+  # 3.14's ClientResponse (which added a required stream_writer kwarg);
+  # see https://github.com/pnuckowski/aioresponses/issues (0.7.9 is latest).
+  "aiohttp>=3.9,<3.14",
   "mashumaro>=3.13",
 ]
 dynamic = ["version"]
