@@ -17,11 +17,11 @@ from aiomobilitydatabase.feeds.models import (
     VehiclePosition,
 )
 
-from tests.feeds.fixtures import build_gtfs_zip_bytes
-from tests.feeds.rt_fixture import (
-    build_alerts,
-    build_trip_updates,
-    build_vehicle_positions,
+from tests.feeds.fixtures import (
+    ALERTS,
+    TRIP_UPDATES_BASELINE,
+    VEHICLE_POSITIONS,
+    build_gtfs_zip_bytes,
 )
 
 
@@ -120,14 +120,15 @@ def test_vehicle_and_station_construct() -> None:
     assert Route(id="R3", short_name="7", long_name=None, type=3).display_name == "7"
 
 
-def test_fixture_builders_produce_bytes() -> None:
+def test_fixtures_are_valid() -> None:
+    """Sanity-check the checked-in fixture data: well-formed zip + protobuf."""
     zip_bytes = build_gtfs_zip_bytes()
     names = set(zipfile.ZipFile(io.BytesIO(zip_bytes)).namelist())
     assert "stop_times.txt" in names and "calendar.txt" in names
     for raw in (
-        build_vehicle_positions(),
-        build_trip_updates(base_epoch=1_785_500_000),
-        build_alerts(),
+        VEHICLE_POSITIONS,
+        TRIP_UPDATES_BASELINE,
+        ALERTS,
     ):
         msg = gtfs_realtime_pb2.FeedMessage()
         msg.ParseFromString(raw)

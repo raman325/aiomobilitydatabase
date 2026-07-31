@@ -5,13 +5,14 @@ from datetime import UTC, datetime, timedelta
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 
 from tests.feeds.fixtures import (
+    ADDED_TRIPS_S1,
     GTFS_FEED,
     GTFS_RT_FEED,
     TOKEN_RESPONSE,
+    TRIP_UPDATES_T1_DELAYED,
     build_gtfs_zip_bytes,
     with_base,
 )
-from tests.feeds.rt_fixture import build_added_trips, build_trip_updates
 from tests.mock_server import MockApi
 
 NOW = datetime(2026, 7, 30, 14, 45, tzinfo=UTC)  # Thursday 07:45 PDT
@@ -57,7 +58,7 @@ async def test_rt_merge_delay_cancellation_and_added(
     _mock_catalog(mock_api, rt=True)
     mock_api.get(
         "/rt/all",
-        body=build_trip_updates(base_epoch=T1_DEPARTURE_EPOCH),
+        body=TRIP_UPDATES_T1_DELAYED,
         content_type=PB,
     )
     handle = await feeds_client.get_transit_feed("mdb-100", api_key="secret123")
@@ -99,7 +100,7 @@ async def test_route_filter_applies_to_added_trips(
     _mock_catalog(mock_api, rt=True)
     mock_api.get(
         "/rt/all",
-        body=build_trip_updates(base_epoch=T1_DEPARTURE_EPOCH),
+        body=TRIP_UPDATES_T1_DELAYED,
         content_type=PB,
     )
     handle = await feeds_client.get_transit_feed("mdb-100")
@@ -113,14 +114,13 @@ async def test_limit_caps_merged_rows_per_stop(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
     _mock_catalog(mock_api, rt=True)
-    now_epoch = int(NOW.timestamp())
     # 3 RT-added trips at S1, departing 1/2/3 minutes from now: all strictly
     # earlier than the scheduled T1 (15:00:30, ~15.5min out) and T2
     # (15:30:30, ~45.5min out). Together with the 2 scheduled rows, S1 has
     # 5 candidate rows before the per-stop limit is applied.
     mock_api.get(
         "/rt/all",
-        body=build_added_trips(base_epoch=now_epoch, stop_id="S1", count=3),
+        body=ADDED_TRIPS_S1,
         content_type=PB,
     )
     handle = await feeds_client.get_transit_feed("mdb-100")

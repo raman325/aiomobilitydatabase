@@ -7,13 +7,14 @@ from aiomobilitydatabase.feeds.geo import Circle
 from aiomobilitydatabase.feeds.models import ServiceAlert
 
 from tests.feeds.fixtures import (
+    ALERTS,
     GTFS_FEED,
     GTFS_RT_FEED,
     TOKEN_RESPONSE,
+    VEHICLE_POSITIONS,
     build_gtfs_zip_bytes,
     with_base,
 )
-from tests.feeds.rt_fixture import build_alerts, build_vehicle_positions
 from tests.mock_server import MockApi
 
 PB = "application/octet-stream"
@@ -35,7 +36,7 @@ async def test_get_vehicles_resolves_route_names(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
     _mock_catalog(mock_api)
-    mock_api.get("/rt/all", body=build_vehicle_positions(), content_type=PB)
+    mock_api.get("/rt/all", body=VEHICLE_POSITIONS, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
     vehicles = await handle.get_vehicles()
     assert len(vehicles) == 2
@@ -46,7 +47,7 @@ async def test_get_vehicles_resolves_route_names(
 
 async def test_get_alerts(mock_api: MockApi, feeds_client: MobilityFeedsClient) -> None:
     _mock_catalog(mock_api)
-    mock_api.get("/rt/all", body=build_alerts(), content_type=PB)
+    mock_api.get("/rt/all", body=ALERTS, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
     alerts = await handle.get_alerts()
     assert alerts[0].header == "Detour on Main"

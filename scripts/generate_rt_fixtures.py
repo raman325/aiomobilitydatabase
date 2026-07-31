@@ -1,11 +1,32 @@
-"""Builders for GTFS-RT FeedMessage protobuf fixtures."""
+"""Regenerates the checked-in GTFS-RT protobuf fixtures under tests/feeds/data/rt/.
+
+Not a test (pytest never collects anything outside tests/) -- run manually
+with ``uv run python scripts/generate_rt_fixtures.py`` if a fixture needs to
+change. Each ``_build_*`` function below is a fixed-parameter snapshot of
+what used to be a parameterized fixture builder; every call site across the
+test suite passes fixed, deterministic arguments (test "now" values are
+hardcoded datetimes, never wall-clock time), so baking one .pb file per
+distinct call is exact and reproducible.
+"""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from pathlib import Path
+
 from google.transit import gtfs_realtime_pb2
 
+_OUTPUT_DIR = Path(__file__).parent.parent / "tests" / "feeds" / "data" / "rt"
 
-def build_vehicle_positions() -> bytes:
+# Matches test_transit_arrivals.py's NOW / T1_DEPARTURE_EPOCH constants.
+_NOW_EPOCH = int(datetime(2026, 7, 30, 14, 45, tzinfo=UTC).timestamp())
+_T1_DEPARTURE_EPOCH = int(datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC).timestamp())
+# Arbitrary fixed epoch used by test_rt.py/test_models.py's non-arrivals
+# protobuf-parsing tests, unrelated to any particular "now".
+_BASELINE_EPOCH = 1_785_500_000
+
+
+def _build_vehicle_positions() -> bytes:
     """Build a VehiclePositions FeedMessage with two vehicles."""
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
@@ -33,8 +54,8 @@ def build_vehicle_positions() -> bytes:
     return msg.SerializeToString()
 
 
-def build_trip_updates(*, base_epoch: int) -> bytes:
-    """Build TripUpdates: T1 delayed 300s at S1, T2 canceled, added trip on R1 at S2."""
+def _build_trip_updates(*, base_epoch: int) -> bytes:
+    """TripUpdates: T1 delayed 300s at S1, T2 canceled, added trip on R1 at S2."""
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
     msg.header.timestamp = base_epoch
@@ -67,8 +88,8 @@ def build_trip_updates(*, base_epoch: int) -> bytes:
     return msg.SerializeToString()
 
 
-def build_added_trips(*, base_epoch: int, stop_id: str, count: int) -> bytes:
-    """Build TripUpdates with `count` distinct ADDED trips at one stop.
+def _build_added_trips(*, base_epoch: int, stop_id: str, count: int) -> bytes:
+    """TripUpdates with `count` distinct ADDED trips at one stop.
 
     Trips are named ADDED-A, ADDED-B, ... and their departures are spaced
     60s apart starting at ``base_epoch + 60``, so callers can assert a
@@ -92,7 +113,7 @@ def build_added_trips(*, base_epoch: int, stop_id: str, count: int) -> bytes:
     return msg.SerializeToString()
 
 
-def build_alerts() -> bytes:
+def _build_alerts() -> bytes:
     """Build an Alert FeedMessage with one active alert."""
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
@@ -115,3 +136,25 @@ def build_alerts() -> bytes:
     desc.text = "Use Second Ave"
     desc.language = "en"
     return msg.SerializeToString()
+
+
+def main() -> None:
+    """Write every fixture .pb file used by the feeds test suite."""
+    fixtures = {
+        "vehicle_positions.pb": _build_vehicle_positions(),
+        "alerts.pb": _build_alerts(),
+        "trip_updates_baseline.pb": _build_trip_updates(base_epoch=_BASELINE_EPOCH),
+        "trip_updates_t1_delayed.pb": _build_trip_updates(
+            base_epoch=_T1_DEPARTURE_EPOCH
+        ),
+        "added_trips_s1.pb": _build_added_trips(
+            base_epoch=_NOW_EPOCH, stop_id="S1", count=3
+        ),
+    }
+    for filename, content in fixtures.items():
+        (_OUTPUT_DIR / filename).write_bytes(content)
+        print(f"wrote {filename} ({len(content)} bytes)")
+
+
+if __name__ == "__main__":
+    main()

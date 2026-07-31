@@ -18,11 +18,7 @@ from aiomobilitydatabase.feeds.rt import (
     vehicles_from_message,
 )
 
-from tests.feeds.rt_fixture import (
-    build_alerts,
-    build_trip_updates,
-    build_vehicle_positions,
-)
+from tests.feeds.fixtures import ALERTS, TRIP_UPDATES_BASELINE, VEHICLE_POSITIONS
 from tests.mock_server import MockApi
 
 PB = "application/octet-stream"
@@ -36,19 +32,19 @@ async def _fetch(
 
 
 async def test_fetch_plain(mock_api: MockApi) -> None:
-    mock_api.get("/rt", body=build_vehicle_positions(), content_type=PB)
+    mock_api.get("/rt", body=VEHICLE_POSITIONS, content_type=PB)
     msg = await _fetch(mock_api)
     assert len(msg.entity) == 2
 
 
 async def test_fetch_header_auth(mock_api: MockApi) -> None:
-    mock_api.get("/rt", body=build_vehicle_positions(), content_type=PB)
+    mock_api.get("/rt", body=VEHICLE_POSITIONS, content_type=PB)
     await _fetch(mock_api, auth_type=2, api_key_name="X-Api-Key", api_key="secret123")
     assert mock_api.requests[-1].headers.get("X-Api-Key") == "secret123"
 
 
 async def test_fetch_query_param_auth(mock_api: MockApi) -> None:
-    mock_api.get("/rt", body=build_vehicle_positions(), content_type=PB)
+    mock_api.get("/rt", body=VEHICLE_POSITIONS, content_type=PB)
     await _fetch(mock_api, auth_type=1, api_key_name="api_key", api_key="secret123")
     assert mock_api.requests[-1].query.get("api_key") == "secret123"
 
@@ -80,7 +76,7 @@ async def test_fetch_garbage_maps_to_feed_parse_error(mock_api: MockApi) -> None
 
 def test_vehicles_from_message() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
-    msg.ParseFromString(build_vehicle_positions())
+    msg.ParseFromString(VEHICLE_POSITIONS)
     vehicles = vehicles_from_message(
         msg,
         route_names={"R1": "10 Main Line", "R2": "20 Night Owl"},
@@ -99,7 +95,7 @@ def test_vehicles_from_message() -> None:
 
 def test_trip_updates_from_message() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
-    msg.ParseFromString(build_trip_updates(base_epoch=1_785_500_000))
+    msg.ParseFromString(TRIP_UPDATES_BASELINE)
     updates = trip_updates_from_message(msg)
     assert updates.canceled_trips == {"T2"}
     prediction = updates.predictions[("T1", "S1")]
@@ -178,7 +174,7 @@ def test_trip_updates_cancellation_wins_regardless_of_entity_order(
 
 def test_alerts_from_message() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
-    msg.ParseFromString(build_alerts())
+    msg.ParseFromString(ALERTS)
     alerts = alerts_from_message(msg)
     assert len(alerts) == 1
     alert = alerts[0]
