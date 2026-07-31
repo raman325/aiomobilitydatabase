@@ -203,10 +203,26 @@ def test_in_circle_equivalent_to_exact_distance(
     )
 
 
+def _normalize_lon(lon_deg: float) -> float:
+    """Wrap a longitude to (-180, 180], matching real-world GPS coordinates."""
+    return (lon_deg + 180.0) % 360.0 - 180.0
+
+
 def _point_at(
     lat: float, lon: float, bearing_deg: float, distance_m: float
 ) -> tuple[float, float]:
-    """Exact spherical destination point (independent forward great-circle formula)."""
+    """Exact spherical destination point (independent forward great-circle formula).
+
+    The returned longitude is normalized to (-180, 180] -- real-world
+    coordinates are always normalized, and an earlier version of this helper
+    returned the raw (potentially >180 or <-180) angle, which is precisely
+    why ``test_bbox_safety_factor_admits_boundary_points`` never tripped the
+    dateline-wraparound bug in ``in_circle``'s bbox prefilter (Task 15R-b
+    item 1): an unnormalized point near +180 landing at e.g. 180.4 degrees
+    never lands anywhere close to a zone whose longitude is a normalized
+    -179.6, so the naive linear bbox comparison happened to still "work" by
+    accident.
+    """
     radius = 6_371_000.0  # must match geo._EARTH_RADIUS_M
     delta = distance_m / radius
     theta = math.radians(bearing_deg)
@@ -220,7 +236,7 @@ def _point_at(
         math.sin(theta) * math.sin(delta) * math.cos(phi1),
         math.cos(delta) - math.sin(phi1) * math.sin(phi2),
     )
-    return math.degrees(phi2), math.degrees(lambda2)
+    return math.degrees(phi2), _normalize_lon(math.degrees(lambda2))
 
 
 @settings(max_examples=500)
@@ -241,6 +257,57 @@ def test_bbox_safety_factor_admits_boundary_points(
     """
     zone = Circle(latitude=zone_lat, longitude=zone_lon, radius_m=radius_m)
     lat, lon = _point_at(zone_lat, zone_lon, bearing, fraction * radius_m)
+    assert in_circle(zone, lat, lon)
+
+
+# Zone longitude close enough to +-180 that an eastbound/westbound point a
+# fraction of the radius away crosses the antimeridian and wraps sign.
+_ZONE_LON_NEAR_DATELINE = st.builds(
+    lambda abs_lon, sign: abs_lon * sign,
+    st.floats(min_value=178.0, max_value=179.9),
+    st.sampled_from([1.0, -1.0]),
+)
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    zone_lat=st.floats(min_value=-60.0, max_value=60.0),
+    zone_lon=_ZONE_LON_NEAR_DATELINE,
+    radius_m=st.floats(min_value=10_000.0, max_value=100_000.0),
+    bearing=st.sampled_from(
+        [90.0, 270.0]
+    ),  # due east / due west: crosses the antimeridian
+    # Capped at 0.995 (not 0.999) so the true-distance sanity check below has
+    # headroom over floating-point rounding in the independent _point_at oracle.
+    fraction=st.floats(min_value=0.90, max_value=0.995),
+)
+def test_in_circle_admits_points_across_the_antimeridian(
+    zone_lat: float,
+    zone_lon: float,
+    radius_m: float,
+    bearing: float,
+    fraction: float,
+) -> None:
+    """Task 15R-b item 1: zones sitting near +-180 longitude, with a point a
+    true distance well inside the radius but on the OTHER side of the
+    antimeridian (e.g. zone at 179.5, point at -179.9), must still be
+    admitted. ``in_circle``'s bbox prefilter compared raw (non-wrapped)
+    longitude deltas, so a point that wrapped from ~180.4 to ~-179.6 looked
+    (falsely) like it was ~360 degrees away instead of ~0.8 degrees away,
+    and got rejected by the prefilter before haversine ever ran.
+
+    Falsifying example captured pre-fix (verbatim, via a standalone repro
+    script, not shrunk by hypothesis): zone_lat=20.0, zone_lon=179.5,
+    radius_m=100_000.0, bearing=90.0 (due east), fraction=0.95 ->
+    point normalizes to lon=-179.590823..., true distance=95000.0m (0.95 *
+    radius, i.e. comfortably inside) but ``in_circle`` returned False.
+    """
+    zone = Circle(latitude=zone_lat, longitude=zone_lon, radius_m=radius_m)
+    lat, lon = _point_at(zone_lat, zone_lon, bearing, fraction * radius_m)
+    # Sanity-check the oracle itself: the point must actually be well inside
+    # the circle by true great-circle distance, independent of in_circle.
+    true_distance = haversine_m(zone_lat, zone_lon, lat, lon)
+    assert true_distance <= 0.999 * radius_m
     assert in_circle(zone, lat, lon)
 
 

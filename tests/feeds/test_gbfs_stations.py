@@ -8,6 +8,7 @@ from aiomobilitydatabase.feeds.geo import Circle
 
 from tests.feeds.fixtures import (
     GBFS_FEED,
+    GTFS_FEED,
     STATION_INFO_23,
     STATION_STATUS_23,
     SYSTEM_INFO_23,
@@ -88,6 +89,35 @@ async def test_ttl_micro_cache(
     assert len(status_hits) == 1
 
 
+async def test_gbfs_feed_id_resolving_to_gtfs_shaped_payload(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Task 15R-b item 5: get_gbfs_feed() on an id whose catalog record is
+    actually GTFS-shaped (data_type mismatch -- caller/config error, not
+    caught at resolution time since GbfsFeed.from_dict tolerates unknown/
+    missing fields). ``versions`` is absent from a GTFS payload, so endpoint
+    resolution yields an empty dict; verified (not guessed) actual behavior
+    per-method, since it isn't uniform:
+
+    - get_system_info() needs one specific endpoint -> raises
+      SourceConnectionError("... not published").
+    - get_stations() ALSO needs an endpoint up front (station_information)
+      -> ALSO raises SourceConnectionError, not an empty list.
+    - get_vehicles() degrades gracefully by design (docstring: "Returns []
+      for docked-only systems") since it checks endpoint presence itself
+      before ever calling _document -> returns [].
+    """
+    base = mock_api.url()
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/mdb-100", payload=with_base(GTFS_FEED, base))
+    handle = await feeds_client.get_gbfs_feed("mdb-100")
+    with pytest.raises(SourceConnectionError, match="not published"):
+        await handle.get_system_info()
+    with pytest.raises(SourceConnectionError, match="not published"):
+        await handle.get_stations()
+    assert await handle.get_vehicles() == []
+
+
 async def test_document_endpoint_not_published_raises(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
@@ -118,6 +148,25 @@ async def test_document_fetch_unreachable_raises_source_connection_error(
     mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=feed)
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     with pytest.raises(SourceConnectionError, match="Error fetching"):
+        await handle.get_system_info()
+
+
+async def test_document_rejects_non_http_scheme(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Task 15R-b item 8: a GBFS endpoint URL is catalog/GBFS-document
+    DATA; a non-http(s) scheme is rejected explicitly, before any network
+    attempt, naming the scheme.
+    """
+    base = mock_api.url()
+    feed = with_base(GBFS_FEED, base)
+    feed["versions"][0]["endpoints"] = [
+        {"name": "system_information", "url": "file:///etc/passwd"},
+    ]
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=feed)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    with pytest.raises(SourceConnectionError, match="scheme"):
         await handle.get_system_info()
 
 

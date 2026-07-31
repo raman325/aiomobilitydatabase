@@ -1,9 +1,12 @@
 """Tests for sibling-feed resolution and static index acquisition."""
 
+from pathlib import Path
+
 import pytest
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import (
+    FeedParseError,
     SourceConnectionError,
     StaticDataUnavailableError,
 )
@@ -122,6 +125,54 @@ async def test_hosted_dataset_unreachable_raises_source_connection_error(
         await feeds_client.get_transit_feed("mdb-100")
 
 
+async def test_ensure_index_rejects_cache_path_escape_from_catalog_data(
+    mock_api: MockApi, feeds_client_cached: MobilityFeedsClient, tmp_path: Path
+) -> None:
+    """Task 15R-b item 7: the static feed's id -- used to build the
+    per-feed cache subdirectory -- is catalog DATA, not a caller-supplied
+    parameter (callers only pass the requested feed_id used in the URL; the
+    id ORIGINATING FROM the JSON response body is what names the cache
+    dir). A malicious or corrupt catalog payload can set it to a traversal
+    string. Same escape class as purge_cache's feed_id, so it gets the
+    identical resolve()+is_relative_to() containment check, but raises
+    FeedParseError (a data problem) rather than ValueError (a caller
+    problem), and crucially runs BEFORE mkdir -- pre-fix, mkdir(parents=True)
+    silently created the directory outside cache_dir.
+    """
+    base = mock_api.url()
+    evil = with_base(GTFS_FEED, base)
+    evil["id"] = "../evil"
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/feeds/mdb-100", payload=evil)
+    mock_api.get("/v1/gtfs_feeds/mdb-100", payload=evil)
+    mock_api.get("/v1/gtfs_feeds/mdb-100/gtfs_rt_feeds", payload=[])
+    with pytest.raises(FeedParseError, match="escapes"):
+        await feeds_client_cached.get_transit_feed("mdb-100")
+    # cache_dir IS tmp_path (feeds_client_cached wires cache_dir=str(tmp_path));
+    # "../evil" resolves to a sibling of it, which must never be created.
+    assert not (tmp_path.parent / "evil").exists()
+
+
+async def test_hosted_dataset_rejects_non_http_scheme(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Task 15R-b item 8: hosted_url is catalog DATA; a non-http(s) scheme
+    is rejected explicitly, before any network attempt, naming the scheme.
+    """
+    base = mock_api.url()
+    feed = with_base(GTFS_FEED, base)
+    feed["latest_dataset"] = {
+        **feed["latest_dataset"],
+        "hosted_url": "file:///etc/passwd",
+    }
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/feeds/mdb-100", payload=feed)
+    mock_api.get("/v1/gtfs_feeds/mdb-100", payload=feed)
+    mock_api.get("/v1/gtfs_feeds/mdb-100/gtfs_rt_feeds", payload=[])
+    with pytest.raises(SourceConnectionError, match="scheme"):
+        await feeds_client.get_transit_feed("mdb-100")
+
+
 async def test_rt_feed_without_references_raises(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
@@ -178,3 +229,21 @@ async def test_static_build_progress_reported(
     assert all(
         event.fraction is None or 0.0 <= event.fraction <= 1.0 for event in events
     )
+
+
+async def test_on_progress_raising_aborts_the_download(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Task 15R-b item 6 pin: a raising on_progress callback is fail-fast,
+    not swallowed. The download-phase callback runs inline (see docstring
+    on get_transit_feed), so raising on the very first event propagates
+    synchronously out of get_transit_feed rather than the call silently
+    succeeding with a half-built (or unbuilt) index.
+    """
+    _mock_catalog_for_gtfs(mock_api)
+
+    def boom(event: StaticBuildProgress) -> None:
+        raise RuntimeError("on_progress must not raise, but this one does")
+
+    with pytest.raises(RuntimeError, match="on_progress must not raise"):
+        await feeds_client.get_transit_feed("mdb-100", on_progress=boom)

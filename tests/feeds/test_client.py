@@ -111,3 +111,29 @@ async def test_purge_cache_rejects_escaping_feed_ids(
         await client.purge_cache("../victim")
     assert (victim / "data").exists()
     await client.close()
+
+
+async def test_purge_cache_rejects_symlink_escape(
+    mock_api: MockApi, tmp_path: object
+) -> None:
+    """Task 15R-b item 4: a legitimately-named feed_id (no ``..`` or
+    absolute-path tricks in the string itself) whose cache_dir ENTRY is a
+    symlink pointing outside cache_dir must still be rejected -- confirming
+    the existing ``resolve().is_relative_to()`` check (which follows
+    symlinks before the containment comparison) already closes this, not
+    just the string-based traversal case above.
+    """
+    root = Path(str(tmp_path)) / "cache"
+    root.mkdir()
+    victim = Path(str(tmp_path)) / "victim"
+    victim.mkdir()
+    (victim / "data").write_bytes(b"precious")
+    (root / "mdb-100").symlink_to(victim, target_is_directory=True)
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(ValueError, match="escapes"):
+        await client.purge_cache("mdb-100")
+    assert victim.exists()
+    assert (victim / "data").exists()
+    await client.close()

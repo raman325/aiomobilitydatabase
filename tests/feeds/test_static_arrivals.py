@@ -91,6 +91,68 @@ def test_calendar_dates_exceptions(tmp_path: Path) -> None:
     index.close()
 
 
+def _index_with_calendar_dates_conflict(
+    tmp_path: Path, csv_row_order: str
+) -> StaticIndex:
+    """A minimal feed where SVC has BOTH a type-1 (added) and a type-2
+    (removed) calendar_dates row for the SAME date, in the given CSV row
+    order -- deliberately outside the shared build_gtfs_zip_bytes fixture,
+    which has no same-date conflict.
+    """
+    if csv_row_order == "added_row_first":
+        calendar_dates = (
+            "service_id,date,exception_type\nSVC,20260810,1\nSVC,20260810,2\n"
+        )
+    else:
+        assert csv_row_order == "removed_row_first"
+        calendar_dates = (
+            "service_id,date,exception_type\nSVC,20260810,2\nSVC,20260810,1\n"
+        )
+    files = {
+        "agency.txt": (
+            "agency_id,agency_name,agency_url,agency_timezone\nA1,T,https://e.com,UTC\n"
+        ),
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,Stop,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\nR1,SVC,T1,H\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T1,08:00:00,08:00:00,S1,1\n"
+        ),
+        "calendar.txt": (
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+            "start_date,end_date\nSVC,0,0,0,0,0,0,0,20260101,20271231\n"
+        ),
+        "calendar_dates.txt": calendar_dates,
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    zip_path = tmp_path / f"conflict-{csv_row_order}.zip"
+    zip_path.write_bytes(buf.getvalue())
+    return StaticIndex.build(zip_path, ":memory:", DATASET, "UTC")
+
+
+def test_calendar_dates_same_date_conflict_removed_wins(tmp_path: Path) -> None:
+    """Task 15R-b item 3: a service with BOTH an added (type 1) and a
+    removed (type 2) calendar_dates exception for the SAME date must
+    resolve to inactive -- deterministically, regardless of which row the
+    CSV lists first. Pre-fix, ``active_service_ids`` processed exceptions in
+    a single pass in row-fetch order, so whichever exception type happened
+    to be LAST in the CSV silently won; this pins the desired two-pass
+    "removed always wins" semantics for both row orders.
+    """
+    for order in ("added_row_first", "removed_row_first"):
+        index = _index_with_calendar_dates_conflict(tmp_path, order)
+        try:
+            assert index.active_service_ids(date(2026, 8, 10)) == set(), order
+        finally:
+            index.close()
+
+
 def test_upcoming_departures_basic_window(tmp_path: Path) -> None:
     index = _index(tmp_path)
     # Thursday 2026-07-30 07:45 PDT == 14:45 UTC. T1 departs S1 08:00:30, T2 08:30:30.

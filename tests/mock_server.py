@@ -25,6 +25,11 @@ class RecordedRequest:
     query: dict[str, str]
     json: Any | None
     headers: dict[str, str]
+    # The percent-ENCODED wire path, unlike ``path`` above which aiohttp
+    # decodes (e.g. "%2F" -> "/"). Needed to verify a client actually quoted
+    # a path segment rather than sending a raw special character; excludes
+    # the query string (aiohttp's raw_path includes it when present).
+    raw_path: str = ""
 
 
 @dataclass
@@ -75,6 +80,7 @@ class MockApi:
                 query=dict(request.query),
                 json=body_json,
                 headers=dict(request.headers),
+                raw_path=request.raw_path.split("?", 1)[0],
             )
         )
         queue = self._queues.get((request.method, request.path))

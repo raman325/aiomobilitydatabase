@@ -74,6 +74,21 @@ async def test_fetch_garbage_maps_to_feed_parse_error(mock_api: MockApi) -> None
         await _fetch(mock_api)
 
 
+async def test_fetch_rejects_non_http_scheme() -> None:
+    """Task 15R-b item 8: a producer_url with a non-http(s) scheme (data
+    from the catalog, not a caller parameter) is rejected explicitly and
+    BEFORE any network attempt, naming the scheme in the message. Pre-fix,
+    this still raised SourceConnectionError (aiohttp itself rejects
+    file:// with a ClientError subclass the existing except clause already
+    caught) but with a generic message that never mentioned "scheme" --
+    incidental, not deliberate, and not guaranteed for every non-http
+    scheme aiohttp might handle differently in some other version/config.
+    """
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError, match="scheme"):
+            await fetch_feed_message(session, "file:///etc/passwd")
+
+
 def test_vehicles_from_message() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(VEHICLE_POSITIONS)
