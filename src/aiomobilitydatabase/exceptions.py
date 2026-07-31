@@ -4,7 +4,12 @@ from __future__ import annotations
 
 
 class MobilityDatabaseError(Exception):
-    """Base exception for all aiomobilitydatabase errors."""
+    """Base exception for all aiomobilitydatabase errors.
+
+    ``aiomobilitydatabase.feeds.MobilityFeedsError`` (the feeds subpackage's
+    own base exception) subclasses this, so catching ``MobilityDatabaseError``
+    catches errors from both the catalog client and the feeds layer.
+    """
 
 
 class MobilityDatabaseConnectionError(MobilityDatabaseError):

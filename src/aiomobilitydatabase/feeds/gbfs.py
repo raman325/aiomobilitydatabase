@@ -1,0 +1,207 @@
+"""GbfsFeedHandle: station and vehicle snapshots for a GBFS system."""
+
+from __future__ import annotations
+
+import time
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any
+
+import aiohttp
+
+from .const import GBFS_LANGUAGE_PREFERENCE
+from .exceptions import FeedParseError, SourceConnectionError
+from .geo import Circle, in_circle
+from .models import GbfsVehicle, Station, SystemInfo
+
+if TYPE_CHECKING:
+    from ..models import GbfsFeed
+    from .client import MobilityFeedsClient
+
+
+def _localized(value: Any) -> str | None:
+    """Normalize GBFS text: 3.x localized lists vs 2.x plain strings."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        for entry in value:
+            if (
+                isinstance(entry, dict)
+                and entry.get("language") == GBFS_LANGUAGE_PREFERENCE
+            ):
+                return str(entry.get("text"))
+        if value and isinstance(value[0], dict):
+            return str(value[0].get("text"))
+    return None
+
+
+def _version_key(version: str | None) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in (version or "0").split("."))
+    except ValueError:
+        return (0,)
+
+
+def _as_bool(value: Any) -> bool | None:
+    """Coerce a GBFS status flag to bool without lying on ambiguous input.
+
+    ``bool("false")`` is ``True`` in Python, so strings (and anything else
+    that isn't already a bool/int/float) are treated as UNKNOWN (``None``)
+    rather than silently coerced.
+    """
+    if isinstance(value, bool | int | float):
+        return bool(value)
+    return None
+
+
+class GbfsFeedHandle:
+    """Snapshot access to one GBFS system, resolved from catalog metadata."""
+
+    def __init__(
+        self, client: MobilityFeedsClient, feed: GbfsFeed, endpoints: dict[str, str]
+    ) -> None:
+        """Initialize; internal — use MobilityFeedsClient.get_gbfs_feed()."""
+        self._client = client
+        self._feed = feed
+        self._endpoints = endpoints
+        self._doc_cache: dict[str, tuple[float, float, dict[str, Any]]] = {}
+
+    @classmethod
+    async def create(cls, client: MobilityFeedsClient, feed_id: str) -> GbfsFeedHandle:
+        """Resolve endpoint URLs from the newest catalog-listed version."""
+        feed = await client.catalog.get_gbfs_feed(feed_id)
+        best: dict[str, str] = {}
+        for version in sorted(
+            feed.versions or [], key=lambda v: _version_key(v.version)
+        ):
+            endpoints = {
+                endpoint.name: endpoint.url
+                for endpoint in (version.endpoints or [])
+                if endpoint.name and endpoint.url
+            }
+            if endpoints:
+                best = endpoints  # last (highest) version with endpoints wins
+        return cls(client, feed, best)
+
+    async def _document(self, name: str) -> dict[str, Any]:
+        cached = self._doc_cache.get(name)
+        if cached is not None:
+            fetched_at, ttl, data = cached
+            if time.monotonic() - fetched_at < ttl:
+                return data
+        url = self._endpoints.get(name)
+        if url is None:
+            raise SourceConnectionError(f"GBFS endpoint not published: {name}")
+        session = self._client._get_session()  # deliberate friend access
+        try:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=self._client.timeout_seconds)
+            ) as resp:
+                if resp.status >= HTTPStatus.BAD_REQUEST:
+                    raise SourceConnectionError(
+                        f"GBFS endpoint error {resp.status}: {url}", status=resp.status
+                    )
+                try:
+                    document = await resp.json(content_type=None)
+                except ValueError as err:
+                    raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
+        except (TimeoutError, aiohttp.ClientError) as err:
+            raise SourceConnectionError(f"Error fetching {url}: {err}") from err
+        if not isinstance(document, dict) or "data" not in document:
+            raise FeedParseError(f"GBFS document missing data envelope: {url}")
+        ttl = float(document.get("ttl") or 0)
+        self._doc_cache[name] = (time.monotonic(), ttl, document)
+        return document
+
+    async def get_system_info(self) -> SystemInfo:
+        """GBFS system information."""
+        data = (await self._document("system_information"))["data"]
+        return SystemInfo(
+            system_id=str(data.get("system_id")),
+            name=_localized(data.get("name")),
+            operator=_localized(data.get("operator")),
+            timezone=data.get("timezone"),
+        )
+
+    async def get_stations(self, zone: Circle | None = None) -> list[Station]:
+        """Stations with information and status merged by station_id.
+
+        With ``zone``, only stations inside the circle are returned (stations
+        without coordinates are excluded when filtering) — this powers both
+        the config-flow station multi-select and zone-scoped station sensors.
+        """
+        info_rows = (await self._document("station_information"))["data"].get(
+            "stations", []
+        )
+        status_rows = (await self._document("station_status"))["data"].get(
+            "stations", []
+        )
+        status_by_id = {row.get("station_id"): row for row in status_rows}
+        stations: list[Station] = []
+        for info in info_rows:
+            if zone is not None:
+                lat, lon = info.get("lat"), info.get("lon")
+                if lat is None or lon is None or not in_circle(zone, lat, lon):
+                    continue
+            station_id = info.get("station_id")
+            status = status_by_id.get(station_id, {})
+            types_list = status.get("vehicle_types_available")
+            types = (
+                {
+                    str(entry.get("vehicle_type_id")): int(entry.get("count", 0))
+                    for entry in types_list
+                }
+                if types_list
+                else None
+            )
+            stations.append(
+                Station(
+                    id=str(station_id),
+                    name=_localized(info.get("name")),
+                    latitude=info.get("lat"),
+                    longitude=info.get("lon"),
+                    capacity=info.get("capacity"),
+                    bikes_available=status.get(
+                        "num_bikes_available", status.get("num_vehicles_available")
+                    ),
+                    docks_available=status.get("num_docks_available"),
+                    is_renting=_as_bool(status.get("is_renting")),
+                    is_returning=_as_bool(status.get("is_returning")),
+                    vehicle_types_available=types,
+                )
+            )
+        return stations
+
+    async def get_vehicles(self, zone: Circle | None = None) -> list[GbfsVehicle]:
+        """Free-floating vehicles, optionally filtered to a circular zone.
+
+        Uses ``vehicle_status`` (GBFS 3.x) when published, else falls back to
+        ``free_bike_status`` (2.x). Returns [] for docked-only systems.
+        Filtering is client-side: GBFS has no server-side geo-query.
+        """
+        if "vehicle_status" in self._endpoints:
+            rows = (await self._document("vehicle_status"))["data"].get("vehicles", [])
+            id_key = "vehicle_id"
+        elif "free_bike_status" in self._endpoints:
+            rows = (await self._document("free_bike_status"))["data"].get("bikes", [])
+            id_key = "bike_id"
+        else:
+            return []
+        vehicles: list[GbfsVehicle] = []
+        for row in rows:
+            latitude, longitude = row.get("lat"), row.get("lon")
+            if latitude is None or longitude is None:
+                continue
+            if zone is not None and not in_circle(zone, latitude, longitude):
+                continue
+            vehicles.append(
+                GbfsVehicle(
+                    id=str(row.get(id_key)),
+                    latitude=latitude,
+                    longitude=longitude,
+                    is_reserved=row.get("is_reserved"),
+                    is_disabled=row.get("is_disabled"),
+                    vehicle_type_id=row.get("vehicle_type_id"),
+                    current_range_m=row.get("current_range_meters"),
+                )
+            )
+        return vehicles

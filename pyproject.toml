@@ -26,12 +26,17 @@ dependencies = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+feeds = ["gtfs-realtime-bindings>=1.0.0"]
+
 [project.urls]
 "Source Code" = "https://github.com/raman325/aiomobilitydatabase"
 "Bug Reports" = "https://github.com/raman325/aiomobilitydatabase/issues"
 
 [dependency-groups]
 dev = [
+  "gtfs-realtime-bindings>=1.0.0",
+  "hypothesis>=6.100",
   "mypy>=1.14",
   "pre-commit>=4.0",
   "pytest>=8.3",
@@ -54,6 +59,10 @@ testpaths = ["tests"]
 [tool.mypy]
 strict = true
 warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = "google.transit.*"
+ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py312"
