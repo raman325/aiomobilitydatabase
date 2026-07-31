@@ -372,6 +372,16 @@ class TransitFeedHandle:
 
         Returns True if the index was rebuilt. Stale-while-revalidate: the
         old index keeps serving until the new one is ready, then swaps.
+
+        Concurrency contract: this method is intended for one consumer at a
+        time (the Home Assistant coordinator pattern — a single scheduled
+        refresh loop). It is not safe to call concurrently with itself, nor
+        with queries that may still be in flight when it completes: a query
+        captured against the old index (e.g. via a reference grabbed before
+        the swap) can execute after the swap-and-close and hit a closed
+        SQLite connection. Callers that need concurrent queries during a
+        refresh must serialize access externally (e.g. a lock around both
+        the refresh and the queries it might race).
         """
         fresh = await self._client.catalog.get_gtfs_feed(self.static_feed_id)
         dataset = fresh.latest_dataset

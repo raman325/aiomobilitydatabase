@@ -110,6 +110,22 @@ async def test_route_filter_applies_to_added_trips(
     assert arrivals == []  # R2 has nothing scheduled in window; ADDED-9 is R1
 
 
+async def test_added_trip_outside_queried_stops_excluded(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=ADDED_TRIPS_S1, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    # ADDED_TRIPS_S1's rows are all at S1; querying only S2 must filter every
+    # one of them out via the stop-id check, before the route filter even
+    # runs -- only S2's own scheduled row (T1) can come back.
+    arrivals = await handle.get_arrivals(
+        ["S2"], lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert [a.stop_id for a in arrivals] == ["S2"]
+    assert all(not (a.trip_id or "").startswith("ADDED") for a in arrivals)
+
+
 async def test_limit_caps_merged_rows_per_stop(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:

@@ -75,6 +75,25 @@ def test_missing_timezone_everywhere_raises(tmp_path: Path) -> None:
         StaticIndex.build(zip_path, ":memory:", DATASET, None)
 
 
+def test_agency_txt_present_but_blank_timezone_raises(tmp_path: Path) -> None:
+    """agency.txt is present (so the ``no agency.txt`` short-circuit doesn't
+    apply) but every row's agency_timezone is blank -- the fallback scan
+    must fall through its loop to "no timezone found" rather than crash.
+    """
+    files = dict(_FILES)
+    files["agency.txt"] = (
+        "agency_id,agency_name,agency_url,agency_timezone\nA1,T,https://e.com,\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    zip_path = tmp_path / "blank_tz.zip"
+    zip_path.write_bytes(buf.getvalue())
+    with pytest.raises(FeedParseError, match="No agency timezone"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, None)
+
+
 def test_ragged_stops_row_raises_feed_parse_error(tmp_path: Path) -> None:
     """A stops.txt data row with fewer columns than the header (a ragged row,
     which real producers ship) must surface as FeedParseError, not the raw
@@ -105,3 +124,99 @@ def test_schema_version_mismatch_invalidates(tmp_path: Path) -> None:
     built._conn.commit()
     built.close()
     assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_open_cached_corrupted_database_returns_none(tmp_path: Path) -> None:
+    """A file that exists but isn't a valid SQLite DB (e.g. truncated by a
+    prior crash) must be treated as a cache miss, not raise.
+    """
+    db_path = tmp_path / "static.db"
+    db_path.write_bytes(b"not a sqlite database at all")
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_build_to_file_cleans_up_building_file_on_failure(tmp_path: Path) -> None:
+    """A build failure partway through (missing required file) must leave
+    neither the ``.building`` scratch file nor a final DB behind -- the old
+    cache entry (if any) is untouched, and no half-built file lingers.
+    """
+    zip_path = tmp_path / "bad.zip"
+    zip_path.write_bytes(build_gtfs_zip_bytes(omit=frozenset({"stops.txt"})))
+    db_path = tmp_path / "static.db"
+    with pytest.raises(FeedParseError):
+        StaticIndex.build(zip_path, str(db_path), DATASET, TZ)
+    assert not db_path.exists()
+    assert not Path(f"{db_path}.building").exists()
+
+
+def test_build_to_file_reraises_and_cleans_up_on_replace_failure(
+    tmp_path: Path,
+) -> None:
+    """If the final atomic rename fails (e.g. the target is unexpectedly a
+    directory), the ``.building`` scratch file must still be removed and the
+    original OSError must propagate rather than being swallowed.
+    """
+    db_target = tmp_path / "static_as_dir"
+    db_target.mkdir()  # not a plausible DB path: forces Path.replace() to fail
+    with pytest.raises(OSError, match="Is a directory"):
+        StaticIndex.build(_write_zip(tmp_path), str(db_target), DATASET, TZ)
+    assert not Path(f"{db_target}.building").exists()
+
+
+def test_routes_for_trips_empty_list_returns_empty_dict(tmp_path: Path) -> None:
+    index = StaticIndex.build(_write_zip(tmp_path), ":memory:", DATASET, TZ)
+    try:
+        assert index.routes_for_trips([]) == {}
+    finally:
+        index.close()
+
+
+def test_loaders_flush_mid_loop_past_batch_size(tmp_path: Path) -> None:
+    """The fixture GTFS feed is far too small to reach the 5000-row mid-loop
+    flush in every ``_load_*`` loader; manufacture oversized-but-valid CSVs
+    (one file at a time is enough to prove the pattern, but we push every
+    file past the threshold at once for coverage of all six loaders) and
+    also pass a progress callback so the flush's ``report()`` call itself
+    runs, not just the flush condition.
+    """
+    n = 5001
+    files = {
+        "agency.txt": (
+            "agency_id,agency_name,agency_url,agency_timezone\nA1,T,https://e.com,UTC\n"
+        ),
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
+        + "".join(f"S{i},Stop {i},34.0,-118.0\n" for i in range(n)),
+        "routes.txt": "route_id,route_short_name,route_long_name,route_type\n"
+        + "".join(f"R{i},{i},Route {i},3\n" for i in range(n)),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\n"
+        + "".join(f"R0,SVC,T{i},H\n" for i in range(n)),
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        + "".join(f"T{i},08:00:00,08:00:00,S0,1\n" for i in range(n)),
+        "calendar.txt": (
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date\n"
+        )
+        + "".join(f"SVC{i},1,1,1,1,1,1,1,20260101,20271231\n" for i in range(n)),
+        "calendar_dates.txt": "service_id,date,exception_type\n"
+        + "".join("SVC,20260704,1\n" for _ in range(n)),
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    zip_path = tmp_path / "big.zip"
+    zip_path.write_bytes(buf.getvalue())
+    progress_calls: list[tuple[int, int | None]] = []
+    index = StaticIndex.build(
+        zip_path,
+        ":memory:",
+        DATASET,
+        TZ,
+        lambda done, total: progress_calls.append((done, total)),
+    )
+    try:
+        assert len(index.stops()) == n
+        assert len(index.routes()) == n
+        assert progress_calls  # report() ran at least once per flushed loader
+    finally:
+        index.close()

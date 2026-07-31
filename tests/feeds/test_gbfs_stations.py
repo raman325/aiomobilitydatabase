@@ -1,6 +1,9 @@
 """Tests for GBFS endpoint resolution, ttl caching, system info, stations."""
 
+import pytest
+
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
+from aiomobilitydatabase.feeds.exceptions import SourceConnectionError
 from aiomobilitydatabase.feeds.geo import Circle
 
 from tests.feeds.fixtures import (
@@ -83,6 +86,39 @@ async def test_ttl_micro_cache(
     ]
     assert len(info_hits) == 1
     assert len(status_hits) == 1
+
+
+async def test_document_endpoint_not_published_raises(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    base = mock_api.url()
+    feed = with_base(GBFS_FEED, base)
+    feed["versions"][0]["endpoints"] = [
+        e for e in feed["versions"][0]["endpoints"] if e["name"] != "system_information"
+    ]
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=feed)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    with pytest.raises(SourceConnectionError, match="not published"):
+        await handle.get_system_info()
+
+
+async def test_document_fetch_unreachable_raises_source_connection_error(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    base = mock_api.url()
+    feed = with_base(GBFS_FEED, base)
+    feed["versions"][0]["endpoints"] = [
+        {
+            "name": "system_information",
+            "url": "http://127.0.0.1:1/gbfs/system_information.json",
+        },
+    ]
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=feed)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    with pytest.raises(SourceConnectionError, match="Error fetching"):
+        await handle.get_system_info()
 
 
 async def test_gbfs_30_localized_name(

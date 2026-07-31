@@ -5,6 +5,7 @@ from pathlib import Path
 import aiohttp
 import pytest
 
+from aiomobilitydatabase.const import PROD_BASE_URL
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 
 from tests.feeds.fixtures import TOKEN_RESPONSE
@@ -18,6 +19,14 @@ async def test_catalog_property_reaches_api(
     mock_api.get("/v1/metadata", payload={"version": "1.0.0", "commit_hash": "abc"})
     metadata = await feeds_client.catalog.get_metadata()
     assert metadata.version == "1.0.0"
+
+
+async def test_catalog_defaults_to_prod_base_url_when_unset() -> None:
+    # No base_url passed: the inner catalog client must fall back to the
+    # production API rather than requiring every caller to pass it through.
+    client = MobilityFeedsClient("test-refresh-token")
+    assert client.catalog._base_url == PROD_BASE_URL  # deliberate friend access
+    await client.close()
 
 
 async def test_owned_session_closed_and_recreated(mock_api: MockApi) -> None:
