@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -184,7 +185,7 @@ class TransitFeedHandle:
                 raise FeedParseError(
                     f"Feed id {static_feed.id!r} escapes the cache directory"
                 )
-            feed_dir.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(feed_dir.mkdir, parents=True, exist_ok=True)
             db_path = feed_dir / STATIC_DB_FILENAME
             cached = await asyncio.to_thread(
                 StaticIndex.open_cached, db_path, dataset.id
@@ -192,7 +193,8 @@ class TransitFeedHandle:
             if cached is not None:
                 return cached
         session = client._get_session()  # deliberate friend access
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = await asyncio.to_thread(tempfile.mkdtemp)
+        try:
             zip_path = Path(tmp_dir) / "dataset.zip"
             try:
                 async with session.get(
@@ -210,9 +212,13 @@ class TransitFeedHandle:
                     done_bytes = 0
                     last_emitted = 0
                     first_chunk = True
-                    with zip_path.open("wb") as fp:
+                    # File writes stay off the event loop: consumers (for
+                    # example Home Assistant) run this on their loop and a
+                    # large dataset means thousands of 64 KiB writes.
+                    fp = await asyncio.to_thread(zip_path.open, "wb")
+                    try:
                         async for chunk in resp.content.iter_chunked(1 << 16):
-                            fp.write(chunk)
+                            await asyncio.to_thread(fp.write, chunk)
                             done_bytes += len(chunk)
                             if on_progress is not None and (
                                 first_chunk
@@ -227,6 +233,8 @@ class TransitFeedHandle:
                                 )
                                 last_emitted = done_bytes
                                 first_chunk = False
+                    finally:
+                        await asyncio.to_thread(fp.close)
                     if on_progress is not None:
                         on_progress(
                             StaticBuildProgress(
@@ -259,6 +267,8 @@ class TransitFeedHandle:
                 dataset.agency_timezone,
                 build_progress,
             )
+        finally:
+            await asyncio.to_thread(shutil.rmtree, tmp_dir, ignore_errors=True)
 
     def _rt_feeds_for(self, entity_type: EntityType) -> list[GtfsRtFeed]:
         return [
