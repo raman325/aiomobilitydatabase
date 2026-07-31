@@ -137,3 +137,142 @@ GBFS_FEED: dict[str, Any] = {
     "bounding_box": BOUNDING_BOX,
     "bounding_box_generated_at": "2023-07-10T22:06:00Z",
 }
+
+SEARCH_RESPONSE: dict[str, Any] = {
+    "total": 1,
+    "results": [
+        {
+            "id": "mdb-1210",
+            "data_type": "gtfs",
+            "status": "active",
+            "created_at": "2023-07-10T22:06:00Z",
+            "official": True,
+            "external_ids": [],
+            "provider": "LADOT",
+            "feed_name": "Bus",
+            "note": None,
+            "feed_contact_email": None,
+            "source_info": SOURCE_INFO,
+            "redirects": None,
+            "locations": [LOCATION],
+            "latest_dataset": LATEST_DATASET,
+            "entity_types": None,
+            "versions": None,
+            "feed_references": None,
+        }
+    ],
+}
+
+GTFS_DATASET: dict[str, Any] = {
+    "id": "mdb-10-202402080058",
+    "feed_id": "mdb-10",
+    "hosted_url": "https://storage.googleapis.com/datasets/mdb-10.zip",
+    "note": None,
+    "downloaded_at": "2026-07-31T00:45:30.828071Z",
+    "hash": "6497e85e34390b8b377130881f2f10ec29c18a80dd6005d504a2038cdd00aa71",
+    "hash_md5": "098f6bcd4621d373cade4e832627b4f6",
+    "bounding_box": None,
+    "validation_report": {
+        "validated_at": "2023-07-10T22:06:00Z",
+        "features": ["Shapes"],
+        "validator_version": "4.2.0",
+        "total_error": 10,
+        "total_warning": 20,
+        "total_info": 30,
+        "unique_error_count": 1,
+        "unique_warning_count": 2,
+        "unique_info_count": 3,
+        "url_json": "https://example.com/report.json",
+        "url_html": "https://example.com/report.html",
+    },
+    "service_date_range_start": "2026-05-20T07:00:00Z",
+    "service_date_range_end": "2028-01-01T07:59:00Z",
+    "agency_timezone": "America/Los_Angeles",
+    "zipped_folder_size_mb": 100.2,
+    "unzipped_folder_size_mb": 200.5,
+}
+
+AVAILABILITY_RESPONSE: dict[str, Any] = {
+    "feed_id": "mdb-123",
+    "total": 42,
+    "offset": 0,
+    "limit": 100,
+    "checks": [
+        {
+            "checked_at": "2026-05-14T10:00:00Z",
+            "success": True,
+            "request_method": "HEAD",
+            "status_code": 200,
+            "latency_ms": 845.3,
+            "error_type": None,
+        }
+    ],
+}
+
+LOCATION_SEARCH_RESPONSE: dict[str, Any] = {
+    "total": 1,
+    "results": [
+        {
+            "location_id": 175905,
+            "parent_location_id": 161950,
+            "name": "Montréal",
+            "alt_name": "City of Montréal",
+            "location_type": "municipality",
+            "country_name": "Canada",
+            "country_code": "CA",
+            "subdivision_name": "Quebec",
+            "subdivision_code": "CA-QC",
+            "path_names": ["Canada", "Quebec", "Montréal"],
+            "display_name": "Canada, Quebec, Montréal",
+        }
+    ],
+}
+
+LICENSE: dict[str, Any] = {
+    "id": "0BSD",
+    "type": "standard",
+    "is_spdx": True,
+    "name": "BSD Zero Clause License",
+    "url": "https://example.com/license",
+    "description": "This is the 0BSD license.",
+    "created_at": "2023-07-10T22:06:00Z",
+    "updated_at": "2023-07-10T22:06:00Z",
+    "license_tags": ["family:ODC"],
+}
+
+LICENSE_WITH_RULES: dict[str, Any] = {
+    **LICENSE,
+    "license_rules": [
+        {
+            "name": "commercial-use",
+            "label": "Commercial use",
+            "description": "Allows commercial use.",
+            "type": "permission",
+        }
+    ],
+}
+
+MATCHING_LICENSE: dict[str, Any] = {
+    "license_id": "CC-BY-4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/deed.nl",
+    "normalized_url": "creativecommons.org/licenses/by/4.0",
+    "match_type": "heuristic",
+    "confidence": 0.99,
+    "spdx_id": "CC-BY-4.0",
+    "matched_name": "Creative Commons Attribution 4.0 International",
+    "matched_catalog_url": "https://creativecommons.org/licenses/by/4.0/legalcode",
+    "matched_source": "cc-resolver",
+    "notes": None,
+    "regional_id": "CC-BY-4.0-nl",
+}
+
+METADATA: dict[str, Any] = {
+    "version": "1.0.0",
+    "commit_hash": "8635fdac4fbff025b4eaca6972fcc9504bc1552d",
+}
+
+TOKEN_RESPONSE: dict[str, Any] = {
+    "access_token": "test-access-token",
+    "expiration_datetime_utc": "2030-01-01T00:00:00Z",
+    "token_type": "Bearer",
+}
