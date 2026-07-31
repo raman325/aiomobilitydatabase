@@ -21,10 +21,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-  # aiohttp<3.14 pending an aioresponses release compatible with aiohttp
-  # 3.14's ClientResponse (which added a required stream_writer kwarg);
-  # see https://github.com/pnuckowski/aioresponses/issues (0.7.9 is latest).
-  "aiohttp>=3.9,<3.14",
+  "aiohttp>=3.9",
   "mashumaro>=3.13",
 ]
 dynamic = ["version"]
@@ -35,7 +32,6 @@ dynamic = ["version"]
 
 [dependency-groups]
 dev = [
-  "aioresponses>=0.7.7",
   "mypy>=1.14",
   "pre-commit>=4.0",
   "pytest>=8.3",
@@ -58,10 +54,6 @@ testpaths = ["tests"]
 [tool.mypy]
 strict = true
 warn_unreachable = true
-
-[[tool.mypy.overrides]]
-module = "aioresponses.*"
-ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py312"

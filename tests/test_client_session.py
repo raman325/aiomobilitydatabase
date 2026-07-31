@@ -1,16 +1,17 @@
 """Tests for client construction, session ownership, and close()."""
 
 import aiohttp
-from aioresponses import aioresponses
 
 from aiomobilitydatabase.client import MobilityDatabaseClient
 from tests.fixtures import METADATA, TOKEN_RESPONSE
+from tests.mock_server import MockApi
 
 
-async def test_owned_session_closed_on_close(mock_api: aioresponses) -> None:
-    client = MobilityDatabaseClient("test-refresh-token")
-    mock_api.post("https://api.mobilitydatabase.org/v1/tokens", payload=TOKEN_RESPONSE)
-    mock_api.get("https://api.mobilitydatabase.org/v1/metadata", payload=METADATA)
+async def test_owned_session_closed_on_close(mock_api: MockApi) -> None:
+    base_url = str(mock_api.server.make_url("")).rstrip("/")
+    client = MobilityDatabaseClient("test-refresh-token", base_url=base_url)
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/metadata", payload=METADATA)
     await client.get_metadata()  # forces lazy session creation
     session = client._session
     assert session is not None
@@ -18,7 +19,7 @@ async def test_owned_session_closed_on_close(mock_api: aioresponses) -> None:
     assert session.closed
 
 
-async def test_injected_session_not_closed(mock_api: aioresponses) -> None:
+async def test_injected_session_not_closed(mock_api: MockApi) -> None:
     async with aiohttp.ClientSession() as session:
         client = MobilityDatabaseClient("test-refresh-token", session)
         await client.close()
@@ -41,10 +42,13 @@ async def test_close_idempotent_and_safe_before_use() -> None:
     await client.close()  # second call must not raise
 
 
-async def test_context_manager_closes(mock_api: aioresponses) -> None:
-    mock_api.post("https://api.mobilitydatabase.org/v1/tokens", payload=TOKEN_RESPONSE)
-    mock_api.get("https://api.mobilitydatabase.org/v1/metadata", payload=METADATA)
-    async with MobilityDatabaseClient("test-refresh-token") as client:
+async def test_context_manager_closes(mock_api: MockApi) -> None:
+    base_url = str(mock_api.server.make_url("")).rstrip("/")
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/metadata", payload=METADATA)
+    async with MobilityDatabaseClient(
+        "test-refresh-token", base_url=base_url
+    ) as client:
         await client.get_metadata()
         session = client._session
     assert session is not None
