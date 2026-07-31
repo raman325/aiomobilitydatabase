@@ -1,0 +1,19 @@
+{
+  "id": "mdb-200",
+  "data_type": "gtfs_rt",
+  "provider": "Test Transit",
+  "status": "active",
+  "entity_types": [
+    "vp",
+    "tu",
+    "sa"
+  ],
+  "feed_references": [
+    "mdb-100"
+  ],
+  "source_info": {
+    "producer_url": "__MOCK__/rt/all",
+    "authentication_type": 2,
+    "api_key_parameter_name": "X-Api-Key"
+  }
+}

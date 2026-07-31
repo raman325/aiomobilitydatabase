@@ -12,6 +12,7 @@ from aiomobilitydatabase.models import (
     License,
     SortOrder,
 )
+
 from tests.fixtures import (
     AVAILABILITY_RESPONSE,
     GBFS_FEED,

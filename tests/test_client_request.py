@@ -9,6 +9,7 @@ from aiomobilitydatabase.exceptions import (
     MobilityDatabaseNotFoundError,
     MobilityDatabaseRateLimitError,
 )
+
 from tests.fixtures import TOKEN_RESPONSE
 from tests.mock_server import MockApi
 

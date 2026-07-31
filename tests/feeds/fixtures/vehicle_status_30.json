@@ -1,0 +1,18 @@
+{
+  "last_updated": "2026-07-31T12:00:00Z",
+  "ttl": 30,
+  "version": "3.0",
+  "data": {
+    "vehicles": [
+      {
+        "vehicle_id": "v1",
+        "lat": 34.0505,
+        "lon": -118.2505,
+        "is_reserved": false,
+        "is_disabled": false,
+        "vehicle_type_id": "scooter",
+        "current_range_meters": 12000.0
+      }
+    ]
+  }
+}

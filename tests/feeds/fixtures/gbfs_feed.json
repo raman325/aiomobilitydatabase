@@ -1,0 +1,30 @@
+{
+  "id": "gbfs-300",
+  "data_type": "gbfs",
+  "provider": "Test Bikes",
+  "system_id": "test-bikes",
+  "versions": [
+    {
+      "version": "2.3",
+      "source": "autodiscovery",
+      "endpoints": [
+        {
+          "name": "system_information",
+          "url": "__MOCK__/gbfs/system_information.json"
+        },
+        {
+          "name": "station_information",
+          "url": "__MOCK__/gbfs/station_information.json"
+        },
+        {
+          "name": "station_status",
+          "url": "__MOCK__/gbfs/station_status.json"
+        },
+        {
+          "name": "free_bike_status",
+          "url": "__MOCK__/gbfs/free_bike_status.json"
+        }
+      ]
+    }
+  ]
+}

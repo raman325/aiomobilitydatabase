@@ -1,0 +1,5 @@
+stop_id,stop_name,stop_lat,stop_lon,parent_station,location_type
+S1,Main St,34.05,-118.25,,
+S2,Second Ave,34.06,-118.24,,
+S3,Depot,34.07,-118.23,ST1,0
+ST1,Depot Station,34.0705,-118.2295,,1

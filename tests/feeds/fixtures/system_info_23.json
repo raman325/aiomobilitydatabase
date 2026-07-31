@@ -1,0 +1,10 @@
+{
+  "last_updated": 1785500000,
+  "ttl": 60,
+  "data": {
+    "system_id": "test-bikes",
+    "name": "Test Bikes",
+    "operator": "Test Op",
+    "timezone": "America/Los_Angeles"
+  }
+}

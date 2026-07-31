@@ -27,6 +27,7 @@ from aiomobilitydatabase.models import (
     SearchResults,
     SourceInfo,
 )
+
 from tests.fixtures import (
     AVAILABILITY_RESPONSE,
     BOUNDING_BOX,

@@ -1,0 +1,22 @@
+{
+  "last_updated": 1785500000,
+  "ttl": 30,
+  "data": {
+    "bikes": [
+      {
+        "bike_id": "b1",
+        "lat": 34.0505,
+        "lon": -118.2505,
+        "is_reserved": false,
+        "is_disabled": false
+      },
+      {
+        "bike_id": "b2",
+        "lat": 34.2,
+        "lon": -118.2,
+        "is_reserved": false,
+        "is_disabled": false
+      }
+    ]
+  }
+}

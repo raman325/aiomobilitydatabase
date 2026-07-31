@@ -1,10 +1,11 @@
-"""Shared test fixtures."""
+"""Shared test fixtures: mock server + catalog client."""
 
 from collections.abc import AsyncGenerator
 
 import pytest
 
 from aiomobilitydatabase.client import MobilityDatabaseClient
+
 from tests.mock_server import MockApi
 
 

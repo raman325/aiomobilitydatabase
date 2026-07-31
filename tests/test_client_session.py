@@ -3,6 +3,7 @@
 import aiohttp
 
 from aiomobilitydatabase.client import MobilityDatabaseClient
+
 from tests.fixtures import METADATA, TOKEN_RESPONSE
 from tests.mock_server import MockApi
 

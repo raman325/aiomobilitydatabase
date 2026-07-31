@@ -1,0 +1,14 @@
+{
+  "id": "mdb-100",
+  "data_type": "gtfs",
+  "provider": "Test Transit",
+  "status": "active",
+  "source_info": {
+    "producer_url": "https://producer.example/gtfs.zip"
+  },
+  "latest_dataset": {
+    "id": "mdb-100-202607310000",
+    "hosted_url": "__MOCK__/hosted/mdb-100.zip",
+    "agency_timezone": "America/Los_Angeles"
+  }
+}

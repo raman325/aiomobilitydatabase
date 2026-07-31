@@ -10,6 +10,7 @@ from aiomobilitydatabase.exceptions import (
     MobilityDatabaseAuthenticationError,
     MobilityDatabaseConnectionError,
 )
+
 from tests.fixtures import METADATA, TOKEN_RESPONSE
 from tests.mock_server import MockApi
 

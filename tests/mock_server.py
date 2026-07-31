@@ -1,146 +1,112 @@
-"""In-repo aiohttp TestServer mock, replacing aioresponses.
+"""In-repo HTTP mock: a real aiohttp TestServer with scripted responses.
 
-aiohttp 3.14 made ``ClientResponse.__init__``'s ``stream_writer`` kwarg
-required; aioresponses 0.7.9 (latest on PyPI, fix unmerged upstream) can no
-longer construct mocked responses under it. This module runs a real
-``aiohttp.test_utils.TestServer`` on loopback instead, so it is version-proof
-against the actually-installed aiohttp.
+Used instead of aioresponses, which is incompatible with aiohttp >=3.14.
 """
 
 from __future__ import annotations
 
+import json as jsonlib
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-UNREGISTERED_STATUS = 599
-_UNREGISTERED_BODY = "MOCK_API: no response registered for {method} {path}"
+
+@dataclass
+class RecordedRequest:
+    """A single request observed by the mock server."""
+
+    method: str
+    path: str
+    # NOTE: dict(request.query) keeps only the last value per repeated key.
+    # Fine while clients comma-join multi-values; beware if that changes.
+    query: dict[str, str]
+    json: Any | None
+    headers: dict[str, str]
 
 
 @dataclass
 class _MockResponse:
+    """A single scripted response to return for a queued request."""
+
     status: int = 200
     payload: Any | None = None
-    body: str | None = None
+    body: bytes | str | None = None
     content_type: str = "application/json"
 
 
 @dataclass
-class RecordedRequest:
-    """A single request captured by the mock server."""
-
-    method: str
-    path: str
-    query: dict[str, str]
-    json: Any | None
-
-
 class MockApi:
-    """A minimal loopback aiohttp server that replays queued responses.
+    """Scripted responses served by a real local aiohttp server."""
 
-    Register responses per ``(method, path)`` as a FIFO queue -- each
-    registration is consumed exactly once, mirroring aioresponses' queueing
-    semantics. Every request that reaches the server (matched or not) is
-    recorded in ``requests``. Unregistered or exhausted routes return
-    ``UNREGISTERED_STATUS`` with a loud marker body so tests fail visibly
-    instead of hanging or silently mismatching.
-    """
+    requests: list[RecordedRequest] = field(default_factory=list)
+    _queues: dict[tuple[str, str], deque[_MockResponse]] = field(
+        default_factory=lambda: defaultdict(deque)
+    )
+    server: TestServer | None = None
 
-    def __init__(self) -> None:
-        """Build the backing app/server; call ``start()`` to serve it."""
-        self._queues: dict[tuple[str, str], deque[_MockResponse]] = defaultdict(deque)
-        self.requests: list[RecordedRequest] = []
-        self.server = TestServer(self._build_app())
+    def get(self, path: str, **kwargs: Any) -> None:
+        """Queue a scripted GET response for the given path."""
+        self._queues[("GET", path)].append(_MockResponse(**kwargs))
 
-    def get(
-        self,
-        path: str,
-        *,
-        status: int = 200,
-        payload: Any | None = None,
-        body: str | None = None,
-        content_type: str = "application/json",
-    ) -> None:
-        """Queue a response for the next GET to ``path``."""
-        self._register(
-            "GET",
-            path,
-            _MockResponse(
-                status=status, payload=payload, body=body, content_type=content_type
-            ),
-        )
+    def post(self, path: str, **kwargs: Any) -> None:
+        """Queue a scripted POST response for the given path."""
+        self._queues[("POST", path)].append(_MockResponse(**kwargs))
 
-    def post(
-        self,
-        path: str,
-        *,
-        status: int = 200,
-        payload: Any | None = None,
-        body: str | None = None,
-        content_type: str = "application/json",
-    ) -> None:
-        """Queue a response for the next POST to ``path``."""
-        self._register(
-            "POST",
-            path,
-            _MockResponse(
-                status=status, payload=payload, body=body, content_type=content_type
-            ),
-        )
-
-    def _register(self, method: str, path: str, response: _MockResponse) -> None:
-        self._queues[(method, path)].append(response)
-
-    async def start(self) -> None:
-        """Start the backing TestServer."""
-        await self.server.start_server()
-
-    async def stop(self) -> None:
-        """Stop the backing TestServer."""
-        await self.server.close()
-
-    def _build_app(self) -> web.Application:
-        application = web.Application()
-        application.router.add_route("*", "/{tail:.*}", self._handle)
-        return application
+    def url(self, path: str = "") -> str:
+        """Return the base URL of the running mock server plus an optional path."""
+        assert self.server is not None
+        return str(self.server.make_url(path)).rstrip("/")
 
     async def _handle(self, request: web.Request) -> web.Response:
-        """Record the request and serve the next queued response, if any."""
-        json_body: Any | None = None
-        if request.body_exists:
+        body_json: Any | None = None
+        if request.can_read_body and request.content_type == "application/json":
             try:
-                json_body = await request.json()
+                # ValueError covers JSONDecodeError: malformed bodies record as None.
+                body_json = await request.json()
             except ValueError:
-                json_body = None
-        # dict(request.query) keeps only the last value per repeated query
-        # key. Fine today because encode_params() comma-joins list/tuple
-        # values into a single key=value pair -- but a future test asserting
-        # on a genuinely repeated key (e.g. ?x=1&x=2) would need
-        # request.query.getall("x") instead.
+                body_json = None
         self.requests.append(
             RecordedRequest(
                 method=request.method,
                 path=request.path,
                 query=dict(request.query),
-                json=json_body,
+                json=body_json,
+                headers=dict(request.headers),
             )
         )
         queue = self._queues.get((request.method, request.path))
         if not queue:
             return web.Response(
-                status=UNREGISTERED_STATUS,
-                text=_UNREGISTERED_BODY.format(
-                    method=request.method, path=request.path
-                ),
+                status=599,
+                text=f"UNREGISTERED MOCK ROUTE: {request.method} {request.path}",
             )
-        mock_response = queue.popleft()
-        if mock_response.body is not None:
+        scripted = queue.popleft()
+        if scripted.payload is not None:
             return web.Response(
-                status=mock_response.status,
-                text=mock_response.body,
-                content_type=mock_response.content_type,
+                status=scripted.status,
+                body=jsonlib.dumps(scripted.payload).encode(),
+                content_type="application/json",
             )
-        return web.json_response(mock_response.payload, status=mock_response.status)
+        # Deliberate divergence from the pkg1 reference mock: no payload/body scripted
+        # returns a truly empty body (204-style), not JSON `null`.
+        body = scripted.body or b""
+        if isinstance(body, str):
+            body = body.encode()
+        return web.Response(
+            status=scripted.status, body=body, content_type=scripted.content_type
+        )
+
+    async def start(self) -> None:
+        """Start the underlying aiohttp TestServer."""
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", self._handle)
+        self.server = TestServer(app)
+        await self.server.start_server()
+
+    async def stop(self) -> None:
+        """Stop the underlying aiohttp TestServer."""
+        if self.server is not None:
+            await self.server.close()
