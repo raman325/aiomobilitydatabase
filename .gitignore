@@ -9,3 +9,4 @@ dist/
 .coverage
 coverage.xml
 uv.lock
+.DS_Store

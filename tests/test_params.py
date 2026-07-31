@@ -45,3 +45,9 @@ def test_int_and_str_passthrough() -> None:
         "limit": "10",
         "search_query": "new york",
     }
+
+
+def test_empty_containers_dropped() -> None:
+    assert encode_params({"data_type": [], "dataset_latitudes": (), "limit": 1}) == {
+        "limit": "1"
+    }

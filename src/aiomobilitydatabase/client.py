@@ -56,20 +56,23 @@ def _encode_value(value: Any) -> str:
         return str(value.value)
     if isinstance(value, datetime):
         return value.isoformat()
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return ",".join(_encode_value(item) for item in value)
     return str(value)
 
 
 def encode_params(params: dict[str, Any]) -> dict[str, str]:
-    """Encode query parameters, dropping None values.
+    """Encode query parameters, dropping None values and empty containers.
 
     Booleans become "true"/"false", enums use their value, datetimes use ISO
     format, and lists/tuples are comma-joined (the API's convention for
-    multi-value filters).
+    multi-value filters). An empty list or tuple means "no filter" and is
+    dropped just like None, rather than encoding to an empty-string param.
     """
     return {
-        key: _encode_value(value) for key, value in params.items() if value is not None
+        key: _encode_value(value)
+        for key, value in params.items()
+        if value is not None and not (isinstance(value, list | tuple) and not value)
     }
 
 

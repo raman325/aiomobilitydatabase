@@ -73,6 +73,13 @@ class LicenseRuleType(StrEnum):
     LIMITATION = "limitation"
 
 
+class RequestMethod(StrEnum):
+    """HTTP method used for a feed availability check."""
+
+    HEAD = "HEAD"
+    GET = "GET"
+
+
 @dataclass
 class Redirect(DataClassDictMixin):
     """A feed redirect to a replacement feed ID."""
@@ -328,7 +335,7 @@ class GtfsFeedAvailabilityCheck(DataClassDictMixin):
 
     checked_at: datetime
     success: bool
-    request_method: str
+    request_method: RequestMethod
     status_code: int | None = None
     latency_ms: float | None = None
     error_type: str | None = None

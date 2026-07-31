@@ -15,6 +15,7 @@ def test_public_exports() -> None:
         "DataType",
         "FeedStatus",
         "EntityType",
+        "RequestMethod",
         "MobilityDatabaseError",
         "MobilityDatabaseAuthenticationError",
         "__version__",

@@ -23,6 +23,7 @@ from aiomobilitydatabase.models import (
     LocationType,
     MatchingLicense,
     Metadata,
+    RequestMethod,
     SearchResults,
     SourceInfo,
 )
@@ -144,6 +145,7 @@ def test_availability() -> None:
     check = availability.checks[0]
     assert check.success is True
     assert check.request_method == "HEAD"
+    assert check.request_method is RequestMethod.HEAD
     assert check.error_type is None
 
 

@@ -79,6 +79,8 @@ async def test_get_gtfs_feed(mock_api: MockApi, client: MobilityDatabaseClient) 
     mock_api.get("/v1/gtfs_feeds/mdb-1210", payload=GTFS_FEED)
     feed = await client.get_gtfs_feed("mdb-1210")
     assert feed.latest_dataset is not None
+    req = _last_request(mock_api, "/v1/gtfs_feeds/mdb-1210")
+    assert req.query == {}
 
 
 async def test_get_gtfs_rt_feeds_entity_types(
@@ -104,6 +106,8 @@ async def test_get_gtfs_rt_feed(
     mock_api.get("/v1/gtfs_rt_feeds/mdb-1211", payload=GTFS_RT_FEED)
     feed = await client.get_gtfs_rt_feed("mdb-1211")
     assert feed.id == "mdb-1211"
+    req = _last_request(mock_api, "/v1/gtfs_rt_feeds/mdb-1211")
+    assert req.query == {}
 
 
 async def test_get_gbfs_feeds(
@@ -122,6 +126,8 @@ async def test_get_gbfs_feed(mock_api: MockApi, client: MobilityDatabaseClient) 
     mock_api.get("/v1/gbfs_feeds/gbfs-citibike", payload=GBFS_FEED)
     feed = await client.get_gbfs_feed("gbfs-citibike")
     assert feed.provider_url == "https://www.citybikenyc.com/"
+    req = _last_request(mock_api, "/v1/gbfs_feeds/gbfs-citibike")
+    assert req.query == {}
 
 
 async def test_get_gtfs_feed_datasets(
@@ -179,6 +185,8 @@ async def test_get_dataset_gtfs(
     mock_api.get("/v1/datasets/gtfs/mdb-10-202402080058", payload=GTFS_DATASET)
     dataset = await client.get_dataset_gtfs("mdb-10-202402080058")
     assert dataset.id == "mdb-10-202402080058"
+    req = _last_request(mock_api, "/v1/datasets/gtfs/mdb-10-202402080058")
+    assert req.query == {}
 
 
 async def test_search_feeds(mock_api: MockApi, client: MobilityDatabaseClient) -> None:
@@ -226,6 +234,8 @@ async def test_get_license(mock_api: MockApi, client: MobilityDatabaseClient) ->
     mock_api.get("/v1/licenses/0BSD", payload=LICENSE_WITH_RULES)
     license_ = await client.get_license("0BSD")
     assert license_.license_rules is not None
+    req = _last_request(mock_api, "/v1/licenses/0BSD")
+    assert req.query == {}
 
 
 async def test_get_matching_licenses(
