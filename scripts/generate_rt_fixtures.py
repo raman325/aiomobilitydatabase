@@ -51,7 +51,7 @@ def _build_vehicle_positions() -> bytes:
     vehicle2.trip.trip_id = "T3"  # route resolved via static index (no route_id set)
     vehicle2.position.latitude = 34.06
     vehicle2.position.longitude = -118.24
-    return msg.SerializeToString()
+    return bytes(msg.SerializeToString())
 
 
 def _build_trip_updates(*, base_epoch: int) -> bytes:
@@ -85,7 +85,7 @@ def _build_trip_updates(*, base_epoch: int) -> bytes:
     stu3.stop_id = "S2"
     stu3.arrival.time = base_epoch + 600
     stu3.departure.time = base_epoch + 630
-    return msg.SerializeToString()
+    return bytes(msg.SerializeToString())
 
 
 def _build_added_trips(*, base_epoch: int, stop_id: str, count: int) -> bytes:
@@ -110,7 +110,7 @@ def _build_added_trips(*, base_epoch: int, stop_id: str, count: int) -> bytes:
         offset = 60 * (i + 1)
         stu.arrival.time = base_epoch + offset
         stu.departure.time = base_epoch + offset + 30
-    return msg.SerializeToString()
+    return bytes(msg.SerializeToString())
 
 
 def _build_alerts() -> bytes:
@@ -135,7 +135,7 @@ def _build_alerts() -> bytes:
     desc = alert.description_text.translation.add()
     desc.text = "Use Second Ave"
     desc.language = "en"
-    return msg.SerializeToString()
+    return bytes(msg.SerializeToString())
 
 
 def main() -> None:

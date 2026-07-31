@@ -205,7 +205,7 @@ The suite (174 tests) combines example-based and property-based testing:
   assertions on headers, query params, and bodies. This replaces
   [aioresponses](https://github.com/pnuckowski/aioresponses), which cannot
   construct mocked responses under aiohttp >=3.14.
-- **Property-based tests** (`tests/test_feeds_properties.py`, via
+- **Property-based tests** (`tests/feeds/test_properties.py`, via
   [Hypothesis](https://hypothesis.readthedocs.io/)) target the modules where
   correctness is a matter of an invariant holding across a wide input space
   rather than a handful of hand-picked cases:
