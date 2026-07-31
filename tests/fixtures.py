@@ -51,3 +51,89 @@ LATEST_DATASET: dict[str, Any] = {
         "unique_info_count": 3,
     },
 }
+
+GTFS_FEED: dict[str, Any] = {
+    "id": "mdb-1210",
+    "data_type": "gtfs",
+    "created_at": "2023-07-10T22:06:00Z",
+    "external_ids": [{"external_id": "1210", "source": "mdb"}],
+    "provider": "Los Angeles Department of Transportation",
+    "feed_contact_email": "someEmail@ladotbus.com",
+    "source_info": SOURCE_INFO,
+    "redirects": [],
+    "status": "active",
+    "official": True,
+    "official_updated_at": "2023-07-10T22:06:00Z",
+    "feed_name": "Bus",
+    "note": None,
+    "related_links": [
+        {
+            "code": "next_1",
+            "description": "URL for a future feed version.",
+            "url": "https://example.com/next",
+            "created_at": "2023-07-10T22:06:00Z",
+        }
+    ],
+    "locations": [LOCATION],
+    "latest_dataset": LATEST_DATASET,
+    "bounding_box": BOUNDING_BOX,
+    "visualization_dataset_id": "mdb-1210-202402121801",
+}
+
+GTFS_RT_FEED: dict[str, Any] = {
+    "id": "mdb-1211",
+    "data_type": "gtfs_rt",
+    "created_at": "2023-07-10T22:06:00Z",
+    "external_ids": [],
+    "provider": "LADOT",
+    "feed_contact_email": None,
+    "source_info": SOURCE_INFO,
+    "redirects": None,
+    "status": "active",
+    "official": None,
+    "official_updated_at": None,
+    "feed_name": None,
+    "note": None,
+    "related_links": None,
+    "entity_types": ["vp", "tu"],
+    "feed_references": ["mdb-1210"],
+    "locations": [LOCATION],
+}
+
+GBFS_FEED: dict[str, Any] = {
+    "id": "gbfs-citibike",
+    "data_type": "gbfs",
+    "created_at": "2023-07-10T22:06:00Z",
+    "external_ids": [],
+    "provider": "Citi Bike",
+    "feed_contact_email": None,
+    "source_info": SOURCE_INFO,
+    "redirects": [],
+    "locations": [LOCATION],
+    "system_id": "system-1234",
+    "provider_url": "https://www.citybikenyc.com/",
+    "versions": [
+        {
+            "version": "2.3",
+            "created_at": "2023-07-10T22:06:00Z",
+            "last_updated_at": "2023-07-10T22:06:00Z",
+            "source": "autodiscovery",
+            "endpoints": [
+                {
+                    "name": "system_information",
+                    "url": "https://gbfs.citibikenyc.com/gbfs/system_information.json",
+                    "language": "en",
+                    "is_feature": False,
+                }
+            ],
+            "latest_validation_report": {
+                "validated_at": "2023-07-10T22:06:00Z",
+                "total_error": 0,
+                "report_summary_url": "https://example.com/report.json",
+                "validator_version": "1.0.13",
+            },
+        }
+    ],
+    "bounding_box": BOUNDING_BOX,
+    "bounding_box_generated_at": "2023-07-10T22:06:00Z",
+}

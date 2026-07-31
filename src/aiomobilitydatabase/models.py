@@ -164,3 +164,91 @@ class LatestDataset(DataClassDictMixin):
     zipped_folder_size_mb: float | None = None
     unzipped_folder_size_mb: float | None = None
     validation_report: ValidationReportSummary | None = None
+
+
+@dataclass
+class Feed(DataClassDictMixin):
+    """Common feed fields shared by all feed types."""
+
+    id: str | None = None
+    data_type: DataType | None = None
+    created_at: datetime | None = None
+    external_ids: list[ExternalId] | None = None
+    provider: str | None = None
+    feed_contact_email: str | None = None
+    source_info: SourceInfo | None = None
+    redirects: list[Redirect] | None = None
+    status: FeedStatus | None = None
+    official: bool | None = None
+    official_updated_at: datetime | None = None
+    feed_name: str | None = None
+    note: str | None = None
+    related_links: list[FeedRelatedLink] | None = None
+
+
+@dataclass
+class GtfsFeed(Feed):
+    """A GTFS schedule feed."""
+
+    locations: list[Location] | None = None
+    latest_dataset: LatestDataset | None = None
+    bounding_box: BoundingBox | None = None
+    visualization_dataset_id: str | None = None
+
+
+@dataclass
+class GtfsRtFeed(Feed):
+    """A GTFS Realtime feed."""
+
+    entity_types: list[EntityType] | None = None
+    feed_references: list[str] | None = None
+    locations: list[Location] | None = None
+
+
+@dataclass
+class GbfsEndpoint(DataClassDictMixin):
+    """An endpoint available in a GBFS version."""
+
+    name: str | None = None
+    url: str | None = None
+    language: str | None = None
+    is_feature: bool | None = None
+
+
+@dataclass
+class GbfsValidationReport(DataClassDictMixin):
+    """A validation report for a GBFS feed version."""
+
+    validated_at: datetime | None = None
+    total_error: int | None = None
+    report_summary_url: str | None = None
+    validator_version: str | None = None
+
+
+@dataclass
+class GbfsVersion(DataClassDictMixin):
+    """A GBFS specification version supported by a feed."""
+
+    version: str | None = None
+    created_at: datetime | None = None
+    last_updated_at: datetime | None = None
+    source: GbfsVersionSource | None = None
+    endpoints: list[GbfsEndpoint] | None = None
+    latest_validation_report: GbfsValidationReport | None = None
+
+
+@dataclass
+class GbfsFeed(Feed):
+    """A GBFS feed.
+
+    The spec derives GbfsFeed from BasicFeed (without status/official/related
+    fields); sharing the Feed base here is harmless since all fields are
+    optional and unknown keys are ignored.
+    """
+
+    locations: list[Location] | None = None
+    system_id: str | None = None
+    provider_url: str | None = None
+    versions: list[GbfsVersion] | None = None
+    bounding_box: BoundingBox | None = None
+    bounding_box_generated_at: datetime | None = None

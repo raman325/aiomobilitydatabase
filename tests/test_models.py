@@ -7,11 +7,23 @@ from aiomobilitydatabase.models import (
     DataType,
     EntityType,
     FeedStatus,
+    GbfsFeed,
+    GbfsVersionSource,
+    GtfsFeed,
+    GtfsRtFeed,
     LatestDataset,
     Location,
     SourceInfo,
 )
-from tests.fixtures import BOUNDING_BOX, LATEST_DATASET, LOCATION, SOURCE_INFO
+from tests.fixtures import (
+    BOUNDING_BOX,
+    GBFS_FEED,
+    GTFS_FEED,
+    GTFS_RT_FEED,
+    LATEST_DATASET,
+    LOCATION,
+    SOURCE_INFO,
+)
 
 
 def test_enums() -> None:
@@ -48,3 +60,40 @@ def test_latest_dataset() -> None:
 def test_unknown_fields_ignored() -> None:
     loc = Location.from_dict({**LOCATION, "brand_new_upstream_field": "x"})
     assert loc.country_code == "US"
+
+
+def test_gtfs_feed() -> None:
+    feed = GtfsFeed.from_dict(GTFS_FEED)
+    assert feed.id == "mdb-1210"
+    assert feed.data_type is DataType.GTFS
+    assert feed.status is FeedStatus.ACTIVE
+    assert feed.official is True
+    assert feed.source_info is not None
+    assert feed.source_info.producer_url == "https://ladotbus.com/gtfs"
+    assert feed.latest_dataset is not None
+    assert feed.latest_dataset.hosted_url is not None
+    assert feed.locations is not None
+    assert feed.locations[0].country_code == "US"
+    assert feed.related_links is not None
+    assert feed.related_links[0].code == "next_1"
+    assert feed.related_links[0].created_at is not None
+
+
+def test_gtfs_rt_feed() -> None:
+    feed = GtfsRtFeed.from_dict(GTFS_RT_FEED)
+    assert feed.data_type is DataType.GTFS_RT
+    assert feed.entity_types == [EntityType.VEHICLE_POSITIONS, EntityType.TRIP_UPDATES]
+    assert feed.feed_references == ["mdb-1210"]
+    assert feed.redirects is None
+
+
+def test_gbfs_feed() -> None:
+    feed = GbfsFeed.from_dict(GBFS_FEED)
+    assert feed.system_id == "system-1234"
+    assert feed.versions is not None
+    version = feed.versions[0]
+    assert version.source is GbfsVersionSource.AUTODISCOVERY
+    assert version.endpoints is not None
+    assert version.endpoints[0].name == "system_information"
+    assert version.latest_validation_report is not None
+    assert version.latest_validation_report.total_error == 0
