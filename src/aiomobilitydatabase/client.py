@@ -25,7 +25,27 @@ from .exceptions import (
     MobilityDatabaseNotFoundError,
     MobilityDatabaseRateLimitError,
 )
-from .models import AccessToken, Metadata
+from .models import (
+    AccessToken,
+    BoundingFilterMethod,
+    DataType,
+    EntityType,
+    Feed,
+    FeedStatus,
+    GbfsFeed,
+    GtfsDataset,
+    GtfsFeed,
+    GtfsFeedAvailability,
+    GtfsRtFeed,
+    License,
+    LicenseWithRules,
+    LocationSearchResults,
+    LocationType,
+    MatchingLicense,
+    Metadata,
+    SearchResults,
+    SortOrder,
+)
 
 
 def _encode_value(value: Any) -> str:
@@ -224,3 +244,286 @@ class MobilityDatabaseClient:
         """Get metadata about the API."""
         data = await self._request("GET", "/v1/metadata")
         return Metadata.from_dict(data)
+
+    async def get_feeds(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        status: FeedStatus | None = None,
+        provider: str | None = None,
+        producer_url: str | None = None,
+        is_official: bool | None = None,
+    ) -> list[Feed]:
+        """Get feeds of all data types."""
+        data = await self._request(
+            "GET",
+            "/v1/feeds",
+            params={
+                "limit": limit,
+                "offset": offset,
+                "status": status,
+                "provider": provider,
+                "producer_url": producer_url,
+                "is_official": is_official,
+            },
+        )
+        return [Feed.from_dict(item) for item in data]
+
+    async def get_feed(self, feed_id: str) -> Feed:
+        """Get a single feed by ID."""
+        data = await self._request("GET", f"/v1/feeds/{feed_id}")
+        return Feed.from_dict(data)
+
+    async def get_gtfs_feeds(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        provider: str | None = None,
+        producer_url: str | None = None,
+        country_code: str | None = None,
+        subdivision_name: str | None = None,
+        municipality: str | None = None,
+        dataset_latitudes: tuple[float, float] | None = None,
+        dataset_longitudes: tuple[float, float] | None = None,
+        bounding_filter_method: BoundingFilterMethod | None = None,
+        is_official: bool | None = None,
+    ) -> list[GtfsFeed]:
+        """Get GTFS schedule feeds."""
+        data = await self._request(
+            "GET",
+            "/v1/gtfs_feeds",
+            params={
+                "limit": limit,
+                "offset": offset,
+                "provider": provider,
+                "producer_url": producer_url,
+                "country_code": country_code,
+                "subdivision_name": subdivision_name,
+                "municipality": municipality,
+                "dataset_latitudes": dataset_latitudes,
+                "dataset_longitudes": dataset_longitudes,
+                "bounding_filter_method": bounding_filter_method,
+                "is_official": is_official,
+            },
+        )
+        return [GtfsFeed.from_dict(item) for item in data]
+
+    async def get_gtfs_feed(self, feed_id: str) -> GtfsFeed:
+        """Get a single GTFS feed by ID."""
+        data = await self._request("GET", f"/v1/gtfs_feeds/{feed_id}")
+        return GtfsFeed.from_dict(data)
+
+    async def get_gtfs_rt_feeds(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        provider: str | None = None,
+        producer_url: str | None = None,
+        entity_types: list[EntityType] | None = None,
+        country_code: str | None = None,
+        subdivision_name: str | None = None,
+        municipality: str | None = None,
+        is_official: bool | None = None,
+    ) -> list[GtfsRtFeed]:
+        """Get GTFS Realtime feeds."""
+        data = await self._request(
+            "GET",
+            "/v1/gtfs_rt_feeds",
+            params={
+                "limit": limit,
+                "offset": offset,
+                "provider": provider,
+                "producer_url": producer_url,
+                "entity_types": entity_types,
+                "country_code": country_code,
+                "subdivision_name": subdivision_name,
+                "municipality": municipality,
+                "is_official": is_official,
+            },
+        )
+        return [GtfsRtFeed.from_dict(item) for item in data]
+
+    async def get_gtfs_rt_feed(self, feed_id: str) -> GtfsRtFeed:
+        """Get a single GTFS Realtime feed by ID."""
+        data = await self._request("GET", f"/v1/gtfs_rt_feeds/{feed_id}")
+        return GtfsRtFeed.from_dict(data)
+
+    async def get_gbfs_feeds(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        provider: str | None = None,
+        producer_url: str | None = None,
+        country_code: str | None = None,
+        subdivision_name: str | None = None,
+        municipality: str | None = None,
+        system_id: str | None = None,
+        version: str | None = None,
+    ) -> list[GbfsFeed]:
+        """Get GBFS feeds."""
+        data = await self._request(
+            "GET",
+            "/v1/gbfs_feeds",
+            params={
+                "limit": limit,
+                "offset": offset,
+                "provider": provider,
+                "producer_url": producer_url,
+                "country_code": country_code,
+                "subdivision_name": subdivision_name,
+                "municipality": municipality,
+                "system_id": system_id,
+                "version": version,
+            },
+        )
+        return [GbfsFeed.from_dict(item) for item in data]
+
+    async def get_gbfs_feed(self, feed_id: str) -> GbfsFeed:
+        """Get a single GBFS feed by ID."""
+        data = await self._request("GET", f"/v1/gbfs_feeds/{feed_id}")
+        return GbfsFeed.from_dict(data)
+
+    async def get_gtfs_feed_datasets(
+        self,
+        feed_id: str,
+        *,
+        latest: bool | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        downloaded_after: datetime | None = None,
+        downloaded_before: datetime | None = None,
+    ) -> list[GtfsDataset]:
+        """Get datasets for a GTFS feed, sorted newest to oldest."""
+        data = await self._request(
+            "GET",
+            f"/v1/gtfs_feeds/{feed_id}/datasets",
+            params={
+                "latest": latest,
+                "limit": limit,
+                "offset": offset,
+                "downloaded_after": downloaded_after,
+                "downloaded_before": downloaded_before,
+            },
+        )
+        return [GtfsDataset.from_dict(item) for item in data]
+
+    async def get_gtfs_feed_gtfs_rt_feeds(self, feed_id: str) -> list[GtfsRtFeed]:
+        """Get GTFS Realtime feeds related to a GTFS feed."""
+        data = await self._request("GET", f"/v1/gtfs_feeds/{feed_id}/gtfs_rt_feeds")
+        return [GtfsRtFeed.from_dict(item) for item in data]
+
+    async def get_gtfs_feed_availability(
+        self,
+        feed_id: str,
+        *,
+        checked_after: datetime | None = None,
+        checked_before: datetime | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        sort: SortOrder | None = None,
+    ) -> GtfsFeedAvailability:
+        """Get historical availability checks for a GTFS feed."""
+        data = await self._request(
+            "GET",
+            f"/v1/gtfs_feeds/{feed_id}/availability",
+            params={
+                "from": checked_after,
+                "to": checked_before,
+                "limit": limit,
+                "offset": offset,
+                "sort": sort,
+            },
+        )
+        return GtfsFeedAvailability.from_dict(data)
+
+    async def get_dataset_gtfs(self, dataset_id: str) -> GtfsDataset:
+        """Get a single GTFS dataset by ID."""
+        data = await self._request("GET", f"/v1/datasets/gtfs/{dataset_id}")
+        return GtfsDataset.from_dict(data)
+
+    async def search_feeds(
+        self,
+        *,
+        search_query: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        statuses: list[FeedStatus] | None = None,
+        feed_id: str | None = None,
+        data_types: list[DataType] | None = None,
+        is_official: bool | None = None,
+        version: str | None = None,
+        features: list[str] | None = None,
+        license_ids: list[str] | None = None,
+        license_is_spdx: bool | None = None,
+        license_tags: list[str] | None = None,
+    ) -> SearchResults:
+        """Full-text search for feeds by name, location, and provider."""
+        data = await self._request(
+            "GET",
+            "/v1/search",
+            params={
+                "search_query": search_query,
+                "limit": limit,
+                "offset": offset,
+                "status": statuses,
+                "feed_id": feed_id,
+                "data_type": data_types,
+                "is_official": is_official,
+                "version": version,
+                "feature": features,
+                "license_ids": license_ids,
+                "license_is_spdx": license_is_spdx,
+                "license_tags": license_tags,
+            },
+        )
+        return SearchResults.from_dict(data)
+
+    async def get_locations(
+        self,
+        *,
+        search_query: str | None = None,
+        country_code: str | None = None,
+        subdivision_code: str | None = None,
+        location_type: LocationType | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> LocationSearchResults:
+        """Search locations (countries, subdivisions, municipalities)."""
+        data = await self._request(
+            "GET",
+            "/v1/locations",
+            params={
+                "search_query": search_query,
+                "country_code": country_code,
+                "subdivision_code": subdivision_code,
+                "location_type": location_type,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        return LocationSearchResults.from_dict(data)
+
+    async def get_licenses(
+        self, *, limit: int | None = None, offset: int | None = None
+    ) -> list[License]:
+        """Get all licenses in the database."""
+        data = await self._request(
+            "GET", "/v1/licenses", params={"limit": limit, "offset": offset}
+        )
+        return [License.from_dict(item) for item in data]
+
+    async def get_license(self, license_id: str) -> LicenseWithRules:
+        """Get a single license, including its rules."""
+        data = await self._request("GET", f"/v1/licenses/{license_id}")
+        return LicenseWithRules.from_dict(data)
+
+    async def get_matching_licenses(self, license_url: str) -> list[MatchingLicense]:
+        """Match a license URL against the license database."""
+        data = await self._request(
+            "POST", "/v1/licenses:match", json_body={"license_url": license_url}
+        )
+        return [MatchingLicense.from_dict(item) for item in data]
