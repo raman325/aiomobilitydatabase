@@ -131,7 +131,21 @@ class MobilityFeedsClient:
         api_key: str | None = None,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
     ) -> TransitFeedHandle:
-        """Resolve a GTFS or GTFS-RT feed ID into a TransitFeedHandle."""
+        """Resolve a GTFS or GTFS-RT feed ID into a TransitFeedHandle.
+
+        ``on_progress``, if given, must not raise: it is called inline and
+        is NOT wrapped in a try/except, so a raising callback aborts this
+        call -- its exception propagates out of ``get_transit_feed`` rather
+        than being silently swallowed (fail-fast, not best-effort). This
+        holds cleanly during the download phase, where each call happens
+        directly on this coroutine's task. During the index-build phase
+        (which runs in a worker thread), progress events are marshaled back
+        via ``loop.call_soon_threadsafe`` -- a raising callback there still
+        surfaces (as an unhandled exception in the event loop, reported via
+        the loop's exception handler) but asynchronously, after the
+        callback's own scheduling, so it cannot abort a build already in
+        progress.
+        """
         return await TransitFeedHandle.create(self, feed_id, api_key, on_progress)
 
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeedHandle:

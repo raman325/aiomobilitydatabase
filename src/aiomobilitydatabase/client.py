@@ -8,6 +8,7 @@ from enum import Enum
 from http import HTTPStatus
 from types import TracebackType
 from typing import Any, Self
+from urllib.parse import quote
 
 import aiohttp
 
@@ -59,6 +60,20 @@ def _encode_value(value: Any) -> str:
     if isinstance(value, list | tuple):
         return ",".join(_encode_value(item) for item in value)
     return str(value)
+
+
+def _quote_segment(segment: str) -> str:
+    """Percent-encode one path segment (an id) for safe URL interpolation.
+
+    Every id interpolated into a request path (feed_id, license_id,
+    dataset_id, ...) goes through this. ``safe=""`` quotes every character
+    outside the unreserved set -- including "/" -- so an id containing "/",
+    "?", "#", "%", spaces, or non-ASCII text always becomes exactly one path
+    segment instead of injecting extra segments, a query string, or a
+    fragment. Additive-safe: ids already restricted to unreserved characters
+    (the overwhelming common case) are returned unchanged.
+    """
+    return quote(segment, safe="")
 
 
 def encode_params(params: dict[str, Any]) -> dict[str, str]:
@@ -275,7 +290,7 @@ class MobilityDatabaseClient:
 
     async def get_feed(self, feed_id: str) -> Feed:
         """Get a single feed by ID."""
-        data = await self._request("GET", f"/v1/feeds/{feed_id}")
+        data = await self._request("GET", f"/v1/feeds/{_quote_segment(feed_id)}")
         return Feed.from_dict(data)
 
     async def get_gtfs_feeds(
@@ -315,7 +330,7 @@ class MobilityDatabaseClient:
 
     async def get_gtfs_feed(self, feed_id: str) -> GtfsFeed:
         """Get a single GTFS feed by ID."""
-        data = await self._request("GET", f"/v1/gtfs_feeds/{feed_id}")
+        data = await self._request("GET", f"/v1/gtfs_feeds/{_quote_segment(feed_id)}")
         return GtfsFeed.from_dict(data)
 
     async def get_gtfs_rt_feeds(
@@ -351,7 +366,9 @@ class MobilityDatabaseClient:
 
     async def get_gtfs_rt_feed(self, feed_id: str) -> GtfsRtFeed:
         """Get a single GTFS Realtime feed by ID."""
-        data = await self._request("GET", f"/v1/gtfs_rt_feeds/{feed_id}")
+        data = await self._request(
+            "GET", f"/v1/gtfs_rt_feeds/{_quote_segment(feed_id)}"
+        )
         return GtfsRtFeed.from_dict(data)
 
     async def get_gbfs_feeds(
@@ -387,7 +404,7 @@ class MobilityDatabaseClient:
 
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeed:
         """Get a single GBFS feed by ID."""
-        data = await self._request("GET", f"/v1/gbfs_feeds/{feed_id}")
+        data = await self._request("GET", f"/v1/gbfs_feeds/{_quote_segment(feed_id)}")
         return GbfsFeed.from_dict(data)
 
     async def get_gtfs_feed_datasets(
@@ -403,7 +420,7 @@ class MobilityDatabaseClient:
         """Get datasets for a GTFS feed, sorted newest to oldest."""
         data = await self._request(
             "GET",
-            f"/v1/gtfs_feeds/{feed_id}/datasets",
+            f"/v1/gtfs_feeds/{_quote_segment(feed_id)}/datasets",
             params={
                 "latest": latest,
                 "limit": limit,
@@ -416,7 +433,9 @@ class MobilityDatabaseClient:
 
     async def get_gtfs_feed_gtfs_rt_feeds(self, feed_id: str) -> list[GtfsRtFeed]:
         """Get GTFS Realtime feeds related to a GTFS feed."""
-        data = await self._request("GET", f"/v1/gtfs_feeds/{feed_id}/gtfs_rt_feeds")
+        data = await self._request(
+            "GET", f"/v1/gtfs_feeds/{_quote_segment(feed_id)}/gtfs_rt_feeds"
+        )
         return [GtfsRtFeed.from_dict(item) for item in data]
 
     async def get_gtfs_feed_availability(
@@ -432,7 +451,7 @@ class MobilityDatabaseClient:
         """Get historical availability checks for a GTFS feed."""
         data = await self._request(
             "GET",
-            f"/v1/gtfs_feeds/{feed_id}/availability",
+            f"/v1/gtfs_feeds/{_quote_segment(feed_id)}/availability",
             params={
                 "from": checked_after,
                 "to": checked_before,
@@ -445,7 +464,9 @@ class MobilityDatabaseClient:
 
     async def get_dataset_gtfs(self, dataset_id: str) -> GtfsDataset:
         """Get a single GTFS dataset by ID."""
-        data = await self._request("GET", f"/v1/datasets/gtfs/{dataset_id}")
+        data = await self._request(
+            "GET", f"/v1/datasets/gtfs/{_quote_segment(dataset_id)}"
+        )
         return GtfsDataset.from_dict(data)
 
     async def search_feeds(
@@ -521,7 +542,7 @@ class MobilityDatabaseClient:
 
     async def get_license(self, license_id: str) -> LicenseWithRules:
         """Get a single license, including its rules."""
-        data = await self._request("GET", f"/v1/licenses/{license_id}")
+        data = await self._request("GET", f"/v1/licenses/{_quote_segment(license_id)}")
         return LicenseWithRules.from_dict(data)
 
     async def get_matching_licenses(self, license_url: str) -> list[MatchingLicense]:

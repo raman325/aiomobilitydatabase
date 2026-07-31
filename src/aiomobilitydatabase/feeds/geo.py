@@ -12,6 +12,8 @@ _M_PER_DEG_LAT = _EARTH_RADIUS_M * math.pi / 180.0
 # only costs a few extra haversine calls; a tight box wrongly rejects boundary
 # points (e.g. the cos(lat) linearization under-sizes the box at high latitude).
 _BBOX_SAFETY = 1.01
+_HALF_TURN_DEG = 180.0
+_FULL_TURN_DEG = 360.0
 
 
 @dataclass(frozen=True)
@@ -40,17 +42,20 @@ def in_circle(zone: Circle, latitude: float, longitude: float) -> bool:
 
     A cheap bounding-box prefilter (four float comparisons) rejects most
     points before the trigonometric haversine runs. The box is padded by
-    ``_BBOX_SAFETY`` so it strictly encloses the circle.
+    ``_BBOX_SAFETY`` so it strictly encloses the circle. The longitude
+    comparison wraps around the antimeridian: a naive linear delta treats a
+    zone near +180 and a point near -180 (or vice versa) as ~360 degrees
+    apart, when the true angular separation may be a fraction of a degree.
     """
     dlat_deg = zone.radius_m * _BBOX_SAFETY / _M_PER_DEG_LAT
+    if latitude < zone.latitude - dlat_deg or latitude > zone.latitude + dlat_deg:
+        return False
     cos_lat = math.cos(math.radians(zone.latitude))
     dlon_deg = zone.radius_m * _BBOX_SAFETY / (_M_PER_DEG_LAT * max(cos_lat, 1e-6))
-    if (
-        latitude < zone.latitude - dlat_deg
-        or latitude > zone.latitude + dlat_deg
-        or longitude < zone.longitude - dlon_deg
-        or longitude > zone.longitude + dlon_deg
-    ):
+    dlon = abs(longitude - zone.longitude)
+    if dlon > _HALF_TURN_DEG:
+        dlon = _FULL_TURN_DEG - dlon
+    if dlon > dlon_deg:
         return False
     distance = haversine_m(zone.latitude, zone.longitude, latitude, longitude)
     return distance <= zone.radius_m

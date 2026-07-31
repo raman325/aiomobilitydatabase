@@ -12,6 +12,7 @@ from .const import GBFS_LANGUAGE_PREFERENCE
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
 from .models import GbfsVehicle, Station, SystemInfo
+from .rt import _require_http_url  # deliberate friend access: shared URL guard
 
 if TYPE_CHECKING:
     from ..models import GbfsFeed
@@ -91,6 +92,7 @@ class GbfsFeedHandle:
         url = self._endpoints.get(name)
         if url is None:
             raise SourceConnectionError(f"GBFS endpoint not published: {name}")
+        _require_http_url(url, f"GBFS {name} endpoint URL")
         session = self._client._get_session()  # deliberate friend access
         try:
             async with session.get(

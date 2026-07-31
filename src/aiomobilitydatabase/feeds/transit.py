@@ -21,7 +21,11 @@ from ..models import (
     LatestDataset,
 )
 from .const import STATIC_DB_FILENAME
-from .exceptions import SourceConnectionError, StaticDataUnavailableError
+from .exceptions import (
+    FeedParseError,
+    SourceConnectionError,
+    StaticDataUnavailableError,
+)
 from .geo import Circle, in_circle
 from .models import (
     Route,
@@ -34,6 +38,7 @@ from .models import (
 from .rt import (
     AddedStopTime,
     StopPrediction,
+    _require_http_url,  # deliberate friend access: shared data-origin URL guard
     alerts_from_message,
     fetch_feed_message,
     trip_updates_from_message,
@@ -128,9 +133,22 @@ class TransitFeedHandle:
             raise StaticDataUnavailableError(
                 f"Feed {static_feed.id} has no hosted static dataset"
             )
+        _require_http_url(dataset.hosted_url, "hosted GTFS dataset URL")
         db_path: Path | None = None
         if client.cache_dir is not None:
             feed_dir = client.cache_dir / str(static_feed.id)
+            # static_feed.id is catalog DATA (the JSON response body), not a
+            # caller-supplied parameter -- same traversal class as
+            # purge_cache's feed_id, so it gets the identical
+            # resolve()+is_relative_to() containment check, but raises
+            # FeedParseError (a data problem) rather than ValueError (a
+            # caller problem). Must run BEFORE mkdir: mkdir(parents=True)
+            # would otherwise silently create the directory outside
+            # cache_dir first.
+            if not feed_dir.resolve().is_relative_to(client.cache_dir.resolve()):
+                raise FeedParseError(
+                    f"Feed id {static_feed.id!r} escapes the cache directory"
+                )
             feed_dir.mkdir(parents=True, exist_ok=True)
             db_path = feed_dir / STATIC_DB_FILENAME
             cached = await asyncio.to_thread(

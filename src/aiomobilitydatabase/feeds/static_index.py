@@ -528,13 +528,21 @@ class StaticIndex:
                 (datestr, datestr),
             )
         }
-        for service_id, exception_type in self._conn.execute(
+        exceptions = self._conn.execute(
             "SELECT service_id, exception_type FROM calendar_dates WHERE date = ?",
             (datestr,),
-        ):
+        ).fetchall()
+        # Two passes -- all additions, then all removals -- so a service
+        # with BOTH exception types for the same date resolves the same way
+        # regardless of which row the source CSV happened to list first.
+        # GTFS doesn't define a tiebreak for this producer error, so
+        # "removed wins" is the conservative choice (never show a trip that
+        # might not run).
+        for service_id, exception_type in exceptions:
             if exception_type == _EXCEPTION_SERVICE_ADDED:
                 active.add(service_id)
-            elif exception_type == _EXCEPTION_SERVICE_REMOVED:
+        for service_id, exception_type in exceptions:
+            if exception_type == _EXCEPTION_SERVICE_REMOVED:
                 active.discard(service_id)
         return active
 
