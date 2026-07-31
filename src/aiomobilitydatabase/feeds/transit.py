@@ -31,6 +31,7 @@ from .models import (
     Route,
     ServiceAlert,
     StaticBuildProgress,
+    StationGroup,
     Stop,
     StopArrival,
     VehiclePosition,
@@ -50,6 +51,40 @@ if TYPE_CHECKING:
     from .client import MobilityFeedsClient
 
 _PROGRESS_CHUNK_BYTES = 262_144
+
+
+def group_stations(stops: list[Stop]) -> list[StationGroup]:
+    """Group boarding stops into logical stations, sorted by name.
+
+    GTFS models stations as hierarchies: platforms (location_type 0, or
+    unset) may link to a parent station (1), while entrances (2) and
+    pathway nodes (3+) are never boarding stops and are dropped. Boarding
+    stops sharing a parent station — or, without one, an identical name —
+    are grouped so consumers can offer "Metro Center" instead of every
+    platform and entrance.
+    """
+    stations = {stop.id: stop for stop in stops if stop.location_type == 1}
+    names: dict[str, str] = {}
+    members: dict[str, list[str]] = {}
+    for stop in stops:
+        if stop.location_type not in (None, 0):
+            continue
+        if stop.parent_station:
+            key = stop.parent_station
+            station = stations.get(stop.parent_station)
+            name = (station.name if station else None) or stop.name or key
+        else:
+            name = stop.name or stop.id
+            key = name.casefold()
+        names.setdefault(key, name)
+        members.setdefault(key, []).append(stop.id)
+    return sorted(
+        (
+            StationGroup(id=key, name=names[key], stop_ids=tuple(stop_ids))
+            for key, stop_ids in members.items()
+        ),
+        key=lambda group: group.name,
+    )
 
 
 class TransitFeedHandle:
@@ -422,6 +457,15 @@ class TransitFeedHandle:
             and stop.longitude is not None
             and in_circle(zone, stop.latitude, stop.longitude)
         ]
+
+    def stations_in(self, zone: Circle) -> list[StationGroup]:
+        """Boarding stops within a zone, grouped into logical stations.
+
+        The presentation-ready companion to :meth:`stops_in`: station
+        hierarchies collapse to one entry per station and entrances or
+        pathway nodes never appear.
+        """
+        return group_stations(self.stops_in(zone))
 
     async def routes_serving(self, stop_id: str) -> list[Route]:
         """Routes with scheduled service at the stop (route-filter picker)."""

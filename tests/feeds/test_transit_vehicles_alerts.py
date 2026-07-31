@@ -9,7 +9,7 @@ import pytest
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.geo import Circle
-from aiomobilitydatabase.feeds.models import ServiceAlert
+from aiomobilitydatabase.feeds.models import ServiceAlert, StationGroup
 
 from tests.feeds.fixtures import (
     _FILES,
@@ -114,6 +114,25 @@ async def test_stops_in_zone(
     assert [stop.id for stop in nearby] == ["S1"]
     wider = handle.stops_in(Circle(latitude=34.05, longitude=-118.25, radius_m=2000.0))
     assert {stop.id for stop in wider} == {"S1", "S2"}
+
+
+async def test_stations_in_groups_hierarchy(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """stations_in collapses the fixture's hierarchy: S3 groups under its
+    parent station ST1 (named Depot Station), which itself is not offered
+    as a boarding stop; orphan stops stay as single-member name groups.
+    """
+    _mock_catalog(mock_api)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    groups = handle.stations_in(
+        Circle(latitude=34.05, longitude=-118.25, radius_m=5000.0)
+    )
+    assert groups == [
+        StationGroup(id="ST1", name="Depot Station", stop_ids=("S3",)),
+        StationGroup(id="main st", name="Main St", stop_ids=("S1",)),
+        StationGroup(id="second ave", name="Second Ave", stop_ids=("S2",)),
+    ]
 
 
 def _zip_bytes_with_coordless_entrance() -> bytes:

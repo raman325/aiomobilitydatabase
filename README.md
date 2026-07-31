@@ -99,9 +99,12 @@ async def main() -> None:
         )
 
         # Picker-style helpers: stops in a zone, routes serving a stop.
+        # stations_in collapses GTFS station hierarchies (platforms group
+        # under their parent station, entrances are dropped) for clean UIs.
         home = Circle(latitude=45.52, longitude=-122.68, radius_m=800)
+        stations = transit.stations_in(home)
         nearby_stops = transit.stops_in(home)
-        routes = await transit.routes_serving(nearby_stops[0].id)
+        routes = await transit.routes_serving(stations[0].stop_ids[0])
 
         # Scheduled arrivals merged with realtime (delays, cancellations,
         # RT-added trips) when the feed publishes GTFS-RT TripUpdates.

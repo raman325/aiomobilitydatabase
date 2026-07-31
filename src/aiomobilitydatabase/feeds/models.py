@@ -19,6 +19,21 @@ class Stop:
 
 
 @dataclass(frozen=True)
+class StationGroup:
+    """A logical station: boarding stops grouped for presentation.
+
+    Boarding stops sharing a GTFS ``parent_station`` — or, without one, an
+    identical name (for example direction pairs at an intersection) — form
+    one group. ``id`` is the parent station id when present, else the
+    casefolded shared name; it is stable across rebuilds of the same feed.
+    """
+
+    id: str
+    name: str
+    stop_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Route:
     """A transit route from the static GTFS index."""
 
