@@ -25,6 +25,16 @@ async def test_injected_session_not_closed(mock_api: aioresponses) -> None:
         assert not session.closed
 
 
+async def test_owned_session_recreated_after_close() -> None:
+    client = MobilityDatabaseClient("test-refresh-token")
+    first = client._get_session()
+    await client.close()
+    second = client._get_session()
+    assert second is not first
+    assert not second.closed
+    await client.close()
+
+
 async def test_close_idempotent_and_safe_before_use() -> None:
     client = MobilityDatabaseClient("test-refresh-token")
     await client.close()  # never used: no session exists yet

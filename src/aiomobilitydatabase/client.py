@@ -85,6 +85,7 @@ class MobilityDatabaseClient:
             and not self._session.closed
         ):
             await self._session.close()
+            self._session = None
 
     def _get_session(self) -> aiohttp.ClientSession:
         """Return the session, lazily creating an owned one if needed."""
