@@ -7,17 +7,15 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Self
+from typing import Self
 
 import aiohttp
 
 from ..client import MobilityDatabaseClient
 from .const import DEFAULT_TIMEOUT_SECONDS
+from .gbfs import GbfsFeedHandle
 from .models import StaticBuildProgress
-
-if TYPE_CHECKING:
-    from .gbfs import GbfsFeedHandle
-    from .transit import TransitFeedHandle
+from .transit import TransitFeedHandle
 
 
 class MobilityFeedsClient:
@@ -134,12 +132,8 @@ class MobilityFeedsClient:
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
     ) -> TransitFeedHandle:
         """Resolve a GTFS or GTFS-RT feed ID into a TransitFeedHandle."""
-        from .transit import TransitFeedHandle  # noqa: PLC0415
-
         return await TransitFeedHandle.create(self, feed_id, api_key, on_progress)
 
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeedHandle:
         """Resolve a GBFS feed ID into a GbfsFeedHandle."""
-        from .gbfs import GbfsFeedHandle  # noqa: PLC0415
-
         return await GbfsFeedHandle.create(self, feed_id)
