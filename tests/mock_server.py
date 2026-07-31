@@ -115,6 +115,11 @@ class MockApi:
                 json_body = await request.json()
             except ValueError:
                 json_body = None
+        # dict(request.query) keeps only the last value per repeated query
+        # key. Fine today because encode_params() comma-joins list/tuple
+        # values into a single key=value pair -- but a future test asserting
+        # on a genuinely repeated key (e.g. ?x=1&x=2) would need
+        # request.query.getall("x") instead.
         self.requests.append(
             RecordedRequest(
                 method=request.method,

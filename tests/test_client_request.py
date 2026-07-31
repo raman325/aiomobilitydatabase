@@ -65,3 +65,18 @@ async def test_invalid_json_maps_to_connection_error(
     mock_api.get("/v1/metadata", body="not json", content_type="text/html")
     with pytest.raises(MobilityDatabaseConnectionError):
         await client.get_metadata()
+
+
+async def test_network_error_after_token_maps_to_connection_error(
+    mock_api: MockApi, client: MobilityDatabaseClient
+) -> None:
+    """Covers _request's own transport-error except clause.
+
+    Distinct from test_network_error_maps_to_connection_error, which fails
+    during the token fetch and never reaches _request's endpoint call.
+    """
+    _mock_token(mock_api)
+    await client._async_ensure_token()  # cache a token before breaking the URL
+    client._base_url = "http://127.0.0.1:1"
+    with pytest.raises(MobilityDatabaseConnectionError):
+        await client.get_metadata()

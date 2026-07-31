@@ -115,16 +115,32 @@ class MobilityDatabaseClient:
         skew = timedelta(seconds=TOKEN_EXPIRY_SKEW_SECONDS)
         return datetime.now(UTC) >= self._token_expiration - skew
 
-    async def _async_ensure_token(self, *, force: bool = False) -> str:
+    async def _async_ensure_token(
+        self, *, force: bool = False, stale_token: str | None = None
+    ) -> str:
         """Return a valid access token, fetching or refreshing as needed.
 
         Guarded by a lock so concurrent requests trigger exactly one token
         request. NOTE: the live API returns HTTP 500 for an invalid refresh
         token, so ANY non-200 here is treated as an authentication failure.
+
+        ``stale_token`` dedupes concurrent forced refreshes: when several
+        requests all hit a 401 on the same token, each calls this with
+        ``force=True`` and the token *it* used. Only the first to acquire the
+        lock actually refetches; the rest see that ``self._access_token`` no
+        longer matches their ``stale_token`` (a sibling already refreshed it)
+        and return the new token without another token request.
         """
         async with self._token_lock:
             if not force and not self._token_needs_refresh():
                 assert self._access_token is not None  # guarded above
+                return self._access_token
+            if (
+                force
+                and stale_token is not None
+                and self._access_token is not None
+                and self._access_token != stale_token
+            ):
                 return self._access_token
             session = self._get_session()
             try:
@@ -139,7 +155,7 @@ class MobilityDatabaseClient:
                             f"Unable to obtain access token ({resp.status}): {body}"
                         )
                     data = await resp.json()
-            except (TimeoutError, aiohttp.ClientError) as err:
+            except (TimeoutError, aiohttp.ClientError, ValueError) as err:
                 raise MobilityDatabaseConnectionError(
                     f"Error requesting access token: {err}"
                 ) from err
@@ -174,7 +190,7 @@ class MobilityDatabaseClient:
             ) as resp:
                 if resp.status == HTTPStatus.UNAUTHORIZED:
                     if retry_on_auth_fail:
-                        await self._async_ensure_token(force=True)
+                        await self._async_ensure_token(force=True, stale_token=token)
                         return await self._request(
                             method,
                             path,
