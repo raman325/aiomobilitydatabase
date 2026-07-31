@@ -1,0 +1,11 @@
+docs/superpowers/
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+uv.lock

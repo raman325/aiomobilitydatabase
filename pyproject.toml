@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aiomobilitydatabase"
+description = "Async Python client for the Mobility Database catalog API"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Raman Gupta" }]
+keywords = ["gtfs", "gtfs-rt", "gbfs", "transit", "mobility-database", "asyncio"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+  "aiohttp>=3.9",
+  "mashumaro>=3.13",
+]
+dynamic = ["version"]
+
+[project.urls]
+"Source Code" = "https://github.com/raman325/aiomobilitydatabase"
+"Bug Reports" = "https://github.com/raman325/aiomobilitydatabase/issues"
+
+[dependency-groups]
+dev = [
+  "aioresponses>=0.7.7",
+  "mypy>=1.14",
+  "pre-commit>=4.0",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "pytest-cov>=6.0",
+  "ruff>=0.9",
+]
+
+[tool.hatch.version]
+path = "src/aiomobilitydatabase/const.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aiomobilitydatabase"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = "aioresponses.*"
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["A", "ASYNC", "B", "C4", "D", "E", "F", "I", "N", "PL", "RUF", "SIM", "UP", "W"]
+ignore = [
+  "D203",  # incompatible with D211
+  "D213",  # incompatible with D212
+  "PLR0913",  # endpoint methods legitimately take many keyword-only filters
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
