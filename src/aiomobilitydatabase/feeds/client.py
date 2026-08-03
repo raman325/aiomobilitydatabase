@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -12,6 +12,7 @@ from typing import Self
 import aiohttp
 
 from ..client import MobilityDatabaseClient
+from ..exceptions import MobilityDatabaseError
 from .const import DEFAULT_TIMEOUT_SECONDS
 from .gbfs import GbfsFeedHandle
 from .models import StaticBuildProgress
@@ -25,11 +26,16 @@ class MobilityFeedsClient:
     by :meth:`close`); an injected session is never closed. The inner
     catalog client always receives the shared session, so all HTTP —
     catalog, GTFS-RT, GBFS, zip downloads — flows through one pool.
+
+    ``refresh_token`` is only needed for catalog operations (feed-ID
+    resolution, search, :attr:`catalog`); the direct-URL methods
+    (:meth:`get_transit_feed_from_urls`, :meth:`get_gbfs_feed_from_url`)
+    never touch the catalog and work on a tokenless client.
     """
 
     def __init__(
         self,
-        refresh_token: str,
+        refresh_token: str | None = None,
         session: aiohttp.ClientSession | None = None,
         *,
         cache_dir: Path | str | None = None,
@@ -79,7 +85,17 @@ class MobilityFeedsClient:
 
     @property
     def catalog(self) -> MobilityDatabaseClient:
-        """The underlying Mobility Database catalog client (shared session)."""
+        """The underlying Mobility Database catalog client (shared session).
+
+        Raises :class:`MobilityDatabaseError` when the client was
+        constructed without a refresh token: only catalog operations need
+        one, so the failure is raised here (at first catalog use) rather
+        than at construction, keeping tokenless direct-URL usage valid.
+        """
+        if self._refresh_token is None:
+            raise MobilityDatabaseError(
+                "A refresh token is required for catalog operations"
+            )
         if self._catalog is None:
             if self._base_url is not None:
                 self._catalog = MobilityDatabaseClient(
@@ -105,11 +121,14 @@ class MobilityFeedsClient:
         """Delete cached static data for one feed, or all feeds when None.
 
         Consumers call this on config-entry removal (and before re-pointing
-        storage at a different feed). No-op without a cache_dir. Raises
-        ``ValueError`` if ``feed_id`` would resolve outside the cache
-        directory (e.g. an absolute path or one containing ``..``
-        components). Missing targets are silently skipped; other
-        filesystem errors (e.g. permissions) propagate to the caller.
+        storage at a different feed). ``feed_id`` is either a catalog feed
+        ID or a direct handle's url-derived ``url-<sha256(url)[:16]>`` key
+        — exactly what :attr:`TransitFeedHandle.static_feed_id` returns in
+        both cases. No-op without a cache_dir. Raises ``ValueError`` if
+        ``feed_id`` would resolve outside the cache directory (e.g. an
+        absolute path or one containing ``..`` components). Missing
+        targets are silently skipped; other filesystem errors (e.g.
+        permissions) propagate to the caller.
         """
         if self.cache_dir is None:
             return
@@ -148,6 +167,52 @@ class MobilityFeedsClient:
         """
         return await TransitFeedHandle.create(self, feed_id, api_key, on_progress)
 
+    async def get_transit_feed_from_urls(
+        self,
+        static_url: str,
+        rt_urls: list[str] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+        on_progress: Callable[[StaticBuildProgress], None] | None = None,
+    ) -> TransitFeedHandle:
+        """Build a TransitFeedHandle from user-supplied URLs (no catalog).
+
+        Returns the same handle type as :meth:`get_transit_feed`, so
+        consumers built against catalog handles work unchanged. Each
+        ``rt_urls`` entry is synthesized into an RT source that advertises
+        every entity type (capabilities are unknown without a catalog
+        record; parsers yield nothing for types a producer doesn't
+        publish). ``headers`` apply to the static download and every RT
+        fetch for the handle.
+
+        Dataset identity without a catalog: the static URL is HEAD-probed
+        for an ETag (preferred) or Last-Modified validator; servers
+        offering neither fall back to a sha256 of the downloaded bytes.
+        The on-disk cache key is ``url-<sha256(static_url)[:16]>`` (also
+        exposed as the handle's ``static_feed_id``, accepted by
+        :meth:`purge_cache`). ``on_progress`` follows the same contract as
+        :meth:`get_transit_feed`.
+        """
+        return await TransitFeedHandle.create_from_urls(
+            self, static_url, rt_urls, headers, on_progress
+        )
+
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeedHandle:
         """Resolve a GBFS feed ID into a GbfsFeedHandle."""
         return await GbfsFeedHandle.create(self, feed_id)
+
+    async def get_gbfs_feed_from_url(
+        self,
+        discovery_url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> GbfsFeedHandle:
+        """Build a GbfsFeedHandle from a GBFS auto-discovery URL (no catalog).
+
+        ``discovery_url`` is the system's standard ``gbfs.json`` entry
+        point; its published feed list replaces catalog endpoint
+        resolution. Returns the same handle type as :meth:`get_gbfs_feed`.
+        ``headers`` apply to the discovery fetch and every document fetch
+        for the handle.
+        """
+        return await GbfsFeedHandle.create_from_url(self, discovery_url, headers)

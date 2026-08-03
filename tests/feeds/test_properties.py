@@ -676,7 +676,7 @@ def _run_gbfs_probe(status: int, body: bytes, content_type: str) -> str:
             async with MobilityFeedsClient("t", base_url=api.url()) as client:
                 handle = GbfsFeedHandle(
                     client,
-                    feed=None,  # type: ignore[arg-type]
+                    feed=None,
                     endpoints={"system_information": api.url("/gbfs/doc.json")},
                 )
                 try:

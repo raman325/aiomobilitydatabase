@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -63,27 +64,31 @@ async def fetch_feed_message(
     auth_type: int | None = None,
     api_key_name: str | None = None,
     api_key: str | None = None,
+    headers: Mapping[str, str] | None = None,
     timeout_seconds: float = 30.0,
 ) -> gtfs_realtime_pb2.FeedMessage:
     """GET a GTFS-RT producer URL and parse the protobuf FeedMessage.
 
     ``auth_type`` follows the catalog's ``source_info.authentication_type``:
     1 = query parameter named ``api_key_name``; 2 = header named
-    ``api_key_name``. Parsing runs in a thread (CPU-bound for large feeds).
+    ``api_key_name``. ``headers`` (a direct-URL handle's custom headers)
+    are merged in BEFORE auth handling, so an explicit ``api_key`` always
+    wins over a same-named custom header rather than being silently
+    shadowed. Parsing runs in a thread (CPU-bound for large feeds).
     """
     _require_http_url(url, "GTFS-RT producer URL")
     params: dict[str, str] = {}
-    headers: dict[str, str] = {}
+    req_headers: dict[str, str] = dict(headers) if headers else {}
     if api_key is not None and api_key_name:
         if auth_type == _AUTH_TYPE_QUERY_PARAM:
             params[api_key_name] = api_key
         elif auth_type == _AUTH_TYPE_HEADER:
-            headers[api_key_name] = api_key
+            req_headers[api_key_name] = api_key
     try:
         async with session.get(
             url,
             params=params or None,
-            headers=headers or None,
+            headers=req_headers or None,
             timeout=aiohttp.ClientTimeout(total=timeout_seconds),
         ) as resp:
             if resp.status in _AUTH_STATUSES:

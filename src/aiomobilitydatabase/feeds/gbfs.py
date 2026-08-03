@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
@@ -54,16 +55,62 @@ def _as_bool(value: Any) -> bool | None:
     return None
 
 
+def _endpoints_from_discovery(document: dict[str, Any]) -> dict[str, str]:
+    """Resolve the name->url endpoint table from a GBFS discovery document.
+
+    GBFS 3.x publishes ``data.feeds`` directly; 2.x nests the feed list
+    under language codes (``data.en.feeds``) — prefer the library's
+    language preference and otherwise take the first language block that
+    carries feeds, mirroring the fallback order of :func:`_localized`.
+    The result feeds the same endpoint table the catalog path builds from
+    version metadata, so every handle method works identically after this.
+    """
+    data = document["data"]
+    feeds: Any = None
+    if isinstance(data, dict):
+        feeds = data.get("feeds")
+        if feeds is None:  # 2.x language-keyed layout
+            candidates = [
+                block
+                for block in data.values()
+                if isinstance(block, dict) and isinstance(block.get("feeds"), list)
+            ]
+            preferred = data.get(GBFS_LANGUAGE_PREFERENCE)
+            if isinstance(preferred, dict) and isinstance(preferred.get("feeds"), list):
+                candidates.insert(0, preferred)
+            if candidates:
+                feeds = candidates[0]["feeds"]
+    endpoints = {
+        str(feed["name"]): str(feed["url"])
+        for feed in (feeds if isinstance(feeds, list) else [])
+        if isinstance(feed, dict) and feed.get("name") and feed.get("url")
+    }
+    if not endpoints:
+        raise FeedParseError("GBFS discovery document lists no usable feeds")
+    return endpoints
+
+
 class GbfsFeedHandle:
-    """Snapshot access to one GBFS system, resolved from catalog metadata."""
+    """Snapshot access to one GBFS system.
+
+    Endpoints resolve either from catalog metadata (:meth:`create`) or
+    straight from the system's own auto-discovery document
+    (:meth:`create_from_url`); every snapshot method behaves identically
+    on both.
+    """
 
     def __init__(
-        self, client: MobilityFeedsClient, feed: GbfsFeed, endpoints: dict[str, str]
+        self,
+        client: MobilityFeedsClient,
+        feed: GbfsFeed | None,
+        endpoints: dict[str, str],
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         """Initialize; internal — use MobilityFeedsClient.get_gbfs_feed()."""
         self._client = client
         self._feed = feed
         self._endpoints = endpoints
+        self._headers = headers
         self._doc_cache: dict[str, tuple[float, float, dict[str, Any]]] = {}
 
     @classmethod
@@ -83,20 +130,42 @@ class GbfsFeedHandle:
                 best = endpoints  # last (highest) version with endpoints wins
         return cls(client, feed, best)
 
-    async def _document(self, name: str) -> dict[str, Any]:
-        cached = self._doc_cache.get(name)
-        if cached is not None:
-            fetched_at, ttl, data = cached
-            if time.monotonic() - fetched_at < ttl:
-                return data
-        url = self._endpoints.get(name)
-        if url is None:
-            raise SourceConnectionError(f"GBFS endpoint not published: {name}")
-        _require_http_url(url, f"GBFS {name} endpoint URL")
-        session = self._client._get_session()  # deliberate friend access
+    @classmethod
+    async def create_from_url(
+        cls,
+        client: MobilityFeedsClient,
+        discovery_url: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> GbfsFeedHandle:
+        """Resolve endpoint URLs from a GBFS auto-discovery document.
+
+        The discovery document (``gbfs.json``) is the spec's standard
+        entry point and already lists every published endpoint, so no
+        catalog lookup is needed — its feed list becomes the same endpoint
+        table :meth:`create` builds from catalog version metadata.
+        ``headers`` apply to the discovery fetch and every subsequent
+        document fetch made through this handle.
+        """
+        document = await cls._fetch_json_document(
+            client, discovery_url, headers, "GBFS discovery URL"
+        )
+        return cls(client, None, _endpoints_from_discovery(document), headers=headers)
+
+    @staticmethod
+    async def _fetch_json_document(
+        client: MobilityFeedsClient,
+        url: str,
+        headers: Mapping[str, str] | None,
+        context: str,
+    ) -> dict[str, Any]:
+        """GET one GBFS JSON document and validate its data envelope."""
+        _require_http_url(url, context)
+        session = client._get_session()  # deliberate friend access
         try:
             async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=self._client.timeout_seconds)
+                url,
+                headers=dict(headers) if headers else None,
+                timeout=aiohttp.ClientTimeout(total=client.timeout_seconds),
             ) as resp:
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
@@ -110,6 +179,20 @@ class GbfsFeedHandle:
             raise SourceConnectionError(f"Error fetching {url}: {err}") from err
         if not isinstance(document, dict) or "data" not in document:
             raise FeedParseError(f"GBFS document missing data envelope: {url}")
+        return document
+
+    async def _document(self, name: str) -> dict[str, Any]:
+        cached = self._doc_cache.get(name)
+        if cached is not None:
+            fetched_at, ttl, data = cached
+            if time.monotonic() - fetched_at < ttl:
+                return data
+        url = self._endpoints.get(name)
+        if url is None:
+            raise SourceConnectionError(f"GBFS endpoint not published: {name}")
+        document = await self._fetch_json_document(
+            self._client, url, self._headers, f"GBFS {name} endpoint URL"
+        )
         ttl = float(document.get("ttl") or 0)
         self._doc_cache[name] = (time.monotonic(), ttl, document)
         return document
