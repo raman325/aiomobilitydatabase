@@ -206,6 +206,9 @@ def test_loaders_flush_mid_loop_past_batch_size(tmp_path: Path) -> None:
         "frequencies.txt": (
             "trip_id,start_time,end_time,headway_secs\nT0,00:00:00,01:30:00,1\n"
         ),
+        # feed_info.txt so its (single-row) loader's report() call runs
+        # under a progress callback like every other loader's.
+        "feed_info.txt": ("feed_publisher_name,feed_publisher_url\nBig Publisher,\n"),
     }
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -225,6 +228,8 @@ def test_loaders_flush_mid_loop_past_batch_size(tmp_path: Path) -> None:
         assert len(index.stops()) == n
         assert len(index.routes()) == n
         assert len(index.agencies()) == n
+        info = index.feed_info()
+        assert info is not None and info.publisher_name == "Big Publisher"
         assert progress_calls  # report() ran at least once per flushed loader
     finally:
         index.close()

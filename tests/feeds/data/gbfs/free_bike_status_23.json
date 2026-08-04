@@ -8,7 +8,11 @@
         "lat": 34.0505,
         "lon": -118.2505,
         "is_reserved": false,
-        "is_disabled": false
+        "is_disabled": false,
+        "rental_uris": {
+          "android": "https://example.com/app?bike=b1&platform=android",
+          "ios": "https://example.com/app?bike=b1&platform=ios"
+        }
       },
       {
         "bike_id": "b2",

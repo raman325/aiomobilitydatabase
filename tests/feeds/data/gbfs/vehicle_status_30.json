@@ -11,7 +11,12 @@
         "is_reserved": false,
         "is_disabled": false,
         "vehicle_type_id": "scooter",
-        "current_range_meters": 12000.0
+        "current_range_meters": 12000.0,
+        "rental_uris": {
+          "android": "https://example.com/app?vehicle=v1&platform=android",
+          "ios": "https://example.com/app?vehicle=v1&platform=ios",
+          "web": "https://example.com/vehicles/v1"
+        }
       }
     ]
   }

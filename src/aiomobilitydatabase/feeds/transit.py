@@ -33,6 +33,7 @@ from .exceptions import (
 from .geo import Circle, in_circle
 from .models import (
     Agency,
+    FeedInfo,
     Route,
     ServiceAlert,
     StaticBuildProgress,
@@ -277,6 +278,8 @@ class TransitFeedHandle:
         self.stops: list[Stop] = index.stops()
         self.routes: list[Route] = index.routes()
         self.agencies: list[Agency] = index.agencies()
+        # None when the dataset ships no feed_info.txt (an optional file).
+        self.feed_info: FeedInfo | None = index.feed_info()
 
     @property
     def static_feed_id(self) -> str:
@@ -812,6 +815,8 @@ class TransitFeedHandle:
                     drop_off_type=dep.drop_off_type,
                     timepoint_exact=dep.timepoint_exact,
                     stop_headsign=dep.stop_headsign,
+                    trip_short_name=dep.trip_short_name,
+                    block_id=dep.block_id,
                 )
             )
         wanted_stops = set(stop_ids)
@@ -845,6 +850,8 @@ class TransitFeedHandle:
                     drop_off_type=None,
                     timepoint_exact=None,
                     stop_headsign=None,
+                    trip_short_name=None,
+                    block_id=None,
                 )
             )
         # Total sort key, matching upcoming_departures: effective time alone
@@ -1017,6 +1024,8 @@ class TransitFeedHandle:
                     destination_stop_headsign=trip.destination_stop_headsign,
                     is_first=trip.is_first,
                     is_last=trip.is_last,
+                    trip_short_name=trip.trip_short_name,
+                    block_id=trip.block_id,
                 )
             )
         # Total sort key, matching get_arrivals: origin predictions can
@@ -1060,7 +1069,17 @@ class TransitFeedHandle:
         return vehicles
 
     async def get_alerts(self) -> list[ServiceAlert]:
-        """Service alerts across the feed's SA-capable RT sources."""
+        """Service alerts across the feed's SA-capable RT sources.
+
+        Alert scoping contract: each alert carries the route ids, stop
+        ids, AND informed-entity trip ids it names. An alert is unscoped
+        ("applies everywhere") ONLY when ``route_ids``, ``stop_ids``, and
+        ``trip_ids`` are all empty -- a trip-scoped alert (informed
+        entities carrying only trip descriptors) is scoped to those
+        trips, not agency-wide. Alert trip references keep the producer's
+        PLAIN trip ids (like vehicles): a display-only association with
+        no per-repetition matching for frequency-based trips.
+        """
         messages = await self._fetch_entity_messages(EntityType.SERVICE_ALERTS)
         alerts: list[ServiceAlert] = []
         for message in messages:
@@ -1134,6 +1153,7 @@ class TransitFeedHandle:
         self.stops = await asyncio.to_thread(new_index.stops)
         self.routes = await asyncio.to_thread(new_index.routes)
         self.agencies = await asyncio.to_thread(new_index.agencies)
+        self.feed_info = await asyncio.to_thread(new_index.feed_info)
         await asyncio.to_thread(old_index.close)
 
     def stops_in(self, zone: Circle) -> list[Stop]:

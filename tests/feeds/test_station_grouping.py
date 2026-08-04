@@ -27,6 +27,10 @@ def _stop(
         stop_code=None,
         platform_code=None,
         wheelchair_boarding=None,
+        description=None,
+        url=None,
+        zone_id=None,
+        timezone=None,
     )
 
 

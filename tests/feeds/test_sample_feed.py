@@ -45,7 +45,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
-from aiomobilitydatabase.feeds.models import Agency
+from aiomobilitydatabase.feeds.models import Agency, FeedInfo
 from aiomobilitydatabase.feeds.static_index import ScheduledDeparture, StaticIndex
 
 from tests.feeds.fixtures import (
@@ -103,9 +103,10 @@ def _full_day(index: StaticIndex, day_start_utc: datetime) -> list[ScheduledDepa
 
 def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> None:
     """The canonical feed builds cleanly with every unmodeled file present
-    in the zip (fare_attributes, fare_rules, shapes, transfers, feed_info,
+    in the zip (fare_attributes, fare_rules, shapes, transfers,
     translations -- plus agency.txt's deliberate nonexistent_column), and
-    the modeled entities land with exact counts.
+    the modeled entities land with exact counts. feed_info.txt IS modeled
+    (since the descriptive surface sweep) and is pinned below.
     """
     zip_bytes = build_sample_feed_zip_bytes()
     names = set(zipfile.ZipFile(io.BytesIO(zip_bytes)).namelist())
@@ -125,11 +126,16 @@ def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> N
     assert stagecoach.name == "Stagecoach Hotel & Casino (Demo)"
     assert stagecoach.latitude == 36.915682
     assert stagecoach.longitude == -116.751677
-    # stops.txt ships none of the optional descriptive columns.
+    # stops.txt ships stop_desc/zone_id/stop_url columns with every value
+    # blank, and none of the other optional descriptive columns.
     assert stagecoach.stop_code is None
     assert stagecoach.platform_code is None
     assert stagecoach.wheelchair_boarding is None
     assert stagecoach.location_type is None
+    assert stagecoach.description is None
+    assert stagecoach.url is None
+    assert stagecoach.zone_id is None
+    assert stagecoach.timezone is None  # no stop_timezone column at all
     routes = index.routes()
     assert [route.id for route in routes] == [
         "AAMV",
@@ -147,6 +153,9 @@ def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> N
     assert all(route.color is None for route in routes)
     assert all(route.text_color is None for route in routes)
     assert all(route.url is None for route in routes)
+    # route_desc exists but is blank everywhere; route_sort_order is absent.
+    assert all(route.description is None for route in routes)
+    assert all(route.sort_order is None for route in routes)
     # agency.txt is a full single record (no lang/phone/fare_url columns);
     # the deliberate nonexistent_column is ignored.
     assert index.agencies() == [
@@ -160,6 +169,17 @@ def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> N
             fare_url=None,
         )
     ]
+    # feed_info.txt: publisher name/url populated; the feed's language
+    # column is spelled url_lang (NOT the spec's feed_lang) so lang stays
+    # None, and feed_version is absent while the date cells are blank.
+    assert index.feed_info() == FeedInfo(
+        publisher_name="the feeder",
+        publisher_url="transit.example.com",
+        lang=None,
+        version=None,
+        start_date=None,
+        end_date=None,
+    )
     index.close()
 
 
@@ -198,6 +218,10 @@ def test_friday_full_service_day_exact_departure_rows(tmp_path: Path) -> None:
     assert ab1.departure == datetime(2007, 6, 1, 15, 0, tzinfo=UTC)
     assert ab1.source_trip_id == "AB1"
     assert ab1.start_secs is None
+    # trips.txt has a block_id column (AB1 rides block "1") but no
+    # trip_short_name column.
+    assert ab1.block_id == "1"
+    assert ab1.trip_short_name is None
     index.close()
 
 
@@ -252,6 +276,8 @@ def test_stba_repetitions_exact_starts_and_pinned_departures(tmp_path: Path) -> 
     assert first.drop_off_type is None
     assert first.stop_headsign is None
     assert first.timepoint_exact is True
+    assert first.block_id is None  # STBA's block_id cell is blank
+    assert first.trip_short_name is None
     assert at_stagecoach[-1].trip_id == "STBA#77400"
     assert at_stagecoach[-1].departure == datetime(2007, 6, 2, 4, 30, tzinfo=UTC)
     assert "STBA#79200" not in {dep.trip_id for dep in stba}
@@ -511,7 +537,19 @@ async def test_handle_answers_from_canonical_feed(
     assert trips[0].is_first is True
     assert trips[0].is_last is True
     assert trips[0].direction_id == 0
+    # Trip identifiers pass through the origin->destination overlay too.
+    assert trips[0].block_id == "1"
+    assert trips[0].trip_short_name is None
     # The handle exposes the full agency record surface, like stops/routes.
     assert [agency.id for agency in handle.agencies] == ["DTA"]
     assert handle.agencies[0].name == "Demo Transit Authority"
+    # ... and the feed_info record, refreshed with the index like the rest.
+    assert handle.feed_info == FeedInfo(
+        publisher_name="the feeder",
+        publisher_url="transit.example.com",
+        lang=None,
+        version=None,
+        start_date=None,
+        end_date=None,
+    )
     handle.close()

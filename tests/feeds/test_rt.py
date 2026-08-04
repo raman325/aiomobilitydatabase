@@ -14,7 +14,9 @@ from aiomobilitydatabase.feeds.exceptions import (
 from aiomobilitydatabase.feeds.models import (
     AlertCause,
     AlertEffect,
+    CongestionLevel,
     OccupancyStatus,
+    VehicleStopStatus,
 )
 from aiomobilitydatabase.feeds.rt import (
     TripStopUpdate,
@@ -28,7 +30,13 @@ from aiomobilitydatabase.feeds.rt import (
     vehicles_from_message,
 )
 
-from tests.feeds.fixtures import ALERTS, TRIP_UPDATES_BASELINE, VEHICLE_POSITIONS
+from tests.feeds.fixtures import (
+    ALERTS,
+    ALERTS_TRIP_SCOPED,
+    TRIP_UPDATES_BASELINE,
+    VEHICLE_POSITIONS,
+    VEHICLE_POSITIONS_STATUS,
+)
 from tests.mock_server import MockApi
 
 PB = "application/octet-stream"
@@ -116,9 +124,62 @@ def test_vehicles_from_message() -> None:
     assert v1.occupancy_status is OccupancyStatus.MANY_SEATS_AVAILABLE
     assert v1.occupancy_status == "MANY_SEATS_AVAILABLE"
     assert v1.timestamp == datetime.fromtimestamp(1_785_500_000, tz=UTC)
+    # The baseline fixture sets no status surface at all: no stop referent
+    # means no synthesized IN_TRANSIT_TO default -- everything is None.
+    assert v1.current_status is None
+    assert v1.congestion_level is None
+    assert v1.stop_id is None
+    assert v1.current_stop_sequence is None
+    assert v1.license_plate is None
     v2 = next(v for v in vehicles if v.vehicle_id == "V2")
     assert v2.route_id == "R2"  # resolved via trip_routes fallback
     assert v2.route_name == "20 Night Owl"
+
+
+def test_vehicles_from_message_status_surface() -> None:
+    """The descriptive status surface: explicit current_status verbatim,
+    the spec default IN_TRANSIT_TO synthesized ONLY when a stop referent
+    (current_stop_sequence or stop_id) is present, None with neither, and
+    congestion/stop referent/license plate passed through raw.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.ParseFromString(VEHICLE_POSITIONS_STATUS)
+    vehicles = vehicles_from_message(msg, route_names={}, trip_routes={})
+    v7, v8, v9 = (
+        next(v for v in vehicles if v.vehicle_id == vid) for vid in ("V7", "V8", "V9")
+    )
+    assert v7.current_status is VehicleStopStatus.STOPPED_AT
+    assert v7.current_status == "STOPPED_AT"
+    assert v7.congestion_level is CongestionLevel.SEVERE_CONGESTION
+    assert v7.stop_id == "S2"
+    assert v7.current_stop_sequence == 2
+    assert v7.license_plate == "8ABC123"
+    # V8: referent present (current_stop_sequence), status unset -> the
+    # protobuf default IN_TRANSIT_TO is real information and surfaces.
+    assert v8.current_status is VehicleStopStatus.IN_TRANSIT_TO
+    assert v8.current_stop_sequence == 1
+    assert v8.stop_id is None
+    assert v8.congestion_level is None
+    assert v8.license_plate is None
+    # V9: no status, no referent -> None (nothing to be in transit to).
+    assert v9.current_status is None
+    assert v9.stop_id is None
+    assert v9.current_stop_sequence is None
+
+
+def test_vehicles_stop_id_referent_alone_surfaces_default() -> None:
+    """A bare stop_id (no current_stop_sequence) is also a stop referent:
+    an unset current_status surfaces the IN_TRANSIT_TO default."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "vp-ref"
+    entity.vehicle.position.latitude = 1.0
+    entity.vehicle.position.longitude = 2.0
+    entity.vehicle.stop_id = "S9"
+    (vehicle,) = vehicles_from_message(msg, route_names={}, trip_routes={})
+    assert vehicle.stop_id == "S9"
+    assert vehicle.current_status is VehicleStopStatus.IN_TRANSIT_TO
 
 
 def test_trip_updates_from_message() -> None:
@@ -297,9 +358,26 @@ def test_alerts_from_message() -> None:
     assert alert.severity is None  # fixture sets no severity_level
     assert alert.route_ids == ["R1"]
     assert alert.stop_ids == ["S1"]
+    assert alert.trip_ids == []  # fixture informs a route and a stop only
     assert alert.active_periods == [
         (datetime.fromtimestamp(1_785_400_000, tz=UTC), None)
     ]
+
+
+def test_alerts_trip_scoped_not_agency_wide() -> None:
+    """The semantic fix: an alert whose informed entities carry ONLY trip
+    descriptors populates trip_ids -- so it is scoped (to those trips),
+    not mistaken for an unscoped agency-wide alert. Unscoped now means
+    route_ids, stop_ids, AND trip_ids all empty.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.ParseFromString(ALERTS_TRIP_SCOPED)
+    (alert,) = alerts_from_message(msg)
+    assert alert.header == "T1 and T3 running late"
+    assert alert.route_ids == []
+    assert alert.stop_ids == []
+    assert alert.trip_ids == ["T1", "T3"]  # sorted, deduplicated
+    assert alert.effect is AlertEffect.SIGNIFICANT_DELAYS
 
 
 def test_pb_enum_name_and_vocab_leniency() -> None:
@@ -312,6 +390,13 @@ def test_pb_enum_name_and_vocab_leniency() -> None:
     assert _vocab_or_none(AlertCause, "CONSTRUCTION") is AlertCause.CONSTRUCTION
     assert _vocab_or_none(AlertCause, "FUTURE_SPEC_VALUE") is None
     assert _vocab_or_none(AlertCause, None) is None
+    # The new VehiclePosition vocabularies ride the same two-layer leniency.
+    assert (
+        _pb_enum_name(gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus, 999) is None
+    )
+    assert _pb_enum_name(gtfs_realtime_pb2.VehiclePosition.CongestionLevel, 999) is None
+    assert _vocab_or_none(VehicleStopStatus, "FUTURE_STATUS") is None
+    assert _vocab_or_none(CongestionLevel, "FUTURE_LEVEL") is None
 
 
 def test_trip_updates_delay_field_and_departure_preference() -> None:

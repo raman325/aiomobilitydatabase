@@ -23,6 +23,7 @@ from .exceptions import FeedParseError
 from .models import (
     Agency,
     BikesAllowed,
+    FeedInfo,
     PickupDropOffType,
     Route,
     Stop,
@@ -30,7 +31,9 @@ from .models import (
     WheelchairAccess,
 )
 
-SCHEMA_VERSION = 2  # v2: ix_stop_times_trip_sequence (RT delay propagation)
+# v3: descriptive surface sweep (stop desc/url/zone/timezone, route
+# desc/sort_order, trip short_name/block_id, feed_info table).
+SCHEMA_VERSION = 3
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -46,11 +49,13 @@ CREATE TABLE agencies (
 CREATE TABLE stops (
     id TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL,
     parent_station TEXT, location_type INTEGER,
-    stop_code TEXT, platform_code TEXT, wheelchair_boarding INTEGER
+    stop_code TEXT, platform_code TEXT, wheelchair_boarding INTEGER,
+    description TEXT, url TEXT, zone_id TEXT, timezone TEXT
 );
 CREATE TABLE routes (
     id TEXT PRIMARY KEY, short_name TEXT, long_name TEXT, type INTEGER,
-    agency_id TEXT, color TEXT, text_color TEXT, url TEXT
+    agency_id TEXT, color TEXT, text_color TEXT, url TEXT,
+    description TEXT, sort_order INTEGER
 );
 CREATE TABLE trips (
     id TEXT PRIMARY KEY, route_id TEXT NOT NULL,
@@ -62,7 +67,15 @@ CREATE TABLE trips (
     -- rather than string-parsing the synthetic "#"-suffixed id, which
     -- would be ambiguous if a real trip id contained "#".
     source_trip_id TEXT NOT NULL, start_secs INTEGER,
-    wheelchair_accessible INTEGER, bikes_allowed INTEGER, direction_id INTEGER
+    wheelchair_accessible INTEGER, bikes_allowed INTEGER, direction_id INTEGER,
+    short_name TEXT, block_id TEXT
+);
+-- Single-record feed metadata (feed_info.txt); dates stay raw YYYYMMDD
+-- text cells, parsed leniently at the model boundary like every other
+-- descriptive value.
+CREATE TABLE feed_info (
+    publisher_name TEXT, publisher_url TEXT, lang TEXT, version TEXT,
+    start_date TEXT, end_date TEXT
 );
 CREATE TABLE stop_times (
     trip_id TEXT NOT NULL, stop_id TEXT NOT NULL,
@@ -142,6 +155,28 @@ def _lenient_int(value: str | None) -> int | None:
         return None
 
 
+_GTFS_DATE_LENGTH = 8  # YYYYMMDD
+
+
+def _lenient_date(value: str | None) -> date | None:
+    """Parse a DESCRIPTIVE ``YYYYMMDD`` date cell leniently: garbage -> None.
+
+    Same contract as ``_lenient_int``: absent, blank, wrong-length,
+    non-digit, or calendar-invalid (month 13, day 32) cells become None
+    rather than failing the build. ASCII digits only -- ``int()`` would
+    happily accept unicode digits a GTFS date can never contain.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if len(value) != _GTFS_DATE_LENGTH or not (value.isascii() and value.isdigit()):
+        return None
+    try:
+        return date(int(value[:4]), int(value[4:6]), int(value[6:8]))
+    except ValueError:
+        return None
+
+
 def _enum_or_none[IntEnumT: IntEnum](
     enum_cls: type[IntEnumT], value: int | None
 ) -> IntEnumT | None:
@@ -205,8 +240,9 @@ class ScheduledDeparture:
     departure lands on.
 
     The descriptive tail mirrors :class:`~.models.StopArrival`:
-    trip-level wheelchair/bikes flags plus this stop_time row's
-    pickup/drop-off/timepoint/headsign descriptors.
+    trip-level wheelchair/bikes flags and short-name/block identifiers
+    plus this stop_time row's pickup/drop-off/timepoint/headsign
+    descriptors.
     """
 
     trip_id: str
@@ -225,6 +261,8 @@ class ScheduledDeparture:
     drop_off_type: PickupDropOffType | None
     timepoint_exact: bool | None
     stop_headsign: str | None
+    trip_short_name: str | None
+    block_id: str | None
 
 
 @dataclass(frozen=True)
@@ -273,6 +311,8 @@ class ScheduledTrip:
     destination_stop_headsign: str | None
     is_first: bool
     is_last: bool
+    trip_short_name: str | None
+    block_id: str | None
 
 
 class StaticIndex:
@@ -407,6 +447,7 @@ class StaticIndex:
             ("frequencies.txt", cls._load_frequencies),
             ("calendar.txt", cls._load_calendar),
             ("calendar_dates.txt", cls._load_calendar_dates),
+            ("feed_info.txt", cls._load_feed_info),
         )
         required = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
         parsed = [filename for filename, _ in files if filename in names]
@@ -473,7 +514,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT OR REPLACE INTO stops VALUES (?,?,?,?,?,?,?,?,?)"
+        sql = "INSERT OR REPLACE INTO stops VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
         for row in reader:
             rows.append(
                 (
@@ -486,6 +527,10 @@ class StaticIndex:
                     row.get("stop_code") or None,
                     row.get("platform_code") or None,
                     _lenient_int(row.get("wheelchair_boarding")),
+                    row.get("stop_desc") or None,
+                    row.get("stop_url") or None,
+                    row.get("zone_id") or None,
+                    row.get("stop_timezone") or None,
                 )
             )
             if len(rows) >= _BATCH_SIZE:
@@ -504,7 +549,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT OR REPLACE INTO routes VALUES (?,?,?,?,?,?,?,?)"
+        sql = "INSERT OR REPLACE INTO routes VALUES (?,?,?,?,?,?,?,?,?,?)"
         for row in reader:
             rows.append(
                 (
@@ -518,6 +563,8 @@ class StaticIndex:
                     row.get("route_color") or None,
                     row.get("route_text_color") or None,
                     row.get("route_url") or None,
+                    row.get("route_desc") or None,
+                    _lenient_int(row.get("route_sort_order")),
                 )
             )
             if len(rows) >= _BATCH_SIZE:
@@ -536,7 +583,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?)"
+        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?)"
         for row in reader:
             rows.append(
                 (
@@ -549,6 +596,8 @@ class StaticIndex:
                     _lenient_int(row.get("wheelchair_accessible")),
                     _lenient_int(row.get("bikes_allowed")),
                     _lenient_int(row.get("direction_id")),
+                    row.get("trip_short_name") or None,
+                    row.get("block_id") or None,
                 )
             )
             if len(rows) >= _BATCH_SIZE:
@@ -644,9 +693,11 @@ class StaticIndex:
         trips_sql = (
             "INSERT OR REPLACE INTO trips "
             "(id, route_id, service_id, headsign, source_trip_id, start_secs, "
-            "wheelchair_accessible, bikes_allowed, direction_id) "
+            "wheelchair_accessible, bikes_allowed, direction_id, "
+            "short_name, block_id) "
             "SELECT ?, route_id, service_id, headsign, ?, ?, "
-            "wheelchair_accessible, bikes_allowed, direction_id "
+            "wheelchair_accessible, bikes_allowed, direction_id, "
+            "short_name, block_id "
             "FROM trips WHERE id = ?"
         )
         stop_times_sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
@@ -787,6 +838,36 @@ class StaticIndex:
         if report is not None:
             report()
 
+    @classmethod
+    def _load_feed_info(
+        cls,
+        conn: sqlite3.Connection,
+        reader: csv.DictReader[str],
+        report: Callable[[], None] | None = None,
+    ) -> None:
+        """Load feed_info.txt: a single-record file, so the FIRST data row wins.
+
+        GTFS defines exactly one record; a producer shipping extras is an
+        error the loader resolves by keeping row one and ignoring the rest
+        (documented on :class:`~.models.FeedInfo`). Date cells stay raw
+        text; the model boundary parses them leniently.
+        """
+        for row in reader:
+            conn.execute(
+                "INSERT INTO feed_info VALUES (?,?,?,?,?,?)",
+                (
+                    row.get("feed_publisher_name") or None,
+                    row.get("feed_publisher_url") or None,
+                    row.get("feed_lang") or None,
+                    row.get("feed_version") or None,
+                    row.get("feed_start_date") or None,
+                    row.get("feed_end_date") or None,
+                ),
+            )
+            break
+        if report is not None:
+            report()
+
     # -- queries -----------------------------------------------------------
 
     def stops(self) -> list[Stop]:
@@ -802,10 +883,15 @@ class StaticIndex:
                 stop_code=row[6],
                 platform_code=row[7],
                 wheelchair_boarding=_enum_or_none(WheelchairAccess, row[8]),
+                description=row[9],
+                url=row[10],
+                zone_id=row[11],
+                timezone=row[12],
             )
             for row in self._conn.execute(
                 "SELECT id, name, lat, lon, parent_station, location_type, "
-                "stop_code, platform_code, wheelchair_boarding "
+                "stop_code, platform_code, wheelchair_boarding, "
+                "description, url, zone_id, timezone "
                 "FROM stops ORDER BY name"
             )
         ]
@@ -822,6 +908,8 @@ class StaticIndex:
             color=row[5],
             text_color=row[6],
             url=row[7],
+            description=row[8],
+            sort_order=row[9],
         )
 
     def routes(self) -> list[Route]:
@@ -830,9 +918,32 @@ class StaticIndex:
             self._route_from_row(row)
             for row in self._conn.execute(
                 "SELECT id, short_name, long_name, type, "
-                "agency_id, color, text_color, url FROM routes ORDER BY id"
+                "agency_id, color, text_color, url, description, sort_order "
+                "FROM routes ORDER BY id"
             )
         ]
+
+    def feed_info(self) -> FeedInfo | None:
+        """Return the feed_info.txt record, or None when the file was absent.
+
+        A single record by definition (the loader keeps only the first
+        data row); date columns parse leniently at this boundary, so a
+        malformed feed_start_date surfaces as None rather than an error.
+        """
+        row = self._conn.execute(
+            "SELECT publisher_name, publisher_url, lang, version, "
+            "start_date, end_date FROM feed_info"
+        ).fetchone()
+        if row is None:
+            return None
+        return FeedInfo(
+            publisher_name=row[0],
+            publisher_url=row[1],
+            lang=row[2],
+            version=row[3],
+            start_date=_lenient_date(row[4]),
+            end_date=_lenient_date(row[5]),
+        )
 
     def agencies(self) -> list[Agency]:
         """All agencies, in agency.txt order (route rows reference them)."""
@@ -900,7 +1011,8 @@ class StaticIndex:
             self._route_from_row(row)
             for row in self._conn.execute(
                 "SELECT DISTINCT r.id, r.short_name, r.long_name, r.type, "
-                "r.agency_id, r.color, r.text_color, r.url "
+                "r.agency_id, r.color, r.text_color, r.url, "
+                "r.description, r.sort_order "
                 "FROM stop_times st "
                 "JOIN trips t ON t.id = st.trip_id "
                 "JOIN routes r ON r.id = t.route_id "
@@ -1045,7 +1157,8 @@ class StaticIndex:
                 "st.stop_sequence, "
                 "st.arrival_secs, st.departure_secs, t.source_trip_id, t.start_secs, "
                 "t.wheelchair_accessible, t.bikes_allowed, "
-                "st.pickup_type, st.drop_off_type, st.timepoint, st.stop_headsign "
+                "st.pickup_type, st.drop_off_type, st.timepoint, st.stop_headsign, "
+                "t.short_name, t.block_id "
                 "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
                 f"WHERE st.stop_id IN ({stop_marks}) "
                 f"AND t.service_id IN ({service_marks}) "
@@ -1072,6 +1185,8 @@ class StaticIndex:
                 drop_off_type,
                 timepoint,
                 stop_headsign,
+                trip_short_name,
+                block_id,
             ) in self._conn.execute(sql, params):
                 results.append(
                     ScheduledDeparture(
@@ -1097,6 +1212,8 @@ class StaticIndex:
                         drop_off_type=_enum_or_none(PickupDropOffType, drop_off_type),
                         timepoint_exact=_timepoint_exact(timepoint),
                         stop_headsign=stop_headsign,
+                        trip_short_name=trip_short_name,
+                        block_id=block_id,
                     )
                 )
         # Total sort key: departure alone ties frequently (same-minute
@@ -1217,7 +1334,7 @@ class StaticIndex:
                 "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
                 "o.pickup_type, o.drop_off_type, o.timepoint, o.stop_headsign, "
                 "d.pickup_type, d.drop_off_type, d.timepoint, d.stop_headsign, "
-                "o.stop_sequence, d.stop_sequence "
+                "o.stop_sequence, d.stop_sequence, t.short_name, t.block_id "
                 f"{candidates} "
                 "AND o.departure_secs >= ? AND o.departure_secs <= ? "
                 "GROUP BY o.trip_id, o.stop_sequence"
@@ -1256,6 +1373,8 @@ class StaticIndex:
                 d_stop_headsign,
                 o_sequence,
                 d_sequence,
+                trip_short_name,
+                block_id,
             ) in rows:
                 results.append(
                     ScheduledTrip(
@@ -1292,6 +1411,8 @@ class StaticIndex:
                         destination_stop_headsign=d_stop_headsign,
                         is_first=(trip_id, o_sequence) == first_key,
                         is_last=(trip_id, o_sequence) == last_key,
+                        trip_short_name=trip_short_name,
+                        block_id=block_id,
                     )
                 )
         # Total sort key, matching upcoming_departures's rationale: arrival
