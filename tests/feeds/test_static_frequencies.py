@@ -103,6 +103,37 @@ def test_template_rows_replaced_not_kept(tmp_path: Path) -> None:
     index.close()
 
 
+def test_is_first_last_treats_repetitions_as_ordinary_trips(tmp_path: Path) -> None:
+    """Materialized repetitions are ordinary trips to the first/last flags:
+    Thursday's S1->S2 candidates are the five F1 reps (06:00..07:10), T1
+    (08:00:30), and the three F2 reps (23:30/24:00/24:30) -- so the day's
+    06:00 F1 repetition is the first departure and nothing else in an
+    early-morning window carries a flag.
+    """
+    index = _index(tmp_path)
+    trips = index.upcoming_trips("S1", "S2", NOW, timedelta(hours=1), 10)
+    assert [(t.trip_id, t.is_first, t.is_last) for t in trips] == [
+        ("F1#21600", True, False),
+        ("F1#22200", False, False),
+        ("F1#22800", False, False),
+    ]
+    index.close()
+
+
+def test_is_last_past_midnight_repetition_relative_to_own_day(tmp_path: Path) -> None:
+    """F2's 24:30 repetition (F2#88200, running Friday 00:30 PDT) is the
+    LAST S1->S2 departure of THURSDAY's service day -- the flag rides the
+    service day the repetition belongs to, not the clock day it runs on.
+    """
+    now = datetime(2026, 7, 31, 7, 15, tzinfo=UTC)  # Friday 00:15 PDT
+    index = _index(tmp_path)
+    trips = index.upcoming_trips("S1", "S2", now, timedelta(hours=1), 10)
+    assert [(t.trip_id, t.is_first, t.is_last) for t in trips] == [
+        ("F2#88200", False, True)
+    ]
+    index.close()
+
+
 def test_past_midnight_repetition_on_next_clock_day(tmp_path: Path) -> None:
     """F2's 24:00 and 24:30 repetitions belong to the PREVIOUS service day:
     querying Friday 00:15 PDT must surface Thursday's F2#88200 at Friday

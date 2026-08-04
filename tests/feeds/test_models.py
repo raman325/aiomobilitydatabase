@@ -7,7 +7,10 @@ from datetime import UTC, datetime
 from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.models import (
+    Agency,
+    BikesAllowed,
     GbfsVehicle,
+    PickupDropOffType,
     Route,
     ServiceAlert,
     Station,
@@ -15,6 +18,7 @@ from aiomobilitydatabase.feeds.models import (
     StopArrival,
     SystemInfo,
     VehiclePosition,
+    WheelchairAccess,
 )
 
 from tests.feeds.fixtures import (
@@ -23,6 +27,19 @@ from tests.feeds.fixtures import (
     VEHICLE_POSITIONS,
     build_gtfs_zip_bytes,
 )
+
+
+def _route(route_id: str, short_name: str | None, long_name: str | None) -> Route:
+    return Route(
+        id=route_id,
+        short_name=short_name,
+        long_name=long_name,
+        type=3,
+        agency_id="A1",
+        color="FFD700",
+        text_color="000000",
+        url=None,
+    )
 
 
 def test_stop_arrival_realtime_flags() -> None:
@@ -41,13 +58,31 @@ def test_stop_arrival_realtime_flags() -> None:
         delay_seconds=None,
         realtime=False,
         vehicle_id=None,
+        wheelchair_accessible=WheelchairAccess.POSSIBLE,
+        bikes_allowed=BikesAllowed.NOT_ALLOWED,
+        pickup_type=PickupDropOffType.REGULAR,
+        drop_off_type=PickupDropOffType.NONE,
+        timepoint_exact=True,
+        stop_headsign="Downtown via 5th",
     )
     assert arrival.realtime is False
     assert arrival.scheduled_departure == scheduled
+    assert arrival.wheelchair_accessible is WheelchairAccess.POSSIBLE
+    assert arrival.stop_headsign == "Downtown via 5th"
 
 
 def test_models_are_frozen() -> None:
-    stop = Stop(id="S1", name="Main St", latitude=34.05, longitude=-118.25)
+    stop = Stop(
+        id="S1",
+        name="Main St",
+        latitude=34.05,
+        longitude=-118.25,
+        parent_station=None,
+        location_type=None,
+        stop_code=None,
+        platform_code=None,
+        wheelchair_boarding=None,
+    )
     try:
         stop.name = "x"  # type: ignore[misc]
         raise AssertionError("Stop must be frozen")
@@ -113,11 +148,22 @@ def test_vehicle_and_station_construct() -> None:
         url=None,
     )
     assert alert.route_ids == ["R1"]
-    route = Route(id="R1", short_name="10", long_name="Main Line", type=3)
+    route = _route("R1", short_name="10", long_name="Main Line")
     assert route.display_name == "10 Main Line"
-    owl_route = Route(id="R2", short_name=None, long_name="Owl", type=3)
+    assert route.color == "FFD700"
+    owl_route = _route("R2", short_name=None, long_name="Owl")
     assert owl_route.display_name == "Owl"
-    assert Route(id="R3", short_name="7", long_name=None, type=3).display_name == "7"
+    assert _route("R3", short_name="7", long_name=None).display_name == "7"
+    agency = Agency(
+        id="A1",
+        name="Test Transit",
+        url="https://example.com",
+        timezone="America/Los_Angeles",
+        lang="en",
+        phone=None,
+        fare_url=None,
+    )
+    assert agency.name == "Test Transit"
 
 
 def test_fixtures_are_valid() -> None:

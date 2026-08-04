@@ -5,7 +5,7 @@ from __future__ import annotations
 from hypothesis import given
 from hypothesis import strategies as st
 
-from aiomobilitydatabase.feeds.models import StationGroup, Stop
+from aiomobilitydatabase.feeds.models import StationGroup, Stop, StopLocationType
 from aiomobilitydatabase.feeds.transit import group_stations
 
 
@@ -21,7 +21,12 @@ def _stop(
         latitude=0.0,
         longitude=0.0,
         parent_station=parent,
-        location_type=location_type,
+        location_type=(
+            None if location_type is None else StopLocationType(location_type)
+        ),
+        stop_code=None,
+        platform_code=None,
+        wheelchair_boarding=None,
     )
 
 

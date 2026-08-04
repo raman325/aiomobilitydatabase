@@ -899,6 +899,61 @@ def test_upcoming_trips_invariants(zip_bytes: bytes, data: st.DataObject) -> Non
         index.close()
 
 
+@settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    dep_offsets=st.lists(
+        st.integers(min_value=0, max_value=107_999), min_size=1, max_size=6
+    )
+)
+def test_exactly_one_first_and_one_last_per_service_day_pair(
+    dep_offsets: list[int],
+) -> None:
+    """Over generated single-service-day schedules -- duplicate departure
+    times allowed, >24:00:00 times allowed -- a whole-day query flags
+    EXACTLY one row is_first and exactly one is_last for the pair, and they
+    are the min/max under the (departure, trip_id) total order (the
+    tiebreak that keeps the flags unique when departures tie).
+    """
+    trip_rows = "".join(f"R1,ONE,T{i},H\n" for i in range(len(dep_offsets)))
+    stop_time_rows = "".join(
+        f"T{i},{_format_gtfs_time(secs)},{_format_gtfs_time(secs)},S1,1\n"
+        f"T{i},{_format_gtfs_time(secs + 300)},{_format_gtfs_time(secs + 300)},S2,2\n"
+        for i, secs in enumerate(dep_offsets)
+    )
+    files = {
+        "agency.txt": (
+            "agency_id,agency_name,agency_url,agency_timezone\nA1,T,https://e.com,UTC\n"
+        ),
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,A,0,0\nS2,B,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\n" + trip_rows,
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            + stop_time_rows
+        ),
+        "calendar.txt": (
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+            "start_date,end_date\nONE,1,1,1,1,1,1,1,20260730,20260730\n"
+        ),
+    }
+    index = _build_index_from_files(files)
+    try:
+        now = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)  # the UTC day anchor
+        trips = index.upcoming_trips("S1", "S2", now, timedelta(hours=31), 1000)
+        assert len(trips) == len(dep_offsets)  # the whole day, nothing clipped
+        firsts = [trip for trip in trips if trip.is_first]
+        lasts = [trip for trip in trips if trip.is_last]
+        assert len(firsts) == 1
+        assert len(lasts) == 1
+        keys = [(trip.departure, trip.trip_id) for trip in trips]
+        assert (firsts[0].departure, firsts[0].trip_id) == min(keys)
+        assert (lasts[0].departure, lasts[0].trip_id) == max(keys)
+    finally:
+        index.close()
+
+
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
 @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_cache_roundtrip_equivalent(zip_bytes: bytes, data: st.DataObject) -> None:

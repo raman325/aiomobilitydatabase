@@ -50,6 +50,15 @@ async def test_schedule_only_arrivals(
     assert first.stop_name == "Main St"
     assert first.route_name == "10 Main Line"
     assert first.headsign == "Downtown"
+    # The base fixture ships no descriptive stop_times/trips columns: every
+    # descriptor is None EXCEPT timepoint_exact, whose GTFS default for an
+    # absent column is "times are exact".
+    assert first.wheelchair_accessible is None
+    assert first.bikes_allowed is None
+    assert first.pickup_type is None
+    assert first.drop_off_type is None
+    assert first.stop_headsign is None
+    assert first.timepoint_exact is True
 
 
 async def test_rt_merge_delay_cancellation_and_added(
@@ -89,6 +98,15 @@ async def test_rt_merge_delay_cancellation_and_added(
     assert added.realtime is True
     assert added.scheduled_departure is None
     assert added.route_name == "10 Main Line"
+    # An RT-added trip has no static schedule row: every descriptor is None,
+    # INCLUDING timepoint_exact (the absent-means-exact default only applies
+    # to stop_times rows that exist).
+    assert added.wheelchair_accessible is None
+    assert added.bikes_allowed is None
+    assert added.pickup_type is None
+    assert added.drop_off_type is None
+    assert added.timepoint_exact is None
+    assert added.stop_headsign is None
     # Producer auth header applied (auth_type 2, X-Api-Key).
     rt_request = next(req for req in mock_api.requests if req.path == "/rt/all")
     assert rt_request.headers.get("X-Api-Key") == "secret123"

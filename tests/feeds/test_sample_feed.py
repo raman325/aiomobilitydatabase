@@ -45,6 +45,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
+from aiomobilitydatabase.feeds.models import Agency
 from aiomobilitydatabase.feeds.static_index import ScheduledDeparture, StaticIndex
 
 from tests.feeds.fixtures import (
@@ -124,6 +125,11 @@ def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> N
     assert stagecoach.name == "Stagecoach Hotel & Casino (Demo)"
     assert stagecoach.latitude == 36.915682
     assert stagecoach.longitude == -116.751677
+    # stops.txt ships none of the optional descriptive columns.
+    assert stagecoach.stop_code is None
+    assert stagecoach.platform_code is None
+    assert stagecoach.wheelchair_boarding is None
+    assert stagecoach.location_type is None
     routes = index.routes()
     assert [route.id for route in routes] == [
         "AAMV",
@@ -135,6 +141,25 @@ def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> N
     ]
     ext = next(route for route in routes if route.id == "EXT")
     assert ext.type == 103  # extended route types survive ingestion
+    # routes.txt populates agency_id everywhere; its route_url/route_color/
+    # route_text_color columns exist but every value is blank.
+    assert all(route.agency_id == "DTA" for route in routes)
+    assert all(route.color is None for route in routes)
+    assert all(route.text_color is None for route in routes)
+    assert all(route.url is None for route in routes)
+    # agency.txt is a full single record (no lang/phone/fare_url columns);
+    # the deliberate nonexistent_column is ignored.
+    assert index.agencies() == [
+        Agency(
+            id="DTA",
+            name="Demo Transit Authority",
+            url="http://google.com",
+            timezone="America/Los_Angeles",
+            lang=None,
+            phone=None,
+            fare_url=None,
+        )
+    ]
     index.close()
 
 
@@ -217,6 +242,16 @@ def test_stba_repetitions_exact_starts_and_pinned_departures(tmp_path: Path) -> 
     assert first.start_secs == 21600
     assert first.headsign == "Shuttle"
     assert first.route_id == "STBA"
+    # trips.txt has no wheelchair/bikes columns; stop_times.txt HAS
+    # pickup/drop-off/headsign columns with every value blank, and no
+    # timepoint column at all -- so times are exact by the GTFS default,
+    # carried through materialization to this repetition.
+    assert first.wheelchair_accessible is None
+    assert first.bikes_allowed is None
+    assert first.pickup_type is None
+    assert first.drop_off_type is None
+    assert first.stop_headsign is None
+    assert first.timepoint_exact is True
     assert at_stagecoach[-1].trip_id == "STBA#77400"
     assert at_stagecoach[-1].departure == datetime(2007, 6, 2, 4, 30, tzinfo=UTC)
     assert "STBA#79200" not in {dep.trip_id for dep in stba}
@@ -303,6 +338,15 @@ def test_upcoming_trips_across_frequency_repetitions(tmp_path: Path) -> None:
     assert outbound[0].route_id == "CITY"
     assert outbound[0].source_trip_id == "CITY1"
     assert outbound[0].start_secs == 28800
+    # CITY1's direction_id=0 rides along into every materialized repetition;
+    # neither row is the day's first (CITY1#21600) or last (CITY1#77400)
+    # STAGECOACH->EMSI departure.
+    assert outbound[0].direction_id == 0
+    assert outbound[0].origin_timepoint_exact is True
+    assert [(t.is_first, t.is_last) for t in outbound] == [
+        (False, False),
+        (False, False),
+    ]
     # Reverse pair: CITY2 reps whose EMSI departure (+2:00 from start)
     # falls in window -- same starts; STAGECOACH arrival is +28:00.
     inbound = index.upcoming_trips("EMSI", "STAGECOACH", now, timedelta(minutes=30), 10)
@@ -318,6 +362,7 @@ def test_upcoming_trips_across_frequency_repetitions(tmp_path: Path) -> None:
             datetime(2007, 6, 1, 15, 38, tzinfo=UTC),
         ),
     ]
+    assert inbound[0].direction_id == 1  # CITY2's direction, carried per rep
     index.close()
 
 
@@ -346,6 +391,13 @@ def test_weekend_service_gates_aamv_trips(tmp_path: Path) -> None:
             datetime(2007, 6, 2, 21, 0, tzinfo=UTC),
         ),
     ]
+    # AAMV1 and AAMV3 are Saturday's only BEATTY_AIRPORT->AMV candidates:
+    # first/last-of-service-day flags split across them.
+    assert [(t.trip_id, t.is_first, t.is_last) for t in trips] == [
+        ("AAMV1", True, False),
+        ("AAMV3", False, True),
+    ]
+    assert trips[0].direction_id == 0  # "to Amargosa Valley"
     friday_0745 = datetime(2007, 6, 1, 14, 45, tzinfo=UTC)
     assert (
         index.upcoming_trips(
@@ -454,4 +506,12 @@ async def test_handle_answers_from_canonical_feed(
     assert trips[0].route_name == "10 Airport - Bullfrog"
     assert trips[0].headsign == "to Bullfrog"
     assert trips[0].realtime is False
+    # AB1 is Friday's ONLY BEATTY_AIRPORT->BULLFROG candidate (AB2 runs the
+    # reverse direction), so it is both the first and last of its day.
+    assert trips[0].is_first is True
+    assert trips[0].is_last is True
+    assert trips[0].direction_id == 0
+    # The handle exposes the full agency record surface, like stops/routes.
+    assert [agency.id for agency in handle.agencies] == ["DTA"]
+    assert handle.agencies[0].name == "Demo Transit Authority"
     handle.close()

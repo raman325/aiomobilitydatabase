@@ -23,7 +23,10 @@ from .exceptions import (
 from .gbfs import GbfsFeedHandle
 from .geo import Circle
 from .models import (
+    Agency,
+    BikesAllowed,
     GbfsVehicle,
+    PickupDropOffType,
     Route,
     ServiceAlert,
     StaticBuildProgress,
@@ -31,19 +34,24 @@ from .models import (
     StationGroup,
     Stop,
     StopArrival,
+    StopLocationType,
     SystemInfo,
     UpcomingTrip,
     VehiclePosition,
+    WheelchairAccess,
 )
 from .transit import TransitFeedHandle
 
 __all__ = [
+    "Agency",
+    "BikesAllowed",
     "Circle",
     "FeedParseError",
     "GbfsFeedHandle",
     "GbfsVehicle",
     "MobilityFeedsClient",
     "MobilityFeedsError",
+    "PickupDropOffType",
     "Route",
     "ServiceAlert",
     "SourceAuthenticationError",
@@ -54,8 +62,10 @@ __all__ = [
     "StationGroup",
     "Stop",
     "StopArrival",
+    "StopLocationType",
     "SystemInfo",
     "TransitFeedHandle",
     "UpcomingTrip",
     "VehiclePosition",
+    "WheelchairAccess",
 ]
