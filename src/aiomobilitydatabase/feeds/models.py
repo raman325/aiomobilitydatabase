@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import IntEnum, StrEnum
 
 
@@ -110,6 +110,31 @@ class AlertSeverity(StrEnum):
     SEVERE = "SEVERE"
 
 
+class VehicleStopStatus(StrEnum):
+    """GTFS-RT ``VehiclePosition.VehicleStopStatus`` vocabulary (protobuf names).
+
+    Describes the vehicle's relationship to its current stop
+    (:attr:`VehiclePosition.stop_id` / ``current_stop_sequence``). The
+    protobuf field defaults to IN_TRANSIT_TO; see
+    :attr:`VehiclePosition.current_status` for exactly when that default is
+    surfaced versus None.
+    """
+
+    INCOMING_AT = "INCOMING_AT"
+    STOPPED_AT = "STOPPED_AT"
+    IN_TRANSIT_TO = "IN_TRANSIT_TO"
+
+
+class CongestionLevel(StrEnum):
+    """GTFS-RT ``VehiclePosition.CongestionLevel`` vocabulary (protobuf names)."""
+
+    UNKNOWN_CONGESTION_LEVEL = "UNKNOWN_CONGESTION_LEVEL"
+    RUNNING_SMOOTHLY = "RUNNING_SMOOTHLY"
+    STOP_AND_GO = "STOP_AND_GO"
+    CONGESTION = "CONGESTION"
+    SEVERE_CONGESTION = "SEVERE_CONGESTION"
+
+
 class OccupancyStatus(StrEnum):
     """GTFS-RT ``VehiclePosition.OccupancyStatus`` vocabulary (protobuf names)."""
 
@@ -126,7 +151,15 @@ class OccupancyStatus(StrEnum):
 
 @dataclass(frozen=True)
 class Stop:
-    """A transit stop from the static GTFS index."""
+    """A transit stop from the static GTFS index.
+
+    ``description``/``url``/``zone_id`` are the verbatim ``stop_desc``/
+    ``stop_url``/``zone_id`` cells (empty -> None). ``timezone`` is
+    ``stop_timezone`` and is DISPLAY METADATA ONLY: per the GTFS spec,
+    every stop_times value is expressed in the AGENCY timezone regardless
+    of any stop_timezone, so no time computation in this library reads it
+    -- it exists so consumers can render "local time at this stop".
+    """
 
     id: str
     name: str | None
@@ -137,6 +170,10 @@ class Stop:
     stop_code: str | None
     platform_code: str | None
     wheelchair_boarding: WheelchairAccess | None
+    description: str | None
+    url: str | None
+    zone_id: str | None
+    timezone: str | None
 
 
 @dataclass(frozen=True)
@@ -180,7 +217,11 @@ class Route:
     (e.g. 103) are an open vocabulary a closed enum could not represent.
     ``color``/``text_color`` are the raw GTFS hex strings without a leading
     ``#`` (e.g. ``"FFD700"``); ``agency_id`` resolves against
-    :class:`Agency` records exposed on the handle/index.
+    :class:`Agency` records exposed on the handle/index. ``description``
+    is the verbatim ``route_desc`` cell; ``sort_order`` is
+    ``route_sort_order`` parsed leniently (blank/garbage -> None, any
+    parseable int kept verbatim -- an open ordering key, not a closed
+    vocabulary).
     """
 
     id: str
@@ -191,6 +232,8 @@ class Route:
     color: str | None
     text_color: str | None
     url: str | None
+    description: str | None
+    sort_order: int | None
 
     @property
     def display_name(self) -> str:
@@ -211,8 +254,11 @@ class StopArrival:
     override of the trip-level ``headsign``). ``timepoint_exact`` is True
     when the scheduled times are exact (GTFS's default when the column is
     absent or blank), False for approximate times, None when the value is
-    outside the 0/1 vocabulary. RT-added rows have no static schedule row,
-    so all six are None.
+    outside the 0/1 vocabulary. ``trip_short_name``/``block_id`` are the
+    trip's verbatim ``trip_short_name``/``block_id`` cells -- ``block_id``
+    is raw string exposure only (no block-continuation computation).
+    RT-added rows have no static schedule row, so every descriptive field
+    is None.
     """
 
     stop_id: str
@@ -234,6 +280,8 @@ class StopArrival:
     drop_off_type: PickupDropOffType | None
     timepoint_exact: bool | None
     stop_headsign: str | None
+    trip_short_name: str | None
+    block_id: str | None
 
 
 @dataclass(frozen=True)
@@ -248,7 +296,9 @@ class UpcomingTrip:
 
     ``wheelchair_accessible``/``bikes_allowed``/``direction_id`` describe
     the trip (``direction_id`` stays a raw int: 0/1 with feed-defined
-    meaning). The ``origin_*``/``destination_*`` descriptors come from the
+    meaning), as do ``trip_short_name``/``block_id`` (verbatim cells;
+    ``block_id`` is raw string exposure only -- no block-continuation
+    computation). The ``origin_*``/``destination_*`` descriptors come from the
     stop_time rows at each end, with the same semantics as the matching
     :class:`StopArrival` fields (``timepoint_exact`` defaults to True when
     the GTFS column is absent or blank).
@@ -286,11 +336,27 @@ class UpcomingTrip:
     destination_stop_headsign: str | None
     is_first: bool
     is_last: bool
+    trip_short_name: str | None
+    block_id: str | None
 
 
 @dataclass(frozen=True)
 class VehiclePosition:
-    """A live vehicle position from a GTFS-RT feed."""
+    """A live vehicle position from a GTFS-RT feed.
+
+    ``stop_id``/``current_stop_sequence`` identify the vehicle's current
+    stop as the producer sent them (raw, unresolved). ``current_status``
+    describes the vehicle's relationship to that stop. The protobuf field
+    carries an implicit default (IN_TRANSIT_TO), which per the spec is
+    only meaningful with respect to a current stop -- so the default is
+    surfaced ONLY when ``current_stop_sequence`` or ``stop_id`` is
+    present; with neither, an unset ``current_status`` is None (there is
+    no stop to be in transit to). An EXPLICITLY set ``current_status`` is
+    always surfaced verbatim, referent or not -- consumers decide.
+    ``congestion_level`` is None when unset (its protobuf default,
+    UNKNOWN_CONGESTION_LEVEL, carries no information to synthesize);
+    ``license_plate`` is the vehicle descriptor's verbatim plate.
+    """
 
     vehicle_id: str | None
     label: str | None
@@ -303,11 +369,23 @@ class VehiclePosition:
     trip_id: str | None
     occupancy_status: OccupancyStatus | None
     timestamp: datetime | None
+    current_status: VehicleStopStatus | None
+    congestion_level: CongestionLevel | None
+    stop_id: str | None
+    current_stop_sequence: int | None
+    license_plate: str | None
 
 
 @dataclass(frozen=True)
 class ServiceAlert:
-    """A service alert from a GTFS-RT feed."""
+    """A service alert from a GTFS-RT feed.
+
+    ``route_ids``/``stop_ids``/``trip_ids`` are the alert's scope: the
+    distinct route ids, stop ids, and informed-entity trip descriptor
+    trip ids across ``informed_entity``, each sorted. An alert is
+    UNSCOPED (applies feed-wide) only when ALL THREE lists are empty --
+    an alert informing only trips is trip-scoped, not agency-wide.
+    """
 
     id: str
     header: str | None
@@ -317,6 +395,7 @@ class ServiceAlert:
     severity: AlertSeverity | None
     route_ids: list[str]
     stop_ids: list[str]
+    trip_ids: list[str]
     active_periods: list[tuple[datetime | None, datetime | None]]
     url: str | None
 
@@ -336,7 +415,12 @@ class ServiceAlert:
 
 @dataclass(frozen=True)
 class Station:
-    """A GBFS station: information + status merged."""
+    """A GBFS station: information + status merged.
+
+    ``rental_uris`` passes through the station's deep-link table as
+    provided (keys ``android``/``ios``/``web`` per the spec, any string
+    key kept); None when the document omits it.
+    """
 
     id: str
     name: str | None
@@ -348,11 +432,17 @@ class Station:
     is_renting: bool | None
     is_returning: bool | None
     vehicle_types_available: dict[str, int] | None
+    rental_uris: dict[str, str] | None
 
 
 @dataclass(frozen=True)
 class GbfsVehicle:
-    """A free-floating GBFS vehicle."""
+    """A free-floating GBFS vehicle.
+
+    ``rental_uris`` passes through the vehicle's deep-link table as
+    provided (keys ``android``/``ios``/``web`` per the spec, any string
+    key kept); None when the document omits it.
+    """
 
     id: str
     latitude: float
@@ -361,6 +451,28 @@ class GbfsVehicle:
     is_disabled: bool | None
     vehicle_type_id: str | None
     current_range_m: float | None
+    rental_uris: dict[str, str] | None
+
+
+@dataclass(frozen=True)
+class FeedInfo:
+    """The static feed's own metadata record (feed_info.txt).
+
+    Text fields are verbatim cells (empty -> None); ``start_date``/
+    ``end_date`` are the ``feed_start_date``/``feed_end_date`` cells
+    parsed leniently from YYYYMMDD (absent, malformed, or
+    calendar-invalid -> None -- descriptive metadata never fails a
+    build). GTFS defines feed_info.txt as a single-record file; if a
+    producer ships several data rows, the FIRST one wins and the rest
+    are ignored.
+    """
+
+    publisher_name: str | None
+    publisher_url: str | None
+    lang: str | None
+    version: str | None
+    start_date: date | None
+    end_date: date | None
 
 
 @dataclass(frozen=True)

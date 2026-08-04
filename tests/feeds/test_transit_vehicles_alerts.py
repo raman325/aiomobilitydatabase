@@ -14,6 +14,7 @@ from aiomobilitydatabase.feeds.models import ServiceAlert, StationGroup
 from tests.feeds.fixtures import (
     _FILES,
     ALERTS,
+    ALERTS_TRIP_SCOPED,
     GTFS_FEED,
     GTFS_RT_FEED,
     TOKEN_RESPONSE,
@@ -76,6 +77,24 @@ async def test_get_alerts(mock_api: MockApi, feeds_client: MobilityFeedsClient) 
     alerts = await handle.get_alerts()
     assert alerts[0].header == "Detour on Main"
     assert alerts[0].route_ids == ["R1"]
+    assert alerts[0].trip_ids == []
+
+
+async def test_get_alerts_trip_scoped_is_not_agency_wide(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Alert-scoping contract through the handle: a trip-only alert carries
+    its trip_ids, so it no longer satisfies the "unscoped = everywhere"
+    condition (route_ids, stop_ids, AND trip_ids all empty)."""
+    _mock_catalog(mock_api)
+    mock_api.get("/rt/all", body=ALERTS_TRIP_SCOPED, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    (alert,) = await handle.get_alerts()
+    assert alert.route_ids == []
+    assert alert.stop_ids == []
+    assert alert.trip_ids == ["T1", "T3"]
+    # The documented unscoped predicate must be False for this alert.
+    assert bool(alert.route_ids or alert.stop_ids or alert.trip_ids)
 
 
 async def test_refresh_static_noop_when_dataset_unchanged(
@@ -238,6 +257,7 @@ def test_service_alert_is_active() -> None:
             severity=None,
             route_ids=[],
             stop_ids=[],
+            trip_ids=[],
             active_periods=periods,
             url=None,
         )

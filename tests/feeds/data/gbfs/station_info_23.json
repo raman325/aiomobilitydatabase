@@ -8,7 +8,12 @@
         "name": "Dock A",
         "lat": 34.05,
         "lon": -118.25,
-        "capacity": 20
+        "capacity": 20,
+        "rental_uris": {
+          "android": "https://example.com/app?station=st1&platform=android",
+          "ios": "https://example.com/app?station=st1&platform=ios",
+          "web": "https://example.com/stations/st1"
+        }
       },
       {
         "station_id": "st2",

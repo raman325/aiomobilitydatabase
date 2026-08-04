@@ -205,7 +205,9 @@ def build_sample_feed_zip_bytes() -> bytes:
 # Regenerate via `uv run python scripts/generate_rt_fixtures.py` (repo root).
 
 VEHICLE_POSITIONS: bytes = (_RT_DIR / "vehicle_positions.pb").read_bytes()
+VEHICLE_POSITIONS_STATUS: bytes = (_RT_DIR / "vehicle_positions_status.pb").read_bytes()
 ALERTS: bytes = (_RT_DIR / "alerts.pb").read_bytes()
+ALERTS_TRIP_SCOPED: bytes = (_RT_DIR / "alerts_trip_scoped.pb").read_bytes()
 TRIP_UPDATES_BASELINE: bytes = (_RT_DIR / "trip_updates_baseline.pb").read_bytes()
 TRIP_UPDATES_T1_DELAYED: bytes = (_RT_DIR / "trip_updates_t1_delayed.pb").read_bytes()
 TRIP_UPDATES_T1_DEST_ARRIVAL: bytes = (

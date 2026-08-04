@@ -51,9 +51,16 @@ async def test_stations_merged(
     assert st1.docks_available == 15
     assert st1.is_renting is True
     assert st1.vehicle_types_available == {"bike": 4, "ebike": 1}
+    # 2.x station_information rental_uris pass through as provided.
+    assert st1.rental_uris == {
+        "android": "https://example.com/app?station=st1&platform=android",
+        "ios": "https://example.com/app?station=st1&platform=ios",
+        "web": "https://example.com/stations/st1",
+    }
     st2 = stations["st2"]
     assert st2.is_renting is False
     assert st2.vehicle_types_available is None
+    assert st2.rental_uris is None  # absent in the document
 
 
 async def test_stations_zone_filter(

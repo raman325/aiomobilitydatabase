@@ -43,6 +43,21 @@ def _version_key(version: str | None) -> tuple[int, ...]:
         return (0,)
 
 
+def _rental_uris(value: Any) -> dict[str, str] | None:
+    """Pass through a GBFS ``rental_uris`` object: platform key -> URI.
+
+    Identical shape in 2.x and 3.x (``android``/``ios``/``web`` keys on
+    station_information rows and free_bike_status/vehicle_status rows).
+    Keys are kept as provided; non-string URI values are dropped rather
+    than coerced, and anything that isn't a non-empty object (absent,
+    null, wrong type, or nothing string-valued left) is None.
+    """
+    if not isinstance(value, dict):
+        return None
+    uris = {str(key): uri for key, uri in value.items() if isinstance(uri, str)}
+    return uris or None
+
+
 def _as_bool(value: Any) -> bool | None:
     """Coerce a GBFS status flag to bool without lying on ambiguous input.
 
@@ -252,6 +267,7 @@ class GbfsFeedHandle:
                     is_renting=_as_bool(status.get("is_renting")),
                     is_returning=_as_bool(status.get("is_returning")),
                     vehicle_types_available=types,
+                    rental_uris=_rental_uris(info.get("rental_uris")),
                 )
             )
         return stations
@@ -287,6 +303,7 @@ class GbfsFeedHandle:
                     is_disabled=row.get("is_disabled"),
                     vehicle_type_id=row.get("vehicle_type_id"),
                     current_range_m=row.get("current_range_meters"),
+                    rental_uris=_rental_uris(row.get("rental_uris")),
                 )
             )
         return vehicles

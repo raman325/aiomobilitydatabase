@@ -19,9 +19,11 @@ from .models import (
     AlertCause,
     AlertEffect,
     AlertSeverity,
+    CongestionLevel,
     OccupancyStatus,
     ServiceAlert,
     VehiclePosition,
+    VehicleStopStatus,
 )
 from .static_index import parse_gtfs_time
 
@@ -191,6 +193,38 @@ def vehicles_from_message(
             if vehicle.HasField("occupancy_status")
             else None
         )
+        # current_status is only meaningful with respect to a current stop
+        # (the proto documents it as ignored without one), but its proto2
+        # default (IN_TRANSIT_TO) is real information once a stop referent
+        # exists. So: an explicitly SET status always surfaces verbatim;
+        # the implicit default surfaces only when current_stop_sequence or
+        # stop_id identifies the stop it refers to; with neither, an unset
+        # status is None -- there is no stop to be "in transit to".
+        has_stop_referent = vehicle.HasField(
+            "current_stop_sequence"
+        ) or vehicle.HasField("stop_id")
+        current_status = (
+            _vocab_or_none(
+                VehicleStopStatus,
+                _pb_enum_name(
+                    gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus,
+                    vehicle.current_status,
+                ),
+            )
+            if vehicle.HasField("current_status") or has_stop_referent
+            else None
+        )
+        congestion = (
+            _vocab_or_none(
+                CongestionLevel,
+                _pb_enum_name(
+                    gtfs_realtime_pb2.VehiclePosition.CongestionLevel,
+                    vehicle.congestion_level,
+                ),
+            )
+            if vehicle.HasField("congestion_level")
+            else None
+        )
         vehicles.append(
             VehiclePosition(
                 vehicle_id=vehicle.vehicle.id or None,
@@ -208,6 +242,15 @@ def vehicles_from_message(
                 trip_id=vehicle.trip.trip_id or None,
                 occupancy_status=occupancy,
                 timestamp=_epoch_to_utc(vehicle.timestamp),
+                current_status=current_status,
+                congestion_level=congestion,
+                stop_id=vehicle.stop_id or None,
+                current_stop_sequence=(
+                    vehicle.current_stop_sequence
+                    if vehicle.HasField("current_stop_sequence")
+                    else None
+                ),
+                license_plate=vehicle.vehicle.license_plate or None,
             )
         )
     return vehicles
@@ -548,7 +591,14 @@ def _first_translation(translated: object) -> str | None:
 
 
 def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceAlert]:
-    """Extract service alerts with best-effort English text."""
+    """Extract service alerts with best-effort English text.
+
+    Scoping: every informed_entity's route_id, stop_id, AND trip
+    descriptor trip_id is collected, so a trip-scoped alert carries its
+    trip ids instead of reading as unscoped -- an alert is unscoped
+    (feed-wide) only when route_ids, stop_ids, and trip_ids are ALL empty
+    (see :class:`~.models.ServiceAlert`).
+    """
     alerts: list[ServiceAlert] = []
     for entity in message.entity:
         if not entity.HasField("alert"):
@@ -556,6 +606,9 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
         alert = entity.alert
         route_ids = sorted({ie.route_id for ie in alert.informed_entity if ie.route_id})
         stop_ids = sorted({ie.stop_id for ie in alert.informed_entity if ie.stop_id})
+        trip_ids = sorted(
+            {ie.trip.trip_id for ie in alert.informed_entity if ie.trip.trip_id}
+        )
         alerts.append(
             ServiceAlert(
                 id=entity.id,
@@ -586,6 +639,7 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
                 ),
                 route_ids=route_ids,
                 stop_ids=stop_ids,
+                trip_ids=trip_ids,
                 active_periods=[
                     (
                         _epoch_to_utc(period.start)

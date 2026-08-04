@@ -23,6 +23,13 @@ async def test_vehicles_23_and_zone_filter(
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     all_vehicles = await handle.get_vehicles()
     assert {v.id for v in all_vehicles} == {"b1", "b2"}
+    by_id = {v.id: v for v in all_vehicles}
+    # 2.x free_bike_status rental_uris pass through; absent stays None.
+    assert by_id["b1"].rental_uris == {
+        "android": "https://example.com/app?bike=b1&platform=android",
+        "ios": "https://example.com/app?bike=b1&platform=ios",
+    }
+    assert by_id["b2"].rental_uris is None
     zoned = await handle.get_vehicles(
         zone=Circle(latitude=34.05, longitude=-118.25, radius_m=500)
     )
@@ -51,6 +58,12 @@ async def test_vehicles_30_uses_vehicle_status(
     assert vehicles[0].id == "v1"
     assert vehicles[0].vehicle_type_id == "scooter"
     assert vehicles[0].current_range_m == 12_000.0
+    # 3.x vehicle_status rental_uris pass through identically to 2.x.
+    assert vehicles[0].rental_uris == {
+        "android": "https://example.com/app?vehicle=v1&platform=android",
+        "ios": "https://example.com/app?vehicle=v1&platform=ios",
+        "web": "https://example.com/vehicles/v1",
+    }
 
 
 async def test_vehicles_absent_endpoint_returns_empty(

@@ -11,6 +11,7 @@ from aiomobilitydatabase.feeds.models import (
     AlertCause,
     AlertEffect,
     BikesAllowed,
+    CongestionLevel,
     GbfsVehicle,
     OccupancyStatus,
     PickupDropOffType,
@@ -21,13 +22,16 @@ from aiomobilitydatabase.feeds.models import (
     StopArrival,
     SystemInfo,
     VehiclePosition,
+    VehicleStopStatus,
     WheelchairAccess,
 )
 
 from tests.feeds.fixtures import (
     ALERTS,
+    ALERTS_TRIP_SCOPED,
     TRIP_UPDATES_BASELINE,
     VEHICLE_POSITIONS,
+    VEHICLE_POSITIONS_STATUS,
     build_gtfs_zip_bytes,
 )
 
@@ -42,6 +46,8 @@ def _route(route_id: str, short_name: str | None, long_name: str | None) -> Rout
         color="FFD700",
         text_color="000000",
         url=None,
+        description=None,
+        sort_order=None,
     )
 
 
@@ -67,11 +73,15 @@ def test_stop_arrival_realtime_flags() -> None:
         drop_off_type=PickupDropOffType.NONE,
         timepoint_exact=True,
         stop_headsign="Downtown via 5th",
+        trip_short_name="42",
+        block_id="B1",
     )
     assert arrival.realtime is False
     assert arrival.scheduled_departure == scheduled
     assert arrival.wheelchair_accessible is WheelchairAccess.POSSIBLE
     assert arrival.stop_headsign == "Downtown via 5th"
+    assert arrival.trip_short_name == "42"
+    assert arrival.block_id == "B1"
 
 
 def test_models_are_frozen() -> None:
@@ -85,6 +95,10 @@ def test_models_are_frozen() -> None:
         stop_code=None,
         platform_code=None,
         wheelchair_boarding=None,
+        description=None,
+        url=None,
+        zone_id=None,
+        timezone=None,
     )
     try:
         stop.name = "x"  # type: ignore[misc]
@@ -106,11 +120,20 @@ def test_vehicle_and_station_construct() -> None:
         trip_id="T1",
         occupancy_status=OccupancyStatus.MANY_SEATS_AVAILABLE,
         timestamp=datetime(2026, 7, 31, 15, 0, tzinfo=UTC),
+        current_status=VehicleStopStatus.STOPPED_AT,
+        congestion_level=CongestionLevel.RUNNING_SMOOTHLY,
+        stop_id="S1",
+        current_stop_sequence=3,
+        license_plate="8ABC123",
     )
     # StrEnum members compare equal to their raw protobuf-name strings, so
     # pre-typing consumers keep working.
     assert vehicle.occupancy_status == "MANY_SEATS_AVAILABLE"
     assert vehicle.occupancy_status is OccupancyStatus.MANY_SEATS_AVAILABLE
+    assert vehicle.current_status == "STOPPED_AT"
+    assert vehicle.current_status is VehicleStopStatus.STOPPED_AT
+    assert vehicle.congestion_level is CongestionLevel.RUNNING_SMOOTHLY
+    assert vehicle.license_plate == "8ABC123"
     station = Station(
         id="st1",
         name="Dock A",
@@ -122,6 +145,7 @@ def test_vehicle_and_station_construct() -> None:
         is_renting=True,
         is_returning=True,
         vehicle_types_available=None,
+        rental_uris={"web": "https://example.com/stations/st1"},
     )
     assert station.bikes_available == 5
     gbfs_vehicle = GbfsVehicle(
@@ -132,6 +156,7 @@ def test_vehicle_and_station_construct() -> None:
         is_disabled=False,
         vehicle_type_id=None,
         current_range_m=None,
+        rental_uris=None,
     )
     assert gbfs_vehicle.id == "b1"
     info = SystemInfo(
@@ -150,10 +175,12 @@ def test_vehicle_and_station_construct() -> None:
         severity=None,
         route_ids=["R1"],
         stop_ids=[],
+        trip_ids=["T1"],
         active_periods=[(datetime(2026, 7, 1, tzinfo=UTC), None)],
         url=None,
     )
     assert alert.route_ids == ["R1"]
+    assert alert.trip_ids == ["T1"]
     route = _route("R1", short_name="10", long_name="Main Line")
     assert route.display_name == "10 Main Line"
     assert route.color == "FFD700"
@@ -179,8 +206,10 @@ def test_fixtures_are_valid() -> None:
     assert "stop_times.txt" in names and "calendar.txt" in names
     for raw in (
         VEHICLE_POSITIONS,
+        VEHICLE_POSITIONS_STATUS,
         TRIP_UPDATES_BASELINE,
         ALERTS,
+        ALERTS_TRIP_SCOPED,
     ):
         msg = gtfs_realtime_pb2.FeedMessage()
         msg.ParseFromString(raw)

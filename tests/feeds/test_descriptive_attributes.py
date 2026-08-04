@@ -11,12 +11,13 @@ at the model boundary.
 
 import io
 import zipfile
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from aiomobilitydatabase.feeds.models import (
     Agency,
     BikesAllowed,
+    FeedInfo,
     PickupDropOffType,
     StopLocationType,
     WheelchairAccess,
@@ -48,25 +49,28 @@ _DESCRIPTIVE_FILES = {
     ),
     "stops.txt": (
         "stop_id,stop_name,stop_lat,stop_lon,parent_station,location_type,"
-        "stop_code,platform_code,wheelchair_boarding\n"
-        "S1,Main St,34.05,-118.25,,0,MAIN,1A,1\n"
-        "S2,Second Ave,34.06,-118.24,,,,,2\n"
-        "S3,Depot,34.07,-118.23,,4,,,0\n"
-        "S4,Odd,34.08,-118.22,,9,,,9\n"
-        "S5,Bad,34.09,-118.21,,,,,x\n"
+        "stop_code,platform_code,wheelchair_boarding,stop_desc,stop_url,"
+        "zone_id,stop_timezone\n"
+        "S1,Main St,34.05,-118.25,,0,MAIN,1A,1,Northeast corner,"
+        "https://example.com/s1,Z1,America/Denver\n"
+        "S2,Second Ave,34.06,-118.24,,,,,2,,,,\n"
+        "S3,Depot,34.07,-118.23,,4,,,0,,,,\n"
+        "S4,Odd,34.08,-118.22,,9,,,9,,,,\n"
+        "S5,Bad,34.09,-118.21,,,,,x,,,,\n"
     ),
     "routes.txt": (
         "route_id,route_short_name,route_long_name,route_type,agency_id,"
-        "route_color,route_text_color,route_url\n"
-        "R1,10,Main Line,3,A1,FFD700,000000,https://example.com/r1\n"
-        "R2,20,Bare,3,,,,\n"
+        "route_color,route_text_color,route_url,route_desc,route_sort_order\n"
+        "R1,10,Main Line,3,A1,FFD700,000000,https://example.com/r1,"
+        "Runs along Main,5\n"
+        "R2,20,Bare,3,,,,,,x\n"
     ),
     "trips.txt": (
         "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible,"
-        "bikes_allowed,direction_id\n"
-        "R1,WKDY,T1,Downtown,1,2,0\n"
-        "R1,WKDY,T2,Uptown,9,x,1\n"
-        "R2,WKDY,T3,Loop,,,\n"
+        "bikes_allowed,direction_id,trip_short_name,block_id\n"
+        "R1,WKDY,T1,Downtown,1,2,0,42,B1\n"
+        "R1,WKDY,T2,Uptown,9,x,1,,\n"
+        "R2,WKDY,T3,Loop,,,,,\n"
     ),
     "stop_times.txt": (
         "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
@@ -89,8 +93,8 @@ _FREQUENCY_DESCRIPTOR_FILES = {
     "routes.txt": _DESCRIPTIVE_FILES["routes.txt"],
     "trips.txt": (
         "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible,"
-        "bikes_allowed,direction_id\n"
-        "R1,WKDY,F1,Loop,1,2,1\n"
+        "bikes_allowed,direction_id,trip_short_name,block_id\n"
+        "R1,WKDY,F1,Loop,1,2,1,7X,BLK-9\n"
     ),
     "stop_times.txt": (
         "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
@@ -145,8 +149,18 @@ def test_stop_descriptive_columns_and_lenient_boundary(tmp_path: Path) -> None:
     assert stops["S1"].platform_code == "1A"
     assert stops["S1"].wheelchair_boarding is WheelchairAccess.POSSIBLE
     assert stops["S1"].location_type is StopLocationType.STOP
+    assert stops["S1"].description == "Northeast corner"
+    assert stops["S1"].url == "https://example.com/s1"
+    assert stops["S1"].zone_id == "Z1"
+    # stop_timezone is display metadata only: stored verbatim, never used
+    # in time computation (stop_times values are always agency-timezone).
+    assert stops["S1"].timezone == "America/Denver"
     assert stops["S2"].stop_code is None  # blank value
     assert stops["S2"].platform_code is None
+    assert stops["S2"].description is None
+    assert stops["S2"].url is None
+    assert stops["S2"].zone_id is None
+    assert stops["S2"].timezone is None
     assert stops["S2"].wheelchair_boarding is WheelchairAccess.NOT_POSSIBLE
     assert stops["S2"].location_type is None  # blank value
     assert stops["S3"].wheelchair_boarding is WheelchairAccess.UNKNOWN
@@ -165,10 +179,14 @@ def test_route_descriptive_columns(tmp_path: Path) -> None:
     assert routes["R1"].color == "FFD700"
     assert routes["R1"].text_color == "000000"
     assert routes["R1"].url == "https://example.com/r1"
+    assert routes["R1"].description == "Runs along Main"
+    assert routes["R1"].sort_order == 5
     assert routes["R2"].agency_id is None
     assert routes["R2"].color is None
     assert routes["R2"].text_color is None
     assert routes["R2"].url is None
+    assert routes["R2"].description is None
+    assert routes["R2"].sort_order is None  # "x": garbage, lenient -> None
     # routes_serving carries the same full record as routes().
     assert index.routes_serving("S1") == sorted(
         routes.values(), key=lambda route: route.id
@@ -247,12 +265,18 @@ def test_absent_descriptive_columns_load_as_none(tmp_path: Path) -> None:
     assert stops["S1"].stop_code is None
     assert stops["S1"].platform_code is None
     assert stops["S1"].wheelchair_boarding is None
+    assert stops["S1"].description is None
+    assert stops["S1"].url is None
+    assert stops["S1"].zone_id is None
+    assert stops["S1"].timezone is None
     assert stops["ST1"].location_type is StopLocationType.STATION
     routes = {route.id: route for route in index.routes()}
     assert routes["R1"].agency_id is None
     assert routes["R1"].color is None
     assert routes["R1"].text_color is None
     assert routes["R1"].url is None
+    assert routes["R1"].description is None
+    assert routes["R1"].sort_order is None
     departures = index.upcoming_departures(
         ["S1"], None, datetime(2026, 7, 30, 14, 45, tzinfo=UTC), timedelta(hours=1), 10
     )
@@ -264,6 +288,11 @@ def test_absent_descriptive_columns_load_as_none(tmp_path: Path) -> None:
         assert dep.drop_off_type is None
         assert dep.stop_headsign is None
         assert dep.timepoint_exact is True
+        assert dep.trip_short_name is None
+        assert dep.block_id is None
+    # No feed_info.txt in the base fixture zip: the accessor is None, not
+    # an empty record.
+    assert index.feed_info() is None
     index.close()
 
 
@@ -276,6 +305,8 @@ def test_departure_stop_time_and_trip_descriptors(tmp_path: Path) -> None:
     t1_s1 = by_key[("T1", "S1")]
     assert t1_s1.wheelchair_accessible is WheelchairAccess.POSSIBLE
     assert t1_s1.bikes_allowed is BikesAllowed.NOT_ALLOWED
+    assert t1_s1.trip_short_name == "42"
+    assert t1_s1.block_id == "B1"
     assert t1_s1.pickup_type is PickupDropOffType.REGULAR
     assert t1_s1.drop_off_type is PickupDropOffType.NONE
     assert t1_s1.timepoint_exact is True
@@ -300,6 +331,8 @@ def test_departure_stop_time_and_trip_descriptors(tmp_path: Path) -> None:
     assert t3_s1.wheelchair_accessible is None
     assert t3_s1.bikes_allowed is None
     assert t3_s1.timepoint_exact is True
+    assert t3_s1.trip_short_name is None  # blank value
+    assert t3_s1.block_id is None
     t3_s2 = by_key[("T3", "S2")]
     assert t3_s2.pickup_type is PickupDropOffType.NONE
     assert t3_s2.drop_off_type is PickupDropOffType.REGULAR
@@ -321,6 +354,8 @@ def test_trip_query_descriptors_both_ends(tmp_path: Path) -> None:
     assert t1.wheelchair_accessible is WheelchairAccess.POSSIBLE
     assert t1.bikes_allowed is BikesAllowed.NOT_ALLOWED
     assert t1.direction_id == 0
+    assert t1.trip_short_name == "42"
+    assert t1.block_id == "B1"
     assert t1.origin_pickup_type is PickupDropOffType.REGULAR
     assert t1.origin_drop_off_type is PickupDropOffType.NONE
     assert t1.origin_timepoint_exact is True
@@ -336,6 +371,8 @@ def test_trip_query_descriptors_both_ends(tmp_path: Path) -> None:
     t3 = trips["T3"]
     assert t3.direction_id is None
     assert t3.destination_stop_headsign == "Loop End"
+    assert t3.trip_short_name is None
+    assert t3.block_id is None
     # The three trips are the day's only S1->S2 candidates, in that order.
     assert (t1.is_first, t1.is_last) == (True, False)
     assert (t2.is_first, t2.is_last) == (False, False)
@@ -367,6 +404,8 @@ def test_frequency_repetitions_carry_all_descriptors(tmp_path: Path) -> None:
         origin = by_key[(rep, "S1")]
         assert origin.wheelchair_accessible is WheelchairAccess.POSSIBLE
         assert origin.bikes_allowed is BikesAllowed.NOT_ALLOWED
+        assert origin.trip_short_name == "7X"  # template identifiers ride along
+        assert origin.block_id == "BLK-9"
         assert origin.pickup_type is PickupDropOffType.PHONE_AGENCY
         assert origin.drop_off_type is PickupDropOffType.COORDINATE_WITH_DRIVER
         assert origin.timepoint_exact is False
@@ -388,4 +427,104 @@ def test_frequency_repetitions_carry_all_descriptors(tmp_path: Path) -> None:
     assert trips[0].wheelchair_accessible is WheelchairAccess.POSSIBLE
     assert trips[0].origin_stop_headsign == "Loop Start"
     assert trips[0].destination_stop_headsign == "Loop End"
+    assert trips[0].trip_short_name == "7X"
+    assert trips[0].block_id == "BLK-9"
+    index.close()
+
+
+# -- feed_info.txt ------------------------------------------------------------
+
+_FEED_INFO_BASE = dict(_DESCRIPTIVE_FILES)
+
+
+def test_feed_info_full_record(tmp_path: Path) -> None:
+    files = dict(_FEED_INFO_BASE)
+    files["feed_info.txt"] = (
+        "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
+        "feed_start_date,feed_end_date\n"
+        "Example Transit,https://example.com,en,2026.07,20260101,20271231\n"
+    )
+    index = _index_from_files(tmp_path, files)
+    info = index.feed_info()
+    assert info == FeedInfo(
+        publisher_name="Example Transit",
+        publisher_url="https://example.com",
+        lang="en",
+        version="2026.07",
+        start_date=date(2026, 1, 1),
+        end_date=date(2027, 12, 31),
+    )
+    index.close()
+
+
+def test_feed_info_lenient_dates_and_blank_cells(tmp_path: Path) -> None:
+    """Malformed/blank date cells and blank text cells are None -- feed_info
+    is descriptive metadata and must never fail a build (wrong-length,
+    non-digit, and calendar-invalid dates all degrade)."""
+    for bad_start, bad_end in (
+        ("garbage!", "2026073"),
+        ("20261332", ""),
+        ("00000101", "202607301"),
+    ):
+        files = dict(_FEED_INFO_BASE)
+        files["feed_info.txt"] = (
+            "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
+            "feed_start_date,feed_end_date\n"
+            f"Example Transit,,,,{bad_start},{bad_end}\n"
+        )
+        index = _index_from_files(tmp_path, files)
+        info = index.feed_info()
+        assert info is not None
+        assert info.publisher_name == "Example Transit"
+        assert info.publisher_url is None
+        assert info.lang is None
+        assert info.version is None
+        assert info.start_date is None
+        assert info.end_date is None
+        index.close()
+
+
+def test_feed_info_missing_columns_are_none(tmp_path: Path) -> None:
+    """A minimal feed_info.txt (only the required publisher columns) loads
+    with every absent field None."""
+    files = dict(_FEED_INFO_BASE)
+    files["feed_info.txt"] = "feed_publisher_name,feed_publisher_url\nSolo Publisher,\n"
+    index = _index_from_files(tmp_path, files)
+    assert index.feed_info() == FeedInfo(
+        publisher_name="Solo Publisher",
+        publisher_url=None,
+        lang=None,
+        version=None,
+        start_date=None,
+        end_date=None,
+    )
+    index.close()
+
+
+def test_feed_info_first_data_row_wins(tmp_path: Path) -> None:
+    """GTFS defines feed_info.txt as single-record; a producer shipping
+    several rows gets the FIRST one, the rest ignored (documented)."""
+    files = dict(_FEED_INFO_BASE)
+    files["feed_info.txt"] = (
+        "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
+        "feed_start_date,feed_end_date\n"
+        "First Publisher,https://first.example.com,en,1,20260101,20260131\n"
+        "Second Publisher,https://second.example.com,fr,2,20260201,20260228\n"
+    )
+    index = _index_from_files(tmp_path, files)
+    info = index.feed_info()
+    assert info is not None
+    assert info.publisher_name == "First Publisher"
+    assert info.version == "1"
+    assert info.start_date == date(2026, 1, 1)
+    index.close()
+
+
+def test_feed_info_header_only_file_is_none(tmp_path: Path) -> None:
+    """A feed_info.txt with a header but no data rows behaves like an
+    absent file: no record to expose."""
+    files = dict(_FEED_INFO_BASE)
+    files["feed_info.txt"] = "feed_publisher_name,feed_publisher_url,feed_lang\n"
+    index = _index_from_files(tmp_path, files)
+    assert index.feed_info() is None
     index.close()

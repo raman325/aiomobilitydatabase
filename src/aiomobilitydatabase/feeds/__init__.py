@@ -28,6 +28,8 @@ from .models import (
     AlertEffect,
     AlertSeverity,
     BikesAllowed,
+    CongestionLevel,
+    FeedInfo,
     GbfsVehicle,
     OccupancyStatus,
     PickupDropOffType,
@@ -42,6 +44,7 @@ from .models import (
     SystemInfo,
     UpcomingTrip,
     VehiclePosition,
+    VehicleStopStatus,
     WheelchairAccess,
 )
 from .transit import TransitFeedHandle
@@ -53,6 +56,8 @@ __all__ = [
     "AlertSeverity",
     "BikesAllowed",
     "Circle",
+    "CongestionLevel",
+    "FeedInfo",
     "FeedParseError",
     "GbfsFeedHandle",
     "GbfsVehicle",
@@ -75,5 +80,6 @@ __all__ = [
     "TransitFeedHandle",
     "UpcomingTrip",
     "VehiclePosition",
+    "VehicleStopStatus",
     "WheelchairAccess",
 ]

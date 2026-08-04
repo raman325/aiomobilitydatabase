@@ -365,6 +365,73 @@ def _build_freq_trip_updates_canceled_tomorrow() -> bytes:
     return bytes(msg.SerializeToString())
 
 
+def _build_vehicle_positions_status() -> bytes:
+    """VehiclePositions exercising the descriptive status surface.
+
+    Three vehicles against the fixture static feed:
+
+    - V7: EXPLICIT current_status (STOPPED_AT) with a full stop referent
+      (stop_id + current_stop_sequence), congestion_level, license_plate.
+    - V8: a stop referent (current_stop_sequence only) but NO explicit
+      current_status -- the spec default IN_TRANSIT_TO must surface.
+    - V9: neither current_status nor any stop referent -- current_status
+      must be None (no stop to be in transit to), congestion None.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = 1_785_500_000
+    e1 = msg.entity.add()
+    e1.id = "vp-s1"
+    v1 = e1.vehicle
+    v1.vehicle.id = "V7"
+    v1.vehicle.license_plate = "8ABC123"
+    v1.trip.trip_id = "T1"
+    v1.position.latitude = 34.056
+    v1.position.longitude = -118.246
+    v1.current_status = gtfs_realtime_pb2.VehiclePosition.STOPPED_AT
+    v1.stop_id = "S2"
+    v1.current_stop_sequence = 2
+    v1.congestion_level = gtfs_realtime_pb2.VehiclePosition.SEVERE_CONGESTION
+    e2 = msg.entity.add()
+    e2.id = "vp-s2"
+    v2 = e2.vehicle
+    v2.vehicle.id = "V8"
+    v2.trip.trip_id = "T3"
+    v2.position.latitude = 34.061
+    v2.position.longitude = -118.241
+    v2.current_stop_sequence = 1  # referent present, status unset -> default
+    e3 = msg.entity.add()
+    e3.id = "vp-s3"
+    v3 = e3.vehicle
+    v3.vehicle.id = "V9"
+    v3.position.latitude = 34.062
+    v3.position.longitude = -118.242
+    return bytes(msg.SerializeToString())
+
+
+def _build_alerts_trip_scoped() -> bytes:
+    """Build an alert whose ONLY scoping is informed_entity trip descriptors.
+
+    Pins the semantic fix: with trip_ids populated, a trip-scoped alert
+    (route_ids and stop_ids both empty) no longer reads as agency-wide.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = 1_785_500_000
+    entity = msg.entity.add()
+    entity.id = "alert-trip"
+    alert = entity.alert
+    informed = alert.informed_entity.add()
+    informed.trip.trip_id = "T1"
+    informed2 = alert.informed_entity.add()
+    informed2.trip.trip_id = "T3"
+    alert.effect = gtfs_realtime_pb2.Alert.SIGNIFICANT_DELAYS
+    text = alert.header_text.translation.add()
+    text.text = "T1 and T3 running late"
+    text.language = "en"
+    return bytes(msg.SerializeToString())
+
+
 def _build_alerts() -> bytes:
     """Build an Alert FeedMessage with one active alert."""
     msg = gtfs_realtime_pb2.FeedMessage()
@@ -394,7 +461,9 @@ def main() -> None:
     """Write every fixture .pb file used by the feeds test suite."""
     fixtures = {
         "vehicle_positions.pb": _build_vehicle_positions(),
+        "vehicle_positions_status.pb": _build_vehicle_positions_status(),
         "alerts.pb": _build_alerts(),
+        "alerts_trip_scoped.pb": _build_alerts_trip_scoped(),
         "trip_updates_baseline.pb": _build_trip_updates(base_epoch=_BASELINE_EPOCH),
         "trip_updates_t1_delayed.pb": _build_trip_updates(
             base_epoch=_T1_DEPARTURE_EPOCH

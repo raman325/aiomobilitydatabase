@@ -35,11 +35,14 @@ from aiomobilitydatabase.feeds.models import (
     AlertEffect,
     AlertSeverity,
     BikesAllowed,
+    CongestionLevel,
+    FeedInfo,
     OccupancyStatus,
     PickupDropOffType,
     StaticBuildProgress,
     StopArrival,
     UpcomingTrip,
+    VehicleStopStatus,
     WheelchairAccess,
 )
 from aiomobilitydatabase.feeds.rt import (
@@ -492,9 +495,17 @@ def test_station_merge_invariants(
 
 def _maybe_fill_vehicle_entity(
     entity: gtfs_realtime_pb2.FeedEntity, data: st.DataObject
-) -> bool:
-    """Fill a vehicle entity; return whether a position was set (i.e.
-    whether vehicles_from_message should surface this entity at all).
+) -> dict[str, object] | None:
+    """Fill a vehicle entity; return the expected descriptive status
+    surface when a position was set (the entity surfaces), else None.
+
+    Draws exercise the whole VehiclePosition descriptive surface:
+    current_status across EVERY protobuf value and absent, congestion
+    across every value and absent, stop_id / current_stop_sequence
+    presence (the referent gate for the IN_TRANSIT_TO default), and
+    license_plate. The expected values restate the documented rules from
+    the drawn values: explicit status verbatim, the default only with a
+    stop referent, None otherwise; congestion only when set.
     """
     has_position = data.draw(st.booleans())
     if has_position:
@@ -504,7 +515,54 @@ def _maybe_fill_vehicle_entity(
         entity.vehicle.trip.trip_id = data.draw(st.text(max_size=6))
     if data.draw(st.booleans()):
         entity.vehicle.vehicle.id = data.draw(st.text(max_size=6))
-    return has_position
+    license_plate = data.draw(st.none() | st.text(min_size=1, max_size=8))
+    if license_plate is not None:
+        entity.vehicle.vehicle.license_plate = license_plate
+    stop_id = data.draw(st.none() | st.text(min_size=1, max_size=6))
+    if stop_id is not None:
+        entity.vehicle.stop_id = stop_id
+    stop_sequence = data.draw(st.none() | st.integers(0, 50))
+    if stop_sequence is not None:
+        entity.vehicle.current_stop_sequence = stop_sequence
+    status_value = data.draw(
+        st.none()
+        | st.sampled_from(
+            list(gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.values())
+        )
+    )
+    if status_value is not None:
+        entity.vehicle.current_status = status_value
+    congestion_value = data.draw(
+        st.none()
+        | st.sampled_from(
+            list(gtfs_realtime_pb2.VehiclePosition.CongestionLevel.values())
+        )
+    )
+    if congestion_value is not None:
+        entity.vehicle.congestion_level = congestion_value
+    if not has_position:
+        return None
+    if status_value is not None:
+        expected_status: VehicleStopStatus | None = VehicleStopStatus(
+            gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.Name(status_value)
+        )
+    elif stop_id is not None or stop_sequence is not None:
+        expected_status = VehicleStopStatus.IN_TRANSIT_TO
+    else:
+        expected_status = None
+    return {
+        "current_status": expected_status,
+        "congestion_level": (
+            CongestionLevel(
+                gtfs_realtime_pb2.VehiclePosition.CongestionLevel.Name(congestion_value)
+            )
+            if congestion_value is not None
+            else None
+        ),
+        "stop_id": stop_id,
+        "current_stop_sequence": stop_sequence,
+        "license_plate": license_plate,
+    }
 
 
 # Sampled TripDescriptor.start_time values with their expected parsed
@@ -575,13 +633,26 @@ def _maybe_fill_trip_update_entity(
 
 def _maybe_fill_alert_entity(
     entity: gtfs_realtime_pb2.FeedEntity, data: st.DataObject
-) -> None:
+) -> list[str]:
+    """Fill an alert entity; return the EXACT trip_ids the parsed alert
+    must carry (sorted, deduplicated, empty trip ids excluded)."""
+    # Force the alert submessage to exist even when every draw below
+    # declines, so the entity ALWAYS surfaces and the expected list zips
+    # 1:1 with the parsed alerts.
+    entity.alert.SetInParent()
     if data.draw(st.booleans()):
         translation = entity.alert.header_text.translation.add()
         translation.text = data.draw(st.text(max_size=10))
     if data.draw(st.booleans()):
         informed = entity.alert.informed_entity.add()
         informed.route_id = data.draw(st.text(max_size=6))
+    trip_ids: set[str] = set()
+    for _ in range(data.draw(st.integers(0, 2))):
+        informed_trip = entity.alert.informed_entity.add()
+        trip_id = data.draw(st.text(max_size=6))
+        informed_trip.trip.trip_id = trip_id
+        if trip_id:
+            trip_ids.add(trip_id)
     if data.draw(st.booleans()):
         entity.alert.cause = data.draw(
             st.sampled_from(list(gtfs_realtime_pb2.Alert.Cause.values()))
@@ -594,6 +665,7 @@ def _maybe_fill_alert_entity(
         entity.alert.severity_level = data.draw(
             st.sampled_from(list(gtfs_realtime_pb2.Alert.SeverityLevel.values()))
         )
+    return sorted(trip_ids)
 
 
 @given(data=st.data())
@@ -612,7 +684,8 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         "alert": _maybe_fill_alert_entity,
         "empty": None,
     }
-    expected_vehicle_count = 0
+    expected_vehicles: list[dict[str, object]] = []
+    expected_alert_trip_ids: list[list[str]] = []
     possible_entry_keys: set[tuple[str, date | None, int | None]] = set()
     for i in range(data.draw(st.integers(0, 4))):
         entity = msg.entity.add()
@@ -623,17 +696,27 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
             continue
         result = filler(entity, data)
         if kind == "vehicle":
-            if result:
-                expected_vehicle_count += 1
+            if result is not None:
+                expected_vehicles.append(result)  # type: ignore[arg-type]
         elif kind == "trip_update":
             possible_entry_keys |= result  # type: ignore[arg-type]
+        elif kind == "alert":
+            expected_alert_trip_ids.append(result)  # type: ignore[arg-type]
     vehicles = vehicles_from_message(msg, route_names={}, trip_routes={})
-    assert len(vehicles) == expected_vehicle_count
-    for vehicle in vehicles:
+    assert len(vehicles) == len(expected_vehicles)
+    for vehicle, expected in zip(vehicles, expected_vehicles, strict=True):
         assert vehicle.latitude is not None and vehicle.longitude is not None
         assert vehicle.occupancy_status is None or isinstance(
             vehicle.occupancy_status, OccupancyStatus
         )
+        # The descriptive status surface maps EXACTLY per the drawn spec:
+        # explicit status verbatim, the IN_TRANSIT_TO default only behind
+        # a stop referent, and raw pass-through for the rest.
+        assert vehicle.current_status is expected["current_status"]
+        assert vehicle.congestion_level is expected["congestion_level"]
+        assert vehicle.stop_id == expected["stop_id"]
+        assert vehicle.current_stop_sequence == expected["current_stop_sequence"]
+        assert vehicle.license_plate == expected["license_plate"]
     updates = trip_updates_from_message(msg)
     assert updates.canceled_trips.isdisjoint(set(updates.trips))
     assert set(updates.trips) <= possible_entry_keys
@@ -650,10 +733,12 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         assert resolved.skipped <= known_seqs
         assert resolved.skipped.isdisjoint(resolved.predictions)
     alerts = alerts_from_message(msg)  # must simply not raise
-    for alert in alerts:
+    for alert, expected_trip_ids in zip(alerts, expected_alert_trip_ids, strict=True):
         assert alert.cause is None or isinstance(alert.cause, AlertCause)
         assert alert.effect is None or isinstance(alert.effect, AlertEffect)
         assert alert.severity is None or isinstance(alert.severity, AlertSeverity)
+        # Informed-entity trip descriptors map to the EXACT trip_ids list.
+        assert alert.trip_ids == expected_trip_ids
 
 
 _GARBAGE_NUMERICS = ["abc", "1.2.3", "NaN?", "--", "1e999x", " ", "12a"]
@@ -1051,6 +1136,14 @@ _DESCRIPTIVE_ROW_CELLS = st.fixed_dictionaries(
         "route_color": _TEXT_CELL,
         "route_text_color": _TEXT_CELL,
         "route_url": _TEXT_CELL,
+        "stop_desc": _TEXT_CELL,
+        "stop_url": _TEXT_CELL,
+        "zone_id": _TEXT_CELL,
+        "stop_timezone": _TEXT_CELL,
+        "route_desc": _TEXT_CELL,
+        "route_sort_order": _INT_CELL,
+        "trip_short_name": _TEXT_CELL,
+        "block_id": _TEXT_CELL,
     }
 )
 
@@ -1069,22 +1162,26 @@ def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) 
         "agency.txt": _UTC_AGENCY,
         "stops.txt": (
             "stop_id,stop_name,stop_lat,stop_lon,stop_code,platform_code,"
-            "wheelchair_boarding\n"
+            "wheelchair_boarding,stop_desc,stop_url,zone_id,stop_timezone\n"
             f"S1,A,0,0,{cells['stop_code']},{cells['platform_code']},"
-            f"{cells['wheelchair_boarding']}\n"
-            "S2,B,0,0,,,\n"
+            f"{cells['wheelchair_boarding']},{cells['stop_desc']},"
+            f"{cells['stop_url']},{cells['zone_id']},{cells['stop_timezone']}\n"
+            "S2,B,0,0,,,,,,,\n"
         ),
         "routes.txt": (
             "route_id,route_short_name,route_long_name,route_type,agency_id,"
-            "route_color,route_text_color,route_url\n"
+            "route_color,route_text_color,route_url,route_desc,"
+            "route_sort_order\n"
             f"R1,1,Line,3,{cells['agency_id']},{cells['route_color']},"
-            f"{cells['route_text_color']},{cells['route_url']}\n"
+            f"{cells['route_text_color']},{cells['route_url']},"
+            f"{cells['route_desc']},{cells['route_sort_order']}\n"
         ),
         "trips.txt": (
             "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible,"
-            "bikes_allowed,direction_id\n"
+            "bikes_allowed,direction_id,trip_short_name,block_id\n"
             f"R1,ONE,T1,H,{cells['wheelchair_accessible']},"
-            f"{cells['bikes_allowed']},{cells['direction_id']}\n"
+            f"{cells['bikes_allowed']},{cells['direction_id']},"
+            f"{cells['trip_short_name']},{cells['block_id']}\n"
         ),
         "stop_times.txt": (
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
@@ -1104,11 +1201,17 @@ def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) 
         assert stop.wheelchair_boarding is _expected_enum(
             WheelchairAccess, cells["wheelchair_boarding"]
         )
+        assert stop.description == _expected_text(cells["stop_desc"])
+        assert stop.url == _expected_text(cells["stop_url"])
+        assert stop.zone_id == _expected_text(cells["zone_id"])
+        assert stop.timezone == _expected_text(cells["stop_timezone"])
         (route,) = index.routes()
         assert route.agency_id == _expected_text(cells["agency_id"])
         assert route.color == _expected_text(cells["route_color"])
         assert route.text_color == _expected_text(cells["route_text_color"])
         assert route.url == _expected_text(cells["route_url"])
+        assert route.description == _expected_text(cells["route_desc"])
+        assert route.sort_order == _expected_lenient_int(cells["route_sort_order"])
         now = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
         (trip,) = index.upcoming_trips("S1", "S2", now, timedelta(hours=24), 10)
         assert trip.wheelchair_accessible is _expected_enum(
@@ -1126,6 +1229,8 @@ def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) 
         )
         assert trip.origin_timepoint_exact == _expected_timepoint(cells["timepoint"])
         assert trip.origin_stop_headsign == _expected_text(cells["stop_headsign"])
+        assert trip.trip_short_name == _expected_text(cells["trip_short_name"])
+        assert trip.block_id == _expected_text(cells["block_id"])
         # Non-None enum results are exact members whose .value round-trips
         # to the raw cell int.
         for member, cell in (
@@ -1188,10 +1293,101 @@ def test_timepoint_tristate_oracle(column_present: bool, cells: list[str]) -> No
         index.close()
 
 
+# Producer date cells for feed_info: every valid calendar date plus the
+# malformed shapes real feeds ship (wrong length, non-digits,
+# calendar-invalid months/days, year zero, whitespace, blank).
+_DATE_CELL = st.one_of(
+    st.dates().map(lambda d: f"{d.year:04d}{d.month:02d}{d.day:02d}"),
+    st.sampled_from(
+        [
+            "",
+            " ",
+            "garbage!",
+            "2026073",
+            "202607301",
+            "20261332",
+            "00000000",
+            "20260230",
+        ]
+    ),
+)
+
+
+def _expected_lenient_date(cell: str) -> date | None:
+    """Oracle for lenient YYYYMMDD cells: exactly 8 ASCII digits forming a
+    real calendar date -> that date; anything else -> None."""
+    cell = cell.strip()
+    if len(cell) != 8 or not (cell.isascii() and cell.isdigit()):
+        return None
+    try:
+        return date(int(cell[:4]), int(cell[4:6]), int(cell[6:8]))
+    except ValueError:
+        return None
+
+
+_FEED_INFO_CELLS = st.fixed_dictionaries(
+    {
+        "publisher_name": _TEXT_CELL,
+        "publisher_url": _TEXT_CELL,
+        "lang": _TEXT_CELL,
+        "version": _TEXT_CELL,
+        "start": _DATE_CELL,
+        "end": _DATE_CELL,
+    }
+)
+
+
+@settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(cells=_FEED_INFO_CELLS)
+def test_feed_info_cells_parse_total_and_map_per_rules(cells: dict[str, str]) -> None:
+    """Arbitrary producer cells across EVERY feed_info column at once: the
+    build never raises, text columns pass through verbatim (empty -> None),
+    and the date columns map per the lenient-date oracle (valid YYYYMMDD ->
+    the exact date, every malformed shape -> None).
+    """
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,A,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\nR1,ONE,T1,H\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T1,08:00:00,08:00:00,S1,1\n"
+        ),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+        "feed_info.txt": (
+            "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
+            "feed_start_date,feed_end_date\n"
+            f"{cells['publisher_name']},{cells['publisher_url']},"
+            f"{cells['lang']},{cells['version']},{cells['start']},{cells['end']}\n"
+        ),
+    }
+    index = _build_index_from_files(files)  # totality: must never raise
+    try:
+        assert index.feed_info() == FeedInfo(
+            publisher_name=_expected_text(cells["publisher_name"]),
+            publisher_url=_expected_text(cells["publisher_url"]),
+            lang=_expected_text(cells["lang"]),
+            version=_expected_text(cells["version"]),
+            start_date=_expected_lenient_date(cells["start"]),
+            end_date=_expected_lenient_date(cells["end"]),
+        )
+    finally:
+        index.close()
+
+
 @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     trip_cells=st.fixed_dictionaries(
-        {"wheelchair": _INT_CELL, "bikes": _INT_CELL, "direction": _INT_CELL}
+        {
+            "wheelchair": _INT_CELL,
+            "bikes": _INT_CELL,
+            "direction": _INT_CELL,
+            "short_name": _TEXT_CELL,
+            "block": _TEXT_CELL,
+        }
     ),
     stop_cells=st.lists(
         st.fixed_dictionaries(
@@ -1233,9 +1429,10 @@ def test_frequency_repetitions_carry_template_descriptors(
         ),
         "trips.txt": (
             "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible,"
-            "bikes_allowed,direction_id\n"
+            "bikes_allowed,direction_id,trip_short_name,block_id\n"
             f"R1,ONE,F1,H,{trip_cells['wheelchair']},{trip_cells['bikes']},"
-            f"{trip_cells['direction']}\n"
+            f"{trip_cells['direction']},{trip_cells['short_name']},"
+            f"{trip_cells['block']}\n"
         ),
         "stop_times.txt": (
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
@@ -1285,10 +1482,14 @@ def test_frequency_repetitions_carry_template_descriptors(
                 )
                 assert dep.timepoint_exact == _expected_timepoint(cell["timepoint"])
                 assert dep.stop_headsign == _expected_text(cell["headsign"])
+                assert dep.trip_short_name == _expected_text(trip_cells["short_name"])
+                assert dep.block_id == _expected_text(trip_cells["block"])
         trip_rows = index.upcoming_trips("S0", "S1", now, timedelta(hours=30), 1000)
         assert len(trip_rows) == reps
         for trip in trip_rows:
             assert trip.direction_id == _expected_lenient_int(trip_cells["direction"])
+            assert trip.trip_short_name == _expected_text(trip_cells["short_name"])
+            assert trip.block_id == _expected_text(trip_cells["block"])
     finally:
         index.close()
 
