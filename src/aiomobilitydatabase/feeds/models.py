@@ -4,6 +4,59 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from enum import IntEnum
+
+
+class WheelchairAccess(IntEnum):
+    """Wheelchair support, as GTFS's shared 0/1/2 vocabulary.
+
+    One enum for BOTH ``trips.wheelchair_accessible`` (can the vehicle carry
+    a rider in a wheelchair?) and ``stops.wheelchair_boarding`` (is boarding
+    possible at the stop?): the spec defines the identical value shape for
+    the two columns, and POSSIBLE/NOT_POSSIBLE reads naturally in either
+    position. Values match the spec ints, so ``int(...)``/``.value``
+    comparisons keep working for consumers who want the raw number.
+    """
+
+    UNKNOWN = 0
+    POSSIBLE = 1
+    NOT_POSSIBLE = 2
+
+
+class BikesAllowed(IntEnum):
+    """GTFS ``trips.bikes_allowed`` vocabulary (values match the spec ints)."""
+
+    UNKNOWN = 0
+    ALLOWED = 1
+    NOT_ALLOWED = 2
+
+
+class PickupDropOffType(IntEnum):
+    """GTFS ``stop_times.pickup_type``/``drop_off_type`` shared vocabulary.
+
+    The spec defines the identical value shape for both columns, so one
+    enum serves the two fields (values match the spec ints).
+    """
+
+    REGULAR = 0
+    NONE = 1
+    PHONE_AGENCY = 2
+    COORDINATE_WITH_DRIVER = 3
+
+
+class StopLocationType(IntEnum):
+    """GTFS ``stops.location_type`` vocabulary (values match the spec ints).
+
+    Named ``StopLocationType`` because the catalog-side
+    :class:`aiomobilitydatabase.models.LocationType` (a StrEnum of catalog
+    location kinds) is an unrelated vocabulary.
+    """
+
+    STOP = 0
+    STATION = 1
+    ENTRANCE_EXIT = 2
+    GENERIC_NODE = 3
+    BOARDING_AREA = 4
 
 
 @dataclass(frozen=True)
@@ -14,8 +67,29 @@ class Stop:
     name: str | None
     latitude: float | None
     longitude: float | None
-    parent_station: str | None = None
-    location_type: int | None = None
+    parent_station: str | None
+    location_type: StopLocationType | None
+    stop_code: str | None
+    platform_code: str | None
+    wheelchair_boarding: WheelchairAccess | None
+
+
+@dataclass(frozen=True)
+class Agency:
+    """A transit agency from the static GTFS index (agency.txt).
+
+    ``id`` is None for single-agency feeds that omit the optional
+    ``agency_id`` column. Route rows reference agencies through
+    :attr:`Route.agency_id`.
+    """
+
+    id: str | None
+    name: str | None
+    url: str | None
+    timezone: str | None
+    lang: str | None
+    phone: str | None
+    fare_url: str | None
 
 
 @dataclass(frozen=True)
@@ -35,12 +109,23 @@ class StationGroup:
 
 @dataclass(frozen=True)
 class Route:
-    """A transit route from the static GTFS index."""
+    """A transit route from the static GTFS index.
+
+    ``type`` stays a raw int (not an enum): Google's extended route types
+    (e.g. 103) are an open vocabulary a closed enum could not represent.
+    ``color``/``text_color`` are the raw GTFS hex strings without a leading
+    ``#`` (e.g. ``"FFD700"``); ``agency_id`` resolves against
+    :class:`Agency` records exposed on the handle/index.
+    """
 
     id: str
     short_name: str | None
     long_name: str | None
     type: int | None
+    agency_id: str | None
+    color: str | None
+    text_color: str | None
+    url: str | None
 
     @property
     def display_name(self) -> str:
@@ -52,7 +137,18 @@ class Route:
 
 @dataclass(frozen=True)
 class StopArrival:
-    """An upcoming (or realtime-added) arrival/departure at a stop."""
+    """An upcoming (or realtime-added) arrival/departure at a stop.
+
+    The trailing descriptive fields come from the static schedule:
+    ``wheelchair_accessible``/``bikes_allowed`` describe the trip,
+    ``pickup_type``/``drop_off_type``/``timepoint_exact``/``stop_headsign``
+    describe this stop's stop_time row (``stop_headsign`` is the per-stop
+    override of the trip-level ``headsign``). ``timepoint_exact`` is True
+    when the scheduled times are exact (GTFS's default when the column is
+    absent or blank), False for approximate times, None when the value is
+    outside the 0/1 vocabulary. RT-added rows have no static schedule row,
+    so all six are None.
+    """
 
     stop_id: str
     stop_name: str | None
@@ -67,6 +163,12 @@ class StopArrival:
     delay_seconds: int | None
     realtime: bool
     vehicle_id: str | None
+    wheelchair_accessible: WheelchairAccess | None
+    bikes_allowed: BikesAllowed | None
+    pickup_type: PickupDropOffType | None
+    drop_off_type: PickupDropOffType | None
+    timepoint_exact: bool | None
+    stop_headsign: str | None
 
 
 @dataclass(frozen=True)
@@ -78,6 +180,20 @@ class UpcomingTrip:
     destination stop. Scheduled times are non-optional because the
     producing query requires an origin departure time and a destination
     arrival time; ``delay_seconds`` is the origin departure delay.
+
+    ``wheelchair_accessible``/``bikes_allowed``/``direction_id`` describe
+    the trip (``direction_id`` stays a raw int: 0/1 with feed-defined
+    meaning). The ``origin_*``/``destination_*`` descriptors come from the
+    stop_time rows at each end, with the same semantics as the matching
+    :class:`StopArrival` fields (``timepoint_exact`` defaults to True when
+    the GTFS column is absent or blank).
+
+    ``is_first``/``is_last`` mark whether this departure is the first/last
+    departure OF ITS SERVICE DAY for this origin->destination pair --
+    legacy ``gtfs`` sensor parity. A past-midnight departure (>24:00:00)
+    is flagged relative to the service day it belongs to, not the clock
+    day it happens on, and frequency-materialized repetitions count as
+    ordinary trips (the day's first repetition is the first departure).
     """
 
     trip_id: str
@@ -92,6 +208,19 @@ class UpcomingTrip:
     predicted_arrival: datetime | None
     delay_seconds: int | None
     realtime: bool
+    wheelchair_accessible: WheelchairAccess | None
+    bikes_allowed: BikesAllowed | None
+    direction_id: int | None
+    origin_pickup_type: PickupDropOffType | None
+    origin_drop_off_type: PickupDropOffType | None
+    origin_timepoint_exact: bool | None
+    origin_stop_headsign: str | None
+    destination_pickup_type: PickupDropOffType | None
+    destination_drop_off_type: PickupDropOffType | None
+    destination_timepoint_exact: bool | None
+    destination_stop_headsign: str | None
+    is_first: bool
+    is_last: bool
 
 
 @dataclass(frozen=True)

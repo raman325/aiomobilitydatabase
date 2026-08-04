@@ -57,6 +57,23 @@ async def test_schedule_only_trips(
     assert trip.destination_stop_id == "S3"
     assert trip.route_name == "10 Main Line"
     assert trip.headsign == "Downtown"
+    # Descriptor pass-through from the index: the base fixture ships no
+    # descriptive columns (None everywhere, timepoint defaulting to exact),
+    # and T1 is Thursday's ONLY S1->S3 candidate, so it is both the first
+    # and the last departure of its service day for the pair.
+    assert trip.wheelchair_accessible is None
+    assert trip.bikes_allowed is None
+    assert trip.direction_id is None
+    assert trip.origin_pickup_type is None
+    assert trip.origin_drop_off_type is None
+    assert trip.origin_timepoint_exact is True
+    assert trip.origin_stop_headsign is None
+    assert trip.destination_pickup_type is None
+    assert trip.destination_drop_off_type is None
+    assert trip.destination_timepoint_exact is True
+    assert trip.destination_stop_headsign is None
+    assert trip.is_first is True
+    assert trip.is_last is True
 
 
 async def test_rt_origin_prediction_only(

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
+from aiomobilitydatabase.feeds.models import StopLocationType
 from aiomobilitydatabase.feeds.static_index import SCHEMA_VERSION, StaticIndex
 
 from tests.feeds.fixtures import _FILES, build_gtfs_zip_bytes
@@ -27,7 +28,8 @@ def test_build_in_memory_and_query_static_tables(tmp_path: Path) -> None:
     assert stops["S1"].name == "Main St"
     assert stops["S1"].latitude == 34.05
     assert stops["S3"].parent_station == "ST1"
-    assert stops["ST1"].location_type == 1
+    assert stops["ST1"].location_type is StopLocationType.STATION
+    assert stops["ST1"].location_type == 1  # IntEnum: raw comparisons keep working
     assert stops["S1"].parent_station is None
     routes = {route.id: route for route in index.routes()}
     assert routes["R1"].display_name == "10 Main Line"
@@ -175,15 +177,14 @@ def test_loaders_flush_mid_loop_past_batch_size(tmp_path: Path) -> None:
     """The fixture GTFS feed is far too small to reach the 5000-row mid-loop
     flush in every ``_load_*`` loader; manufacture oversized-but-valid CSVs
     (one file at a time is enough to prove the pattern, but we push every
-    file past the threshold at once for coverage of all six loaders) and
+    file past the threshold at once for coverage of every loader) and
     also pass a progress callback so the flush's ``report()`` call itself
     runs, not just the flush condition.
     """
     n = 5001
     files = {
-        "agency.txt": (
-            "agency_id,agency_name,agency_url,agency_timezone\nA1,T,https://e.com,UTC\n"
-        ),
+        "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
+        + "".join(f"A{i},T,https://e.com,UTC\n" for i in range(n)),
         "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
         + "".join(f"S{i},Stop {i},34.0,-118.0\n" for i in range(n)),
         "routes.txt": "route_id,route_short_name,route_long_name,route_type\n"
@@ -223,6 +224,7 @@ def test_loaders_flush_mid_loop_past_batch_size(tmp_path: Path) -> None:
     try:
         assert len(index.stops()) == n
         assert len(index.routes()) == n
+        assert len(index.agencies()) == n
         assert progress_calls  # report() ran at least once per flushed loader
     finally:
         index.close()

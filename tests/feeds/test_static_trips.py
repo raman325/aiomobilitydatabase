@@ -108,4 +108,56 @@ def test_past_midnight_trip_crosses_service_day(tmp_path: Path) -> None:
     assert [trip.trip_id for trip in trips] == ["T3"]
     assert trips[0].departure == datetime(2026, 7, 31, 8, 31, tzinfo=UTC)
     assert trips[0].arrival == datetime(2026, 7, 31, 8, 40, tzinfo=UTC)
+    # Legacy-sensor parity for the service-day boundary: the flags are
+    # relative to T3's OWN service day (Thursday), whose S1->S2 candidates
+    # are T1 (08:00:30) and T3 (25:31) -- so this >24:00:00 departure is
+    # Thursday's last but not its first, even though it runs on Friday's
+    # clock day.
+    assert trips[0].is_first is False
+    assert trips[0].is_last is True
+    index.close()
+
+
+def test_is_first_is_last_single_candidate_both_true(tmp_path: Path) -> None:
+    """A pair with exactly one candidate all service day (S1->S3 only runs
+    T1: T2's S3 call has no arrival, T9 is reverse) marks that departure
+    both the first AND the last of its day.
+    """
+    index = _index(tmp_path)
+    trips = index.upcoming_trips("S1", "S3", NOW, timedelta(hours=1), 10)
+    assert [(t.trip_id, t.is_first, t.is_last) for t in trips] == [("T1", True, True)]
+    index.close()
+
+
+def test_is_first_is_last_computed_over_whole_day_not_window(tmp_path: Path) -> None:
+    """Thursday's S1->S2 candidates are T1 (08:00:30) and T3 (25:31): a
+    window holding only T1 still knows T3 exists later that service day,
+    so T1 is the day's first but NOT its last.
+    """
+    index = _index(tmp_path)
+    trips = index.upcoming_trips("S1", "S2", NOW, timedelta(hours=1), 10)
+    assert [(t.trip_id, t.is_first, t.is_last) for t in trips] == [("T1", True, False)]
+    # A window wide enough for both candidates (T3 departs Thursday 25:31,
+    # i.e. Friday 01:31 PDT) keeps exactly one first and one last.
+    both = index.upcoming_trips("S1", "S2", NOW, timedelta(hours=18), 10)
+    assert [(t.trip_id, t.is_first, t.is_last) for t in both] == [
+        ("T1", True, False),
+        ("T3", False, True),
+    ]
+    index.close()
+
+
+def test_flags_reset_per_service_day(tmp_path: Path) -> None:
+    """A 26-hour window spans Thursday's AND Friday's T1 runs; each carries
+    its own service day's flags (both first-of-day, neither last-of-day:
+    T3 closes the S1->S2 pair on both weekdays).
+    """
+    index = _index(tmp_path)
+    both = index.upcoming_trips("S1", "S2", NOW, timedelta(hours=26), 10)
+    assert [(t.trip_id, t.is_first, t.is_last) for t in both] == [
+        ("T1", True, False),
+        ("T3", False, True),
+        ("T1", True, False),
+    ]
+    assert both[0].departure < both[2].departure
     index.close()

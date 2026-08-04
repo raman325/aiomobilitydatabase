@@ -32,12 +32,14 @@ from .exceptions import (
 )
 from .geo import Circle, in_circle
 from .models import (
+    Agency,
     Route,
     ServiceAlert,
     StaticBuildProgress,
     StationGroup,
     Stop,
     StopArrival,
+    StopLocationType,
     UpcomingTrip,
     VehiclePosition,
 )
@@ -122,11 +124,15 @@ def group_stations(stops: list[Stop]) -> list[StationGroup]:
     are grouped so consumers can offer "Metro Center" instead of every
     platform and entrance.
     """
-    stations = {stop.id: stop for stop in stops if stop.location_type == 1}
+    stations = {
+        stop.id: stop
+        for stop in stops
+        if stop.location_type is StopLocationType.STATION
+    }
     names: dict[str, str] = {}
     members: dict[str, list[str]] = {}
     for stop in stops:
-        if stop.location_type not in (None, 0):
+        if stop.location_type not in (None, StopLocationType.STOP):
             continue
         if stop.parent_station:
             key = stop.parent_station
@@ -183,6 +189,7 @@ class TransitFeedHandle:
         self._api_key = api_key
         self.stops: list[Stop] = index.stops()
         self.routes: list[Route] = index.routes()
+        self.agencies: list[Agency] = index.agencies()
 
     @property
     def static_feed_id(self) -> str:
@@ -613,6 +620,12 @@ class TransitFeedHandle:
                     delay_seconds=prediction.delay_seconds if prediction else None,
                     realtime=prediction is not None,
                     vehicle_id=prediction.vehicle_id if prediction else None,
+                    wheelchair_accessible=dep.wheelchair_accessible,
+                    bikes_allowed=dep.bikes_allowed,
+                    pickup_type=dep.pickup_type,
+                    drop_off_type=dep.drop_off_type,
+                    timepoint_exact=dep.timepoint_exact,
+                    stop_headsign=dep.stop_headsign,
                 )
             )
         wanted_stops = set(stop_ids)
@@ -636,6 +649,16 @@ class TransitFeedHandle:
                     delay_seconds=None,
                     realtime=True,
                     vehicle_id=row.vehicle_id,
+                    # RT-added trips have no static schedule row, so every
+                    # descriptive field is unknown — including timepoint,
+                    # whose absent-means-exact default only applies to rows
+                    # that exist in stop_times.
+                    wheelchair_accessible=None,
+                    bikes_allowed=None,
+                    pickup_type=None,
+                    drop_off_type=None,
+                    timepoint_exact=None,
+                    stop_headsign=None,
                 )
             )
         # Total sort key, matching upcoming_departures: effective time alone
@@ -675,7 +698,11 @@ class TransitFeedHandle:
         its sensor tracks "the next vehicle leaving stop A that will reach
         stop B", not merely the next departure at A. Wrong-direction trips
         are excluded — a return trip serves both stops too, but in reverse
-        order.
+        order. Each row also carries the legacy sensor's descriptive
+        surface: trip wheelchair/bikes/direction flags, both ends'
+        stop_time descriptors, and ``is_first``/``is_last`` — whether the
+        departure is the first/last OF ITS SERVICE DAY for this stop pair
+        (see :class:`~.models.UpcomingTrip`).
 
         ``limit`` caps the SCHEDULED candidates, nearest origin departure
         first; RT cancellations then remove rows without backfilling, so
@@ -728,6 +755,19 @@ class TransitFeedHandle:
                     predicted_arrival=dest_pred.arrival if dest_pred else None,
                     delay_seconds=(origin_pred.delay_seconds if origin_pred else None),
                     realtime=origin_pred is not None or dest_pred is not None,
+                    wheelchair_accessible=trip.wheelchair_accessible,
+                    bikes_allowed=trip.bikes_allowed,
+                    direction_id=trip.direction_id,
+                    origin_pickup_type=trip.origin_pickup_type,
+                    origin_drop_off_type=trip.origin_drop_off_type,
+                    origin_timepoint_exact=trip.origin_timepoint_exact,
+                    origin_stop_headsign=trip.origin_stop_headsign,
+                    destination_pickup_type=trip.destination_pickup_type,
+                    destination_drop_off_type=trip.destination_drop_off_type,
+                    destination_timepoint_exact=trip.destination_timepoint_exact,
+                    destination_stop_headsign=trip.destination_stop_headsign,
+                    is_first=trip.is_first,
+                    is_last=trip.is_last,
                 )
             )
         # Total sort key, matching get_arrivals: origin predictions can
@@ -844,6 +884,7 @@ class TransitFeedHandle:
         old_index, self._index = self._index, new_index
         self.stops = await asyncio.to_thread(new_index.stops)
         self.routes = await asyncio.to_thread(new_index.routes)
+        self.agencies = await asyncio.to_thread(new_index.agencies)
         await asyncio.to_thread(old_index.close)
 
     def stops_in(self, zone: Circle) -> list[Stop]:

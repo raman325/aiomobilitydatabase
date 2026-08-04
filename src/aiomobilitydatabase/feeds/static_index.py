@@ -14,25 +14,43 @@ import zipfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from enum import IntEnum
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 from zoneinfo import ZoneInfo
 
 from .exceptions import FeedParseError
-from .models import Route, Stop
+from .models import (
+    Agency,
+    BikesAllowed,
+    PickupDropOffType,
+    Route,
+    Stop,
+    StopLocationType,
+    WheelchairAccess,
+)
 
 SCHEMA_VERSION = 1
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
+# Descriptive vocabulary columns are stored as the raw parsed ints (or NULL
+# for blank/unparseable values); the closed-vocabulary enums live at the
+# Python model boundary only, where out-of-vocabulary ints turn into None.
 _SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE agencies (
+    id TEXT, name TEXT, url TEXT, timezone TEXT,
+    lang TEXT, phone TEXT, fare_url TEXT
+);
 CREATE TABLE stops (
     id TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL,
-    parent_station TEXT, location_type INTEGER
+    parent_station TEXT, location_type INTEGER,
+    stop_code TEXT, platform_code TEXT, wheelchair_boarding INTEGER
 );
 CREATE TABLE routes (
-    id TEXT PRIMARY KEY, short_name TEXT, long_name TEXT, type INTEGER
+    id TEXT PRIMARY KEY, short_name TEXT, long_name TEXT, type INTEGER,
+    agency_id TEXT, color TEXT, text_color TEXT, url TEXT
 );
 CREATE TABLE trips (
     id TEXT PRIMARY KEY, route_id TEXT NOT NULL,
@@ -43,11 +61,14 @@ CREATE TABLE trips (
     -- carry (template trip id, repetition start seconds). Real columns
     -- rather than string-parsing the synthetic "#"-suffixed id, which
     -- would be ambiguous if a real trip id contained "#".
-    source_trip_id TEXT NOT NULL, start_secs INTEGER
+    source_trip_id TEXT NOT NULL, start_secs INTEGER,
+    wheelchair_accessible INTEGER, bikes_allowed INTEGER, direction_id INTEGER
 );
 CREATE TABLE stop_times (
     trip_id TEXT NOT NULL, stop_id TEXT NOT NULL,
-    arrival_secs INTEGER, departure_secs INTEGER, stop_sequence INTEGER NOT NULL
+    arrival_secs INTEGER, departure_secs INTEGER, stop_sequence INTEGER NOT NULL,
+    pickup_type INTEGER, drop_off_type INTEGER, timepoint INTEGER,
+    stop_headsign TEXT
 );
 CREATE INDEX ix_stop_times_stop_departure ON stop_times (stop_id, departure_secs);
 CREATE TABLE calendar (
@@ -97,6 +118,59 @@ def parse_gtfs_time(value: str) -> int | None:
     return hours * 3600 + minutes * 60 + seconds
 
 
+def _lenient_int(value: str | None) -> int | None:
+    """Parse a DESCRIPTIVE integer column leniently: blank/garbage -> None.
+
+    Descriptive metadata (wheelchair flags, pickup types, direction ids)
+    must never fail a build the way structural fields (stop_sequence,
+    times) do -- a producer's typo in an accessibility column should not
+    take the whole schedule down. Parseable ints are stored as-is, even
+    outside the closed vocabulary; the model boundary maps those to None.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _enum_or_none[IntEnumT: IntEnum](
+    enum_cls: type[IntEnumT], value: int | None
+) -> IntEnumT | None:
+    """Model-boundary enum conversion: out-of-vocabulary ints become None."""
+    if value is None:
+        return None
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return None
+
+
+def _stored_timepoint(value: str | None) -> int | None:
+    """Resolve stop_times.timepoint at load time: GTFS's default is EXACT.
+
+    An absent column or blank value means the scheduled times ARE exact
+    (stored 1); ``0``/``1`` are stored as-is; anything else (garbage text,
+    out-of-vocabulary ints) stores NULL, surfacing as None at the model
+    boundary. Resolved here rather than at query time because a NULL in
+    the column must mean "unknown", not "absent" -- the absent-means-exact
+    default would otherwise be indistinguishable from a bad value.
+    """
+    if value is None or not value.strip():
+        return 1
+    parsed = _lenient_int(value)
+    return parsed if parsed in (0, 1) else None
+
+
+def _timepoint_exact(stored: int | None) -> bool | None:
+    """Model-boundary read of the load-resolved timepoint column."""
+    return None if stored is None else bool(stored)
+
+
 def _reporter(
     progress: Callable[[int, int | None], None] | None,
     fp: IO[bytes],
@@ -118,6 +192,10 @@ class ScheduledDeparture:
     repetition (synthetic ``{trip_id}#{start_secs}`` id) they are the
     template trip id and the repetition start in GTFS seconds -- the pair a
     GTFS-RT ``TripDescriptor`` (trip_id + start_time) addresses.
+
+    The descriptive tail mirrors :class:`~.models.StopArrival`:
+    trip-level wheelchair/bikes flags plus this stop_time row's
+    pickup/drop-off/timepoint/headsign descriptors.
     """
 
     trip_id: str
@@ -128,6 +206,12 @@ class ScheduledDeparture:
     departure: datetime
     source_trip_id: str
     start_secs: int | None
+    wheelchair_accessible: WheelchairAccess | None
+    bikes_allowed: BikesAllowed | None
+    pickup_type: PickupDropOffType | None
+    drop_off_type: PickupDropOffType | None
+    timepoint_exact: bool | None
+    stop_headsign: str | None
 
 
 @dataclass(frozen=True)
@@ -139,6 +223,10 @@ class ScheduledTrip:
     require the underlying GTFS times to be present.
     ``source_trip_id``/``start_secs`` are the RT-matching identity, exactly
     as on :class:`ScheduledDeparture`.
+
+    The descriptive tail mirrors :class:`~.models.UpcomingTrip`: trip-level
+    wheelchair/bikes/direction, per-end stop_time descriptors, and the
+    ``is_first``/``is_last`` service-day flags (see ``upcoming_trips``).
     """
 
     trip_id: str
@@ -150,6 +238,19 @@ class ScheduledTrip:
     arrival: datetime
     source_trip_id: str
     start_secs: int | None
+    wheelchair_accessible: WheelchairAccess | None
+    bikes_allowed: BikesAllowed | None
+    direction_id: int | None
+    origin_pickup_type: PickupDropOffType | None
+    origin_drop_off_type: PickupDropOffType | None
+    origin_timepoint_exact: bool | None
+    origin_stop_headsign: str | None
+    destination_pickup_type: PickupDropOffType | None
+    destination_drop_off_type: PickupDropOffType | None
+    destination_timepoint_exact: bool | None
+    destination_stop_headsign: str | None
+    is_first: bool
+    is_last: bool
 
 
 class StaticIndex:
@@ -274,6 +375,7 @@ class StaticIndex:
         progress: Callable[[int, int | None], None] | None = None,
     ) -> None:
         files = (
+            ("agency.txt", cls._load_agencies),
             ("stops.txt", cls._load_stops),
             ("routes.txt", cls._load_routes),
             ("trips.txt", cls._load_trips),
@@ -313,6 +415,35 @@ class StaticIndex:
             rows.clear()
 
     @classmethod
+    def _load_agencies(
+        cls,
+        conn: sqlite3.Connection,
+        reader: csv.DictReader[str],
+        report: Callable[[], None] | None = None,
+    ) -> None:
+        rows: list[tuple[object, ...]] = []
+        sql = "INSERT INTO agencies VALUES (?,?,?,?,?,?,?)"
+        for row in reader:
+            rows.append(
+                (
+                    row.get("agency_id") or None,
+                    row.get("agency_name") or None,
+                    row.get("agency_url") or None,
+                    row.get("agency_timezone") or None,
+                    row.get("agency_lang") or None,
+                    row.get("agency_phone") or None,
+                    row.get("agency_fare_url") or None,
+                )
+            )
+            if len(rows) >= _BATCH_SIZE:
+                cls._batched_insert(conn, sql, rows)
+                if report is not None:
+                    report()
+        cls._batched_insert(conn, sql, rows)
+        if report is not None:
+            report()
+
+    @classmethod
     def _load_stops(
         cls,
         conn: sqlite3.Connection,
@@ -320,6 +451,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
+        sql = "INSERT OR REPLACE INTO stops VALUES (?,?,?,?,?,?,?,?,?)"
         for row in reader:
             rows.append(
                 (
@@ -329,17 +461,16 @@ class StaticIndex:
                     float(lon) if (lon := row.get("stop_lon", "").strip()) else None,
                     row.get("parent_station") or None,
                     int(loc) if (loc := row.get("location_type", "").strip()) else None,
+                    row.get("stop_code") or None,
+                    row.get("platform_code") or None,
+                    _lenient_int(row.get("wheelchair_boarding")),
                 )
             )
             if len(rows) >= _BATCH_SIZE:
-                cls._batched_insert(
-                    conn, "INSERT OR REPLACE INTO stops VALUES (?,?,?,?,?,?)", rows
-                )
+                cls._batched_insert(conn, sql, rows)
                 if report is not None:
                     report()
-        cls._batched_insert(
-            conn, "INSERT OR REPLACE INTO stops VALUES (?,?,?,?,?,?)", rows
-        )
+        cls._batched_insert(conn, sql, rows)
         if report is not None:
             report()
 
@@ -351,6 +482,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
+        sql = "INSERT OR REPLACE INTO routes VALUES (?,?,?,?,?,?,?,?)"
         for row in reader:
             rows.append(
                 (
@@ -360,17 +492,17 @@ class StaticIndex:
                     int(rtype)
                     if (rtype := row.get("route_type", "").strip())
                     else None,
+                    row.get("agency_id") or None,
+                    row.get("route_color") or None,
+                    row.get("route_text_color") or None,
+                    row.get("route_url") or None,
                 )
             )
             if len(rows) >= _BATCH_SIZE:
-                cls._batched_insert(
-                    conn, "INSERT OR REPLACE INTO routes VALUES (?,?,?,?)", rows
-                )
+                cls._batched_insert(conn, sql, rows)
                 if report is not None:
                     report()
-        cls._batched_insert(
-            conn, "INSERT OR REPLACE INTO routes VALUES (?,?,?,?)", rows
-        )
+        cls._batched_insert(conn, sql, rows)
         if report is not None:
             report()
 
@@ -382,7 +514,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?)"
+        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?)"
         for row in reader:
             rows.append(
                 (
@@ -392,6 +524,9 @@ class StaticIndex:
                     row.get("trip_headsign") or None,
                     row["trip_id"],  # source_trip_id: a plain trip is its own source
                     None,  # start_secs: only frequency repetitions carry one
+                    _lenient_int(row.get("wheelchair_accessible")),
+                    _lenient_int(row.get("bikes_allowed")),
+                    _lenient_int(row.get("direction_id")),
                 )
             )
             if len(rows) >= _BATCH_SIZE:
@@ -410,6 +545,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
+        sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
         for row in reader:
             rows.append(
                 (
@@ -418,15 +554,17 @@ class StaticIndex:
                     parse_gtfs_time(row.get("arrival_time", "")),
                     parse_gtfs_time(row.get("departure_time", "")),
                     int(row["stop_sequence"]),
+                    _lenient_int(row.get("pickup_type")),
+                    _lenient_int(row.get("drop_off_type")),
+                    _stored_timepoint(row.get("timepoint")),
+                    row.get("stop_headsign") or None,
                 )
             )
             if len(rows) >= _BATCH_SIZE:
-                cls._batched_insert(
-                    conn, "INSERT INTO stop_times VALUES (?,?,?,?,?)", rows
-                )
+                cls._batched_insert(conn, sql, rows)
                 if report is not None:
                     report()
-        cls._batched_insert(conn, "INSERT INTO stop_times VALUES (?,?,?,?,?)", rows)
+        cls._batched_insert(conn, sql, rows)
         if report is not None:
             report()
 
@@ -477,17 +615,25 @@ class StaticIndex:
         non-positive headway) raise, mirroring stop_times.
         """
         spans = cls._parse_frequency_spans(reader)
+        # The INSERT..SELECT and the template copy below must carry EVERY
+        # descriptive trip/stop_time column, or repetitions would silently
+        # drop wheelchair/bikes/direction and pickup/drop-off/timepoint/
+        # headsign metadata their template declared.
         trips_sql = (
             "INSERT OR REPLACE INTO trips "
-            "(id, route_id, service_id, headsign, source_trip_id, start_secs) "
-            "SELECT ?, route_id, service_id, headsign, ?, ? FROM trips WHERE id = ?"
+            "(id, route_id, service_id, headsign, source_trip_id, start_secs, "
+            "wheelchair_accessible, bikes_allowed, direction_id) "
+            "SELECT ?, route_id, service_id, headsign, ?, ?, "
+            "wheelchair_accessible, bikes_allowed, direction_id "
+            "FROM trips WHERE id = ?"
         )
-        stop_times_sql = "INSERT INTO stop_times VALUES (?,?,?,?,?)"
+        stop_times_sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
         trip_rows: list[tuple[object, ...]] = []
         stop_time_rows: list[tuple[object, ...]] = []
         for trip_id, trip_spans in spans.items():
             template = conn.execute(
-                "SELECT stop_id, arrival_secs, departure_secs, stop_sequence "
+                "SELECT stop_id, arrival_secs, departure_secs, stop_sequence, "
+                "pickup_type, drop_off_type, timepoint, stop_headsign "
                 "FROM stop_times WHERE trip_id = ? ORDER BY stop_sequence",
                 (trip_id,),
             ).fetchall()
@@ -511,7 +657,16 @@ class StaticIndex:
                 synthetic_id = f"{trip_id}#{rep_start}"
                 shift = rep_start - anchor
                 trip_rows.append((synthetic_id, trip_id, rep_start, trip_id))
-                for stop_id, arrival_secs, departure_secs, stop_sequence in template:
+                for (
+                    stop_id,
+                    arrival_secs,
+                    departure_secs,
+                    stop_sequence,
+                    pickup_type,
+                    drop_off_type,
+                    timepoint,
+                    stop_headsign,
+                ) in template:
                     stop_time_rows.append(
                         (
                             synthetic_id,
@@ -523,6 +678,10 @@ class StaticIndex:
                                 else None
                             ),
                             stop_sequence,
+                            pickup_type,
+                            drop_off_type,
+                            timepoint,
+                            stop_headsign,
                         )
                     )
                 if len(stop_time_rows) >= _BATCH_SIZE:
@@ -617,20 +776,56 @@ class StaticIndex:
                 latitude=row[2],
                 longitude=row[3],
                 parent_station=row[4],
-                location_type=row[5],
+                location_type=_enum_or_none(StopLocationType, row[5]),
+                stop_code=row[6],
+                platform_code=row[7],
+                wheelchair_boarding=_enum_or_none(WheelchairAccess, row[8]),
             )
             for row in self._conn.execute(
-                "SELECT id, name, lat, lon, parent_station, location_type "
+                "SELECT id, name, lat, lon, parent_station, location_type, "
+                "stop_code, platform_code, wheelchair_boarding "
                 "FROM stops ORDER BY name"
             )
         ]
 
+    @staticmethod
+    def _route_from_row(row: tuple[Any, ...]) -> Route:
+        """One Route from a full-width routes row (shared by both queries)."""
+        return Route(
+            id=row[0],
+            short_name=row[1],
+            long_name=row[2],
+            type=row[3],
+            agency_id=row[4],
+            color=row[5],
+            text_color=row[6],
+            url=row[7],
+        )
+
     def routes(self) -> list[Route]:
         """All routes (for pickers)."""
         return [
-            Route(id=row[0], short_name=row[1], long_name=row[2], type=row[3])
+            self._route_from_row(row)
             for row in self._conn.execute(
-                "SELECT id, short_name, long_name, type FROM routes ORDER BY id"
+                "SELECT id, short_name, long_name, type, "
+                "agency_id, color, text_color, url FROM routes ORDER BY id"
+            )
+        ]
+
+    def agencies(self) -> list[Agency]:
+        """All agencies, in agency.txt order (route rows reference them)."""
+        return [
+            Agency(
+                id=row[0],
+                name=row[1],
+                url=row[2],
+                timezone=row[3],
+                lang=row[4],
+                phone=row[5],
+                fare_url=row[6],
+            )
+            for row in self._conn.execute(
+                "SELECT id, name, url, timezone, lang, phone, fare_url FROM agencies"
             )
         ]
 
@@ -659,9 +854,10 @@ class StaticIndex:
     def routes_serving(self, stop_id: str) -> list[Route]:
         """Routes with at least one scheduled stop_time at the stop."""
         return [
-            Route(id=row[0], short_name=row[1], long_name=row[2], type=row[3])
+            self._route_from_row(row)
             for row in self._conn.execute(
-                "SELECT DISTINCT r.id, r.short_name, r.long_name, r.type "
+                "SELECT DISTINCT r.id, r.short_name, r.long_name, r.type, "
+                "r.agency_id, r.color, r.text_color, r.url "
                 "FROM stop_times st "
                 "JOIN trips t ON t.id = st.trip_id "
                 "JOIN routes r ON r.id = t.route_id "
@@ -675,7 +871,9 @@ class StaticIndex:
 
         Sourced from trips.trip_headsign — the same field StopArrival.headsign
         exposes, so picker options and filterable values always agree. (GTFS's
-        per-stop stop_times.stop_headsign override is not indexed in v1.)
+        per-stop stop_times.stop_headsign override IS loaded and exposed as
+        StopArrival.stop_headsign, but deliberately not offered as picker
+        options: filters match on the trip-level headsign.)
         """
         sql = (
             "SELECT DISTINCT t.headsign FROM stop_times st "
@@ -797,7 +995,9 @@ class StaticIndex:
             service_marks = ",".join("?" * len(active))
             sql = (
                 "SELECT st.trip_id, t.route_id, t.headsign, st.stop_id, "
-                "st.arrival_secs, st.departure_secs, t.source_trip_id, t.start_secs "
+                "st.arrival_secs, st.departure_secs, t.source_trip_id, t.start_secs, "
+                "t.wheelchair_accessible, t.bikes_allowed, "
+                "st.pickup_type, st.drop_off_type, st.timepoint, st.stop_headsign "
                 "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
                 f"WHERE st.stop_id IN ({stop_marks}) "
                 f"AND t.service_id IN ({service_marks}) "
@@ -817,6 +1017,12 @@ class StaticIndex:
                 dep_secs,
                 source_trip_id,
                 start_secs,
+                wheelchair,
+                bikes,
+                pickup_type,
+                drop_off_type,
+                timepoint,
+                stop_headsign,
             ) in self._conn.execute(sql, params):
                 results.append(
                     ScheduledDeparture(
@@ -832,6 +1038,14 @@ class StaticIndex:
                         departure=day_start_utc + timedelta(seconds=dep_secs),
                         source_trip_id=source_trip_id,
                         start_secs=start_secs,
+                        wheelchair_accessible=_enum_or_none(
+                            WheelchairAccess, wheelchair
+                        ),
+                        bikes_allowed=_enum_or_none(BikesAllowed, bikes),
+                        pickup_type=_enum_or_none(PickupDropOffType, pickup_type),
+                        drop_off_type=_enum_or_none(PickupDropOffType, drop_off_type),
+                        timepoint_exact=_timepoint_exact(timepoint),
+                        stop_headsign=stop_headsign,
                     )
                 )
         # Total sort key: departure alone ties frequently (same-minute
@@ -850,6 +1064,53 @@ class StaticIndex:
                 limited.append(dep)
                 per_stop_counts[dep.stop_id] = count + 1
         return limited
+
+    # Shared origin->destination candidate predicate: right direction, both
+    # ends timed, service active. Kept as one fragment so the row query and
+    # the first/last-of-day extremes query can NEVER drift apart (the flags
+    # are only correct if both queries agree on what a candidate is).
+    _PAIR_CANDIDATES_SQL = (
+        "FROM stop_times o "
+        "JOIN stop_times d ON d.trip_id = o.trip_id "
+        "JOIN trips t ON t.id = o.trip_id "
+        "WHERE o.stop_id = ? AND d.stop_id = ? "
+        "AND o.stop_sequence < d.stop_sequence "
+        "AND o.departure_secs IS NOT NULL "
+        "AND d.arrival_secs IS NOT NULL "
+        "AND t.service_id IN ({service_marks})"
+    )
+
+    def _pair_day_extremes(
+        self,
+        origin_stop_id: str,
+        destination_stop_id: str,
+        active: set[str],
+    ) -> tuple[tuple[str, int], tuple[str, int]]:
+        """Return one service day's first/last departure identities for the pair.
+
+        The identities are (trip_id, origin stop_sequence) pairs computed
+        over the WHOLE service day, not the query window.
+
+        Ordered by (departure_secs, trip_id, stop_sequence) — the same
+        total order the row sort uses — so exactly one candidate is the
+        first and exactly one is the last even when departures tie. Callers
+        only invoke this for days that produced candidate rows, so both
+        LIMIT-1 queries always find a row.
+        """
+        service_marks = ",".join("?" * len(active))
+        candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
+        params = [origin_stop_id, destination_stop_id, *sorted(active)]
+        extremes: list[tuple[str, int]] = []
+        for direction in ("ASC", "DESC"):
+            sql = (
+                "SELECT o.trip_id, o.stop_sequence "
+                f"{candidates} "
+                f"ORDER BY o.departure_secs {direction}, o.trip_id {direction}, "
+                f"o.stop_sequence {direction} LIMIT 1"
+            )
+            row = self._conn.execute(sql, params).fetchone()
+            extremes.append((row[0], row[1]))
+        return extremes[0], extremes[1]
 
     def upcoming_trips(
         self,
@@ -870,27 +1131,39 @@ class StaticIndex:
         earliest destination arrival (MIN) — ride until the vehicle first
         reaches the destination. Results are sorted by origin departure and
         truncated to ``limit``.
+
+        ``is_first``/``is_last`` are computed per SERVICE DAY, over the
+        whole day rather than the query window (legacy ``gtfs`` sensor
+        parity): a row is first/last iff it is that day's first/last
+        candidate departure for this pair, under the same candidate
+        predicate as the rows themselves. Each scanned day costs at most
+        two extra LIMIT-1 index lookups, and only when it produced rows.
+        A >24:00:00 departure carries its own service day's flags, and
+        frequency-materialized repetitions count as ordinary trips.
         """
         results: list[ScheduledTrip] = []
         for day_start_utc, active, window_lo, window_hi in self._service_day_windows(
             now_utc, lookahead
         ):
             service_marks = ",".join("?" * len(active))
-            # The IS NOT NULL clauses guarantee ScheduledTrip's non-optional
-            # datetimes: a stop_time without a departure at the origin (or an
-            # arrival at the destination) can never produce a row.
+            candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
+            # The IS NOT NULL clauses (in the shared candidate predicate)
+            # guarantee ScheduledTrip's non-optional datetimes: a stop_time
+            # without a departure at the origin (or an arrival at the
+            # destination) can never produce a row. The bare d.* columns are
+            # well-defined under GROUP BY because the query has exactly one
+            # min/max aggregate: SQLite documents that they then come from
+            # the row MIN(d.arrival_secs) selected, i.e. the destination
+            # call actually ridden to.
             sql = (
                 "SELECT o.trip_id, t.route_id, t.headsign, "
                 "o.departure_secs, MIN(d.arrival_secs), "
-                "t.source_trip_id, t.start_secs "
-                "FROM stop_times o "
-                "JOIN stop_times d ON d.trip_id = o.trip_id "
-                "JOIN trips t ON t.id = o.trip_id "
-                "WHERE o.stop_id = ? AND d.stop_id = ? "
-                "AND o.stop_sequence < d.stop_sequence "
-                "AND o.departure_secs IS NOT NULL "
-                "AND d.arrival_secs IS NOT NULL "
-                f"AND t.service_id IN ({service_marks}) "
+                "t.source_trip_id, t.start_secs, "
+                "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
+                "o.pickup_type, o.drop_off_type, o.timepoint, o.stop_headsign, "
+                "d.pickup_type, d.drop_off_type, d.timepoint, d.stop_headsign, "
+                "o.stop_sequence "
+                f"{candidates} "
                 "AND o.departure_secs >= ? AND o.departure_secs <= ? "
                 "GROUP BY o.trip_id, o.stop_sequence"
             )
@@ -901,6 +1174,12 @@ class StaticIndex:
                 window_lo,
                 window_hi,
             ]
+            rows = self._conn.execute(sql, params).fetchall()
+            if not rows:
+                continue
+            first_key, last_key = self._pair_day_extremes(
+                origin_stop_id, destination_stop_id, active
+            )
             for (
                 trip_id,
                 route_id,
@@ -909,7 +1188,19 @@ class StaticIndex:
                 arr_secs,
                 source_trip_id,
                 start_secs,
-            ) in self._conn.execute(sql, params):
+                wheelchair,
+                bikes,
+                direction_id,
+                o_pickup,
+                o_drop_off,
+                o_timepoint,
+                o_stop_headsign,
+                d_pickup,
+                d_drop_off,
+                d_timepoint,
+                d_stop_headsign,
+                o_sequence,
+            ) in rows:
                 results.append(
                     ScheduledTrip(
                         trip_id=trip_id,
@@ -921,6 +1212,27 @@ class StaticIndex:
                         arrival=day_start_utc + timedelta(seconds=arr_secs),
                         source_trip_id=source_trip_id,
                         start_secs=start_secs,
+                        wheelchair_accessible=_enum_or_none(
+                            WheelchairAccess, wheelchair
+                        ),
+                        bikes_allowed=_enum_or_none(BikesAllowed, bikes),
+                        direction_id=direction_id,
+                        origin_pickup_type=_enum_or_none(PickupDropOffType, o_pickup),
+                        origin_drop_off_type=_enum_or_none(
+                            PickupDropOffType, o_drop_off
+                        ),
+                        origin_timepoint_exact=_timepoint_exact(o_timepoint),
+                        origin_stop_headsign=o_stop_headsign,
+                        destination_pickup_type=_enum_or_none(
+                            PickupDropOffType, d_pickup
+                        ),
+                        destination_drop_off_type=_enum_or_none(
+                            PickupDropOffType, d_drop_off
+                        ),
+                        destination_timepoint_exact=_timepoint_exact(d_timepoint),
+                        destination_stop_headsign=d_stop_headsign,
+                        is_first=(trip_id, o_sequence) == first_key,
+                        is_last=(trip_id, o_sequence) == last_key,
                     )
                 )
         # Total sort key, matching upcoming_departures's rationale: arrival

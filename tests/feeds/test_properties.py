@@ -7,6 +7,7 @@ import math
 import tempfile
 import zipfile
 from datetime import UTC, date, datetime, time, timedelta
+from enum import IntEnum
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -29,7 +30,13 @@ from aiomobilitydatabase.feeds.gbfs import (
     _version_key,
 )
 from aiomobilitydatabase.feeds.geo import Circle, haversine_m, in_circle
-from aiomobilitydatabase.feeds.models import StaticBuildProgress, StopArrival
+from aiomobilitydatabase.feeds.models import (
+    BikesAllowed,
+    PickupDropOffType,
+    StaticBuildProgress,
+    StopArrival,
+    WheelchairAccess,
+)
 from aiomobilitydatabase.feeds.rt import (
     _epoch_to_utc,
     _first_translation,
@@ -38,7 +45,11 @@ from aiomobilitydatabase.feeds.rt import (
     trip_updates_from_message,
     vehicles_from_message,
 )
-from aiomobilitydatabase.feeds.static_index import StaticIndex, parse_gtfs_time
+from aiomobilitydatabase.feeds.static_index import (
+    ScheduledTrip,
+    StaticIndex,
+    parse_gtfs_time,
+)
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle
 
 from tests.feeds.fixtures import (
@@ -895,6 +906,400 @@ def test_upcoming_trips_invariants(zip_bytes: bytes, data: st.DataObject) -> Non
         assert first == sorted(
             first, key=lambda trip: (trip.departure, trip.trip_id, trip.arrival)
         )
+    finally:
+        index.close()
+
+
+# --- descriptive attribute-surface properties --------------------------------
+
+# Cells a real producer might put in a DESCRIPTIVE integer column: ints in
+# and around every vocabulary (incl. negative), huge ints, decimals,
+# garbage text, empty, whitespace-only.
+_INT_CELL = st.one_of(
+    st.integers(min_value=-5, max_value=12).map(str),
+    st.sampled_from(["", " ", "x", "1.5", "abc", "999999999999", "--"]),
+)
+# Text-column cells: empty (-> None) or CSV-safe text kept verbatim
+# (including whitespace-only and digit-only values).
+_TEXT_CELL = st.one_of(
+    st.just(""),
+    st.text(
+        alphabet=st.characters(categories=["L", "N"], include_characters=" -_"),
+        min_size=1,
+        max_size=8,
+    ),
+)
+
+
+def _expected_lenient_int(cell: str) -> int | None:
+    """Oracle for descriptive int cells: blank/garbage -> None, parseable
+    ints kept as-is (even outside every vocabulary)."""
+    cell = cell.strip()
+    if not cell:
+        return None
+    try:
+        return int(cell)
+    except ValueError:
+        return None
+
+
+def _expected_enum(enum_cls: type[IntEnum], cell: str) -> IntEnum | None:
+    """Oracle for closed-vocabulary cells: in-vocabulary int -> the exact
+    member; anything else -> None."""
+    parsed = _expected_lenient_int(cell)
+    members = {member.value: member for member in enum_cls}
+    return None if parsed is None else members.get(parsed)
+
+
+def _expected_text(cell: str) -> str | None:
+    """Oracle for text cells: verbatim pass-through, empty -> None."""
+    return cell or None
+
+
+def _expected_timepoint(cell: str | None) -> bool | None:
+    """Oracle for the timepoint tri-state: absent column (None) or blank ->
+    True (GTFS default: times are exact), 0 -> False, 1 -> True, anything
+    else -> None."""
+    if cell is None or not cell.strip():
+        return True
+    parsed = _expected_lenient_int(cell)
+    return {0: False, 1: True}.get(parsed) if parsed is not None else None
+
+
+_ONE_DAY_CALENDAR = (
+    "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+    "start_date,end_date\nONE,1,1,1,1,1,1,1,20260730,20260730\n"
+)
+_UTC_AGENCY = (
+    "agency_id,agency_name,agency_url,agency_timezone\nA1,T,https://e.com,UTC\n"
+)
+
+_DESCRIPTIVE_ROW_CELLS = st.fixed_dictionaries(
+    {
+        "wheelchair_boarding": _INT_CELL,
+        "wheelchair_accessible": _INT_CELL,
+        "bikes_allowed": _INT_CELL,
+        "direction_id": _INT_CELL,
+        "pickup_type": _INT_CELL,
+        "drop_off_type": _INT_CELL,
+        "timepoint": _INT_CELL,
+        "stop_code": _TEXT_CELL,
+        "platform_code": _TEXT_CELL,
+        "stop_headsign": _TEXT_CELL,
+        "agency_id": _TEXT_CELL,
+        "route_color": _TEXT_CELL,
+        "route_text_color": _TEXT_CELL,
+        "route_url": _TEXT_CELL,
+    }
+)
+
+
+@settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(cells=_DESCRIPTIVE_ROW_CELLS)
+def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) -> None:
+    """Arbitrary producer cells in EVERY descriptive column at once: the
+    build never raises, in-vocabulary ints surface as the exact enum member
+    (matching .value), everything else (out-of-vocabulary, negative, huge,
+    decimal, garbage, blank) is None, open-vocabulary direction_id keeps
+    any parseable int verbatim, and text columns pass through verbatim with
+    empty -> None (whitespace-only text is kept, not blanked).
+    """
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": (
+            "stop_id,stop_name,stop_lat,stop_lon,stop_code,platform_code,"
+            "wheelchair_boarding\n"
+            f"S1,A,0,0,{cells['stop_code']},{cells['platform_code']},"
+            f"{cells['wheelchair_boarding']}\n"
+            "S2,B,0,0,,,\n"
+        ),
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type,agency_id,"
+            "route_color,route_text_color,route_url\n"
+            f"R1,1,Line,3,{cells['agency_id']},{cells['route_color']},"
+            f"{cells['route_text_color']},{cells['route_url']}\n"
+        ),
+        "trips.txt": (
+            "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible,"
+            "bikes_allowed,direction_id\n"
+            f"R1,ONE,T1,H,{cells['wheelchair_accessible']},"
+            f"{cells['bikes_allowed']},{cells['direction_id']}\n"
+        ),
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
+            "pickup_type,drop_off_type,timepoint,stop_headsign\n"
+            f"T1,08:00:00,08:00:00,S1,1,{cells['pickup_type']},"
+            f"{cells['drop_off_type']},{cells['timepoint']},"
+            f"{cells['stop_headsign']}\n"
+            "T1,08:10:00,08:10:00,S2,2,,,,\n"
+        ),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+    }
+    index = _build_index_from_files(files)  # totality: must never raise
+    try:
+        stop = next(s for s in index.stops() if s.id == "S1")
+        assert stop.stop_code == _expected_text(cells["stop_code"])
+        assert stop.platform_code == _expected_text(cells["platform_code"])
+        assert stop.wheelchair_boarding is _expected_enum(
+            WheelchairAccess, cells["wheelchair_boarding"]
+        )
+        (route,) = index.routes()
+        assert route.agency_id == _expected_text(cells["agency_id"])
+        assert route.color == _expected_text(cells["route_color"])
+        assert route.text_color == _expected_text(cells["route_text_color"])
+        assert route.url == _expected_text(cells["route_url"])
+        now = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
+        (trip,) = index.upcoming_trips("S1", "S2", now, timedelta(hours=24), 10)
+        assert trip.wheelchair_accessible is _expected_enum(
+            WheelchairAccess, cells["wheelchair_accessible"]
+        )
+        assert trip.bikes_allowed is _expected_enum(
+            BikesAllowed, cells["bikes_allowed"]
+        )
+        assert trip.direction_id == _expected_lenient_int(cells["direction_id"])
+        assert trip.origin_pickup_type is _expected_enum(
+            PickupDropOffType, cells["pickup_type"]
+        )
+        assert trip.origin_drop_off_type is _expected_enum(
+            PickupDropOffType, cells["drop_off_type"]
+        )
+        assert trip.origin_timepoint_exact == _expected_timepoint(cells["timepoint"])
+        assert trip.origin_stop_headsign == _expected_text(cells["stop_headsign"])
+        # Non-None enum results are exact members whose .value round-trips
+        # to the raw cell int.
+        for member, cell in (
+            (stop.wheelchair_boarding, cells["wheelchair_boarding"]),
+            (trip.bikes_allowed, cells["bikes_allowed"]),
+            (trip.origin_pickup_type, cells["pickup_type"]),
+        ):
+            if member is not None:
+                assert member.value == int(cell)
+    finally:
+        index.close()
+
+
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    column_present=st.booleans(),
+    cells=st.lists(
+        st.sampled_from(["", " ", "0", "1", "01", "2", "7", "-1", "x", "1.5"]),
+        min_size=1,
+        max_size=5,
+    ),
+)
+def test_timepoint_tristate_oracle(column_present: bool, cells: list[str]) -> None:
+    """timepoint is a tri-state at the model boundary: True for an absent
+    COLUMN (whole file without the header) and for blank cells (GTFS
+    default: times are exact), False for 0, True for 1, None for anything
+    outside the 0/1 vocabulary.
+    """
+    if column_present:
+        header = "trip_id,arrival_time,departure_time,stop_id,stop_sequence,timepoint\n"
+        rows = "".join(
+            f"T{i},08:00:00,08:00:00,S1,1,{cell}\n" for i, cell in enumerate(cells)
+        )
+    else:
+        header = "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        rows = "".join(f"T{i},08:00:00,08:00:00,S1,1\n" for i in range(len(cells)))
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,A,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\n"
+        + "".join(f"R1,ONE,T{i},H\n" for i in range(len(cells))),
+        "stop_times.txt": header + rows,
+        "calendar.txt": _ONE_DAY_CALENDAR,
+    }
+    index = _build_index_from_files(files)
+    try:
+        now = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
+        departures = index.upcoming_departures(
+            ["S1"], None, now, timedelta(hours=24), 100
+        )
+        got = {dep.trip_id: dep.timepoint_exact for dep in departures}
+        assert got == {
+            f"T{i}": _expected_timepoint(cell if column_present else None)
+            for i, cell in enumerate(cells)
+        }
+    finally:
+        index.close()
+
+
+@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    trip_cells=st.fixed_dictionaries(
+        {"wheelchair": _INT_CELL, "bikes": _INT_CELL, "direction": _INT_CELL}
+    ),
+    stop_cells=st.lists(
+        st.fixed_dictionaries(
+            {
+                "pickup": _INT_CELL,
+                "drop_off": _INT_CELL,
+                "timepoint": _INT_CELL,
+                "headsign": _TEXT_CELL,
+            }
+        ),
+        min_size=2,
+        max_size=3,
+    ),
+    start_offset=st.integers(min_value=0, max_value=7200),
+    headway=st.sampled_from([600, 1800]),
+    reps=st.integers(min_value=1, max_value=4),
+)
+def test_frequency_repetitions_carry_template_descriptors(
+    trip_cells: dict[str, str],
+    stop_cells: list[dict[str, str]],
+    start_offset: int,
+    headway: int,
+    reps: int,
+) -> None:
+    """EVERY materialized repetition carries, at EVERY stop, descriptors
+    equal to what the DRAWN template cells map to (oracle from the drawn
+    values, not another repetition) -- materialization may never drop or
+    garble trip-level or stop_time descriptive metadata.
+    """
+    template_base = 28800  # template anchored at 08:00:00 (arbitrary)
+    start = 21600 + start_offset
+    end = start + headway * reps  # strict-<: exactly `reps` repetitions
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
+        + "".join(f"S{i},Stop,0,0\n" for i in range(len(stop_cells))),
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": (
+            "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible,"
+            "bikes_allowed,direction_id\n"
+            f"R1,ONE,F1,H,{trip_cells['wheelchair']},{trip_cells['bikes']},"
+            f"{trip_cells['direction']}\n"
+        ),
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
+            "pickup_type,drop_off_type,timepoint,stop_headsign\n"
+            + "".join(
+                f"F1,{_format_gtfs_time(template_base + i * 300)},"
+                f"{_format_gtfs_time(template_base + i * 300)},S{i},{i + 1},"
+                f"{cell['pickup']},{cell['drop_off']},{cell['timepoint']},"
+                f"{cell['headsign']}\n"
+                for i, cell in enumerate(stop_cells)
+            )
+        ),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs\n"
+            f"F1,{_format_gtfs_time(start)},{_format_gtfs_time(end)},{headway}\n"
+        ),
+    }
+    index = _build_index_from_files(files)
+    try:
+        now = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
+        departures = index.upcoming_departures(
+            [f"S{i}" for i in range(len(stop_cells))],
+            None,
+            now,
+            timedelta(hours=30),
+            1000,
+        )
+        expected_ids = {f"F1#{start + n * headway}" for n in range(reps)}
+        assert {dep.trip_id for dep in departures} == expected_ids
+        assert len(departures) == reps * len(stop_cells)
+        by_key = {(dep.trip_id, dep.stop_id): dep for dep in departures}
+        for rep_id in expected_ids:
+            for i, cell in enumerate(stop_cells):
+                dep = by_key[(rep_id, f"S{i}")]
+                assert dep.wheelchair_accessible is _expected_enum(
+                    WheelchairAccess, trip_cells["wheelchair"]
+                )
+                assert dep.bikes_allowed is _expected_enum(
+                    BikesAllowed, trip_cells["bikes"]
+                )
+                assert dep.pickup_type is _expected_enum(
+                    PickupDropOffType, cell["pickup"]
+                )
+                assert dep.drop_off_type is _expected_enum(
+                    PickupDropOffType, cell["drop_off"]
+                )
+                assert dep.timepoint_exact == _expected_timepoint(cell["timepoint"])
+                assert dep.stop_headsign == _expected_text(cell["headsign"])
+        trip_rows = index.upcoming_trips("S0", "S1", now, timedelta(hours=30), 1000)
+        assert len(trip_rows) == reps
+        for trip in trip_rows:
+            assert trip.direction_id == _expected_lenient_int(trip_cells["direction"])
+    finally:
+        index.close()
+
+
+@settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    base_offsets=st.lists(
+        st.integers(min_value=0, max_value=86_399), min_size=1, max_size=5
+    ),
+    spill_offset=st.integers(min_value=86_400, max_value=107_999),
+)
+def test_exactly_one_first_and_one_last_per_service_day_pair(
+    base_offsets: list[int], spill_offset: int
+) -> None:
+    """Over generated TWO-service-day schedules -- duplicate departure times
+    allowed, always including one guaranteed >24:00:00 spillover trip --
+    every service day flags EXACTLY one is_first and one is_last row for
+    the pair, the flagged rows ARE the min/max of the (departure, trip_id)
+    total order WITHIN their own service day, and the spillover row (which
+    runs on the next clock day, interleaved with that day's departures) is
+    flagged as its OWN day's last, never the next day's.
+    """
+    dep_offsets = [*base_offsets, spill_offset]
+    trip_rows = "".join(f"R1,TWO,T{i},H\n" for i in range(len(dep_offsets)))
+    stop_time_rows = "".join(
+        f"T{i},{_format_gtfs_time(secs)},{_format_gtfs_time(secs)},S1,1\n"
+        f"T{i},{_format_gtfs_time(secs + 300)},{_format_gtfs_time(secs + 300)},S2,2\n"
+        for i, secs in enumerate(dep_offsets)
+    )
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,A,0,0\nS2,B,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\n" + trip_rows,
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            + stop_time_rows
+        ),
+        "calendar.txt": (
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+            "start_date,end_date\nTWO,1,1,1,1,1,1,1,20260730,20260731\n"
+        ),
+    }
+    index = _build_index_from_files(files)
+    try:
+        now = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)  # day 1's UTC anchor
+        # 55h reaches 31h of elapsed seconds even on day 2, so BOTH service
+        # days are fully inside the window and nothing is clipped.
+        trips = index.upcoming_trips("S1", "S2", now, timedelta(hours=55), 1000)
+        assert len(trips) == 2 * len(dep_offsets)
+        offset_of = {f"T{i}": secs for i, secs in enumerate(dep_offsets)}
+        by_day: dict[datetime, list[ScheduledTrip]] = {}
+        for trip in trips:
+            anchor = trip.departure - timedelta(seconds=offset_of[trip.trip_id])
+            by_day.setdefault(anchor, []).append(trip)
+        assert set(by_day) == {
+            datetime(2026, 7, 30, 0, 0, tzinfo=UTC),
+            datetime(2026, 7, 31, 0, 0, tzinfo=UTC),
+        }
+        ordered = sorted((secs, trip_id) for trip_id, secs in offset_of.items())
+        first_key, last_key = ordered[0], ordered[-1]
+        # Base offsets stay below 24:00:00, so the guaranteed spillover is
+        # the strict maximum: each day's last IS its spillover departure.
+        assert last_key == (spill_offset, f"T{len(base_offsets)}")
+        for day_trips in by_day.values():
+            assert len(day_trips) == len(dep_offsets)
+            for trip in day_trips:
+                key = (offset_of[trip.trip_id], trip.trip_id)
+                assert trip.is_first == (key == first_key)
+                assert trip.is_last == (key == last_key)
     finally:
         index.close()
 
