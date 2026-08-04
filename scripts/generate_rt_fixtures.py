@@ -21,6 +21,10 @@ _OUTPUT_DIR = Path(__file__).parent.parent / "tests" / "feeds" / "data" / "rt"
 # Matches test_transit_arrivals.py's NOW / T1_DEPARTURE_EPOCH constants.
 _NOW_EPOCH = int(datetime(2026, 7, 30, 14, 45, tzinfo=UTC).timestamp())
 _T1_DEPARTURE_EPOCH = int(datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC).timestamp())
+# Matches test_transit_trips.py's T1_S3_ARRIVAL_EPOCH: T1 reaches S3 (the
+# trip-query variant zip's terminal call) at 08:20:00 PDT on the fixture
+# Thursday.
+_T1_S3_ARRIVAL_EPOCH = int(datetime(2026, 7, 30, 15, 20, 0, tzinfo=UTC).timestamp())
 # Arbitrary fixed epoch used by test_rt.py/test_models.py's non-arrivals
 # protobuf-parsing tests, unrelated to any particular "now".
 _BASELINE_EPOCH = 1_785_500_000
@@ -88,6 +92,57 @@ def _build_trip_updates(*, base_epoch: int) -> bytes:
     return bytes(msg.SerializeToString())
 
 
+def _build_trip_updates_dest_arrival() -> bytes:
+    """TripUpdates: T1 predicted 120s late at S3 only (destination end)."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-dest"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "T1"
+    stu = trip_update.stop_time_update.add()
+    stu.stop_id = "S3"
+    stu.arrival.delay = 120
+    stu.arrival.time = _T1_S3_ARRIVAL_EPOCH + 120
+    return bytes(msg.SerializeToString())
+
+
+def _build_trip_updates_both_ends() -> bytes:
+    """TripUpdates: T1 delayed 300s at both S1 (origin) and S3 (destination)."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-both"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "T1"
+    origin = trip_update.stop_time_update.add()
+    origin.stop_id = "S1"
+    origin.arrival.delay = 300
+    origin.arrival.time = _T1_DEPARTURE_EPOCH + 300
+    origin.departure.delay = 300
+    origin.departure.time = _T1_DEPARTURE_EPOCH + 330
+    dest = trip_update.stop_time_update.add()
+    dest.stop_id = "S3"
+    dest.arrival.delay = 300
+    dest.arrival.time = _T1_S3_ARRIVAL_EPOCH + 300
+    return bytes(msg.SerializeToString())
+
+
+def _build_trip_updates_t1_canceled() -> bytes:
+    """TripUpdates: T1 canceled outright (no stop_time_updates)."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-cancel"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "T1"
+    trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.CANCELED
+    return bytes(msg.SerializeToString())
+
+
 def _build_added_trips(*, base_epoch: int, stop_id: str, count: int) -> bytes:
     """TripUpdates with `count` distinct ADDED trips at one stop.
 
@@ -147,6 +202,9 @@ def main() -> None:
         "trip_updates_t1_delayed.pb": _build_trip_updates(
             base_epoch=_T1_DEPARTURE_EPOCH
         ),
+        "trip_updates_t1_dest_arrival.pb": _build_trip_updates_dest_arrival(),
+        "trip_updates_t1_both_ends.pb": _build_trip_updates_both_ends(),
+        "trip_updates_t1_canceled.pb": _build_trip_updates_t1_canceled(),
         "added_trips_s1.pb": _build_added_trips(
             base_epoch=_NOW_EPOCH, stop_id="S1", count=3
         ),

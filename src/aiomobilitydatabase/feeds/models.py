@@ -70,6 +70,31 @@ class StopArrival:
 
 
 @dataclass(frozen=True)
+class UpcomingTrip:
+    """An upcoming origin-to-destination journey on one scheduled trip.
+
+    The shape Home Assistant's legacy ``gtfs`` sensor needs: the next
+    departure from an origin stop on a trip that later serves the
+    destination stop. Scheduled times are non-optional because the
+    producing query requires an origin departure time and a destination
+    arrival time; ``delay_seconds`` is the origin departure delay.
+    """
+
+    trip_id: str
+    route_id: str
+    route_name: str | None
+    headsign: str | None
+    origin_stop_id: str
+    destination_stop_id: str
+    scheduled_departure: datetime
+    predicted_departure: datetime | None
+    scheduled_arrival: datetime
+    predicted_arrival: datetime | None
+    delay_seconds: int | None
+    realtime: bool
+
+
+@dataclass(frozen=True)
 class VehiclePosition:
     """A live vehicle position from a GTFS-RT feed."""
 
