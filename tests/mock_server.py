@@ -40,6 +40,9 @@ class _MockResponse:
     payload: Any | None = None
     body: bytes | str | None = None
     content_type: str = "application/json"
+    # Extra response headers (e.g. ETag/Last-Modified validators for the
+    # direct-URL dataset-identity probes).
+    headers: dict[str, str] | None = None
 
 
 @dataclass
@@ -59,6 +62,15 @@ class MockApi:
     def post(self, path: str, **kwargs: Any) -> None:
         """Queue a scripted POST response for the given path."""
         self._queues[("POST", path)].append(_MockResponse(**kwargs))
+
+    def head(self, path: str, **kwargs: Any) -> None:
+        """Queue a scripted HEAD response for the given path.
+
+        HEAD has its own queue (not derived from GET scripts) so tests can
+        assert exactly which validator headers a probe saw, independent of
+        what a subsequent GET would return.
+        """
+        self._queues[("HEAD", path)].append(_MockResponse(**kwargs))
 
     def url(self, path: str = "") -> str:
         """Return the base URL of the running mock server plus an optional path."""
@@ -95,6 +107,7 @@ class MockApi:
                 status=scripted.status,
                 body=jsonlib.dumps(scripted.payload).encode(),
                 content_type="application/json",
+                headers=scripted.headers,
             )
         # Deliberate divergence from the pkg1 reference mock: no payload/body scripted
         # returns a truly empty body (204-style), not JSON `null`.
@@ -102,7 +115,10 @@ class MockApi:
         if isinstance(body, str):
             body = body.encode()
         return web.Response(
-            status=scripted.status, body=body, content_type=scripted.content_type
+            status=scripted.status,
+            body=body,
+            content_type=scripted.content_type,
+            headers=scripted.headers,
         )
 
     async def start(self) -> None:

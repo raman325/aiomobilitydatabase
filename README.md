@@ -41,6 +41,9 @@ access tokens automatically (including proactive refresh before expiry). Both
 `MobilityDatabaseClient` and `MobilityFeedsClient` take the same refresh token —
 the feeds client wraps a catalog client internally and shares its authentication.
 
+The token is only required for catalog operations: `MobilityFeedsClient`'s
+[direct-URL methods](#direct-urls-no-catalog-account) work without one.
+
 ## Quick start — catalog
 
 ```python
@@ -126,6 +129,60 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+### Direct URLs (no catalog account)
+
+If you already know your feed URLs, you can skip the catalog — and the
+refresh token — entirely. `get_transit_feed_from_urls` and
+`get_gbfs_feed_from_url` return the exact same handle objects as the
+catalog methods, so everything above works unchanged:
+
+```python
+import asyncio
+
+from aiomobilitydatabase.feeds import MobilityFeedsClient
+
+
+async def main() -> None:
+    # No refresh token: only catalog operations need one.
+    async with MobilityFeedsClient(cache_dir="/path/to/cache") as client:
+        transit = await client.get_transit_feed_from_urls(
+            "https://agency.example/gtfs.zip",
+            trip_updates_urls=["https://agency.example/gtfs-rt/trip-updates.pb"],
+            vehicle_positions_urls=["https://agency.example/gtfs-rt/positions.pb"],
+            headers={"Authorization": "Bearer PRODUCER_TOKEN"},  # optional
+        )
+        arrivals = await transit.get_arrivals([transit.stops[0].id])
+
+        bikes = await client.get_gbfs_feed_from_url(
+            "https://bikes.example/gbfs/gbfs.json"
+        )
+        stations = await bikes.get_stations()
+
+
+asyncio.run(main())
+```
+
+Notes on direct mode:
+
+- Catalog static datasets are served from the Mobility Database's own
+  storage; direct mode fetches **your** URL, with the optional `headers`
+  applied to the static download and every GTFS-RT/GBFS fetch the handle
+  makes.
+- RT URLs are declared per layer (`trip_updates_urls`,
+  `vehicle_positions_urls`, `service_alerts_urls`), so each operation only
+  fetches sources that can serve it. A combined feed listed under several
+  layers is deduplicated and fetched once per operation; if you don't know
+  a producer's layer split, pass the same URL to every layer.
+- Dataset identity comes from HTTP validators (`ETag`, then
+  `Last-Modified`, via a `HEAD` probe) instead of catalog dataset IDs;
+  servers offering neither fall back to hashing the downloaded bytes, so
+  `refresh_static()` still only rebuilds on real changes. The cache key is
+  derived from the static URL (`url-<hash>`, exposed as
+  `transit.static_feed_id` and accepted by `purge_cache()`), and
+  `transit.static_dataset` is `None` (there is no catalog metadata).
+- Accessing `client.catalog` (or any catalog-backed method) on a tokenless
+  client raises `MobilityDatabaseError`.
+
 ## How it works
 
 - **Scheduled arrivals for every feed**: the hosted GTFS zip is indexed into
@@ -199,7 +256,7 @@ finally:
 
 ## Testing methodology
 
-The suite (174 tests) combines example-based and property-based testing:
+The suite (231 tests) combines example-based and property-based testing:
 
 - **Example-based tests** cover the catalog's endpoint methods and the feeds
   layer's client/transit/GBFS/static-index modules against a real

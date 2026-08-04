@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import shutil
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
@@ -20,6 +22,7 @@ from ..models import (
     GtfsFeed,
     GtfsRtFeed,
     LatestDataset,
+    SourceInfo,
 )
 from .const import STATIC_DB_FILENAME
 from .exceptions import (
@@ -52,6 +55,61 @@ if TYPE_CHECKING:
     from .client import MobilityFeedsClient
 
 _PROGRESS_CHUNK_BYTES = 262_144
+_CACHE_KEY_HASH_CHARS = 16
+
+# Direct-URL RT feeds advertise every entity type: capabilities are unknown
+# without a catalog record, so every fetch tries all parsers and absent
+# types simply yield nothing.
+
+
+def _direct_cache_key(static_url: str) -> str:
+    """Cache-directory name for a direct static URL: ``url-<sha256[:16]>``.
+
+    A hash rather than the URL itself: URLs contain path separators and
+    other filesystem-hostile characters, while a fixed-length hex prefix
+    can never carry traversal components -- so purge_cache's (and
+    _ensure_index_from_source's) path-containment guard keeps working
+    unchanged. This key is what :attr:`TransitFeedHandle.static_feed_id`
+    returns for direct handles, so consumers can purge with it.
+    """
+    digest = hashlib.sha256(static_url.encode()).hexdigest()
+    return f"url-{digest[:_CACHE_KEY_HASH_CHARS]}"
+
+
+def _sha256_of_file(path: Path) -> str:
+    """Hash a downloaded zip (synchronous: call via ``asyncio.to_thread``)."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fp:
+        while chunk := fp.read(1 << 16):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class _StaticSource:
+    """Where a static GTFS zip comes from and how its dataset is identified.
+
+    One shape for both acquisition paths so the download+build core never
+    forks: the catalog path fills ``dataset_id`` from latest-dataset
+    metadata, while the direct-URL path fills it from HTTP validators
+    (``etag:``/``lastmod:`` prefixed) -- or leaves it None, meaning
+    "identify by sha256 of the downloaded bytes" (which requires the
+    download to happen before the cache can be consulted).
+    """
+
+    url: str
+    cache_key: str
+    dataset_id: str | None
+    timezone_name: str | None
+    headers: Mapping[str, str] | None
+
+
+@dataclass(frozen=True)
+class _DirectUrls:
+    """A direct handle's origin, kept for refresh_static re-probing."""
+
+    static_url: str
+    headers: Mapping[str, str] | None
 
 
 def group_stations(stops: list[Stop]) -> list[StationGroup]:
@@ -93,20 +151,33 @@ class TransitFeedHandle:
 
     Create via :meth:`MobilityFeedsClient.get_transit_feed` — accepts a GTFS
     or GTFS-RT feed ID and resolves the sibling relationship through the
-    catalog. Construction downloads/opens the static index.
+    catalog — or via :meth:`MobilityFeedsClient.get_transit_feed_from_urls`
+    for user-supplied URLs with no catalog involved. Construction
+    downloads/opens the static index.
     """
 
     def __init__(
         self,
         client: MobilityFeedsClient,
-        static_feed: GtfsFeed,
+        static_feed: GtfsFeed | None,
         rt_feeds: list[GtfsRtFeed],
         index: StaticIndex,
         api_key: str | None,
+        *,
+        direct: _DirectUrls | None = None,
     ) -> None:
         """Construct via ``MobilityFeedsClient.get_transit_feed()`` instead."""
         self._client = client
         self._static_feed = static_feed
+        self._direct = direct
+        if direct is not None:
+            self._feed_key = _direct_cache_key(direct.static_url)
+            self._headers: Mapping[str, str] | None = direct.headers
+        else:
+            # Catalog-resolved feeds always carry IDs (the API keys on them).
+            assert static_feed is not None and static_feed.id is not None
+            self._feed_key = static_feed.id
+            self._headers = None
         self.rt_feeds = rt_feeds
         self._index = index
         self._api_key = api_key
@@ -115,18 +186,25 @@ class TransitFeedHandle:
 
     @property
     def static_feed_id(self) -> str:
-        """Catalog ID of the resolved static GTFS feed."""
-        assert self._static_feed.id is not None  # resolved feeds always have IDs
-        return self._static_feed.id
+        """Catalog ID of the static feed, or the url-derived cache key.
+
+        Direct-URL handles have no catalog identity, so they return the
+        same ``url-<sha256(static_url)[:16]>`` key that names their cache
+        directory — always safe to pass to
+        :meth:`MobilityFeedsClient.purge_cache`.
+        """
+        return self._feed_key
 
     @property
     def static_dataset(self) -> LatestDataset | None:
-        """Catalog metadata for the indexed dataset.
+        """Catalog metadata for the indexed dataset (None for direct handles).
 
         Includes downloaded_at, service date range, and hashes — for
-        consumer diagnostics entities.
+        consumer diagnostics entities. Direct-URL handles have no catalog
+        dataset record, so consumers must treat None as "no metadata
+        available", not as "no data".
         """
-        return self._static_feed.latest_dataset
+        return None if self._static_feed is None else self._static_feed.latest_dataset
 
     @classmethod
     async def create(
@@ -158,117 +236,270 @@ class TransitFeedHandle:
         index = await cls._ensure_index(client, static_feed, on_progress)
         return cls(client, static_feed, rt_feeds, index, api_key)
 
+    @classmethod
+    async def create_from_urls(
+        cls,
+        client: MobilityFeedsClient,
+        static_url: str,
+        *,
+        trip_updates_urls: Sequence[str] | None = None,
+        vehicle_positions_urls: Sequence[str] | None = None,
+        service_alerts_urls: Sequence[str] | None = None,
+        headers: Mapping[str, str] | None = None,
+        on_progress: Callable[[StaticBuildProgress], None] | None = None,
+    ) -> TransitFeedHandle:
+        """Build a handle from user-supplied URLs, bypassing the catalog.
+
+        RT URLs are declared per layer so each operation fetches only the
+        sources that can serve it (and so consumers can see real
+        trip-updates capability instead of an assumption). A URL listed
+        under several layers — a combined feed — is deduplicated into ONE
+        synthesized :class:`GtfsRtFeed` carrying the union of its declared
+        entity types, so it is fetched once per operation, never twice.
+        Each synthesized feed's id IS the url, with
+        ``SourceInfo(producer_url=url, authentication_type=0)`` — the
+        shared RT fetch/merge machinery runs unchanged. ``headers`` apply
+        to the static download and every RT fetch made through this
+        handle.
+        """
+        _require_http_url(static_url, "static GTFS dataset URL")
+        url_types: dict[str, list[EntityType]] = {}
+        for urls, entity_type in (
+            (trip_updates_urls, EntityType.TRIP_UPDATES),
+            (vehicle_positions_urls, EntityType.VEHICLE_POSITIONS),
+            (service_alerts_urls, EntityType.SERVICE_ALERTS),
+        ):
+            for rt_url in urls or []:
+                _require_http_url(rt_url, "GTFS-RT producer URL")
+                types = url_types.setdefault(rt_url, [])
+                if entity_type not in types:
+                    types.append(entity_type)
+        rt_feeds = [
+            GtfsRtFeed(
+                id=rt_url,
+                data_type=DataType.GTFS_RT,
+                entity_types=types,
+                source_info=SourceInfo(producer_url=rt_url, authentication_type=0),
+            )
+            for rt_url, types in url_types.items()
+        ]
+        direct = _DirectUrls(static_url=static_url, headers=headers)
+        source = _StaticSource(
+            url=static_url,
+            cache_key=_direct_cache_key(static_url),
+            dataset_id=await cls._probe_direct_dataset_id(client, direct),
+            timezone_name=None,  # always sourced from agency.txt at build
+            headers=headers,
+        )
+        index = await cls._ensure_index_from_source(client, source, on_progress)
+        return cls(client, None, rt_feeds, index, None, direct=direct)
+
     @staticmethod
+    async def _probe_direct_dataset_id(
+        client: MobilityFeedsClient, direct: _DirectUrls
+    ) -> str | None:
+        """HEAD the static URL and derive a dataset id from HTTP validators.
+
+        Catalog datasets carry a stable dataset id for cache comparisons; a
+        bare URL doesn't, so ETag (preferred: content-derived) or
+        Last-Modified stand in, cheaply checked without downloading.
+        Returns None when the server offers neither validator or rejects
+        HEAD outright (e.g. 405) — callers then fall back to hashing the
+        downloaded bytes. Connection failures raise instead of silently
+        degrading to the hash path: the GET would fail identically, so
+        failing here is both earlier and cheaper.
+        """
+        session = client._get_session()  # deliberate friend access
+        try:
+            async with session.head(
+                direct.static_url,
+                headers=dict(direct.headers) if direct.headers else None,
+                allow_redirects=True,  # match GET semantics: probe the final URL
+                timeout=aiohttp.ClientTimeout(total=client.timeout_seconds),
+            ) as resp:
+                if resp.status < HTTPStatus.BAD_REQUEST:
+                    if etag := resp.headers.get("ETag"):
+                        return f"etag:{etag}"
+                    if last_modified := resp.headers.get("Last-Modified"):
+                        return f"lastmod:{last_modified}"
+        except (TimeoutError, aiohttp.ClientError) as err:
+            raise SourceConnectionError(
+                f"Error probing {direct.static_url}: {err}"
+            ) from err
+        return None
+
+    @classmethod
     async def _ensure_index(
+        cls,
         client: MobilityFeedsClient,
         static_feed: GtfsFeed,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
     ) -> StaticIndex:
+        """Catalog strategy: translate latest-dataset metadata to a source."""
         dataset = static_feed.latest_dataset
         if dataset is None or not dataset.id or not dataset.hosted_url:
             raise StaticDataUnavailableError(
                 f"Feed {static_feed.id} has no hosted static dataset"
             )
         _require_http_url(dataset.hosted_url, "hosted GTFS dataset URL")
+        source = _StaticSource(
+            url=dataset.hosted_url,
+            cache_key=str(static_feed.id),
+            dataset_id=dataset.id,
+            timezone_name=dataset.agency_timezone,
+            headers=None,
+        )
+        return await cls._ensure_index_from_source(client, source, on_progress)
+
+    @classmethod
+    async def _ensure_index_from_source(
+        cls,
+        client: MobilityFeedsClient,
+        source: _StaticSource,
+        on_progress: Callable[[StaticBuildProgress], None] | None = None,
+    ) -> StaticIndex:
+        """Shared download+build core behind both acquisition strategies.
+
+        With a known ``dataset_id`` the cache is consulted before any
+        network I/O; a None id (direct URL without HTTP validators) forces
+        the download first, then retries the cache with the computed
+        ``sha256:`` id — an unchanged validator-less dataset still avoids
+        an index rebuild, just not the transfer.
+        """
         db_path: Path | None = None
         if client.cache_dir is not None:
-            feed_dir = client.cache_dir / str(static_feed.id)
-            # static_feed.id is catalog DATA (the JSON response body), not a
-            # caller-supplied parameter -- same traversal class as
-            # purge_cache's feed_id, so it gets the identical
-            # resolve()+is_relative_to() containment check, but raises
-            # FeedParseError (a data problem) rather than ValueError (a
-            # caller problem). Must run BEFORE mkdir: mkdir(parents=True)
+            feed_dir = client.cache_dir / source.cache_key
+            # The catalog cache_key is catalog DATA (the JSON response
+            # body's feed id), not a caller-supplied parameter -- same
+            # traversal class as purge_cache's feed_id, so it gets the
+            # identical resolve()+is_relative_to() containment check, but
+            # raises FeedParseError (a data problem) rather than ValueError
+            # (a caller problem). Must run BEFORE mkdir: mkdir(parents=True)
             # would otherwise silently create the directory outside
-            # cache_dir first.
+            # cache_dir first. (Direct-URL keys are generated fixed-length
+            # hashes and can never escape, but they flow through the same
+            # guard anyway.)
             if not feed_dir.resolve().is_relative_to(client.cache_dir.resolve()):
                 raise FeedParseError(
-                    f"Feed id {static_feed.id!r} escapes the cache directory"
+                    f"Feed id {source.cache_key!r} escapes the cache directory"
                 )
             await asyncio.to_thread(feed_dir.mkdir, parents=True, exist_ok=True)
             db_path = feed_dir / STATIC_DB_FILENAME
-            cached = await asyncio.to_thread(
-                StaticIndex.open_cached, db_path, dataset.id
-            )
-            if cached is not None:
-                return cached
-        session = client._get_session()  # deliberate friend access
+            if source.dataset_id is not None:
+                cached = await asyncio.to_thread(
+                    StaticIndex.open_cached, db_path, source.dataset_id
+                )
+                if cached is not None:
+                    return cached
         tmp_dir = await asyncio.to_thread(tempfile.mkdtemp)
         try:
             zip_path = Path(tmp_dir) / "dataset.zip"
-            try:
-                async with session.get(
-                    dataset.hosted_url,
-                    timeout=aiohttp.ClientTimeout(
-                        total=None, sock_read=client.timeout_seconds
-                    ),
-                ) as resp:
-                    if resp.status >= HTTPStatus.BAD_REQUEST:
-                        raise SourceConnectionError(
-                            f"Hosted dataset fetch failed ({resp.status})",
-                            status=resp.status,
-                        )
-                    total_bytes = resp.content_length
-                    done_bytes = 0
-                    last_emitted = 0
-                    first_chunk = True
-                    # File writes stay off the event loop: consumers (for
-                    # example Home Assistant) run this on their loop and a
-                    # large dataset means thousands of 64 KiB writes.
-                    fp = await asyncio.to_thread(zip_path.open, "wb")
-                    try:
-                        async for chunk in resp.content.iter_chunked(1 << 16):
-                            await asyncio.to_thread(fp.write, chunk)
-                            done_bytes += len(chunk)
-                            if on_progress is not None and (
-                                first_chunk
-                                or done_bytes - last_emitted >= _PROGRESS_CHUNK_BYTES
-                            ):
-                                on_progress(
-                                    StaticBuildProgress(
-                                        phase="download",
-                                        done_bytes=done_bytes,
-                                        total_bytes=total_bytes,
-                                    )
-                                )
-                                last_emitted = done_bytes
-                                first_chunk = False
-                    finally:
-                        await asyncio.to_thread(fp.close)
-                    if on_progress is not None:
-                        on_progress(
-                            StaticBuildProgress(
-                                phase="download",
-                                done_bytes=done_bytes,
-                                total_bytes=total_bytes,
-                            )
-                        )
-            except (TimeoutError, aiohttp.ClientError) as err:
-                raise SourceConnectionError(
-                    f"Error downloading dataset: {err}"
-                ) from err
-            build_progress: Callable[[int, int | None], None] | None = None
-            if on_progress is not None:
-                loop = asyncio.get_running_loop()
-
-                def build_progress(done: int, total: int | None) -> None:
-                    loop.call_soon_threadsafe(
-                        on_progress,
-                        StaticBuildProgress(
-                            phase="index", done_bytes=done, total_bytes=total
-                        ),
+            await cls._download_zip(client, source, zip_path, on_progress)
+            dataset_id = source.dataset_id
+            if dataset_id is None:
+                sha = await asyncio.to_thread(_sha256_of_file, zip_path)
+                dataset_id = f"sha256:{sha}"
+                if db_path is not None:
+                    cached = await asyncio.to_thread(
+                        StaticIndex.open_cached, db_path, dataset_id
                     )
-
-            return await asyncio.to_thread(
-                StaticIndex.build,
-                zip_path,
-                str(db_path) if db_path is not None else ":memory:",
-                dataset.id,
-                dataset.agency_timezone,
-                build_progress,
+                    if cached is not None:
+                        return cached
+            return await cls._build_index(
+                zip_path, db_path, dataset_id, source.timezone_name, on_progress
             )
         finally:
             await asyncio.to_thread(shutil.rmtree, tmp_dir, ignore_errors=True)
+
+    @staticmethod
+    async def _download_zip(
+        client: MobilityFeedsClient,
+        source: _StaticSource,
+        zip_path: Path,
+        on_progress: Callable[[StaticBuildProgress], None] | None,
+    ) -> None:
+        """Stream the dataset zip to disk, emitting download progress."""
+        session = client._get_session()  # deliberate friend access
+        try:
+            async with session.get(
+                source.url,
+                headers=dict(source.headers) if source.headers else None,
+                timeout=aiohttp.ClientTimeout(
+                    total=None, sock_read=client.timeout_seconds
+                ),
+            ) as resp:
+                if resp.status >= HTTPStatus.BAD_REQUEST:
+                    raise SourceConnectionError(
+                        f"Dataset fetch failed ({resp.status}) for {source.url}",
+                        status=resp.status,
+                    )
+                total_bytes = resp.content_length
+                done_bytes = 0
+                last_emitted = 0
+                first_chunk = True
+                # File writes stay off the event loop: consumers (for
+                # example Home Assistant) run this on their loop and a
+                # large dataset means thousands of 64 KiB writes.
+                fp = await asyncio.to_thread(zip_path.open, "wb")
+                try:
+                    async for chunk in resp.content.iter_chunked(1 << 16):
+                        await asyncio.to_thread(fp.write, chunk)
+                        done_bytes += len(chunk)
+                        if on_progress is not None and (
+                            first_chunk
+                            or done_bytes - last_emitted >= _PROGRESS_CHUNK_BYTES
+                        ):
+                            on_progress(
+                                StaticBuildProgress(
+                                    phase="download",
+                                    done_bytes=done_bytes,
+                                    total_bytes=total_bytes,
+                                )
+                            )
+                            last_emitted = done_bytes
+                            first_chunk = False
+                finally:
+                    await asyncio.to_thread(fp.close)
+                if on_progress is not None:
+                    on_progress(
+                        StaticBuildProgress(
+                            phase="download",
+                            done_bytes=done_bytes,
+                            total_bytes=total_bytes,
+                        )
+                    )
+        except (TimeoutError, aiohttp.ClientError) as err:
+            raise SourceConnectionError(f"Error downloading dataset: {err}") from err
+
+    @staticmethod
+    async def _build_index(
+        zip_path: Path,
+        db_path: Path | None,
+        dataset_id: str,
+        timezone_name: str | None,
+        on_progress: Callable[[StaticBuildProgress], None] | None,
+    ) -> StaticIndex:
+        """Build the SQLite index in a worker thread, marshaling progress."""
+        build_progress: Callable[[int, int | None], None] | None = None
+        if on_progress is not None:
+            loop = asyncio.get_running_loop()
+
+            def build_progress(done: int, total: int | None) -> None:
+                loop.call_soon_threadsafe(
+                    on_progress,
+                    StaticBuildProgress(
+                        phase="index", done_bytes=done, total_bytes=total
+                    ),
+                )
+
+        return await asyncio.to_thread(
+            StaticIndex.build,
+            zip_path,
+            str(db_path) if db_path is not None else ":memory:",
+            dataset_id,
+            timezone_name,
+            build_progress,
+        )
 
     def _rt_feeds_for(self, entity_type: EntityType) -> list[GtfsRtFeed]:
         return [
@@ -293,6 +524,7 @@ class TransitFeedHandle:
                     auth_type=source.authentication_type,
                     api_key_name=source.api_key_parameter_name,
                     api_key=self._api_key,
+                    headers=self._headers,
                     timeout_seconds=self._client.timeout_seconds,
                 )
             )
@@ -513,10 +745,13 @@ class TransitFeedHandle:
         return alerts
 
     async def refresh_static(self) -> bool:
-        """Re-check the catalog; rebuild the index only on a new dataset.
+        """Re-check the dataset's identity; rebuild the index only on change.
 
-        Returns True if the index was rebuilt. Stale-while-revalidate: the
-        old index keeps serving until the new one is ready, then swaps.
+        Catalog handles re-fetch the feed and compare dataset IDs; direct
+        handles re-probe the URL's HTTP validators (falling back to
+        re-downloading and hashing when the server offers none). Returns
+        True if the index was rebuilt. Stale-while-revalidate: the old
+        index keeps serving until the new one is ready, then swaps.
 
         Concurrency contract: this method is intended for one consumer at a
         time (the Home Assistant coordinator pattern — a single scheduled
@@ -528,17 +763,54 @@ class TransitFeedHandle:
         refresh must serialize access externally (e.g. a lock around both
         the refresh and the queries it might race).
         """
+        if self._direct is not None:
+            return await self._refresh_static_direct(self._direct)
+        return await self._refresh_static_catalog()
+
+    async def _refresh_static_catalog(self) -> bool:
+        """Catalog strategy: compare the latest dataset ID against ours."""
         fresh = await self._client.catalog.get_gtfs_feed(self.static_feed_id)
         dataset = fresh.latest_dataset
         if dataset is None or not dataset.id or dataset.id == self._index.dataset_id:
             return False
         new_index = await self._ensure_index(self._client, fresh)
-        old_index, self._index = self._index, new_index
         self._static_feed = fresh
+        await self._swap_index(new_index)
+        return True
+
+    async def _refresh_static_direct(self, direct: _DirectUrls) -> bool:
+        """Direct strategy: HTTP validators stand in for the catalog compare.
+
+        A HEAD-derived id (``etag:``/``lastmod:``) that matches the current
+        index short-circuits with no download. A validator-less server
+        forces a re-download so the bytes can be hashed — the resulting
+        ``sha256:`` id may then match the current index after all, in which
+        case the freshly acquired candidate is discarded and False is
+        returned (the transfer was the unavoidable cost of identification).
+        """
+        probed = await self._probe_direct_dataset_id(self._client, direct)
+        if probed is not None and probed == self._index.dataset_id:
+            return False
+        source = _StaticSource(
+            url=direct.static_url,
+            cache_key=self._feed_key,
+            dataset_id=probed,
+            timezone_name=None,
+            headers=direct.headers,
+        )
+        new_index = await self._ensure_index_from_source(self._client, source)
+        if new_index.dataset_id == self._index.dataset_id:
+            await asyncio.to_thread(new_index.close)
+            return False
+        await self._swap_index(new_index)
+        return True
+
+    async def _swap_index(self, new_index: StaticIndex) -> None:
+        """Publish the new index, then close the old one (see refresh_static)."""
+        old_index, self._index = self._index, new_index
         self.stops = await asyncio.to_thread(new_index.stops)
         self.routes = await asyncio.to_thread(new_index.routes)
         await asyncio.to_thread(old_index.close)
-        return True
 
     def stops_in(self, zone: Circle) -> list[Stop]:
         """Return stops within a circular zone (config-flow stop picker)."""
