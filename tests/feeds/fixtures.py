@@ -179,6 +179,28 @@ def build_frequencies_gtfs_zip_bytes(extra_frequency_rows: str = "") -> bytes:
     return buf.getvalue()
 
 
+# -- Google's canonical GTFS sample feed -------------------------------------
+# data/sample_feed/*.txt is Google's canonical GTFS example feed (the
+# original transitfeed project's sample), vendored UNMODIFIED via the
+# MIT-licensed pygtfs repository -- see data/sample_feed/README.md for
+# provenance and license text. Unlike the synthetic mini-feed above, it
+# ships files the index does not model (fare_attributes.txt, fare_rules.txt,
+# shapes.txt, transfers.txt, feed_info.txt, translations.txt); they go into
+# the zip on purpose so the conformance tests prove the build ignores them
+# gracefully.
+
+_SAMPLE_FEED_DIR = _DATA_DIR / "sample_feed"
+
+
+def build_sample_feed_zip_bytes() -> bytes:
+    """Return Google's canonical GTFS sample feed as a byte-deterministic zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(_SAMPLE_FEED_DIR.glob("*.txt")):
+            _writestr(zf, path.name, path.read_text(encoding="utf-8"))
+    return buf.getvalue()
+
+
 # -- GTFS-RT protobuf messages ----------------------------------------------
 # Regenerate via `uv run python scripts/generate_rt_fixtures.py` (repo root).
 

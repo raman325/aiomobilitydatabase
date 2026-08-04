@@ -1,0 +1,39 @@
+# Google's canonical GTFS sample feed
+
+The `*.txt` files in this directory are Google's canonical GTFS example
+feed (the sample feed shipped with Google's original `transitfeed`
+project), copied **verbatim and unmodified** from the MIT-licensed
+[pygtfs](https://github.com/jarondl/pygtfs) repository
+(`pygtfs/test/data/sample_feed/`).
+
+`tests/feeds/test_sample_feed.py` uses this data as conformance input: the
+static index was developed against a synthetic mini-feed, and this feed is
+the canonical example the rest of the GTFS ecosystem validates against.
+
+Do not edit these files. The conformance tests pin exact hand-computed
+expectations against the rows as published.
+
+## pygtfs license (MIT)
+
+```text
+Copyright (c) 2014 Yaron de Leeuw
+Copyright (c) 2012 Andrew Lim
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
