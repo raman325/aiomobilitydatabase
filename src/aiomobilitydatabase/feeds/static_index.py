@@ -30,7 +30,7 @@ from .models import (
     WheelchairAccess,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: ix_stop_times_trip_sequence (RT delay propagation)
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -71,6 +71,10 @@ CREATE TABLE stop_times (
     stop_headsign TEXT
 );
 CREATE INDEX ix_stop_times_stop_departure ON stop_times (stop_id, departure_secs);
+-- Per-trip ordered stop calls: RT delay propagation resolves StopTimeUpdates
+-- against a trip's full static stop order at query time, and the frequency
+-- loader reads whole templates by trip during build.
+CREATE INDEX ix_stop_times_trip_sequence ON stop_times (trip_id, stop_sequence);
 CREATE TABLE calendar (
     service_id TEXT PRIMARY KEY,
     monday INTEGER, tuesday INTEGER, wednesday INTEGER, thursday INTEGER,
@@ -192,6 +196,9 @@ class ScheduledDeparture:
     repetition (synthetic ``{trip_id}#{start_secs}`` id) they are the
     template trip id and the repetition start in GTFS seconds -- the pair a
     GTFS-RT ``TripDescriptor`` (trip_id + start_time) addresses.
+    ``stop_sequence`` positions this call within its trip so RT delay
+    propagation (resolved per stop_sequence) can address it unambiguously,
+    including on loop trips where stop_id repeats.
 
     The descriptive tail mirrors :class:`~.models.StopArrival`:
     trip-level wheelchair/bikes flags plus this stop_time row's
@@ -202,6 +209,7 @@ class ScheduledDeparture:
     route_id: str
     headsign: str | None
     stop_id: str
+    stop_sequence: int
     arrival: datetime | None
     departure: datetime
     source_trip_id: str
@@ -222,7 +230,10 @@ class ScheduledTrip:
     both are non-optional because the producing query's WHERE clauses
     require the underlying GTFS times to be present.
     ``source_trip_id``/``start_secs`` are the RT-matching identity, exactly
-    as on :class:`ScheduledDeparture`.
+    as on :class:`ScheduledDeparture`;
+    ``origin_stop_sequence``/``destination_stop_sequence`` position the two
+    calls for RT delay propagation (the destination sequence belongs to the
+    earliest-arrival destination call the MIN aggregate selected).
 
     The descriptive tail mirrors :class:`~.models.UpcomingTrip`: trip-level
     wheelchair/bikes/direction, per-end stop_time descriptors, and the
@@ -238,6 +249,8 @@ class ScheduledTrip:
     arrival: datetime
     source_trip_id: str
     start_secs: int | None
+    origin_stop_sequence: int
+    destination_stop_sequence: int
     wheelchair_accessible: WheelchairAccess | None
     bikes_allowed: BikesAllowed | None
     direction_id: int | None
@@ -851,6 +864,27 @@ class StaticIndex:
             )
         )
 
+    def trip_stop_calls(self, trip_ids: list[str]) -> dict[str, list[tuple[int, str]]]:
+        """Ordered ``(stop_sequence, stop_id)`` calls per trip.
+
+        The RT delay-propagation seam: :mod:`.rt` resolves a trip's
+        StopTimeUpdates against this static stop order. Keys are CONCRETE
+        trip ids (synthetic repetition ids for frequency trips), so
+        propagation stays within one materialized repetition. Trips with
+        no stop_times rows are simply absent from the result.
+        """
+        if not trip_ids:
+            return {}
+        marks = ",".join("?" * len(trip_ids))
+        calls: dict[str, list[tuple[int, str]]] = {}
+        for trip_id, stop_sequence, stop_id in self._conn.execute(
+            "SELECT trip_id, stop_sequence, stop_id FROM stop_times "
+            f"WHERE trip_id IN ({marks}) ORDER BY trip_id, stop_sequence",
+            trip_ids,
+        ):
+            calls.setdefault(trip_id, []).append((stop_sequence, stop_id))
+        return calls
+
     def routes_serving(self, stop_id: str) -> list[Route]:
         """Routes with at least one scheduled stop_time at the stop."""
         return [
@@ -995,6 +1029,7 @@ class StaticIndex:
             service_marks = ",".join("?" * len(active))
             sql = (
                 "SELECT st.trip_id, t.route_id, t.headsign, st.stop_id, "
+                "st.stop_sequence, "
                 "st.arrival_secs, st.departure_secs, t.source_trip_id, t.start_secs, "
                 "t.wheelchair_accessible, t.bikes_allowed, "
                 "st.pickup_type, st.drop_off_type, st.timepoint, st.stop_headsign "
@@ -1013,6 +1048,7 @@ class StaticIndex:
                 route_id,
                 headsign,
                 stop_id,
+                stop_sequence,
                 arr_secs,
                 dep_secs,
                 source_trip_id,
@@ -1030,6 +1066,7 @@ class StaticIndex:
                         route_id=route_id,
                         headsign=headsign,
                         stop_id=stop_id,
+                        stop_sequence=stop_sequence,
                         arrival=(
                             day_start_utc + timedelta(seconds=arr_secs)
                             if arr_secs is not None
@@ -1162,7 +1199,7 @@ class StaticIndex:
                 "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
                 "o.pickup_type, o.drop_off_type, o.timepoint, o.stop_headsign, "
                 "d.pickup_type, d.drop_off_type, d.timepoint, d.stop_headsign, "
-                "o.stop_sequence "
+                "o.stop_sequence, d.stop_sequence "
                 f"{candidates} "
                 "AND o.departure_secs >= ? AND o.departure_secs <= ? "
                 "GROUP BY o.trip_id, o.stop_sequence"
@@ -1200,6 +1237,7 @@ class StaticIndex:
                 d_timepoint,
                 d_stop_headsign,
                 o_sequence,
+                d_sequence,
             ) in rows:
                 results.append(
                     ScheduledTrip(
@@ -1212,6 +1250,8 @@ class StaticIndex:
                         arrival=day_start_utc + timedelta(seconds=arr_secs),
                         source_trip_id=source_trip_id,
                         start_secs=start_secs,
+                        origin_stop_sequence=o_sequence,
+                        destination_stop_sequence=d_sequence,
                         wheelchair_accessible=_enum_or_none(
                             WheelchairAccess, wheelchair
                         ),

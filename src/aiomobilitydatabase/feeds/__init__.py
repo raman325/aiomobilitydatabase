@@ -24,8 +24,12 @@ from .gbfs import GbfsFeedHandle
 from .geo import Circle
 from .models import (
     Agency,
+    AlertCause,
+    AlertEffect,
+    AlertSeverity,
     BikesAllowed,
     GbfsVehicle,
+    OccupancyStatus,
     PickupDropOffType,
     Route,
     ServiceAlert,
@@ -44,6 +48,9 @@ from .transit import TransitFeedHandle
 
 __all__ = [
     "Agency",
+    "AlertCause",
+    "AlertEffect",
+    "AlertSeverity",
     "BikesAllowed",
     "Circle",
     "FeedParseError",
@@ -51,6 +58,7 @@ __all__ = [
     "GbfsVehicle",
     "MobilityFeedsClient",
     "MobilityFeedsError",
+    "OccupancyStatus",
     "PickupDropOffType",
     "Route",
     "ServiceAlert",

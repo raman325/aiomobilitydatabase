@@ -12,6 +12,11 @@ from tests.feeds.fixtures import (
     TRIP_UPDATES_T1_CANCELED,
     TRIP_UPDATES_T1_DELAYED,
     TRIP_UPDATES_T1_DEST_ARRIVAL,
+    TRIP_UPDATES_T1_NO_DATA_CUT,
+    TRIP_UPDATES_T1_SKIP_S1,
+    TRIP_UPDATES_T1_SKIP_S2,
+    TRIP_UPDATES_T1_SKIP_S3,
+    TRIP_UPDATES_T1_TRIP_DELAY,
     build_trip_query_gtfs_zip_bytes,
     with_base,
 )
@@ -94,8 +99,9 @@ async def test_rt_origin_prediction_only(
     assert trip.predicted_departure == datetime.fromtimestamp(
         T1_DEPARTURE_EPOCH + 330, tz=UTC
     )
-    # The TU names S1 only: no prediction at the destination end.
-    assert trip.predicted_arrival is None
+    # The TU names S1 only, but its 300s delay PROPAGATES to the
+    # destination end (no explicit time there, so scheduled + delay).
+    assert trip.predicted_arrival == datetime(2026, 7, 30, 15, 25, tzinfo=UTC)
     assert trip.scheduled_arrival == datetime(2026, 7, 30, 15, 20, tzinfo=UTC)
 
 
@@ -153,3 +159,141 @@ async def test_rt_cancellation_drops_trip(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert trips == []
+
+
+async def test_skipped_origin_kills_only_that_boarding(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """SKIPPED S1: the vehicle will not serve S1, so the S1→S3 journey is
+    impossible -- but boarding the same trip at S2 still works.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_SKIP_S1, content_type=PB)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_SKIP_S1, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    assert (
+        await handle.upcoming_trips(
+            "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
+        )
+        == []
+    )
+    later_boarding = await handle.upcoming_trips(
+        "S2", "S3", lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert [trip.trip_id for trip in later_boarding] == ["T1"]
+
+
+async def test_skipped_destination_kills_only_that_alighting(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """SKIPPED S3: alighting at S3 is impossible, alighting at S2 is not."""
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_SKIP_S3, content_type=PB)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_SKIP_S3, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    assert (
+        await handle.upcoming_trips(
+            "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
+        )
+        == []
+    )
+    earlier_alighting = await handle.upcoming_trips(
+        "S1", "S2", lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert [trip.trip_id for trip in earlier_alighting] == ["T1"]
+
+
+async def test_skipped_intermediate_changes_nothing_for_the_ends(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """SKIPPED S2 (plus a 300s delay at S1): the S1→S3 journey survives with
+    the propagated delay flowing PAST the skipped stop, while S2 itself
+    vanishes from arrivals and any journey alighting there dies.
+    """
+    _mock_catalog(mock_api, rt=True)
+    for _ in range(3):  # one queued RT response per merging call below
+        mock_api.get("/rt/all", body=TRIP_UPDATES_T1_SKIP_S2, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    trips = await handle.upcoming_trips(
+        "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert [trip.trip_id for trip in trips] == ["T1"]
+    trip = trips[0]
+    assert trip.realtime is True
+    assert trip.delay_seconds == 300
+    # No explicit times in the fixture: scheduled + propagated delay.
+    assert trip.predicted_departure == datetime(2026, 7, 30, 15, 5, 30, tzinfo=UTC)
+    assert trip.predicted_arrival == datetime(2026, 7, 30, 15, 25, tzinfo=UTC)
+    assert (
+        await handle.upcoming_trips(
+            "S1", "S2", lookahead=timedelta(hours=1), now_utc=NOW
+        )
+        == []
+    )
+    arrivals = await handle.get_arrivals(
+        ["S1", "S2"], lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    t1_rows = [(a.stop_id, a.realtime) for a in arrivals if a.trip_id == "T1"]
+    assert t1_rows == [("S1", True)]  # the S2 call is suppressed entirely
+
+
+async def test_no_data_cuts_propagation_at_and_after_its_stop(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Delay 300 at S1, NO_DATA at S2: S1 is predicted, S2 and S3 are
+    schedule-only (propagation cut), so the destination end of S1→S3 has
+    no prediction while the origin end keeps its delay.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_NO_DATA_CUT, content_type=PB)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_NO_DATA_CUT, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    trips = await handle.upcoming_trips(
+        "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert [trip.trip_id for trip in trips] == ["T1"]
+    trip = trips[0]
+    assert trip.realtime is True
+    assert trip.delay_seconds == 300
+    assert trip.predicted_departure == datetime(2026, 7, 30, 15, 5, 30, tzinfo=UTC)
+    assert trip.predicted_arrival is None
+    arrivals = await handle.get_arrivals(
+        ["S1", "S2"], lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    by_key = {(a.trip_id, a.stop_id): a for a in arrivals}
+    assert by_key[("T1", "S1")].realtime is True
+    s2_row = by_key[("T1", "S2")]
+    assert s2_row.realtime is False
+    assert s2_row.predicted_departure is None
+    assert s2_row.delay_seconds is None
+
+
+async def test_trip_level_delay_fallback_covers_every_stop(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A TripUpdate carrying ONLY a trip-level delay (no STUs) predicts
+    scheduled+delay at every stop of the trip -- the spec's fallback for
+    producers that don't emit per-stop updates.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_TRIP_DELAY, content_type=PB)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_TRIP_DELAY, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    trips = await handle.upcoming_trips(
+        "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert [trip.trip_id for trip in trips] == ["T1"]
+    trip = trips[0]
+    assert trip.realtime is True
+    assert trip.delay_seconds == 180
+    assert trip.predicted_departure == datetime(2026, 7, 30, 15, 3, 30, tzinfo=UTC)
+    assert trip.predicted_arrival == datetime(2026, 7, 30, 15, 23, tzinfo=UTC)
+    arrivals = await handle.get_arrivals(
+        ["S1", "S2"], lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    t1_rows = {a.stop_id: a for a in arrivals if a.trip_id == "T1"}
+    assert t1_rows["S1"].delay_seconds == 180
+    assert t1_rows["S2"].delay_seconds == 180
+    assert t1_rows["S2"].predicted_departure == datetime(
+        2026, 7, 30, 15, 13, 30, tzinfo=UTC
+    )

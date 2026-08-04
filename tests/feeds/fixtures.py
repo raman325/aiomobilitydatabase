@@ -215,6 +215,15 @@ TRIP_UPDATES_T1_BOTH_ENDS: bytes = (
     _RT_DIR / "trip_updates_t1_both_ends.pb"
 ).read_bytes()
 TRIP_UPDATES_T1_CANCELED: bytes = (_RT_DIR / "trip_updates_t1_canceled.pb").read_bytes()
+TRIP_UPDATES_T1_SKIP_S1: bytes = (_RT_DIR / "trip_updates_t1_skip_s1.pb").read_bytes()
+TRIP_UPDATES_T1_SKIP_S2: bytes = (_RT_DIR / "trip_updates_t1_skip_s2.pb").read_bytes()
+TRIP_UPDATES_T1_SKIP_S3: bytes = (_RT_DIR / "trip_updates_t1_skip_s3.pb").read_bytes()
+TRIP_UPDATES_T1_NO_DATA_CUT: bytes = (
+    _RT_DIR / "trip_updates_t1_no_data_cut.pb"
+).read_bytes()
+TRIP_UPDATES_T1_TRIP_DELAY: bytes = (
+    _RT_DIR / "trip_updates_t1_trip_delay.pb"
+).read_bytes()
 ADDED_TRIPS_S1: bytes = (_RT_DIR / "added_trips_s1.pb").read_bytes()
 TRIP_UPDATES_FREQ_MATCHED: bytes = (
     _RT_DIR / "trip_updates_freq_matched.pb"

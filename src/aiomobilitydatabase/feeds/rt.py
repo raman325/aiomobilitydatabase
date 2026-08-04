@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from http import HTTPStatus
+from typing import Any
 from urllib.parse import urlsplit
 
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
-from .models import ServiceAlert, VehiclePosition
+from .models import (
+    AlertCause,
+    AlertEffect,
+    AlertSeverity,
+    OccupancyStatus,
+    ServiceAlert,
+    VehiclePosition,
+)
 from .static_index import parse_gtfs_time
 
 _AUTH_STATUSES = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
@@ -55,6 +64,40 @@ def _epoch_to_utc(value: int) -> datetime | None:
     try:
         return datetime.fromtimestamp(value, tz=UTC)
     except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _pb_enum_name(enum_type: Any, value: int) -> str | None:
+    """Protobuf enum int -> name; None for values this bindings version lacks.
+
+    ``enum_type`` is a protobuf EnumTypeWrapper class (``Any`` because the
+    protobuf runtime ships no inline types and only the ``Name`` surface is
+    needed). Proto2 shields parsers from out-of-range wire values (they
+    land in unknown fields, leaving the field unset), so in practice
+    ``value`` is always known -- but a bindings/library version skew could
+    still surface one, and RT payloads must degrade rather than raise.
+    """
+    try:
+        return str(enum_type.Name(value))
+    except ValueError:
+        return None
+
+
+def _vocab_or_none[StrEnumT: StrEnum](
+    enum_cls: type[StrEnumT], name: str | None
+) -> StrEnumT | None:
+    """Model-boundary StrEnum conversion: unknown/future names become None.
+
+    Mirrors the static side's ``_enum_or_none``: protobuf vocabularies are
+    closed per bindings version, but the spec adds members over time, so a
+    name the model enum doesn't know (newer bindings than this library)
+    must degrade to None, never raise.
+    """
+    if name is None:
+        return None
+    try:
+        return enum_cls(name)
+    except ValueError:
         return None
 
 
@@ -129,8 +172,12 @@ def vehicles_from_message(
             vehicle.trip.route_id or trip_routes.get(vehicle.trip.trip_id) or None
         )
         occupancy = (
-            gtfs_realtime_pb2.VehiclePosition.OccupancyStatus.Name(
-                vehicle.occupancy_status
+            _vocab_or_none(
+                OccupancyStatus,
+                _pb_enum_name(
+                    gtfs_realtime_pb2.VehiclePosition.OccupancyStatus,
+                    vehicle.occupancy_status,
+                ),
             )
             if vehicle.HasField("occupancy_status")
             else None
@@ -159,7 +206,15 @@ def vehicles_from_message(
 
 @dataclass(frozen=True)
 class StopPrediction:
-    """RT prediction for one (trip, stop)."""
+    """Resolved RT outcome for one (trip, stop) call.
+
+    ``arrival``/``departure`` are EXPLICIT epoch predictions from this
+    stop's own StopTimeUpdate (absent for propagated-only stops);
+    ``delay_seconds`` is the effective delay at the stop -- its own STU's
+    delay, else the propagated last-known delay, else the trip-level
+    fallback. Consumers compute schedule-relative predicted times as
+    ``scheduled + delay`` wherever an explicit time is absent.
+    """
 
     arrival: datetime | None
     departure: datetime | None
@@ -179,28 +234,169 @@ class AddedStopTime:
     vehicle_id: str | None
 
 
+@dataclass(frozen=True)
+class TripStopUpdate:
+    """One StopTimeUpdate, positioned by stop_sequence and/or stop_id.
+
+    ``stop_sequence`` and ``stop_id`` carry exactly what the producer sent
+    (either, or both); resolution against the static stop order prefers
+    ``stop_sequence`` because ``stop_id`` is ambiguous on loop trips.
+    ``relationship`` is the raw per-stop schedule_relationship int
+    (SCHEDULED/SKIPPED/NO_DATA; anything else -- e.g. UNSCHEDULED or a
+    future value -- is treated as SCHEDULED, today's behavior for every
+    unrecognized relationship). ``delay_seconds`` prefers the departure
+    delay over the arrival delay: the departure is the later event at a
+    stop, so it is the "last known delay" the spec says propagates onward.
+    """
+
+    stop_id: str | None
+    stop_sequence: int | None
+    relationship: int
+    arrival: datetime | None
+    departure: datetime | None
+    delay_seconds: int | None
+
+
+@dataclass(frozen=True)
+class TripUpdateEntry:
+    """All StopTimeUpdate-level data for one (trip_id, start_secs) identity.
+
+    ``stop_updates`` keeps feed order (resolution re-orders by static stop
+    position anyway); ``delay_seconds`` is the trip-level
+    ``TripUpdate.delay`` fallback, applied only where no
+    StopTimeUpdate-derived information covers a stop (spec: "should only
+    be used if a prediction ... is not provided").
+    """
+
+    stop_updates: tuple[TripStopUpdate, ...]
+    delay_seconds: int | None
+    vehicle_id: str | None
+
+
+@dataclass(frozen=True)
+class TripPredictions:
+    """Per-stop resolved outcomes for one trip against its static stop order.
+
+    ``predictions`` is keyed by static ``stop_sequence``; ``skipped`` holds
+    the stop_sequences the vehicle will not serve (their arrivals and any
+    origin/destination journey rows touching them must be suppressed).
+    """
+
+    predictions: Mapping[int, StopPrediction]
+    skipped: frozenset[int]
+
+
 @dataclass
 class TripUpdates:
     """Parsed index of a TripUpdates feed.
 
-    Predictions are keyed by ``(trip_id, start_secs, stop_id)`` and
-    cancellations by ``(trip_id, start_secs)``, where ``start_secs`` is the
-    parsed ``TripDescriptor.start_time`` (None when absent or unparseable).
+    Trip entries are keyed by ``(trip_id, start_secs)`` -- also the
+    cancellation key -- where ``start_secs`` is the parsed
+    ``TripDescriptor.start_time`` (None when absent or unparseable).
     ``start_time`` is how GTFS-RT addresses ONE repetition of a
     frequency-based trip, and the consumer-side merge matches it against
-    the static index's materialized repetitions.
+    the static index's materialized repetitions; propagation therefore
+    happens within one matched repetition only.
     ``TripDescriptor.start_date`` is deliberately NOT consulted in this
     pass: a start_time repeats daily, but the arrivals lookahead window
     plus the absolute prediction timestamps make cross-service-day
     collisions marginal -- start_date disambiguation is a documented
     refinement, not a correctness prerequisite here.
+
+    A producer sending several TripUpdate entities for one identity is
+    out of spec ("at most one trip_update per actual trip"); the last
+    entity wins wholesale rather than attempting a field-level merge.
     """
 
-    predictions: dict[tuple[str, int | None, str], StopPrediction] = field(
-        default_factory=dict
-    )
+    trips: dict[tuple[str, int | None], TripUpdateEntry] = field(default_factory=dict)
     canceled_trips: set[tuple[str, int | None]] = field(default_factory=set)
     added: list[AddedStopTime] = field(default_factory=list)
+
+
+def resolve_trip_predictions(
+    entry: TripUpdateEntry, stop_calls: Sequence[tuple[int, str]]
+) -> TripPredictions:
+    """Resolve one trip's StopTimeUpdates against its static stop order.
+
+    ``stop_calls`` is the trip's ordered ``(stop_sequence, stop_id)`` calls
+    from the static schedule (one materialized repetition's calls for
+    frequency trips). Per the GTFS-RT spec, walking the calls in order:
+
+    - A SKIPPED StopTimeUpdate marks its stop skipped and nothing else --
+      it never alters propagation, and any times/delays it carries are
+      ignored (the spec discourages them).
+    - A NO_DATA StopTimeUpdate yields no prediction at its stop AND cuts
+      propagation: subsequent stops are schedule-only (the trip-level
+      delay fallback does NOT resume there -- "no data" IS
+      StopTimeUpdate-derived coverage) until a later STU with a delay.
+    - A SCHEDULED StopTimeUpdate's delay becomes the propagated last-known
+      delay for subsequent stops until newer information; an STU carrying
+      only explicit times (no delay) predicts its own stop but leaves the
+      propagation state untouched.
+    - A stop with no STU at-or-before it falls back to the trip-level
+      delay (when present), else stays schedule-only.
+
+    STUs that cannot be placed on the static order (unknown stop_sequence,
+    unknown stop_id, or neither field) are ignored. ``stop_sequence`` wins
+    when both fields are present; a bare ``stop_id`` matches the FIRST
+    call with that id (loop trips need stop_sequence to address later
+    visits). Several STUs placing on one call: the last one wins.
+    """
+    sequence_pos = {seq: pos for pos, (seq, _) in enumerate(stop_calls)}
+    stop_id_pos: dict[str, int] = {}
+    for pos, (_, stop_id) in enumerate(stop_calls):
+        stop_id_pos.setdefault(stop_id, pos)
+    placed: dict[int, TripStopUpdate] = {}
+    for stu in entry.stop_updates:
+        placed_pos = (
+            sequence_pos.get(stu.stop_sequence)
+            if stu.stop_sequence is not None
+            else stop_id_pos.get(stu.stop_id)
+            if stu.stop_id is not None
+            else None
+        )
+        if placed_pos is not None:
+            placed[placed_pos] = stu
+    skipped_rel = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
+    no_data_rel = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
+    predictions: dict[int, StopPrediction] = {}
+    skipped: set[int] = set()
+    covered = False  # has any delay-bearing or NO_DATA STU been passed?
+    current: int | None = None  # propagated delay; None while covered = no data
+    for pos, (seq, _) in enumerate(stop_calls):
+        own = placed.get(pos)
+        if own is not None and own.relationship == skipped_rel:
+            skipped.add(seq)
+            continue
+        if own is not None and own.relationship == no_data_rel:
+            covered, current = True, None
+            continue
+        if own is not None:
+            if own.delay_seconds is not None:
+                covered, current = True, own.delay_seconds
+            effective = own.delay_seconds
+            if effective is None:
+                effective = current if covered else entry.delay_seconds
+            if own.arrival is None and own.departure is None and effective is None:
+                # An STU with no times and no applicable delay carries no
+                # realtime content for this stop.
+                continue
+            predictions[seq] = StopPrediction(
+                arrival=own.arrival,
+                departure=own.departure,
+                delay_seconds=effective,
+                vehicle_id=entry.vehicle_id,
+            )
+            continue
+        delay = current if covered else entry.delay_seconds
+        if delay is not None:
+            predictions[seq] = StopPrediction(
+                arrival=None,
+                departure=None,
+                delay_seconds=delay,
+                vehicle_id=entry.vehicle_id,
+            )
+    return TripPredictions(predictions=predictions, skipped=frozenset(skipped))
 
 
 def _trip_start_secs(trip: gtfs_realtime_pb2.TripDescriptor) -> int | None:
@@ -218,7 +414,7 @@ def _trip_start_secs(trip: gtfs_realtime_pb2.TripDescriptor) -> int | None:
 
 
 def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpdates:
-    """Index TripUpdate entities by (trip_id, start_secs, stop_id)."""
+    """Index TripUpdate entities by their (trip_id, start_secs) identity."""
     updates = TripUpdates()
     canceled = gtfs_realtime_pb2.TripDescriptor.CANCELED
     added = gtfs_realtime_pb2.TripDescriptor.ADDED
@@ -233,6 +429,7 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
             updates.canceled_trips.add((trip_id, start_secs))
             continue
         is_added = trip_update.trip.schedule_relationship == added
+        stop_updates: list[TripStopUpdate] = []
         for stu in trip_update.stop_time_update:
             arrival = (
                 _epoch_to_utc(stu.arrival.time) if stu.HasField("arrival") else None
@@ -240,12 +437,15 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
             departure = (
                 _epoch_to_utc(stu.departure.time) if stu.HasField("departure") else None
             )
+            # Departure delay preferred over arrival delay: the departure
+            # is the later event at the stop, so it is the "last known
+            # delay" the spec says propagates to subsequent stops.
             delay = (
-                stu.arrival.delay
-                if stu.HasField("arrival") and stu.arrival.HasField("delay")
+                stu.departure.delay
+                if stu.HasField("departure") and stu.departure.HasField("delay")
                 else (
-                    stu.departure.delay
-                    if stu.HasField("departure") and stu.departure.HasField("delay")
+                    stu.arrival.delay
+                    if stu.HasField("arrival") and stu.arrival.HasField("delay")
                     else None
                 )
             )
@@ -261,29 +461,43 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
                     )
                 )
             else:
-                updates.predictions[(trip_id, start_secs, stu.stop_id)] = (
-                    StopPrediction(
+                stop_updates.append(
+                    TripStopUpdate(
+                        stop_id=stu.stop_id or None,
+                        stop_sequence=(
+                            stu.stop_sequence if stu.HasField("stop_sequence") else None
+                        ),
+                        relationship=stu.schedule_relationship,
                         arrival=arrival,
                         departure=departure,
                         delay_seconds=delay,
-                        vehicle_id=vehicle_id,
                     )
                 )
+        if not is_added:
+            # An entry is recorded even with zero StopTimeUpdates: a bare
+            # TripUpdate.delay with no STUs is a valid trip-wide fallback.
+            updates.trips[(trip_id, start_secs)] = TripUpdateEntry(
+                stop_updates=tuple(stop_updates),
+                delay_seconds=(
+                    trip_update.delay if trip_update.HasField("delay") else None
+                ),
+                vehicle_id=vehicle_id,
+            )
     # Cancellation wins regardless of entity order: a producer may send a
     # CANCELED trip_update alongside stale predictions/added-stop-times for
     # the same trip in either order within one message. The parsed result
     # must be self-consistent rather than relying on consumers checking
-    # canceled_trips first. Predictions are matched on the full
+    # canceled_trips first. Trip entries are matched on the full
     # (trip_id, start_secs) identity; ADDED stop times are matched on bare
     # trip_id -- an added trip is identified by the id the producer minted
     # for it, and dropping its rows on ANY cancellation of that id is the
     # conservative "removed wins" choice (never show a trip that might not
     # run).
     if updates.canceled_trips:
-        updates.predictions = {
-            key: prediction
-            for key, prediction in updates.predictions.items()
-            if (key[0], key[1]) not in updates.canceled_trips
+        updates.trips = {
+            key: entry
+            for key, entry in updates.trips.items()
+            if key not in updates.canceled_trips
         }
         canceled_ids = {trip_id for trip_id, _ in updates.canceled_trips}
         updates.added = [
@@ -318,14 +532,26 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
                 id=entity.id,
                 header=_first_translation(alert.header_text),
                 description=_first_translation(alert.description_text),
-                cause=gtfs_realtime_pb2.Alert.Cause.Name(alert.cause)
+                cause=_vocab_or_none(
+                    AlertCause,
+                    _pb_enum_name(gtfs_realtime_pb2.Alert.Cause, alert.cause),
+                )
                 if alert.HasField("cause")
                 else None,
-                effect=gtfs_realtime_pb2.Alert.Effect.Name(alert.effect)
+                effect=_vocab_or_none(
+                    AlertEffect,
+                    _pb_enum_name(gtfs_realtime_pb2.Alert.Effect, alert.effect),
+                )
                 if alert.HasField("effect")
                 else None,
                 severity=(
-                    gtfs_realtime_pb2.Alert.SeverityLevel.Name(alert.severity_level)
+                    _vocab_or_none(
+                        AlertSeverity,
+                        _pb_enum_name(
+                            gtfs_realtime_pb2.Alert.SeverityLevel,
+                            alert.severity_level,
+                        ),
+                    )
                     if alert.HasField("severity_level")
                     else None
                 ),

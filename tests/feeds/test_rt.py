@@ -11,9 +11,19 @@ from aiomobilitydatabase.feeds.exceptions import (
     SourceAuthenticationError,
     SourceConnectionError,
 )
+from aiomobilitydatabase.feeds.models import (
+    AlertCause,
+    AlertEffect,
+    OccupancyStatus,
+)
 from aiomobilitydatabase.feeds.rt import (
+    TripStopUpdate,
+    TripUpdateEntry,
+    _pb_enum_name,
+    _vocab_or_none,
     alerts_from_message,
     fetch_feed_message,
+    resolve_trip_predictions,
     trip_updates_from_message,
     vehicles_from_message,
 )
@@ -101,6 +111,9 @@ def test_vehicles_from_message() -> None:
     v1 = next(v for v in vehicles if v.vehicle_id == "V1")
     assert v1.route_id == "R1"
     assert v1.route_name == "10 Main Line"
+    # Typed vocabulary: the StrEnum member IS the old raw string, so both
+    # identity and legacy string comparisons hold.
+    assert v1.occupancy_status is OccupancyStatus.MANY_SEATS_AVAILABLE
     assert v1.occupancy_status == "MANY_SEATS_AVAILABLE"
     assert v1.timestamp == datetime.fromtimestamp(1_785_500_000, tz=UTC)
     v2 = next(v for v in vehicles if v.vehicle_id == "V2")
@@ -113,15 +126,21 @@ def test_trip_updates_from_message() -> None:
     msg.ParseFromString(TRIP_UPDATES_BASELINE)
     updates = trip_updates_from_message(msg)
     assert updates.canceled_trips == {("T2", None)}
-    prediction = updates.predictions[("T1", None, "S1")]
-    assert prediction.delay_seconds == 300
-    assert prediction.departure == datetime.fromtimestamp(1_785_500_330, tz=UTC)
-    assert prediction.vehicle_id == "V1"
+    entry = updates.trips[("T1", None)]
+    assert entry.vehicle_id == "V1"
+    assert entry.delay_seconds is None  # no trip-level TripUpdate.delay set
+    (stu,) = entry.stop_updates
+    assert stu.stop_id == "S1"
+    assert stu.stop_sequence is None  # producer sent stop_id addressing only
+    assert stu.delay_seconds == 300
+    assert stu.arrival == datetime.fromtimestamp(1_785_500_300, tz=UTC)
+    assert stu.departure == datetime.fromtimestamp(1_785_500_330, tz=UTC)
     added = updates.added[0]
     assert added.trip_id == "ADDED-9"
     assert added.route_id == "R1"
     assert added.stop_id == "S2"
     assert added.departure == datetime.fromtimestamp(1_785_500_630, tz=UTC)
+    assert ("ADDED-9", None) not in updates.trips  # ADDED rows never form entries
 
 
 def _build_conflicting_trip_update(
@@ -183,14 +202,14 @@ def test_trip_updates_cancellation_wins_regardless_of_entity_order(
     msg = _build_conflicting_trip_update(canceled_first=canceled_first)
     updates = trip_updates_from_message(msg)
     assert updates.canceled_trips == {("STALE-TRIP", None)}
-    assert ("STALE-TRIP", None, "S1") not in updates.predictions
+    assert ("STALE-TRIP", None) not in updates.trips
     assert all(added.trip_id != "STALE-TRIP" for added in updates.added)
 
 
 def test_trip_updates_start_time_keys() -> None:
     """TripDescriptor.start_time becomes the start_secs key component:
-    parsed for predictions AND cancellations (>24:00:00 supported), while a
-    garbage start_time degrades to None instead of failing the message.
+    parsed for trip entries AND cancellations (>24:00:00 supported), while
+    a garbage start_time degrades to None instead of failing the message.
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
@@ -211,10 +230,10 @@ def test_trip_updates_start_time_keys() -> None:
         gtfs_realtime_pb2.TripDescriptor.CANCELED
     )
     updates = trip_updates_from_message(msg)
-    assert set(updates.predictions) == {
-        ("F1", 22200, "S1"),
-        ("F2", 90000, "S1"),
-        ("F3", None, "S1"),
+    assert set(updates.trips) == {
+        ("F1", 22200),
+        ("F2", 90000),
+        ("F3", None),
     }
     assert updates.canceled_trips == {("F1", 22800)}
 
@@ -228,10 +247,304 @@ def test_alerts_from_message() -> None:
     assert alert.id == "alert-1"
     assert alert.header == "Detour on Main"
     assert alert.description == "Use Second Ave"
+    # Typed vocabulary: StrEnum members ARE the old raw strings.
+    assert alert.cause is AlertCause.CONSTRUCTION
     assert alert.cause == "CONSTRUCTION"
-    assert alert.effect == "DETOUR"
+    assert alert.effect is AlertEffect.DETOUR
+    assert alert.severity is None  # fixture sets no severity_level
     assert alert.route_ids == ["R1"]
     assert alert.stop_ids == ["S1"]
     assert alert.active_periods == [
         (datetime.fromtimestamp(1_785_400_000, tz=UTC), None)
     ]
+
+
+def test_pb_enum_name_and_vocab_leniency() -> None:
+    """Both conversion layers degrade unknown values to None, never raise:
+    an int the bindings don't know yields no name, and a name the model
+    enum doesn't know (newer bindings than this library) yields no member.
+    """
+    assert _pb_enum_name(gtfs_realtime_pb2.Alert.Cause, 10) == "CONSTRUCTION"
+    assert _pb_enum_name(gtfs_realtime_pb2.Alert.Cause, 999) is None
+    assert _vocab_or_none(AlertCause, "CONSTRUCTION") is AlertCause.CONSTRUCTION
+    assert _vocab_or_none(AlertCause, "FUTURE_SPEC_VALUE") is None
+    assert _vocab_or_none(AlertCause, None) is None
+
+
+def test_trip_updates_delay_field_and_departure_preference() -> None:
+    """TripUpdate.delay is captured only when present, and an STU carrying
+    BOTH delays keeps the departure one (the later event at the stop is the
+    'last known delay' that propagates).
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "tu-delays"
+    entity.trip_update.trip.trip_id = "T1"
+    entity.trip_update.delay = -60
+    stu = entity.trip_update.stop_time_update.add()
+    stu.stop_sequence = 2
+    stu.arrival.delay = 100
+    stu.departure.delay = 200
+    updates = trip_updates_from_message(msg)
+    entry = updates.trips[("T1", None)]
+    assert entry.delay_seconds == -60
+    (parsed,) = entry.stop_updates
+    assert parsed.stop_sequence == 2
+    assert parsed.stop_id is None
+    assert parsed.delay_seconds == 200
+
+
+# --- wire-level out-of-range enum totality ----------------------------------
+
+
+def _varint(value: int) -> bytes:
+    out = b""
+    while True:
+        low, value = value & 0x7F, value >> 7
+        out += bytes([low | 0x80 if value else low])
+        if not value:
+            return out
+
+
+def _tagged(field: int, wire_type: int, payload: bytes) -> bytes:
+    return _varint((field << 3) | wire_type) + payload
+
+
+def _length_delimited(field: int, data: bytes) -> bytes:
+    return _tagged(field, 2, _varint(len(data)) + data)
+
+
+def test_out_of_range_enums_on_the_wire_never_raise() -> None:
+    """A producer (or newer spec) can put enum ints this bindings version
+    doesn't know on the wire. Proto2 parks them in unknown fields, so the
+    parser sees the default (SCHEDULED) and the message flows through as a
+    normal entry -- never an exception. The bytes are hand-encoded because
+    the Python protobuf API refuses to ASSIGN out-of-range values.
+    """
+    # TripDescriptor: trip_id=1, schedule_relationship=4 (varint 99).
+    trip = _length_delimited(1, b"T9") + _tagged(4, 0, _varint(99))
+    # StopTimeUpdate: stop_sequence=1, stop_id=4, schedule_relationship=5.
+    stu = (
+        _tagged(1, 0, _varint(1))
+        + _length_delimited(4, b"S1")
+        + _tagged(5, 0, _varint(99))
+    )
+    # TripUpdate: trip=1, stop_time_update=2, delay=5.
+    trip_update = (
+        _length_delimited(1, trip)
+        + _length_delimited(2, stu)
+        + _tagged(5, 0, _varint(7))
+    )
+    entity = _length_delimited(1, b"e1") + _length_delimited(3, trip_update)
+    header = _length_delimited(1, b"2.0")  # FeedHeader.gtfs_realtime_version
+    raw = _length_delimited(1, header) + _length_delimited(2, entity)
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.ParseFromString(raw)
+    updates = trip_updates_from_message(msg)
+    entry = updates.trips[("T9", None)]
+    assert entry.delay_seconds == 7
+    (parsed,) = entry.stop_updates
+    # Both unknown relationships degraded to the SCHEDULED default.
+    assert parsed.relationship == gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SCHEDULED
+    assert parsed.stop_sequence == 1
+    assert updates.canceled_trips == set()
+    assert updates.added == []
+
+
+# --- resolve_trip_predictions: the propagation state machine ----------------
+
+_CALLS = [(1, "A"), (2, "B"), (3, "C")]
+_LOOP_CALLS = [(1, "A"), (2, "B"), (3, "A"), (4, "C")]
+_SKIPPED = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
+_NO_DATA = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
+
+
+def _stu(
+    *,
+    stop_id: str | None = None,
+    stop_sequence: int | None = None,
+    relationship: int = 0,
+    arrival: datetime | None = None,
+    departure: datetime | None = None,
+    delay: int | None = None,
+) -> TripStopUpdate:
+    return TripStopUpdate(
+        stop_id=stop_id,
+        stop_sequence=stop_sequence,
+        relationship=relationship,
+        arrival=arrival,
+        departure=departure,
+        delay_seconds=delay,
+    )
+
+
+def _entry(
+    *stop_updates: TripStopUpdate,
+    trip_delay: int | None = None,
+    vehicle_id: str | None = None,
+) -> TripUpdateEntry:
+    return TripUpdateEntry(
+        stop_updates=stop_updates, delay_seconds=trip_delay, vehicle_id=vehicle_id
+    )
+
+
+def test_resolve_one_stu_propagates_to_tail() -> None:
+    entry = _entry(_stu(stop_id="A", delay=300), vehicle_id="V1")
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.skipped == frozenset()
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        1: 300,
+        2: 300,
+        3: 300,
+    }
+    # Propagated stops carry no explicit times (consumers compute
+    # scheduled+delay) but DO carry the trip's vehicle.
+    assert resolved.predictions[2].arrival is None
+    assert resolved.predictions[2].departure is None
+    assert resolved.predictions[2].vehicle_id == "V1"
+
+
+def test_resolve_zero_delay_propagates() -> None:
+    """delay=0 (on time) is realtime information, not falsy-absent."""
+    entry = _entry(_stu(stop_id="A", delay=0))
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        1: 0,
+        2: 0,
+        3: 0,
+    }
+
+
+def test_resolve_later_stu_overrides_propagation() -> None:
+    entry = _entry(_stu(stop_id="A", delay=300), _stu(stop_id="C", delay=60))
+    resolved = resolve_trip_predictions(entry, [*_CALLS, (4, "D")])
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        1: 300,
+        2: 300,
+        3: 60,
+        4: 60,
+    }
+
+
+def test_resolve_no_data_cuts_propagation_and_trip_delay() -> None:
+    """NO_DATA yields no prediction at its stop and schedule-only stops
+    after it -- the trip-level fallback does NOT resume inside a NO_DATA
+    region (it is StopTimeUpdate-derived coverage).
+    """
+    entry = _entry(
+        _stu(stop_id="A", delay=300),
+        _stu(stop_id="B", relationship=_NO_DATA),
+        trip_delay=120,
+    )
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert set(resolved.predictions) == {1}
+    assert resolved.predictions[1].delay_seconds == 300
+
+
+def test_resolve_stu_after_no_data_resumes() -> None:
+    entry = _entry(
+        _stu(stop_id="A", relationship=_NO_DATA),
+        _stu(stop_id="B", delay=45),
+    )
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        2: 45,
+        3: 45,
+    }
+
+
+def test_resolve_trip_delay_fallback_only_where_uncovered() -> None:
+    """The trip-level delay covers stops BEFORE the first STU (propagation
+    only flows forward) and trips with no STUs at all; STU-derived state
+    wins from the first delay-bearing STU onward.
+    """
+    entry = _entry(_stu(stop_id="B", delay=300), trip_delay=120)
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        1: 120,
+        2: 300,
+        3: 300,
+    }
+    bare = resolve_trip_predictions(_entry(trip_delay=90), _CALLS)
+    assert {seq: p.delay_seconds for seq, p in bare.predictions.items()} == {
+        1: 90,
+        2: 90,
+        3: 90,
+    }
+
+
+def test_resolve_explicit_times_win_and_delay_less_stu_keeps_state() -> None:
+    when = datetime(2026, 7, 30, 15, 30, tzinfo=UTC)
+    entry = _entry(
+        _stu(stop_id="A", delay=300),
+        _stu(stop_id="B", departure=when),
+    )
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    # B keeps its explicit departure AND inherits the last-known delay;
+    # C still sees 300 (a delay-less STU never changes the propagation state).
+    assert resolved.predictions[2].departure == when
+    assert resolved.predictions[2].delay_seconds == 300
+    assert resolved.predictions[3].delay_seconds == 300
+    assert resolved.predictions[3].departure is None
+
+
+def test_resolve_skipped_marks_stop_and_never_alters_propagation() -> None:
+    entry = _entry(
+        _stu(stop_id="A", delay=300),
+        # Any delay a SKIPPED STU carries is ignored (spec discourages it).
+        _stu(stop_id="B", relationship=_SKIPPED, delay=999),
+    )
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.skipped == frozenset({2})
+    assert set(resolved.predictions) == {1, 3}
+    assert resolved.predictions[3].delay_seconds == 300
+
+
+def test_resolve_empty_stu_has_no_content_unless_covered() -> None:
+    """A SCHEDULED STU with no times and no delay contributes nothing on
+    its own, but inside a propagation region it surfaces the inherited
+    last-known delay at its stop.
+    """
+    alone = resolve_trip_predictions(_entry(_stu(stop_id="B")), _CALLS)
+    assert alone.predictions == {}
+    covered = resolve_trip_predictions(
+        _entry(_stu(stop_id="A", delay=300), _stu(stop_id="B")), _CALLS
+    )
+    assert covered.predictions[2].delay_seconds == 300
+
+
+def test_resolve_stop_id_matches_first_call_on_loop_trips() -> None:
+    entry = _entry(_stu(stop_id="A", delay=100))
+    resolved = resolve_trip_predictions(entry, _LOOP_CALLS)
+    # Bare stop_id addresses the FIRST visit to A; propagation then covers
+    # every later call, including the second visit.
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        1: 100,
+        2: 100,
+        3: 100,
+        4: 100,
+    }
+
+
+def test_resolve_stop_sequence_wins_and_addresses_later_loop_visit() -> None:
+    entry = _entry(_stu(stop_id="A", stop_sequence=3, delay=200))
+    resolved = resolve_trip_predictions(entry, _LOOP_CALLS)
+    # stop_sequence=3 addresses the SECOND visit to A even though stop_id
+    # "A" alone would have matched the first: stops before it stay
+    # schedule-only, the addressed visit and the tail get the delay.
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        3: 200,
+        4: 200,
+    }
+
+
+def test_resolve_unplaceable_stus_are_ignored() -> None:
+    entry = _entry(
+        _stu(stop_id="GHOST", delay=300),
+        _stu(stop_sequence=99, delay=300),
+        _stu(delay=300),  # neither field
+    )
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.predictions == {}
+    assert resolved.skipped == frozenset()

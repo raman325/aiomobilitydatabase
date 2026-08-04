@@ -8,8 +8,11 @@ from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.models import (
     Agency,
+    AlertCause,
+    AlertEffect,
     BikesAllowed,
     GbfsVehicle,
+    OccupancyStatus,
     PickupDropOffType,
     Route,
     ServiceAlert,
@@ -101,10 +104,13 @@ def test_vehicle_and_station_construct() -> None:
         route_id="R1",
         route_name="10 Main Line",
         trip_id="T1",
-        occupancy_status="MANY_SEATS_AVAILABLE",
+        occupancy_status=OccupancyStatus.MANY_SEATS_AVAILABLE,
         timestamp=datetime(2026, 7, 31, 15, 0, tzinfo=UTC),
     )
+    # StrEnum members compare equal to their raw protobuf-name strings, so
+    # pre-typing consumers keep working.
     assert vehicle.occupancy_status == "MANY_SEATS_AVAILABLE"
+    assert vehicle.occupancy_status is OccupancyStatus.MANY_SEATS_AVAILABLE
     station = Station(
         id="st1",
         name="Dock A",
@@ -139,8 +145,8 @@ def test_vehicle_and_station_construct() -> None:
         id="a1",
         header="Detour",
         description=None,
-        cause="CONSTRUCTION",
-        effect="DETOUR",
+        cause=AlertCause.CONSTRUCTION,
+        effect=AlertEffect.DETOUR,
         severity=None,
         route_ids=["R1"],
         stop_ids=[],

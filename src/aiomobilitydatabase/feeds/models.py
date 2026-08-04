@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 
 
 class WheelchairAccess(IntEnum):
@@ -57,6 +57,71 @@ class StopLocationType(IntEnum):
     ENTRANCE_EXIT = 2
     GENERIC_NODE = 3
     BOARDING_AREA = 4
+
+
+class AlertCause(StrEnum):
+    """GTFS-RT ``Alert.Cause`` vocabulary.
+
+    Member values are the protobuf enum NAMES (the strings the previous
+    untyped surface exposed), so ``alert.cause == "CONSTRUCTION"`` keeps
+    working while ``alert.cause is AlertCause.CONSTRUCTION`` becomes
+    available. A protobuf value this library doesn't know (a future spec
+    addition) degrades to None rather than raising -- same leniency as
+    every other closed vocabulary at the model boundary.
+    """
+
+    UNKNOWN_CAUSE = "UNKNOWN_CAUSE"
+    OTHER_CAUSE = "OTHER_CAUSE"
+    TECHNICAL_PROBLEM = "TECHNICAL_PROBLEM"
+    STRIKE = "STRIKE"
+    DEMONSTRATION = "DEMONSTRATION"
+    ACCIDENT = "ACCIDENT"
+    HOLIDAY = "HOLIDAY"
+    WEATHER = "WEATHER"
+    MAINTENANCE = "MAINTENANCE"
+    CONSTRUCTION = "CONSTRUCTION"
+    POLICE_ACTIVITY = "POLICE_ACTIVITY"
+    MEDICAL_EMERGENCY = "MEDICAL_EMERGENCY"
+    SPECIAL_EVENT = "SPECIAL_EVENT"
+
+
+class AlertEffect(StrEnum):
+    """GTFS-RT ``Alert.Effect`` vocabulary (values are the protobuf names)."""
+
+    NO_SERVICE = "NO_SERVICE"
+    REDUCED_SERVICE = "REDUCED_SERVICE"
+    SIGNIFICANT_DELAYS = "SIGNIFICANT_DELAYS"
+    DETOUR = "DETOUR"
+    ADDITIONAL_SERVICE = "ADDITIONAL_SERVICE"
+    MODIFIED_SERVICE = "MODIFIED_SERVICE"
+    OTHER_EFFECT = "OTHER_EFFECT"
+    UNKNOWN_EFFECT = "UNKNOWN_EFFECT"
+    STOP_MOVED = "STOP_MOVED"
+    NO_EFFECT = "NO_EFFECT"
+    ACCESSIBILITY_ISSUE = "ACCESSIBILITY_ISSUE"
+
+
+class AlertSeverity(StrEnum):
+    """GTFS-RT ``Alert.SeverityLevel`` vocabulary (protobuf names)."""
+
+    UNKNOWN_SEVERITY = "UNKNOWN_SEVERITY"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    SEVERE = "SEVERE"
+
+
+class OccupancyStatus(StrEnum):
+    """GTFS-RT ``VehiclePosition.OccupancyStatus`` vocabulary (protobuf names)."""
+
+    EMPTY = "EMPTY"
+    MANY_SEATS_AVAILABLE = "MANY_SEATS_AVAILABLE"
+    FEW_SEATS_AVAILABLE = "FEW_SEATS_AVAILABLE"
+    STANDING_ROOM_ONLY = "STANDING_ROOM_ONLY"
+    CRUSHED_STANDING_ROOM_ONLY = "CRUSHED_STANDING_ROOM_ONLY"
+    FULL = "FULL"
+    NOT_ACCEPTING_PASSENGERS = "NOT_ACCEPTING_PASSENGERS"
+    NO_DATA_AVAILABLE = "NO_DATA_AVAILABLE"
+    NOT_BOARDABLE = "NOT_BOARDABLE"
 
 
 @dataclass(frozen=True)
@@ -236,7 +301,7 @@ class VehiclePosition:
     route_id: str | None
     route_name: str | None
     trip_id: str | None
-    occupancy_status: str | None
+    occupancy_status: OccupancyStatus | None
     timestamp: datetime | None
 
 
@@ -247,9 +312,9 @@ class ServiceAlert:
     id: str
     header: str | None
     description: str | None
-    cause: str | None
-    effect: str | None
-    severity: str | None
+    cause: AlertCause | None
+    effect: AlertEffect | None
+    severity: AlertSeverity | None
     route_ids: list[str]
     stop_ids: list[str]
     active_periods: list[tuple[datetime | None, datetime | None]]

@@ -31,10 +31,15 @@ from aiomobilitydatabase.feeds.gbfs import (
 )
 from aiomobilitydatabase.feeds.geo import Circle, haversine_m, in_circle
 from aiomobilitydatabase.feeds.models import (
+    AlertCause,
+    AlertEffect,
+    AlertSeverity,
     BikesAllowed,
+    OccupancyStatus,
     PickupDropOffType,
     StaticBuildProgress,
     StopArrival,
+    UpcomingTrip,
     WheelchairAccess,
 )
 from aiomobilitydatabase.feeds.rt import (
@@ -42,6 +47,7 @@ from aiomobilitydatabase.feeds.rt import (
     _first_translation,
     alerts_from_message,
     fetch_feed_message,
+    resolve_trip_predictions,
     trip_updates_from_message,
     vehicles_from_message,
 )
@@ -512,10 +518,13 @@ _START_TIME_SAMPLES: dict[str, int | None] = {
 
 def _maybe_fill_trip_update_entity(
     entity: gtfs_realtime_pb2.FeedEntity, data: st.DataObject
-) -> set[tuple[str, int | None, str]]:
-    """Fill a trip_update entity; return the (trip_id, start_secs, stop_id)
-    keys it could contribute as predictions (empty when canceled or added,
-    since those entities never populate ``updates.predictions``).
+) -> set[tuple[str, int | None]]:
+    """Fill a trip_update entity; return the (trip_id, start_secs) key it
+    could contribute as a trip entry (empty when canceled or added, since
+    those entities never populate ``updates.trips``). Draws exercise the
+    full StopTimeUpdate surface: per-stop schedule_relationship (all valid
+    values), stop_id and/or stop_sequence presence, delays, explicit
+    times, and the trip-level TripUpdate.delay.
     """
     trip_id = data.draw(st.text(max_size=6))
     entity.trip_update.trip.trip_id = trip_id
@@ -525,24 +534,24 @@ def _maybe_fill_trip_update_entity(
     start_secs = _START_TIME_SAMPLES[start_time]
     relationship = data.draw(st.sampled_from([0, 1, 2, 3, 5]))
     entity.trip_update.trip.schedule_relationship = relationship
-    is_prediction_eligible = relationship not in (
+    if data.draw(st.booleans()):
+        entity.trip_update.delay = data.draw(st.integers(-3600, 3600))
+    is_entry_eligible = relationship not in (
         gtfs_realtime_pb2.TripDescriptor.CANCELED,
         gtfs_realtime_pb2.TripDescriptor.ADDED,
     )
-    possible_keys: set[tuple[str, int | None, str]] = set()
     for _ in range(data.draw(st.integers(0, 2))):
         stu = entity.trip_update.stop_time_update.add()
-        stop_id = ""
+        stu.schedule_relationship = data.draw(st.sampled_from([0, 1, 2, 3]))
         if data.draw(st.booleans()):
-            stop_id = data.draw(st.text(max_size=6))
-            stu.stop_id = stop_id
+            stu.stop_id = data.draw(st.text(max_size=6))
+        if data.draw(st.booleans()):
+            stu.stop_sequence = data.draw(st.integers(0, 50))
         if data.draw(st.booleans()):
             stu.arrival.time = data.draw(st.integers(0, 2_000_000_000))
         if data.draw(st.booleans()):
             stu.departure.delay = data.draw(st.integers(-3600, 3600))
-        if is_prediction_eligible:
-            possible_keys.add((trip_id, start_secs, stop_id))
-    return possible_keys
+    return {(trip_id, start_secs)} if is_entry_eligible else set()
 
 
 def _maybe_fill_alert_entity(
@@ -554,12 +563,28 @@ def _maybe_fill_alert_entity(
     if data.draw(st.booleans()):
         informed = entity.alert.informed_entity.add()
         informed.route_id = data.draw(st.text(max_size=6))
+    if data.draw(st.booleans()):
+        entity.alert.cause = data.draw(
+            st.sampled_from(list(gtfs_realtime_pb2.Alert.Cause.values()))
+        )
+    if data.draw(st.booleans()):
+        entity.alert.effect = data.draw(
+            st.sampled_from(list(gtfs_realtime_pb2.Alert.Effect.values()))
+        )
+    if data.draw(st.booleans()):
+        entity.alert.severity_level = data.draw(
+            st.sampled_from(list(gtfs_realtime_pb2.Alert.SeverityLevel.values()))
+        )
 
 
 @given(data=st.data())
 @settings(max_examples=100, deadline=None)
 def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
-    """Random field-presence combinations must never crash any RT parser."""
+    """Random field-presence combinations must never crash any RT parser,
+    trip entries only come from eligible entities, drawn enum values map to
+    typed members (or None), and resolving any parsed entry against an
+    arbitrary stop order never raises and stays inside that order.
+    """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
     fillers = {
@@ -569,7 +594,7 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         "empty": None,
     }
     expected_vehicle_count = 0
-    possible_prediction_keys: set[tuple[str, int | None, str]] = set()
+    possible_entry_keys: set[tuple[str, int | None]] = set()
     for i in range(data.draw(st.integers(0, 4))):
         entity = msg.entity.add()
         entity.id = f"e{i}"
@@ -582,17 +607,34 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
             if result:
                 expected_vehicle_count += 1
         elif kind == "trip_update":
-            possible_prediction_keys |= result
+            possible_entry_keys |= result  # type: ignore[arg-type]
     vehicles = vehicles_from_message(msg, route_names={}, trip_routes={})
     assert len(vehicles) == expected_vehicle_count
     for vehicle in vehicles:
         assert vehicle.latitude is not None and vehicle.longitude is not None
+        assert vehicle.occupancy_status is None or isinstance(
+            vehicle.occupancy_status, OccupancyStatus
+        )
     updates = trip_updates_from_message(msg)
-    assert updates.canceled_trips.isdisjoint(
-        {(trip_id, start_secs) for trip_id, start_secs, _ in updates.predictions}
-    )
-    assert set(updates.predictions.keys()) <= possible_prediction_keys
-    alerts_from_message(msg)  # must simply not raise
+    assert updates.canceled_trips.isdisjoint(set(updates.trips))
+    assert set(updates.trips) <= possible_entry_keys
+    # Resolution totality: any entry against any stop order never raises,
+    # and its outcomes never leave that order.
+    stop_calls = [
+        (seq, data.draw(st.sampled_from(["A", "B", "C"])))
+        for seq in sorted(data.draw(st.sets(st.integers(0, 50), max_size=4)))
+    ]
+    known_seqs = {seq for seq, _ in stop_calls}
+    for entry in updates.trips.values():
+        resolved = resolve_trip_predictions(entry, stop_calls)
+        assert set(resolved.predictions) <= known_seqs
+        assert resolved.skipped <= known_seqs
+        assert resolved.skipped.isdisjoint(resolved.predictions)
+    alerts = alerts_from_message(msg)  # must simply not raise
+    for alert in alerts:
+        assert alert.cause is None or isinstance(alert.cause, AlertCause)
+        assert alert.effect is None or isinstance(alert.effect, AlertEffect)
+        assert alert.severity is None or isinstance(alert.severity, AlertSeverity)
 
 
 _GARBAGE_NUMERICS = ["abc", "1.2.3", "NaN?", "--", "1e999x", " ", "12a"]
@@ -1967,6 +2009,15 @@ def _run_frequencies_rt_scenario(
 _F1_REP_STARTS = (21600, 22200, 22800, 25200, 25800)
 
 
+# The frequencies fixture's F1 template offsets from a repetition start
+# (see fixtures.py): S1 arr=dep at +0, S2 +600/+630, S3 +1200. The service
+# day anchor for 2026-07-30 in America/Los_Angeles (PDT) is 07:00 UTC.
+_F1_STOP_POS = {"S1": 0, "S2": 1, "S3": 2}
+_F1_ARR_OFFSETS = {"S1": 0, "S2": 600, "S3": 1200}
+_F1_DEP_OFFSETS = {"S1": 0, "S2": 630, "S3": 1200}
+_F1_DAY_ANCHOR = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
+
+
 @settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     rep=st.sampled_from(_F1_REP_STARTS),
@@ -1981,9 +2032,11 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
 ) -> None:
     """Over generated updates against the frequencies fixture: a prediction
     or cancellation whose start_time is ALIGNED to a materialized
-    repetition affects exactly that one repetition; a MISALIGNED start_time
-    (off by 1..599s -- repetitions are >=600s apart, so it never lands on a
-    sibling) or a MISSING start_time affects none. The window holds 15
+    repetition affects exactly that one repetition -- the STU stop plus
+    propagation to that repetition's SUBSEQUENT stops, never a sibling
+    repetition and never a stop before the STU; a MISALIGNED start_time
+    (off by 1..599s -- repetitions are >=600s apart, so it never lands on
+    a sibling) or a MISSING start_time affects none. The window holds 15
     synthetic rows (5 F1 repetitions x 3 stops) when nothing is canceled.
     """
     msg = gtfs_realtime_pb2.FeedMessage()
@@ -1995,6 +2048,9 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
         entity.trip_update.trip.start_time = _format_gtfs_time(rep)
     elif mode == "misaligned":
         entity.trip_update.trip.start_time = _format_gtfs_time(rep + misalign)
+    explicit_departure_epoch = (
+        int(datetime(2026, 7, 30, 13, 0, tzinfo=UTC).timestamp()) + delay
+    )
     if kind == "cancellation":
         entity.trip_update.trip.schedule_relationship = (
             gtfs_realtime_pb2.TripDescriptor.CANCELED
@@ -2003,9 +2059,7 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
         stu = entity.trip_update.stop_time_update.add()
         stu.stop_id = stop_id
         stu.departure.delay = delay
-        stu.departure.time = (
-            int(datetime(2026, 7, 30, 13, 0, tzinfo=UTC).timestamp()) + delay
-        )
+        stu.departure.time = explicit_departure_epoch
     arrivals = _run_frequencies_rt_scenario(msg)
     all_ids = {f"F1#{start}" for start in _F1_REP_STARTS}
     got_ids = {row.trip_id for row in arrivals}
@@ -2014,20 +2068,390 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
         assert got_ids == all_ids - dropped
         assert len(arrivals) == 15 - 3 * len(dropped)
         assert all(row.realtime is False for row in arrivals)
-    else:
-        assert got_ids == all_ids
-        assert len(arrivals) == 15
-        for row in arrivals:
-            expected_rt = (
-                mode == "aligned"
-                and row.trip_id == f"F1#{rep}"
-                and row.stop_id == stop_id
+        return
+    assert got_ids == all_ids
+    assert len(arrivals) == 15
+    for row in arrivals:
+        assert row.stop_id is not None
+        # Realtime iff this row is the matched repetition's STU stop or a
+        # LATER stop of that same repetition (propagation): siblings and
+        # earlier stops never gain predictions.
+        expected_rt = (
+            mode == "aligned"
+            and row.trip_id == f"F1#{rep}"
+            and _F1_STOP_POS[row.stop_id] >= _F1_STOP_POS[stop_id]
+        )
+        assert row.realtime is expected_rt
+        if not expected_rt:
+            assert row.predicted_departure is None
+            assert row.delay_seconds is None
+            continue
+        assert row.delay_seconds == delay
+        if row.stop_id == stop_id:
+            # The STU's own stop keeps its explicit epoch prediction.
+            assert row.predicted_departure == datetime.fromtimestamp(
+                explicit_departure_epoch, tz=UTC
             )
-            assert row.realtime is expected_rt
-            if expected_rt:
-                assert row.delay_seconds == delay
-            else:
-                assert row.predicted_departure is None
+        else:
+            # Propagated stops predict scheduled + delay on this
+            # repetition's own timeline.
+            assert row.predicted_departure == _F1_DAY_ANCHOR + timedelta(
+                seconds=rep + _F1_DEP_OFFSETS[row.stop_id] + delay
+            )
+            assert row.predicted_arrival == _F1_DAY_ANCHOR + timedelta(
+                seconds=rep + _F1_ARR_OFFSETS[row.stop_id] + delay
+            )
+
+
+# --- delay-propagation properties (spec-correct GTFS-RT overlay) ------------
+
+# One service day so the oracle timeline is anchor + elapsed seconds. The
+# catalog fixture's latest_dataset.agency_timezone (America/Los_Angeles)
+# overrides the generated agency.txt, so the 2026-07-30 service day starts
+# at local midnight PDT = 07:00 UTC.
+_PROP_ANCHOR = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
+_PROP_NOW = datetime(2026, 7, 30, 14, 0, tzinfo=UTC)  # 07:00 PDT
+_PROP_BASE = 28800  # TP's first-stop arrival: 08:00:00
+_PROP_STEP = 600
+_PROP_DWELL = 60
+_PROP_OTHER_SHIFT = 30  # OTHER trip runs 30s behind TP at every stop
+
+
+def _prop_arr_secs(i: int) -> int:
+    return _PROP_BASE + _PROP_STEP * i
+
+
+def _propagation_zip(n_stops: int, seq_gap: int) -> bytes:
+    """One-day UTC feed: trip TP plus an RT-untouched OTHER trip over the
+    same stops, with stop_sequence values spaced by ``seq_gap`` (gaps prove
+    sequence ADDRESSING, not list indexing).
+    """
+    stop_rows = "".join(f"S{i},Stop {i},0,0\n" for i in range(n_stops))
+    stop_time_rows = ""
+    for trip_id, shift in (("TP", 0), ("OTHER", _PROP_OTHER_SHIFT)):
+        for i in range(n_stops):
+            arr = _format_gtfs_time(_prop_arr_secs(i) + shift)
+            dep = _format_gtfs_time(_prop_arr_secs(i) + shift + _PROP_DWELL)
+            stop_time_rows += f"{trip_id},{arr},{dep},S{i},{seq_gap * (i + 1)}\n"
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n" + stop_rows,
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": (
+            "route_id,service_id,trip_id,trip_headsign\nR1,ONE,TP,H\nR1,ONE,OTHER,H\n"
+        ),
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            + stop_time_rows
+        ),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+def _run_propagation_scenario(
+    zip_bytes: bytes,
+    msg: gtfs_realtime_pb2.FeedMessage,
+    stop_ids: list[str],
+    pairs: list[tuple[str, str]],
+) -> tuple[list[StopArrival], dict[tuple[str, str], list[UpcomingTrip]]]:
+    """Serve a generated zip + one RT message; run arrivals and pair queries."""
+
+    async def scenario() -> tuple[
+        list[StopArrival], dict[tuple[str, str], list[UpcomingTrip]]
+    ]:
+        api = MockApi()
+        await api.start()
+        try:
+            base = api.url()
+            api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+            api.get("/v1/feeds/mdb-100", payload=with_base(GTFS_FEED, base))
+            api.get("/v1/gtfs_feeds/mdb-100", payload=with_base(GTFS_FEED, base))
+            api.get(
+                "/v1/gtfs_feeds/mdb-100/gtfs_rt_feeds",
+                payload=[with_base(GTFS_RT_FEED, base)],
+            )
+            api.get(
+                "/hosted/mdb-100.zip", body=zip_bytes, content_type="application/zip"
+            )
+            body = msg.SerializeToString()
+            for _ in range(1 + len(pairs)):  # one RT fetch per merging call
+                api.get("/rt/all", body=body, content_type="application/octet-stream")
+            async with MobilityFeedsClient("t", base_url=base) as client:
+                handle = await client.get_transit_feed("mdb-100")
+                arrivals = await handle.get_arrivals(
+                    stop_ids,
+                    lookahead=timedelta(hours=6),
+                    limit=50,
+                    now_utc=_PROP_NOW,
+                )
+                trips = {}
+                for origin, destination in pairs:
+                    trips[(origin, destination)] = await handle.upcoming_trips(
+                        origin,
+                        destination,
+                        lookahead=timedelta(hours=6),
+                        now_utc=_PROP_NOW,
+                    )
+                return arrivals, trips
+        finally:
+            await api.stop()
+
+    return asyncio.run(scenario())
+
+
+@st.composite
+def _propagation_case(draw: st.DrawFn) -> dict[str, object]:
+    """A static trip (3-8 stops) plus a drawn StopTimeUpdate set.
+
+    Per stop: no STU, a delay STU, an explicit-departure-time STU, both, an
+    empty SCHEDULED STU, a SKIPPED marker, or a NO_DATA marker -- each STU
+    addressed by stop_id, stop_sequence, or both. Optional trip-level
+    delay, optional unplaceable "ghost" STU, drawn feed order.
+    """
+    n_stops = draw(st.integers(3, 8))
+    specs: dict[int, dict[str, object]] = {}
+    for i in range(n_stops):
+        kind = draw(
+            st.sampled_from(
+                [
+                    "none",
+                    "none",
+                    "delay",
+                    "explicit",
+                    "delay_explicit",
+                    "empty",
+                    "skipped",
+                    "no_data",
+                ]
+            )
+        )
+        if kind == "none":
+            continue
+        spec: dict[str, object] = {"kind": kind}
+        if kind in ("delay", "delay_explicit"):
+            spec["delay"] = draw(st.integers(-300, 900))
+        if kind in ("explicit", "delay_explicit"):
+            spec["dep_offset"] = draw(st.integers(-120, 1200))
+        spec["addressing"] = draw(st.sampled_from(["stop_id", "stop_sequence", "both"]))
+        specs[i] = spec
+    return {
+        "n_stops": n_stops,
+        "seq_gap": draw(st.sampled_from([1, 10])),
+        "trip_delay": draw(st.none() | st.integers(-300, 900)),
+        "specs": specs,
+        "ghost": draw(st.booleans()),
+        "reverse_order": draw(st.booleans()),
+    }
+
+
+def _propagation_message(case: dict[str, object]) -> gtfs_realtime_pb2.FeedMessage:
+    """Encode a drawn case as a TripUpdates FeedMessage for trip TP."""
+    specs: dict[int, dict[str, object]] = case["specs"]  # type: ignore[assignment]
+    seq_gap: int = case["seq_gap"]  # type: ignore[assignment]
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "tu-prop"
+    entity.trip_update.trip.trip_id = "TP"
+    if case["trip_delay"] is not None:
+        entity.trip_update.delay = case["trip_delay"]  # type: ignore[assignment]
+    order = sorted(specs)
+    if case["reverse_order"]:
+        order.reverse()  # feed order must not matter: static order rules
+    for i in order:
+        spec = specs[i]
+        stu = entity.trip_update.stop_time_update.add()
+        addressing = spec["addressing"]
+        if addressing in ("stop_id", "both"):
+            stu.stop_id = f"S{i}"
+        if addressing in ("stop_sequence", "both"):
+            stu.stop_sequence = seq_gap * (i + 1)
+        kind = spec["kind"]
+        if kind == "skipped":
+            stu.schedule_relationship = (
+                gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
+            )
+            continue
+        if kind == "no_data":
+            stu.schedule_relationship = (
+                gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
+            )
+            continue
+        if "delay" in spec:
+            stu.departure.delay = spec["delay"]  # type: ignore[assignment]
+        if "dep_offset" in spec:
+            epoch = _PROP_ANCHOR + timedelta(
+                seconds=_prop_arr_secs(i) + _PROP_DWELL + spec["dep_offset"]  # type: ignore[operator]
+            )
+            stu.departure.time = int(epoch.timestamp())
+    if case["ghost"]:
+        ghost = entity.trip_update.stop_time_update.add()
+        ghost.stop_id = "GHOST"  # matches no static call: must change nothing
+        ghost.departure.delay = 999
+    return msg
+
+
+def _propagation_oracle(
+    case: dict[str, object],
+) -> dict[int, object]:
+    """Independent piecewise restatement of the spec, from the DRAWN values.
+
+    Per stop index: ``"skipped"``, ``None`` (schedule-only), or a dict with
+    the effective delay (may be None for an explicit-only stop) and the
+    explicit departure offset (None when the stop's prediction is purely
+    scheduled+delay). Walks the stops in order: last STU delay at-or-before
+    the stop propagates, NO_DATA cuts it, explicit times override at their
+    own stop, the trip-level delay covers stops no STU information reaches,
+    and everything else is schedule-only.
+    """
+    specs: dict[int, dict[str, object]] = case["specs"]  # type: ignore[assignment]
+    trip_delay = case["trip_delay"]
+    outcomes: dict[int, object] = {}
+    covered = False
+    current: object = None
+    for i in range(case["n_stops"]):  # type: ignore[arg-type]
+        spec = specs.get(i)
+        if spec is None:
+            fallback = current if covered else trip_delay
+            outcomes[i] = (
+                None if fallback is None else {"delay": fallback, "dep_offset": None}
+            )
+            continue
+        kind = spec["kind"]
+        if kind == "skipped":
+            outcomes[i] = "skipped"
+            continue
+        if kind == "no_data":
+            covered, current = True, None
+            outcomes[i] = None
+            continue
+        own_delay = spec.get("delay")
+        if own_delay is not None:
+            covered, current = True, own_delay
+        effective = (
+            own_delay if own_delay is not None else (current if covered else trip_delay)
+        )
+        dep_offset = spec.get("dep_offset")
+        if effective is None and dep_offset is None:
+            outcomes[i] = None  # an empty STU carries no realtime content
+        else:
+            outcomes[i] = {"delay": effective, "dep_offset": dep_offset}
+    return outcomes
+
+
+@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(case=_propagation_case())
+def test_propagation_matches_piecewise_oracle(case: dict[str, object]) -> None:
+    """THE load-bearing propagation property: for EVERY stop of a generated
+    trip under a drawn StopTimeUpdate set, the merged arrival row equals
+    the piecewise oracle computed independently from the drawn values --
+    and the RT-untouched sibling trip stays schedule-only throughout.
+    """
+    n_stops: int = case["n_stops"]  # type: ignore[assignment]
+    stop_ids = [f"S{i}" for i in range(n_stops)]
+    arrivals, _ = _run_propagation_scenario(
+        _propagation_zip(n_stops, case["seq_gap"]),  # type: ignore[arg-type]
+        _propagation_message(case),
+        stop_ids,
+        [],
+    )
+    outcomes = _propagation_oracle(case)
+    by_key = {(a.trip_id, a.stop_id): a for a in arrivals}
+    assert len(by_key) == len(arrivals)
+    for i in range(n_stops):
+        # The RT-untouched sibling: always present, always schedule-only.
+        other = by_key[("OTHER", f"S{i}")]
+        assert other.realtime is False
+        assert other.predicted_departure is None
+        assert other.delay_seconds is None
+        outcome = outcomes[i]
+        sched_arr = _PROP_ANCHOR + timedelta(seconds=_prop_arr_secs(i))
+        sched_dep = sched_arr + timedelta(seconds=_PROP_DWELL)
+        if outcome == "skipped":
+            assert ("TP", f"S{i}") not in by_key
+            continue
+        row = by_key[("TP", f"S{i}")]
+        assert row.scheduled_departure == sched_dep
+        if outcome is None:
+            assert row.realtime is False
+            assert row.predicted_arrival is None
+            assert row.predicted_departure is None
+            assert row.delay_seconds is None
+            continue
+        assert isinstance(outcome, dict)
+        assert row.realtime is True
+        delay, dep_offset = outcome["delay"], outcome["dep_offset"]
+        assert row.delay_seconds == delay
+        if dep_offset is not None:
+            assert row.predicted_departure == sched_dep + timedelta(seconds=dep_offset)
+        elif delay is not None:
+            assert row.predicted_departure == sched_dep + timedelta(seconds=delay)
+        if delay is not None:
+            assert row.predicted_arrival == sched_arr + timedelta(seconds=delay)
+        else:
+            assert row.predicted_arrival is None
+
+
+@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    n_stops=st.integers(3, 5),
+    data=st.data(),
+)
+def test_skipped_totality_over_arrivals_and_trips(
+    n_stops: int, data: st.DataObject
+) -> None:
+    """SKIPPED totality: any drawn subset of skipped stops (optionally
+    alongside a real delay) removes exactly those stops from arrivals and
+    kills exactly the origin->destination rows whose boarding OR alighting
+    stop is skipped -- every other row, including the whole RT-untouched
+    sibling trip, is unaffected.
+    """
+    skipped = data.draw(st.sets(st.integers(0, n_stops - 1), max_size=n_stops))
+    with_delay = data.draw(st.booleans()) and 0 not in skipped
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "tu-skip"
+    entity.trip_update.trip.trip_id = "TP"
+    if with_delay:
+        first = entity.trip_update.stop_time_update.add()
+        first.stop_id = "S0"
+        first.departure.delay = 240
+    for i in sorted(skipped):
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_id = f"S{i}"
+        stu.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
+    stop_ids = [f"S{i}" for i in range(n_stops)]
+    pairs = [(f"S{i}", f"S{j}") for i in range(n_stops) for j in range(i + 1, n_stops)]
+    arrivals, trips_by_pair = _run_propagation_scenario(
+        _propagation_zip(n_stops, 1), msg, stop_ids, pairs
+    )
+    tp_stops = {a.stop_id for a in arrivals if a.trip_id == "TP"}
+    assert tp_stops == {f"S{i}" for i in range(n_stops) if i not in skipped}
+    other_stops = {a.stop_id for a in arrivals if a.trip_id == "OTHER"}
+    assert other_stops == set(stop_ids)  # sibling trip fully unaffected
+    for (origin, destination), rows in trips_by_pair.items():
+        i, j = int(origin[1:]), int(destination[1:])
+        got = {row.trip_id for row in rows}
+        expected = {"OTHER"}  # never touched by RT: every pair keeps its row
+        if i not in skipped and j not in skipped:
+            expected.add("TP")
+        assert got == expected
+        for row in rows:
+            if row.trip_id == "OTHER":
+                assert row.realtime is False
+            elif with_delay:
+                # The S0 delay propagates over the whole trip, so every
+                # surviving TP journey row is realtime with delay 240.
+                assert row.realtime is True
+                assert row.delay_seconds == 240
 
 
 @given(done=st.integers(0, 2**40), total=st.integers(0, 2**40) | st.none())

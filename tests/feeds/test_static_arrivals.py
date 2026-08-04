@@ -273,3 +273,19 @@ def test_dst_fall_back_uses_elapsed_seconds(tmp_path: Path) -> None:
     assert [dep.trip_id for dep in departures] == ["T3"]
     assert departures[0].departure == datetime(2027, 11, 8, 8, 31, tzinfo=UTC)
     index.close()
+
+
+def test_trip_stop_calls_ordering_and_empty(tmp_path: Path) -> None:
+    """The RT-propagation seam query: per-trip (stop_sequence, stop_id)
+    calls come back in stop_sequence order, unknown trips are simply
+    absent, and the no-ids fast path returns an empty map without touching
+    SQL (an empty IN () list is a SQLite syntax error).
+    """
+    index = _index(tmp_path)
+    calls = index.trip_stop_calls(["T1", "T2", "missing"])
+    assert calls == {
+        "T1": [(1, "S1"), (2, "S2")],
+        "T2": [(1, "S1")],
+    }
+    assert index.trip_stop_calls([]) == {}
+    index.close()
