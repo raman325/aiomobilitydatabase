@@ -9,5 +9,8 @@ repos:
     rev: v5.0.0
     hooks:
       - id: end-of-file-fixer
+        # Keep Google's canonical sample feed byte-identical to upstream.
+        exclude: ^tests/feeds/data/sample_feed/.*\.txt$
       - id: trailing-whitespace
+        exclude: ^tests/feeds/data/sample_feed/.*\.txt$
       - id: check-yaml

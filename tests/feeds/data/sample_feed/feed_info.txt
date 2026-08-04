@@ -1,0 +1,2 @@
+feed_publisher_name,feed_publisher_url,url_lang,feed_id,feed_start_date,feed_end_date
+the feeder,transit.example.com,en,17,,
