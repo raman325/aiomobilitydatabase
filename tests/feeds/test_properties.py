@@ -846,6 +846,45 @@ def test_upcoming_departures_deterministic(
 
 
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
+@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_upcoming_trips_invariants(zip_bytes: bytes, data: st.DataObject) -> None:
+    """Over messy generated feeds: identical origin→destination queries are
+    deterministic, echo the queried stop pair, keep every origin departure
+    tz-aware and inside the window, stay sorted by the total key, and
+    respect the limit. (Departure <= arrival is deliberately NOT asserted:
+    generated feeds may contain non-monotonic stop times, and the query
+    reports the schedule as-is rather than repairing producer errors.)
+    """
+    try:
+        index = _index_from_zip_bytes(zip_bytes)
+    except FeedParseError:
+        return  # acceptable outcome for genuinely unbuildable feeds
+    try:
+        stops = [s.id for s in index.stops()]
+        if not stops:
+            return
+        origin = data.draw(st.sampled_from(stops))
+        destination = data.draw(st.sampled_from(stops))
+        now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+        lookahead = timedelta(hours=30)
+        first = index.upcoming_trips(origin, destination, now, lookahead, 5)
+        second = index.upcoming_trips(origin, destination, now, lookahead, 5)
+        assert first == second
+        assert len(first) <= 5
+        for trip in first:
+            assert trip.origin_stop_id == origin
+            assert trip.destination_stop_id == destination
+            assert trip.departure.tzinfo is not None
+            assert trip.arrival.tzinfo is not None
+            assert now <= trip.departure <= now + lookahead
+        assert first == sorted(
+            first, key=lambda trip: (trip.departure, trip.trip_id, trip.arrival)
+        )
+    finally:
+        index.close()
+
+
+@given(zip_bytes=_random_gtfs_zip(), data=st.data())
 @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_cache_roundtrip_equivalent(zip_bytes: bytes, data: st.DataObject) -> None:
     """A reopened cached index answers every query identically to the builder."""

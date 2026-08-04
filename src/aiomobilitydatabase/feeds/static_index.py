@@ -11,7 +11,7 @@ import csv
 import io
 import sqlite3
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -112,6 +112,24 @@ class ScheduledDeparture:
     stop_id: str
     arrival: datetime | None
     departure: datetime
+
+
+@dataclass(frozen=True)
+class ScheduledTrip:
+    """A scheduled origin-to-destination journey resolved to tz-aware datetimes.
+
+    ``departure`` is at the origin stop and ``arrival`` at the destination;
+    both are non-optional because the producing query's WHERE clauses
+    require the underlying GTFS times to be present.
+    """
+
+    trip_id: str
+    route_id: str
+    headsign: str | None
+    origin_stop_id: str
+    destination_stop_id: str
+    departure: datetime
+    arrival: datetime
 
 
 class StaticIndex:
@@ -558,31 +576,22 @@ class StaticIndex:
         noon = datetime.combine(service_date, time(12, 0), tzinfo=self._tz)
         return noon - timedelta(hours=12)
 
-    def upcoming_departures(
-        self,
-        stop_ids: list[str],
-        route_ids: list[str] | None,
-        now_utc: datetime,
-        lookahead: timedelta,
-        per_stop_limit: int,
-    ) -> list[ScheduledDeparture]:
-        """Scheduled departures at the given stops within the lookahead window.
+    def _service_day_windows(
+        self, now_utc: datetime, lookahead: timedelta
+    ) -> Iterator[tuple[datetime, set[str], float, float]]:
+        """Yield one ``(day_start_utc, active_ids, window_lo, window_hi)`` per day.
 
-        Considers every local service day from one day before ``now_utc``
-        through one day after the window's local end date, so past-midnight
-        trips (>24:00:00 times) surface on the correct clock day and long
-        lookaheads are never truncated. Results are sorted by departure and
-        truncated to ``per_stop_limit`` per stop.
+        Shared by ``upcoming_departures`` and ``upcoming_trips`` so the
+        DST-safe day-window arithmetic exists exactly once. Scans every
+        service day that could contribute: one day BEFORE the window
+        (>24:00:00 times still upcoming) through one day AFTER the window's
+        local end date (enclosure margin for DST edge instants). Empty days
+        cost one cheap indexed query; silently narrower bounds cost dropped
+        departures (hypothesis-found bug, 2026-07-31: the old hardcoded
+        local_today +/- 1 day tuple ignored `lookahead` entirely).
         """
         local_today = now_utc.astimezone(self._tz).date()
         end_local = (now_utc + lookahead).astimezone(self._tz).date()
-        results: list[ScheduledDeparture] = []
-        # Scan every service day that could contribute: one day BEFORE the
-        # window (>24:00:00 times still upcoming) through one day AFTER the
-        # window's local end date (enclosure margin for DST edge instants).
-        # Empty days cost one cheap indexed query; silently narrower bounds
-        # cost dropped departures (hypothesis-found bug, 2026-07-31: the old
-        # hardcoded local_today +/- 1 day tuple ignored `lookahead` entirely).
         scan_start = local_today - timedelta(days=1)
         scan_end = end_local + timedelta(days=1)
         num_scan_days = (scan_end - scan_start).days + 1
@@ -602,6 +611,28 @@ class StaticIndex:
             window_hi = window_lo + lookahead.total_seconds()
             if window_hi < 0:
                 continue
+            yield day_start_utc, active, window_lo, window_hi
+
+    def upcoming_departures(
+        self,
+        stop_ids: list[str],
+        route_ids: list[str] | None,
+        now_utc: datetime,
+        lookahead: timedelta,
+        per_stop_limit: int,
+    ) -> list[ScheduledDeparture]:
+        """Scheduled departures at the given stops within the lookahead window.
+
+        Considers every local service day from one day before ``now_utc``
+        through one day after the window's local end date, so past-midnight
+        trips (>24:00:00 times) surface on the correct clock day and long
+        lookaheads are never truncated. Results are sorted by departure and
+        truncated to ``per_stop_limit`` per stop.
+        """
+        results: list[ScheduledDeparture] = []
+        for day_start_utc, active, window_lo, window_hi in self._service_day_windows(
+            now_utc, lookahead
+        ):
             stop_marks = ",".join("?" * len(stop_ids))
             service_marks = ",".join("?" * len(active))
             sql = (
@@ -655,6 +686,75 @@ class StaticIndex:
                 limited.append(dep)
                 per_stop_counts[dep.stop_id] = count + 1
         return limited
+
+    def upcoming_trips(
+        self,
+        origin_stop_id: str,
+        destination_stop_id: str,
+        now_utc: datetime,
+        lookahead: timedelta,
+        limit: int,
+    ) -> list[ScheduledTrip]:
+        """Scheduled trips departing the origin that later serve the destination.
+
+        Uses the same service-day scanning as ``upcoming_departures``; the
+        window applies to the ORIGIN departure. The ``o.stop_sequence <
+        d.stop_sequence`` self-join predicate is what excludes
+        wrong-direction trips: a return trip serves both stops too, but its
+        destination call precedes its origin call. A loop trip serving the
+        destination more than once after the origin collapses to its
+        earliest destination arrival (MIN) — ride until the vehicle first
+        reaches the destination. Results are sorted by origin departure and
+        truncated to ``limit``.
+        """
+        results: list[ScheduledTrip] = []
+        for day_start_utc, active, window_lo, window_hi in self._service_day_windows(
+            now_utc, lookahead
+        ):
+            service_marks = ",".join("?" * len(active))
+            # The IS NOT NULL clauses guarantee ScheduledTrip's non-optional
+            # datetimes: a stop_time without a departure at the origin (or an
+            # arrival at the destination) can never produce a row.
+            sql = (
+                "SELECT o.trip_id, t.route_id, t.headsign, "
+                "o.departure_secs, MIN(d.arrival_secs) "
+                "FROM stop_times o "
+                "JOIN stop_times d ON d.trip_id = o.trip_id "
+                "JOIN trips t ON t.id = o.trip_id "
+                "WHERE o.stop_id = ? AND d.stop_id = ? "
+                "AND o.stop_sequence < d.stop_sequence "
+                "AND o.departure_secs IS NOT NULL "
+                "AND d.arrival_secs IS NOT NULL "
+                f"AND t.service_id IN ({service_marks}) "
+                "AND o.departure_secs >= ? AND o.departure_secs <= ? "
+                "GROUP BY o.trip_id, o.stop_sequence"
+            )
+            params: list[object] = [
+                origin_stop_id,
+                destination_stop_id,
+                *sorted(active),
+                window_lo,
+                window_hi,
+            ]
+            for trip_id, route_id, headsign, dep_secs, arr_secs in self._conn.execute(
+                sql, params
+            ):
+                results.append(
+                    ScheduledTrip(
+                        trip_id=trip_id,
+                        route_id=route_id,
+                        headsign=headsign,
+                        origin_stop_id=origin_stop_id,
+                        destination_stop_id=destination_stop_id,
+                        departure=day_start_utc + timedelta(seconds=dep_secs),
+                        arrival=day_start_utc + timedelta(seconds=arr_secs),
+                    )
+                )
+        # Total sort key, matching upcoming_departures's rationale: arrival
+        # is the third component because a degenerate loop trip can depart
+        # the origin twice at the identical instant.
+        results.sort(key=lambda trip: (trip.departure, trip.trip_id, trip.arrival))
+        return results[:limit]
 
     def close(self) -> None:
         """Close the underlying connection."""

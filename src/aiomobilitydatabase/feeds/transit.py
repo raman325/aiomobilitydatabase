@@ -35,11 +35,11 @@ from .models import (
     StationGroup,
     Stop,
     StopArrival,
+    UpcomingTrip,
     VehiclePosition,
 )
 from .rt import (
-    AddedStopTime,
-    StopPrediction,
+    TripUpdates,
     _require_http_url,  # deliberate friend access: shared data-origin URL guard
     alerts_from_message,
     fetch_feed_message,
@@ -298,6 +298,21 @@ class TransitFeedHandle:
             )
         return messages
 
+    async def _aggregated_trip_updates(self) -> TripUpdates:
+        """Merge TripUpdates across every TU-capable sibling RT source.
+
+        Deliberate tiebreak: when multiple TU-capable sibling feeds report
+        the same (trip, stop), the last feed in catalog order wins (no
+        freshness reconciliation in v1).
+        """
+        aggregate = TripUpdates()
+        for message in await self._fetch_entity_messages(EntityType.TRIP_UPDATES):
+            updates = trip_updates_from_message(message)
+            aggregate.predictions.update(updates.predictions)
+            aggregate.canceled_trips |= updates.canceled_trips
+            aggregate.added.extend(updates.added)
+        return aggregate
+
     async def get_arrivals(
         self,
         stop_ids: list[str],
@@ -321,17 +336,10 @@ class TransitFeedHandle:
         )
         stop_names = await asyncio.to_thread(self._index.stop_names)
         route_names = await asyncio.to_thread(self._index.route_display_names)
-        predictions: dict[tuple[str, str], StopPrediction] = {}
-        canceled: set[str] = set()
-        added_rows: list[AddedStopTime] = []
-        for message in await self._fetch_entity_messages(EntityType.TRIP_UPDATES):
-            updates = trip_updates_from_message(message)
-            # Deliberate tiebreak: when multiple TU-capable sibling feeds
-            # report the same (trip, stop), the last feed in catalog order
-            # wins (no freshness reconciliation in v1).
-            predictions.update(updates.predictions)
-            canceled |= updates.canceled_trips
-            added_rows.extend(updates.added)
+        updates = await self._aggregated_trip_updates()
+        predictions = updates.predictions
+        canceled = updates.canceled_trips
+        added_rows = updates.added
 
         arrivals: list[StopArrival] = []
         for dep in scheduled:
@@ -399,6 +407,80 @@ class TransitFeedHandle:
                 limited.append(arrival)
                 per_stop_counts[arrival.stop_id] = count + 1
         return limited
+
+    async def upcoming_trips(
+        self,
+        origin_stop_id: str,
+        destination_stop_id: str,
+        *,
+        lookahead: timedelta = timedelta(hours=2),
+        limit: int = 10,
+        now_utc: datetime | None = None,
+    ) -> list[UpcomingTrip]:
+        """Upcoming departures from the origin on trips serving the destination.
+
+        The parity query for Home Assistant's legacy ``gtfs`` integration:
+        its sensor tracks "the next vehicle leaving stop A that will reach
+        stop B", not merely the next departure at A. Wrong-direction trips
+        are excluded — a return trip serves both stops too, but in reverse
+        order.
+
+        ``limit`` caps the SCHEDULED candidates, nearest origin departure
+        first; RT cancellations then remove rows without backfilling, so
+        fewer than ``limit`` rows may come back even when later scheduled
+        trips exist (same behavior as :meth:`get_arrivals`). RT-added trips
+        (schedule_relationship ADDED) are never included: an added trip's
+        full stop sequence is unknown, so whether it serves the destination
+        after the origin cannot be determined.
+
+        ``now_utc`` exists for deterministic testing; omit it in production.
+        """
+        now = now_utc or datetime.now(UTC)
+        scheduled = await asyncio.to_thread(
+            self._index.upcoming_trips,
+            origin_stop_id,
+            destination_stop_id,
+            now,
+            lookahead,
+            limit,
+        )
+        route_names = await asyncio.to_thread(self._index.route_display_names)
+        updates = await self._aggregated_trip_updates()
+        trips: list[UpcomingTrip] = []
+        for trip in scheduled:
+            if trip.trip_id in updates.canceled_trips:
+                continue
+            origin_pred = updates.predictions.get((trip.trip_id, origin_stop_id))
+            dest_pred = updates.predictions.get((trip.trip_id, destination_stop_id))
+            trips.append(
+                UpcomingTrip(
+                    trip_id=trip.trip_id,
+                    route_id=trip.route_id,
+                    route_name=route_names.get(trip.route_id),
+                    headsign=trip.headsign,
+                    origin_stop_id=origin_stop_id,
+                    destination_stop_id=destination_stop_id,
+                    scheduled_departure=trip.departure,
+                    predicted_departure=(
+                        origin_pred.departure if origin_pred else None
+                    ),
+                    scheduled_arrival=trip.arrival,
+                    predicted_arrival=dest_pred.arrival if dest_pred else None,
+                    delay_seconds=(origin_pred.delay_seconds if origin_pred else None),
+                    realtime=origin_pred is not None or dest_pred is not None,
+                )
+            )
+        # Total sort key, matching get_arrivals: origin predictions can
+        # reorder rows relative to the scheduled ordering, and trip_id /
+        # scheduled_arrival break effective-departure ties deterministically.
+        trips.sort(
+            key=lambda row: (
+                row.predicted_departure or row.scheduled_departure,
+                row.trip_id,
+                row.scheduled_arrival,
+            )
+        )
+        return trips
 
     async def get_vehicles(self) -> list[VehiclePosition]:
         """Live vehicle positions across the feed's VP-capable RT sources."""

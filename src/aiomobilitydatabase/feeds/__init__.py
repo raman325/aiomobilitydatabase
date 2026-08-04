@@ -32,6 +32,7 @@ from .models import (
     Stop,
     StopArrival,
     SystemInfo,
+    UpcomingTrip,
     VehiclePosition,
 )
 from .transit import TransitFeedHandle
@@ -55,5 +56,6 @@ __all__ = [
     "StopArrival",
     "SystemInfo",
     "TransitFeedHandle",
+    "UpcomingTrip",
     "VehiclePosition",
 ]

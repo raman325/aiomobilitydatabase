@@ -86,6 +86,38 @@ def build_gtfs_zip_bytes(omit: frozenset[str] = frozenset()) -> bytes:
     return buf.getvalue()
 
 
+# -- Variant zip for origin→destination trip queries -------------------------
+# Several arrival tests pin exact per-stop trip sets against the shared zip
+# (e.g. test_added_trip_outside_queried_stops_excluded asserts S2's full row
+# list), so the extra stop calls trip-query tests need live in a variant
+# builder rather than the base data/gtfs files:
+#   T1 gains a terminal S3 call (arrival-only)  -> S1→S3 with intermediate S2
+#   T9 is a NEW reverse trip S3→S2→S1 (WKDY)    -> wrong-direction exclusion
+#   T2 gains an S3 call with NO arrival time    -> NULL-arrival exclusion
+#   T9's S2 call has NO departure time          -> NULL-departure exclusion
+#   T3 gains an S2 call past midnight (25:40)   -> service-day boundary
+_TRIP_QUERY_EXTRA_ROWS: dict[str, str] = {
+    "trips.txt": "R1,WKDY,T9,Uptown\n",
+    "stop_times.txt": (
+        "T1,08:20:00,,S3,3\n"
+        "T2,,08:45:00,S3,2\n"
+        "T3,25:40:00,25:41:00,S2,2\n"
+        "T9,08:05:00,08:05:30,S3,1\n"
+        "T9,08:15:00,,S2,2\n"
+        "T9,08:25:00,08:25:30,S1,3\n"
+    ),
+}
+
+
+def build_trip_query_gtfs_zip_bytes() -> bytes:
+    """Return the fixture GTFS zip extended for origin→destination queries."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in _FILES.items():
+            zf.writestr(name, content + _TRIP_QUERY_EXTRA_ROWS.get(name, ""))
+    return buf.getvalue()
+
+
 # -- GTFS-RT protobuf messages ----------------------------------------------
 # Regenerate via `uv run python scripts/generate_rt_fixtures.py` (repo root).
 
@@ -93,4 +125,11 @@ VEHICLE_POSITIONS: bytes = (_RT_DIR / "vehicle_positions.pb").read_bytes()
 ALERTS: bytes = (_RT_DIR / "alerts.pb").read_bytes()
 TRIP_UPDATES_BASELINE: bytes = (_RT_DIR / "trip_updates_baseline.pb").read_bytes()
 TRIP_UPDATES_T1_DELAYED: bytes = (_RT_DIR / "trip_updates_t1_delayed.pb").read_bytes()
+TRIP_UPDATES_T1_DEST_ARRIVAL: bytes = (
+    _RT_DIR / "trip_updates_t1_dest_arrival.pb"
+).read_bytes()
+TRIP_UPDATES_T1_BOTH_ENDS: bytes = (
+    _RT_DIR / "trip_updates_t1_both_ends.pb"
+).read_bytes()
+TRIP_UPDATES_T1_CANCELED: bytes = (_RT_DIR / "trip_updates_t1_canceled.pb").read_bytes()
 ADDED_TRIPS_S1: bytes = (_RT_DIR / "added_trips_s1.pb").read_bytes()
