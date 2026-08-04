@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import pytest
 from google.transit import gtfs_realtime_pb2
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
@@ -26,6 +26,7 @@ from aiomobilitydatabase.feeds.exceptions import (
 from aiomobilitydatabase.feeds.gbfs import (
     GbfsFeedHandle,
     _as_bool,
+    _endpoints_from_discovery,
     _localized,
     _version_key,
 )
@@ -40,7 +41,9 @@ from aiomobilitydatabase.feeds.models import (
     OccupancyStatus,
     PickupDropOffType,
     StaticBuildProgress,
+    Stop,
     StopArrival,
+    StopLocationType,
     UpcomingTrip,
     VehicleStopStatus,
     WheelchairAccess,
@@ -60,7 +63,7 @@ from aiomobilitydatabase.feeds.static_index import (
     StaticIndex,
     parse_gtfs_time,
 )
-from aiomobilitydatabase.feeds.transit import TransitFeedHandle
+from aiomobilitydatabase.feeds.transit import TransitFeedHandle, group_stations
 
 from tests.feeds.fixtures import (
     _FILES,
@@ -146,25 +149,86 @@ def _oracle_anchor_utc(service_date: date, tz: ZoneInfo) -> datetime:
     return (noon - timedelta(hours=12)).astimezone(UTC)
 
 
+# DST-transition days (and their neighbors) for every DST-observing zone in
+# TIMEZONES, mixed into query_date at a meaningful rate rather than the ~1%
+# a uniform two-year date range would produce: US spring-forward/fall-back,
+# EU changeovers, and the southern-hemisphere Australian pair, 2026 + 2027.
+_DST_TRANSITION_DATES = sorted(
+    {
+        transition + timedelta(days=offset)
+        for transition in (
+            date(2026, 3, 8),  # US spring forward (America/Los_Angeles + New_York)
+            date(2026, 11, 1),  # US fall back
+            date(2027, 3, 14),
+            date(2027, 11, 7),
+            date(2026, 3, 29),  # Europe/Berlin spring forward
+            date(2026, 10, 25),  # Europe/Berlin fall back
+            date(2027, 3, 28),
+            date(2027, 10, 31),
+            date(2026, 4, 5),  # Australia/Sydney end of DST
+            date(2026, 10, 4),  # Australia/Sydney start of DST
+            date(2027, 4, 4),
+            date(2027, 10, 3),
+        )
+        for offset in (-1, 0, 1)
+    }
+)
+
+_QUERY_DATES = st.one_of(
+    st.dates(min_value=date(2026, 2, 1), max_value=date(2027, 11, 30)),
+    st.sampled_from(_DST_TRANSITION_DATES),
+)
+
+
+def _boundary_dep_secs(target: datetime, tz: ZoneInfo, query_date: date) -> int:
+    """A dep_secs placing one service day's departure EXACTLY on ``target``.
+
+    Service-day anchors are ~24h apart, so some day within a few days of
+    the query date puts ``target`` at a representable [0, 30h) offset.
+    """
+    for offset in range(-2, 7):
+        service_date = query_date + timedelta(days=offset)
+        secs = (target - _oracle_anchor_utc(service_date, tz)).total_seconds()
+        if 0 <= secs < 30 * 3600 and secs == int(secs):
+            return int(secs)
+    raise AssertionError(f"no representable boundary dep_secs for {target}")
+
+
 @settings(
-    max_examples=30,
+    max_examples=40,
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow],
 )
 @given(
     tz_name=st.sampled_from(TIMEZONES),
-    query_date=st.dates(min_value=date(2026, 2, 1), max_value=date(2027, 11, 30)),
+    query_date=_QUERY_DATES,
     dep_secs=st.integers(min_value=0, max_value=30 * 3600 - 1),
     lookahead_hours=st.integers(min_value=1, max_value=72),
+    # Pin the departure to EXACTLY `now` or EXACTLY `now + lookahead` on a
+    # drawn fraction of examples: uniform dep_secs draws essentially never
+    # sample the window boundary, so the >= / <= comparisons were only
+    # tested strictly inside the window.
+    pin=st.sampled_from(["none", "lower", "upper"]),
+    limit=st.integers(min_value=1, max_value=3),
 )
 def test_departures_match_elapsed_seconds_oracle(
-    tz_name: str, query_date: date, dep_secs: int, lookahead_hours: int
+    *,
+    tz_name: str,
+    query_date: date,
+    dep_secs: int,
+    lookahead_hours: int,
+    pin: str,
+    limit: int,
 ) -> None:
     tz = ZoneInfo(tz_name)
+    now = datetime.combine(query_date, time(3, 0), tzinfo=UTC)
+    lookahead = timedelta(hours=lookahead_hours)
+    if pin == "lower":
+        dep_secs = _boundary_dep_secs(now, tz, query_date)
+    elif pin == "upper":
+        dep_secs = _boundary_dep_secs(now + lookahead, tz, query_date)
     index = _single_trip_index(tz_name, dep_secs)
     try:
-        now = datetime.combine(query_date, time(3, 0), tzinfo=UTC)
-        lookahead = timedelta(hours=lookahead_hours)
         got = {
             dep.departure
             for dep in index.upcoming_departures(["S1"], None, now, lookahead, 1000)
@@ -179,6 +243,16 @@ def test_departures_match_elapsed_seconds_oracle(
             if now <= instant <= now + lookahead:
                 expected.add(instant)
         assert got == expected
+        # The window boundary is INCLUSIVE at both ends: the pinned instant
+        # must itself be returned (non-vacuous by construction).
+        if pin == "lower":
+            assert now in got
+        elif pin == "upper":
+            assert now + lookahead in got
+        # Per-stop limit law: a small limit keeps exactly the NEAREST-N of
+        # the oracle set, in order -- never the farthest N.
+        limited = index.upcoming_departures(["S1"], None, now, lookahead, limit)
+        assert [dep.departure for dep in limited] == sorted(expected)[:limit]
     finally:
         index.close()
 
@@ -187,9 +261,15 @@ def test_departures_match_elapsed_seconds_oracle(
     hours=st.integers(min_value=0, max_value=47),
     minutes=st.integers(min_value=0, max_value=59),
     seconds=st.integers(min_value=0, max_value=59),
+    pad_hours=st.booleans(),
 )
-def test_parse_gtfs_time_round_trip(hours: int, minutes: int, seconds: int) -> None:
-    value = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+def test_parse_gtfs_time_round_trip(
+    hours: int, minutes: int, seconds: int, pad_hours: bool
+) -> None:
+    # Single-digit UNPADDED hours ("8:00:00") are valid GTFS the spec calls
+    # out explicitly; the suite previously only ever generated "08:00:00".
+    hour_cell = f"{hours:02d}" if pad_hours else str(hours)
+    value = f"{hour_cell}:{minutes:02d}:{seconds:02d}"
     assert parse_gtfs_time(value) == hours * 3600 + minutes * 60 + seconds
 
 
@@ -351,7 +431,11 @@ def test_active_service_ids_matches_naive_oracle(
     probe: date,
 ) -> None:
     bits = ",".join("1" if flag else "0" for flag in weekdays)
-    exceptions = [(d, 1) for d in added] + [(d, 2) for d in removed if d not in added]
+    # A date may be drawn as BOTH added and removed -- a real producer error
+    # GTFS leaves undefined. The oracle below encodes the library's
+    # documented resolution (two passes, removed wins) instead of filtering
+    # the collision out of the generated data.
+    exceptions = [(d, 1) for d in added] + [(d, 2) for d in removed]
     exception_rows = "".join(
         f"SVC,{d.strftime('%Y%m%d')},{etype}\n" for d, etype in exceptions
     )
@@ -376,14 +460,15 @@ def test_active_service_ids_matches_naive_oracle(
     }
     index = _build_index_from_files(files)
     try:
-        # Naive oracle, restated from the GTFS rules.
+        # Naive oracle, restated from the GTFS rules plus the library's
+        # documented removed-wins tiebreak for a date carrying both
+        # exception types (static_index.active_service_ids's two passes).
         in_range = CAL_START <= probe <= CAL_END
         base_active = in_range and weekdays[probe.weekday()]
-        exception_map = dict(exceptions)
-        if exception_map.get(probe) == 1:
-            oracle_active = True
-        elif exception_map.get(probe) == 2:
+        if probe in set(removed):
             oracle_active = False
+        elif probe in set(added):
+            oracle_active = True
         else:
             oracle_active = base_active
         assert index.active_service_ids(probe) == ({"SVC"} if oracle_active else set())
@@ -413,28 +498,45 @@ def test_localized_is_total(value: object) -> None:
     assert result is None or isinstance(result, str)
 
 
+# Localized entries with an OPTIONAL "text" key: real GBFS documents ship
+# entries missing text, and the selected entry must then yield None -- never
+# the literal string "None" (the pre-0.3.0 str() coercion bug).
+def _localized_entry(language: st.SearchStrategy[str]) -> st.SearchStrategy[dict]:
+    return st.fixed_dictionaries(
+        {"language": language},
+        optional={"text": st.text(min_size=1, max_size=20)},
+    )
+
+
 @given(
     entries=st.lists(
-        st.fixed_dictionaries(
-            {
-                "text": st.text(min_size=1, max_size=20),
-                "language": st.sampled_from(["de", "fr", "es"]),
-            }
-        ),
+        _localized_entry(st.sampled_from(["de", "fr", "es"])),
         min_size=1,
         max_size=4,
     ),
-    en_text=st.text(min_size=1, max_size=20),
+    en_entry=_localized_entry(st.just("en")),
     include_en=st.booleans(),
 )
 def test_localized_prefers_en_else_first(
-    entries: list[dict[str, str]], en_text: str, include_en: bool
+    entries: list[dict], en_entry: dict, include_en: bool
 ) -> None:
     payload = list(entries)
     if include_en:
-        payload.insert(len(payload) // 2, {"text": en_text, "language": "en"})
-    result = _localized(payload)
-    assert result == (en_text if include_en else entries[0]["text"])
+        payload.insert(len(payload) // 2, en_entry)
+    selected = en_entry if include_en else entries[0]
+    # dict.get: a text-less selected entry maps to None, not "None".
+    assert _localized(payload) == selected.get("text")
+
+
+def test_localized_entry_without_text_is_none() -> None:
+    """Deterministic regression for the "None"-string bug: an entry lacking
+    "text" (or carrying an explicit null) yields None on BOTH the
+    preferred-language branch and the first-entry fallback.
+    """
+    assert _localized([{"language": "en"}]) is None  # preferred-language branch
+    assert _localized([{"language": "de"}]) is None  # first-entry fallback
+    assert _localized([{"language": "en", "text": None}]) is None
+    assert _localized([{"language": "de"}, {"language": "en", "text": "x"}]) == "x"
 
 
 @given(version=st.text(max_size=12))
@@ -457,7 +559,11 @@ def test_version_key_orders_numerically() -> None:
 def test_station_merge_invariants(
     info_ids: list[str], status_ids: list[str], data: st.DataObject
 ) -> None:
-    """Merged stations: ids come only from information; never raises."""
+    """Merged stations: ids come only from information; never raises; every
+    shared id carries EXACTLY the drawn status-row values -- including the
+    2.x ``num_bikes_available`` vs 3.x ``num_vehicles_available`` fallback
+    (a present-but-null num_bikes_available key must NOT fall through).
+    """
     info_rows = [
         {
             "station_id": sid,
@@ -467,14 +573,35 @@ def test_station_merge_invariants(
         }
         for sid in info_ids
     ]
-    status_rows = [
-        {
-            "station_id": sid,
-            "num_bikes_available": data.draw(st.integers(0, 50) | st.none()),
-            "is_renting": data.draw(st.sampled_from([0, 1, True, False]) | st.none()),
-        }
-        for sid in status_ids
-    ]
+    status_rows: list[dict[str, object]] = []
+    expected_status: dict[str, tuple[int | None, bool | None]] = {}
+    for sid in status_ids:
+        row: dict[str, object] = {"station_id": sid}
+        bikes_keys = data.draw(st.sampled_from(["bikes", "vehicles", "both", "none"]))
+        bikes_value = data.draw(st.integers(0, 50) | st.none())
+        vehicles_value = data.draw(st.integers(0, 50) | st.none())
+        if bikes_keys in ("bikes", "both"):
+            row["num_bikes_available"] = bikes_value
+        if bikes_keys in ("vehicles", "both"):
+            row["num_vehicles_available"] = vehicles_value
+        renting = data.draw(st.sampled_from([0, 1, True, False]) | st.none())
+        row["is_renting"] = renting
+        status_rows.append(row)
+        # Oracle from the drawn values: dict.get semantics mean a PRESENT
+        # num_bikes_available key wins even when its value is null; the
+        # num_vehicles_available fallback applies only when the 2.x key is
+        # absent entirely. is_renting: 0/1/bool coerce, null stays None.
+        expected_bikes = (
+            bikes_value
+            if bikes_keys in ("bikes", "both")
+            else vehicles_value
+            if bikes_keys == "vehicles"
+            else None
+        )
+        expected_status[sid] = (
+            expected_bikes,
+            None if renting is None else bool(renting),
+        )
     handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
     handle._doc_cache = {
         "station_information": (
@@ -491,6 +618,17 @@ def test_station_merge_invariants(
     handle._endpoints = {"station_information": "x", "station_status": "x"}
     stations = asyncio.run(handle.get_stations())
     assert {s.id for s in stations} == {str(sid) for sid in info_ids}
+    by_id = {s.id: s for s in stations}
+    for sid in info_ids:
+        station = by_id[str(sid)]
+        if sid in expected_status:
+            expected_bikes, expected_renting = expected_status[sid]
+            assert station.bikes_available == expected_bikes
+            assert station.is_renting is expected_renting
+        else:
+            # No status row at all: everything status-derived is unknown.
+            assert station.bikes_available is None
+            assert station.is_renting is None
 
 
 def _maybe_fill_vehicle_entity(
@@ -589,15 +727,19 @@ _START_DATE_SAMPLES: dict[str, date | None] = {
 
 def _maybe_fill_trip_update_entity(
     entity: gtfs_realtime_pb2.FeedEntity, data: st.DataObject
-) -> set[tuple[str, date | None, int | None]]:
-    """Fill a trip_update entity; return the (trip_id, start_date,
-    start_secs) key it could contribute as a trip entry (empty when
-    canceled or added, since those entities never populate
-    ``updates.trips``). Draws exercise the full StopTimeUpdate surface:
-    per-stop schedule_relationship (all valid values), stop_id and/or
-    stop_sequence presence, delays, explicit times, the trip-level
-    TripUpdate.delay, and start_date/start_time cells across valid,
-    invalid, and absent forms.
+) -> tuple[
+    set[tuple[str, date | None, int | None]],
+    set[tuple[str, date | None, int | None]],
+]:
+    """Fill a trip_update entity; return ``(eligible_keys, canceled_keys)``:
+    the (trip_id, start_date, start_secs) key it contributes as a trip
+    entry, and the key it contributes as a cancellation (ADDED entities
+    contribute neither). Tracking BOTH sets lets the property assert the
+    parsed trips index EXACTLY (a subset check would pass on an empty
+    parse). Draws exercise the full StopTimeUpdate surface: per-stop
+    schedule_relationship (all valid values), stop_id and/or stop_sequence
+    presence, delays, explicit times, the trip-level TripUpdate.delay, and
+    start_date/start_time cells across valid, invalid, and absent forms.
     """
     trip_id = data.draw(st.text(max_size=6))
     entity.trip_update.trip.trip_id = trip_id
@@ -613,10 +755,6 @@ def _maybe_fill_trip_update_entity(
     entity.trip_update.trip.schedule_relationship = relationship
     if data.draw(st.booleans()):
         entity.trip_update.delay = data.draw(st.integers(-3600, 3600))
-    is_entry_eligible = relationship not in (
-        gtfs_realtime_pb2.TripDescriptor.CANCELED,
-        gtfs_realtime_pb2.TripDescriptor.ADDED,
-    )
     for _ in range(data.draw(st.integers(0, 2))):
         stu = entity.trip_update.stop_time_update.add()
         stu.schedule_relationship = data.draw(st.sampled_from([0, 1, 2, 3]))
@@ -628,7 +766,12 @@ def _maybe_fill_trip_update_entity(
             stu.arrival.time = data.draw(st.integers(0, 2_000_000_000))
         if data.draw(st.booleans()):
             stu.departure.delay = data.draw(st.integers(-3600, 3600))
-    return {(trip_id, start_date, start_secs)} if is_entry_eligible else set()
+    key = (trip_id, start_date, start_secs)
+    if relationship == gtfs_realtime_pb2.TripDescriptor.CANCELED:
+        return set(), {key}
+    if relationship == gtfs_realtime_pb2.TripDescriptor.ADDED:
+        return set(), set()
+    return {key}, set()
 
 
 def _maybe_fill_alert_entity(
@@ -686,7 +829,8 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
     }
     expected_vehicles: list[dict[str, object]] = []
     expected_alert_trip_ids: list[list[str]] = []
-    possible_entry_keys: set[tuple[str, date | None, int | None]] = set()
+    eligible_keys: set[tuple[str, date | None, int | None]] = set()
+    canceled_keys: set[tuple[str, date | None, int | None]] = set()
     for i in range(data.draw(st.integers(0, 4))):
         entity = msg.entity.add()
         entity.id = f"e{i}"
@@ -699,7 +843,9 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
             if result is not None:
                 expected_vehicles.append(result)  # type: ignore[arg-type]
         elif kind == "trip_update":
-            possible_entry_keys |= result  # type: ignore[arg-type]
+            entity_eligible, entity_canceled = result  # type: ignore[misc]
+            eligible_keys |= entity_eligible
+            canceled_keys |= entity_canceled
         elif kind == "alert":
             expected_alert_trip_ids.append(result)  # type: ignore[arg-type]
     vehicles = vehicles_from_message(msg, route_names={}, trip_routes={})
@@ -719,7 +865,11 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         assert vehicle.license_plate == expected["license_plate"]
     updates = trip_updates_from_message(msg)
     assert updates.canceled_trips.isdisjoint(set(updates.trips))
-    assert set(updates.trips) <= possible_entry_keys
+    # EXACT key-set equalities (a `<=` check passed even on an empty
+    # parse): every eligible entity's key survives unless canceled, and
+    # the cancellation set is exactly the drawn CANCELED keys.
+    assert updates.canceled_trips == canceled_keys
+    assert set(updates.trips) == eligible_keys - canceled_keys
     # Resolution totality: any entry against any stop order never raises,
     # and its outcomes never leave that order.
     stop_calls = [
@@ -906,6 +1056,12 @@ _IDS = st.text(
 def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
     """A structurally coherent-but-messy GTFS feed: orphans, dupes, unicode,
     shuffled columns, boundary times, calendar absurdities.
+
+    One ANCHOR exists amid the mess: the first trip keeps its real service
+    id, its first calendar row a non-degenerate end date, and its first two
+    stop_times rows real trip/stop ids -- so query properties can bias
+    toward data that CAN produce rows (their non-vacuity guards depend on
+    it) while everything around the anchor stays adversarial.
     """
     stop_ids = draw(st.lists(_IDS, min_size=1, max_size=5, unique=True))
     route_ids = draw(st.lists(_IDS, min_size=1, max_size=3, unique=True))
@@ -933,23 +1089,41 @@ def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
     if draw(st.booleans()):
         stops_rows.append(stops_rows[0])  # duplicate stop row
     trips_rows = [
-        f"{maybe_fake(route_ids)},{maybe_fake(service_ids)},{tid},"
+        # Anchor: the first trip's service reference is always real.
+        f"{maybe_fake(route_ids)},"
+        f"{service_ids[0] if t_idx == 0 else maybe_fake(service_ids)},{tid},"
         f"{draw(st.sampled_from(['Downtown', '終点🚌', '']))}"
-        for tid in trip_ids
+        for t_idx, tid in enumerate(trip_ids)
     ]
     times = ["00:00:00", "08:00:00", "24:00:00", "47:59:59", ""]
     stop_times_rows = []
-    for tid in trip_ids:
-        for seq in range(draw(st.integers(1, 3))):
-            stop_times_rows.append(
-                f"{maybe_fake([tid])},{draw(st.sampled_from(times))},"
-                f"{draw(st.sampled_from(times))},{maybe_fake(stop_ids)},{seq}"
+    for t_idx, tid in enumerate(trip_ids):
+        n_rows = draw(st.integers(2, 3)) if t_idx == 0 else draw(st.integers(1, 3))
+        for seq in range(n_rows):
+            # Anchor: the first trip's first two calls keep real ids.
+            anchored = t_idx == 0 and seq < 2
+            row_tid = tid if anchored else maybe_fake([tid])
+            row_stop = (
+                stop_ids[seq % len(stop_ids)] if anchored else maybe_fake(stop_ids)
             )
+            stop_times_rows.append(
+                f"{row_tid},{draw(st.sampled_from(times))},"
+                f"{draw(st.sampled_from(times))},{row_stop},{seq}"
+            )
+
+    def cal_end(s_idx: int) -> str:
+        # Anchor: the first service keeps a sane end date; later rows may
+        # end before they start.
+        return (
+            "20271231"
+            if s_idx == 0
+            else draw(st.sampled_from(["20271231", "20250101"]))
+        )
+
     cal_rows = [
         f"{sid},1,1,1,1,1,{draw(st.sampled_from(['0', '1']))},1,"
-        f"{draw(st.sampled_from(['20260101', '20270101']))},"
-        f"{draw(st.sampled_from(['20271231', '20250101']))}"  # end may precede start
-        for sid in service_ids[:-1] or service_ids
+        f"{draw(st.sampled_from(['20260101', '20270101']))},{cal_end(s_idx)}"
+        for s_idx, sid in enumerate(service_ids[:-1] or service_ids)
     ]
     files = {
         "agency.txt": (
@@ -987,13 +1161,33 @@ def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
 # --- exhaustive property sweep (Task 13e) ---
 
 
+# Non-vacuity accounting for the two generated-feed query properties: the
+# review found upcoming_trips non-empty on ~1.5% of draws (3/206) and the
+# determinism property on ~17% -- low enough that most assertions ran on
+# empty results. The biased strategies below must keep the non-empty rate
+# healthy, and the *_nonvacuity_rate guard tests (which pytest runs AFTER
+# their property, in definition order) fail the suite if it collapses.
+_DEPARTURES_VACUITY = {"examples": 0, "nonempty": 0}
+_TRIPS_VACUITY = {"examples": 0, "nonempty": 0}
+
+# The generator's calendar rows start service in 2026 OR 2027; probing one
+# Thursday in each year finds in-window schedule data for most feeds that
+# have any at all (2026-07-30 and 2027-07-29 are both Thursdays, and the
+# generator's weekday bits are all-on except Saturday).
+_GEN_PROBE_NOWS = (
+    datetime(2026, 7, 30, 12, 0, tzinfo=UTC),
+    datetime(2027, 7, 29, 12, 0, tzinfo=UTC),
+)
+
+
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
 @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_upcoming_departures_deterministic(
     zip_bytes: bytes, data: st.DataObject
 ) -> None:
     """Identical queries must return identical row sequences (HA sensors must
-    not flap between tied departures).
+    not flap between tied departures), and a drawn route_ids subset returns
+    exactly the oracle-side filter of the unfiltered rows.
     """
     try:
         index = _index_from_zip_bytes(zip_bytes)
@@ -1003,18 +1197,63 @@ def test_upcoming_departures_deterministic(
         stops = [s.id for s in index.stops()]
         if not stops:
             return
+        now = _GEN_PROBE_NOWS[0]
+        lookahead = timedelta(hours=30)
+        # Bias toward a query date and stops that actually have departures
+        # so the invariants are exercised on non-empty results, while still
+        # drawing arbitrary (often-empty) stops on a fraction of examples.
+        pool = stops
+        if data.draw(st.integers(0, 9)) < 8:
+            for probe_now in _GEN_PROBE_NOWS:
+                served = sorted(
+                    {
+                        dep.stop_id
+                        for dep in index.upcoming_departures(
+                            stops, None, probe_now, lookahead, 10_000
+                        )
+                    }
+                )
+                if served:
+                    pool, now = served, probe_now
+                    break
         queried = data.draw(
-            st.lists(st.sampled_from(stops), min_size=1, max_size=3, unique=True)
+            st.lists(st.sampled_from(pool), min_size=1, max_size=3, unique=True)
         )
-        now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
-        first = index.upcoming_departures(queried, None, now, timedelta(hours=30), 5)
-        second = index.upcoming_departures(queried, None, now, timedelta(hours=30), 5)
+        first = index.upcoming_departures(queried, None, now, lookahead, 5)
+        second = index.upcoming_departures(queried, None, now, lookahead, 5)
         assert first == second
         assert first == sorted(
             first, key=lambda dep: (dep.departure, dep.trip_id, dep.stop_id)
         )
+        _DEPARTURES_VACUITY["examples"] += 1
+        if first:
+            _DEPARTURES_VACUITY["nonempty"] += 1
+            event("upcoming_departures non-empty")
+        # route_ids filter law (oracle-side filter over an unlimited query,
+        # so the per-stop limit cannot mask a filter bug).
+        unfiltered = index.upcoming_departures(queried, None, now, lookahead, 10_000)
+        route_pool = sorted({dep.route_id for dep in unfiltered})
+        if route_pool:
+            subset = data.draw(
+                st.lists(
+                    st.sampled_from(route_pool), min_size=1, max_size=2, unique=True
+                )
+            )
+            filtered = index.upcoming_departures(
+                queried, subset, now, lookahead, 10_000
+            )
+            assert filtered == [
+                dep for dep in unfiltered if dep.route_id in set(subset)
+            ]
     finally:
         index.close()
+
+
+def test_upcoming_departures_nonvacuity_rate() -> None:
+    """Guard for the property above: fail if its non-empty rate collapses."""
+    examples = _DEPARTURES_VACUITY["examples"]
+    assert examples > 0
+    assert _DEPARTURES_VACUITY["nonempty"] >= max(3, examples // 5)
 
 
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
@@ -1035,10 +1274,45 @@ def test_upcoming_trips_invariants(zip_bytes: bytes, data: st.DataObject) -> Non
         stops = [s.id for s in index.stops()]
         if not stops:
             return
-        origin = data.draw(st.sampled_from(stops))
-        destination = data.draw(st.sampled_from(stops))
-        now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+        now = _GEN_PROBE_NOWS[0]
         lookahead = timedelta(hours=30)
+        # Bias the pair toward two stops SHARING a trip: pick an in-window
+        # DEPARTURE row (its stop is a known-good origin with a non-null,
+        # in-window departure) and a LATER call of the same trip as the
+        # destination, probing both generator calendar years. A fraction of
+        # examples still draws arbitrary (usually unrelated) stops.
+        origin: str | None = None
+        destination: str | None = None
+        if data.draw(st.integers(0, 9)) < 8:
+            for probe_now in _GEN_PROBE_NOWS:
+                deps = index.upcoming_departures(
+                    stops, None, probe_now, lookahead, 10_000
+                )
+                if not deps:
+                    continue
+                calls_by_trip = index.trip_stop_calls(
+                    sorted({dep.trip_id for dep in deps})
+                )
+                candidates = [
+                    (dep.stop_id, later)
+                    for dep in deps
+                    if (
+                        later := [
+                            call
+                            for call in calls_by_trip.get(dep.trip_id, [])
+                            if call[0] > dep.stop_sequence
+                        ]
+                    )
+                ]
+                if not candidates:
+                    continue
+                origin, later_calls = data.draw(st.sampled_from(candidates))
+                destination = data.draw(st.sampled_from(later_calls))[1]
+                now = probe_now
+                break
+        if origin is None or destination is None:
+            origin = data.draw(st.sampled_from(stops))
+            destination = data.draw(st.sampled_from(stops))
         first = index.upcoming_trips(origin, destination, now, lookahead, 5)
         second = index.upcoming_trips(origin, destination, now, lookahead, 5)
         assert first == second
@@ -1052,8 +1326,19 @@ def test_upcoming_trips_invariants(zip_bytes: bytes, data: st.DataObject) -> Non
         assert first == sorted(
             first, key=lambda trip: (trip.departure, trip.trip_id, trip.arrival)
         )
+        _TRIPS_VACUITY["examples"] += 1
+        if first:
+            _TRIPS_VACUITY["nonempty"] += 1
+            event("upcoming_trips non-empty")
     finally:
         index.close()
+
+
+def test_upcoming_trips_nonvacuity_rate() -> None:
+    """Guard for the property above: fail if its non-empty rate collapses."""
+    examples = _TRIPS_VACUITY["examples"]
+    assert examples > 0
+    assert _TRIPS_VACUITY["nonempty"] >= max(3, examples // 5)
 
 
 # --- descriptive attribute-surface properties --------------------------------
@@ -1496,23 +1781,38 @@ def test_frequency_repetitions_carry_template_descriptors(
 
 @settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
-    base_offsets=st.lists(
-        st.integers(min_value=0, max_value=86_399), min_size=1, max_size=5
+    first_offset=st.integers(min_value=0, max_value=82_800),
+    mid_gaps=st.lists(
+        st.integers(min_value=2, max_value=86_000), min_size=1, max_size=4
     ),
     spill_offset=st.integers(min_value=86_400, max_value=107_999),
+    tie_at_max=st.booleans(),
 )
 def test_exactly_one_first_and_one_last_per_service_day_pair(
-    base_offsets: list[int], spill_offset: int
+    first_offset: int, mid_gaps: list[int], spill_offset: int, tie_at_max: bool
 ) -> None:
     """Over generated TWO-service-day schedules -- duplicate departure times
-    allowed, always including one guaranteed >24:00:00 spillover trip --
-    every service day flags EXACTLY one is_first and one is_last row for
-    the pair, the flagged rows ARE the min/max of the (departure, trip_id)
-    total order WITHIN their own service day, and the spillover row (which
-    runs on the next clock day, interleaved with that day's departures) is
-    flagged as its OWN day's last, never the next day's.
+    allowed, always including one guaranteed >24:00:00 spillover trip, and
+    on drawn examples a SECOND trip TYING the spillover at the day's
+    maximum departure -- every service day flags EXACTLY one is_first and
+    one is_last row for the pair, the flagged rows ARE the min/max of the
+    (departure, trip_id) total order over the WHOLE service day (the tie at
+    the last slot pins the DESC trip_id tiebreak), and the spillover row
+    (which runs on the next clock day, interleaved with that day's
+    departures) is flagged as its OWN day's last, never the next day's.
+
+    A second query then sits `now` MID-DAY with a sub-day window: the
+    day's true first departure precedes the window by construction, so the
+    flags on the returned rows can only be right if the extremes are
+    computed over the whole service day, never the query window.
     """
-    dep_offsets = [*base_offsets, spill_offset]
+    # A guaranteed strictly-later-than-first mid-day trip on every example
+    # (so the mid-day window below always returns a row that is NOT the
+    # day's first); duplicates among mids are allowed and welcome.
+    mid_offsets = [min(first_offset + gap, 86_399) for gap in mid_gaps]
+    dep_offsets = [first_offset, *mid_offsets, spill_offset]
+    if tie_at_max:
+        dep_offsets.append(spill_offset)  # departure tie at the day's LAST slot
     trip_rows = "".join(f"R1,TWO,T{i},H\n" for i in range(len(dep_offsets)))
     stop_time_rows = "".join(
         f"T{i},{_format_gtfs_time(secs)},{_format_gtfs_time(secs)},S1,1\n"
@@ -1537,10 +1837,10 @@ def test_exactly_one_first_and_one_last_per_service_day_pair(
     }
     index = _build_index_from_files(files)
     try:
-        now = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)  # day 1's UTC anchor
+        day_one = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)  # day 1's UTC anchor
         # 55h reaches 31h of elapsed seconds even on day 2, so BOTH service
         # days are fully inside the window and nothing is clipped.
-        trips = index.upcoming_trips("S1", "S2", now, timedelta(hours=55), 1000)
+        trips = index.upcoming_trips("S1", "S2", day_one, timedelta(hours=55), 1000)
         assert len(trips) == 2 * len(dep_offsets)
         offset_of = {f"T{i}": secs for i, secs in enumerate(dep_offsets)}
         by_day: dict[datetime, list[ScheduledTrip]] = {}
@@ -1548,20 +1848,37 @@ def test_exactly_one_first_and_one_last_per_service_day_pair(
             anchor = trip.departure - timedelta(seconds=offset_of[trip.trip_id])
             by_day.setdefault(anchor, []).append(trip)
         assert set(by_day) == {
-            datetime(2026, 7, 30, 0, 0, tzinfo=UTC),
+            day_one,
             datetime(2026, 7, 31, 0, 0, tzinfo=UTC),
         }
         ordered = sorted((secs, trip_id) for trip_id, secs in offset_of.items())
         first_key, last_key = ordered[0], ordered[-1]
-        # Base offsets stay below 24:00:00, so the guaranteed spillover is
-        # the strict maximum: each day's last IS its spillover departure.
-        assert last_key == (spill_offset, f"T{len(base_offsets)}")
+        # first/mid offsets stay below 24:00:00, so the spillover slot is the
+        # maximum departure; when a second trip ties it, the DESC trip_id
+        # tiebreak makes the higher trip_id the day's unique last.
+        assert last_key == (spill_offset, f"T{len(dep_offsets) - 1}")
+        assert first_key == (first_offset, "T0")
         for day_trips in by_day.values():
             assert len(day_trips) == len(dep_offsets)
+            assert sum(trip.is_first for trip in day_trips) == 1
+            assert sum(trip.is_last for trip in day_trips) == 1
             for trip in day_trips:
                 key = (offset_of[trip.trip_id], trip.trip_id)
                 assert trip.is_first == (key == first_key)
                 assert trip.is_last == (key == last_key)
+        # Mid-day query: `now` sits just past the day's first departure with
+        # a sub-day (23:59:59) window. T1's departure is inside the window
+        # by construction, the day's first is NOT -- so any row flagged
+        # is_first here would prove the extremes were window-restricted.
+        now_mid = day_one + timedelta(seconds=first_offset + 1)
+        windowed = index.upcoming_trips(
+            "S1", "S2", now_mid, timedelta(seconds=86_399), 1000
+        )
+        assert windowed  # the guaranteed mid trip is always inside
+        for trip in windowed:
+            key = (offset_of[trip.trip_id], trip.trip_id)
+            assert trip.is_first == (key == first_key)
+            assert trip.is_last == (key == last_key)
     finally:
         index.close()
 
@@ -1717,10 +2034,16 @@ def _run_arrivals_merge_scenario(
             )
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
+                # limit=10 keeps every scheduled AND generated ADDED row
+                # inside the per-stop cap (at most 2 scheduled + 3 added at
+                # S1), so the exactly-once ADDED assertions below can never
+                # be masked by truncation; the per-stop-limit law itself is
+                # pinned by the elapsed-seconds oracle property and the
+                # end-to-end totality property.
                 return await handle.get_arrivals(
                     ["S1", "S2"],
                     lookahead=timedelta(hours=1),
-                    limit=3,
+                    limit=10,
                     now_utc=datetime(2026, 7, 30, 14, 45, tzinfo=UTC),
                 )
         finally:
@@ -1733,7 +2056,10 @@ def _run_arrivals_merge_scenario(
 @settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_arrivals_merge_invariants(data: st.DataObject) -> None:
     """Over random cancellation/prediction/added sets: canceled trips absent,
-    realtime <=> prediction existed, rows sorted, per-stop <= limit.
+    realtime <=> prediction existed, rows sorted, per-stop <= limit, and
+    every NON-canceled generated ADDED trip surfaces EXACTLY once, at its
+    announced stop, carrying its drawn epoch as the predicted departure
+    (deleting the ADDED-row merge loop entirely once survived the suite).
 
     The cancelable pool includes the generated ADDED trip ids too (not just
     the fixture trips) — otherwise cancellation-over-added can never be
@@ -1792,6 +2118,20 @@ def test_arrivals_merge_invariants(data: st.DataObject) -> None:
                 and row.trip_id not in canceled
             )
             assert row.realtime == expected_rt
+    # Every surviving generated ADDED trip merges in exactly once, at its
+    # announced stop, with its drawn epoch as the explicit prediction.
+    for i, trip_id in enumerate(added_ids):
+        rows = [row for row in arrivals if row.trip_id == trip_id]
+        if trip_id in canceled:
+            assert rows == []
+            continue
+        (row,) = rows
+        assert row.stop_id == "S1"
+        assert row.realtime is True
+        assert row.scheduled_departure is None
+        assert row.predicted_departure == datetime.fromtimestamp(
+            base_epoch + 60 * (i + 1), tz=UTC
+        )
     keys = [
         ((a.predicted_departure or a.scheduled_departure), a.trip_id or "", a.stop_id)
         for a in arrivals
@@ -1800,7 +2140,7 @@ def test_arrivals_merge_invariants(data: st.DataObject) -> None:
     per_stop: dict[str, int] = {}
     for row in arrivals:
         per_stop[row.stop_id] = per_stop.get(row.stop_id, 0) + 1
-    assert all(count <= 3 for count in per_stop.values())
+    assert all(count <= 10 for count in per_stop.values())
 
 
 _GBFS_ZONE = Circle(latitude=34.05, longitude=-118.25, radius_m=2_000.0)
@@ -2012,14 +2352,23 @@ def _frequency_template_strategy(draw: st.DrawFn) -> list[tuple[int, int]]:
 
 
 # end = start + span; span may be non-positive, producing a degenerate
-# [start, end) window that must contribute zero repetitions.
-_FREQ_ROW_STRATEGY = st.builds(
-    lambda start, span, headway, exact: (start, max(0, start + span), headway, exact),
-    st.integers(0, 26 * 3600),
-    st.integers(-600, 5400),
-    st.integers(60, 1800),
-    st.sampled_from(["", "0", "1"]),
-)
+# [start, end) window that must contribute zero repetitions. On drawn
+# examples span is an EXACT MULTIPLE of the headway, so a repetition
+# landing precisely on end_time (which must NOT run: the bound is strict)
+# is generated deliberately rather than only via zero-bias luck.
+@st.composite
+def _freq_row(draw: st.DrawFn) -> tuple[int, int, int, str]:
+    start = draw(st.integers(0, 26 * 3600))
+    headway = draw(st.integers(60, 1800))
+    exact = draw(st.sampled_from(["", "0", "1"]))
+    if draw(st.booleans()):
+        span = headway * draw(st.integers(0, 4))  # end lands ON a repetition
+    else:
+        span = draw(st.integers(-600, 5400))
+    return (start, max(0, start + span), headway, exact)
+
+
+_FREQ_ROW_STRATEGY = _freq_row()
 
 
 @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -2238,7 +2587,9 @@ _F1_DEP_OFFSETS = {"S1": 0, "S2": 630, "S3": 1200}
 _F1_DAY_ANCHOR = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
 
 
-@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+# 40+ examples: the drawn space is ~90 discrete combos (5 reps x 3 modes x
+# 2 kinds x 3 stops), so 12 examples left most of it unvisited.
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     rep=st.sampled_from(_F1_REP_STARTS),
     mode=st.sampled_from(["aligned", "misaligned", "missing"]),
@@ -2341,26 +2692,44 @@ def _prop_arr_secs(i: int) -> int:
     return _PROP_BASE + _PROP_STEP * i
 
 
-def _propagation_zip(n_stops: int, seq_gap: int) -> bytes:
+def _case_call_stops(n_stops: int, loop: tuple[int, int] | None) -> list[str]:
+    """The trip's ordered stop ids: position ``dup_at`` REVISITS ``dup_from``'s
+    stop when ``loop`` is set, making the trip a loop (duplicated stop id).
+    """
+    call_stops = [f"S{i}" for i in range(n_stops)]
+    if loop is not None:
+        dup_from, dup_at = loop
+        call_stops[dup_at] = f"S{dup_from}"
+    return call_stops
+
+
+def _propagation_zip(
+    n_stops: int, seq_gap: int, loop: tuple[int, int] | None = None
+) -> bytes:
     """One-day UTC feed: trip TP plus an RT-untouched OTHER trip over the
     same stops, with stop_sequence values spaced by ``seq_gap`` (gaps prove
-    sequence ADDRESSING, not list indexing).
+    sequence ADDRESSING, not list indexing). ``loop`` makes both trips
+    revisit an earlier stop (see :func:`_case_call_stops`). OTHER runs on
+    its own route R2 so route_ids filtering has two distinguishable rows.
     """
+    call_stops = _case_call_stops(n_stops, loop)
     stop_rows = "".join(f"S{i},Stop {i},0,0\n" for i in range(n_stops))
     stop_time_rows = ""
     for trip_id, shift in (("TP", 0), ("OTHER", _PROP_OTHER_SHIFT)):
         for i in range(n_stops):
             arr = _format_gtfs_time(_prop_arr_secs(i) + shift)
             dep = _format_gtfs_time(_prop_arr_secs(i) + shift + _PROP_DWELL)
-            stop_time_rows += f"{trip_id},{arr},{dep},S{i},{seq_gap * (i + 1)}\n"
+            sequence = seq_gap * (i + 1)
+            stop_time_rows += f"{trip_id},{arr},{dep},{call_stops[i]},{sequence}\n"
     files = {
         "agency.txt": _UTC_AGENCY,
         "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n" + stop_rows,
         "routes.txt": (
-            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+            "route_id,route_short_name,route_long_name,route_type\n"
+            "R1,1,Line,3\nR2,2,Other Line,3\n"
         ),
         "trips.txt": (
-            "route_id,service_id,trip_id,trip_headsign\nR1,ONE,TP,H\nR1,ONE,OTHER,H\n"
+            "route_id,service_id,trip_id,trip_headsign\nR1,ONE,TP,H\nR2,ONE,OTHER,H\n"
         ),
         "stop_times.txt": (
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
@@ -2429,55 +2798,152 @@ def _run_propagation_scenario(
     return asyncio.run(scenario())
 
 
+def _draw_stu_spec(
+    draw: st.DrawFn, i: int, call_stops: list[str], *, forced: bool
+) -> dict[str, object] | None:
+    """Draw one StopTimeUpdate spec for call position ``i`` (None = no STU).
+
+    Kinds: a delay STU (departure-side, arrival-side, or BOTH with a
+    different arrival value that must lose to the departure), an
+    explicit-time STU (departure epoch, arrival epoch, or both), both
+    combined, an empty SCHEDULED STU, a SKIPPED marker, or a NO_DATA
+    marker. Addressing: stop_id, stop_sequence, both (consistent), or
+    CONFLICTING both -- stop_sequence names call ``i`` while stop_id names
+    a different call, and stop_sequence must win.
+    """
+    kinds = ["delay", "explicit", "delay_explicit", "empty", "skipped", "no_data"]
+    if not forced:
+        kinds = ["none", "none", *kinds]
+    kind = draw(st.sampled_from(kinds))
+    if kind == "none":
+        return None
+    spec: dict[str, object] = {"kind": kind}
+    if kind in ("delay", "delay_explicit"):
+        side = draw(st.sampled_from(["departure", "arrival", "both"]))
+        spec["delay_side"] = side
+        delay = draw(st.integers(-300, 900))
+        spec["delay"] = delay
+        if side == "both":
+            # The departure delay is the "last known delay" and must win;
+            # the arrival carries a DIFFERENT value so a preference flip
+            # is observable, never masked by an equal draw.
+            spec["shadow_delay"] = delay + draw(st.sampled_from([-97, 61, 293]))
+    if kind in ("explicit", "delay_explicit"):
+        ends = draw(st.sampled_from(["departure", "arrival", "both"]))
+        if ends in ("departure", "both"):
+            spec["dep_time"] = _PROP_ANCHOR + timedelta(
+                seconds=_prop_arr_secs(i) + _PROP_DWELL + draw(st.integers(-120, 1200))
+            )
+        if ends in ("arrival", "both"):
+            spec["arr_time"] = _PROP_ANCHOR + timedelta(
+                seconds=_prop_arr_secs(i) + draw(st.integers(-120, 1200))
+            )
+    addressing_options = ["stop_id", "stop_sequence", "both"]
+    conflict_pool = [
+        k for k in range(len(call_stops)) if call_stops[k] != call_stops[i]
+    ]
+    if conflict_pool:
+        addressing_options.append("conflict")
+    addressing = draw(st.sampled_from(addressing_options))
+    spec["addressing"] = addressing
+    if addressing == "conflict":
+        spec["conflict_index"] = draw(st.sampled_from(conflict_pool))
+    return spec
+
+
 @st.composite
 def _propagation_case(draw: st.DrawFn) -> dict[str, object]:
     """A static trip (3-8 stops) plus a drawn StopTimeUpdate set.
 
-    Per stop: no STU, a delay STU, an explicit-departure-time STU, both, an
-    empty SCHEDULED STU, a SKIPPED marker, or a NO_DATA marker -- each STU
-    addressed by stop_id, stop_sequence, or both. Optional trip-level
-    delay, optional unplaceable "ghost" STU, drawn feed order.
+    Per stop: no STU or a :func:`_draw_stu_spec` draw. Optional loop trip
+    (a later call revisits an earlier stop id, so a bare stop_id STU must
+    resolve to the FIRST visit), optional trip-level delay, optional
+    unplaceable "ghost" STU, optional DUPLICATE trailing STU for one call
+    (the last one in feed order must win), drawn feed order.
     """
     n_stops = draw(st.integers(3, 8))
+    loop: tuple[int, int] | None = None
+    if draw(st.booleans()):
+        dup_at = draw(st.integers(2, n_stops - 1))
+        dup_from = draw(st.integers(0, dup_at - 1))
+        loop = (dup_from, dup_at)
+    call_stops = _case_call_stops(n_stops, loop)
     specs: dict[int, dict[str, object]] = {}
     for i in range(n_stops):
-        kind = draw(
-            st.sampled_from(
-                [
-                    "none",
-                    "none",
-                    "delay",
-                    "explicit",
-                    "delay_explicit",
-                    "empty",
-                    "skipped",
-                    "no_data",
-                ]
-            )
-        )
-        if kind == "none":
-            continue
-        spec: dict[str, object] = {"kind": kind}
-        if kind in ("delay", "delay_explicit"):
-            spec["delay"] = draw(st.integers(-300, 900))
-        if kind in ("explicit", "delay_explicit"):
-            spec["dep_offset"] = draw(st.integers(-120, 1200))
-        spec["addressing"] = draw(st.sampled_from(["stop_id", "stop_sequence", "both"]))
-        specs[i] = spec
+        spec = _draw_stu_spec(draw, i, call_stops, forced=False)
+        if spec is not None:
+            specs[i] = spec
+    extra: tuple[int, dict[str, object]] | None = None
+    if draw(st.booleans()):
+        target = draw(st.integers(0, n_stops - 1))
+        extra_spec = _draw_stu_spec(draw, target, call_stops, forced=True)
+        assert extra_spec is not None
+        extra = (target, extra_spec)
     return {
         "n_stops": n_stops,
         "seq_gap": draw(st.sampled_from([1, 10])),
+        "loop": loop,
         "trip_delay": draw(st.none() | st.integers(-300, 900)),
         "specs": specs,
+        "extra": extra,
         "ghost": draw(st.booleans()),
         "reverse_order": draw(st.booleans()),
     }
+
+
+def _case_feed_order(case: dict[str, object]) -> list[int]:
+    """The order the message writer emits the per-call STUs in."""
+    specs: dict[int, dict[str, object]] = case["specs"]  # type: ignore[assignment]
+    order = sorted(specs)
+    if case["reverse_order"]:
+        order.reverse()  # feed order must not matter for PLACEMENT
+    return order
+
+
+def _write_stu(
+    entity: gtfs_realtime_pb2.FeedEntity,
+    i: int,
+    spec: dict[str, object],
+    seq_gap: int,
+    call_stops: list[str],
+) -> None:
+    """Encode one drawn STU spec for call position ``i``."""
+    stu = entity.trip_update.stop_time_update.add()
+    addressing = spec["addressing"]
+    if addressing in ("stop_id", "both"):
+        stu.stop_id = call_stops[i]
+    if addressing == "conflict":
+        # CONFLICTING addressing: stop_sequence names call i while stop_id
+        # names a different call -- stop_sequence must win.
+        stu.stop_id = call_stops[spec["conflict_index"]]  # type: ignore[index]
+    if addressing in ("stop_sequence", "both", "conflict"):
+        stu.stop_sequence = seq_gap * (i + 1)
+    kind = spec["kind"]
+    if kind == "skipped":
+        stu.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
+        return
+    if kind == "no_data":
+        stu.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
+        return
+    if "delay" in spec:
+        side = spec["delay_side"]
+        if side in ("departure", "both"):
+            stu.departure.delay = spec["delay"]  # type: ignore[assignment]
+        elif side == "arrival":
+            stu.arrival.delay = spec["delay"]  # type: ignore[assignment]
+        if side == "both":
+            stu.arrival.delay = spec["shadow_delay"]  # type: ignore[assignment]
+    if "dep_time" in spec:
+        stu.departure.time = int(spec["dep_time"].timestamp())  # type: ignore[union-attr]
+    if "arr_time" in spec:
+        stu.arrival.time = int(spec["arr_time"].timestamp())  # type: ignore[union-attr]
 
 
 def _propagation_message(case: dict[str, object]) -> gtfs_realtime_pb2.FeedMessage:
     """Encode a drawn case as a TripUpdates FeedMessage for trip TP."""
     specs: dict[int, dict[str, object]] = case["specs"]  # type: ignore[assignment]
     seq_gap: int = case["seq_gap"]  # type: ignore[assignment]
+    call_stops = _case_call_stops(case["n_stops"], case["loop"])  # type: ignore[arg-type]
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
     entity = msg.entity.add()
@@ -2485,40 +2951,30 @@ def _propagation_message(case: dict[str, object]) -> gtfs_realtime_pb2.FeedMessa
     entity.trip_update.trip.trip_id = "TP"
     if case["trip_delay"] is not None:
         entity.trip_update.delay = case["trip_delay"]  # type: ignore[assignment]
-    order = sorted(specs)
-    if case["reverse_order"]:
-        order.reverse()  # feed order must not matter: static order rules
-    for i in order:
-        spec = specs[i]
-        stu = entity.trip_update.stop_time_update.add()
-        addressing = spec["addressing"]
-        if addressing in ("stop_id", "both"):
-            stu.stop_id = f"S{i}"
-        if addressing in ("stop_sequence", "both"):
-            stu.stop_sequence = seq_gap * (i + 1)
-        kind = spec["kind"]
-        if kind == "skipped":
-            stu.schedule_relationship = (
-                gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
-            )
-            continue
-        if kind == "no_data":
-            stu.schedule_relationship = (
-                gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
-            )
-            continue
-        if "delay" in spec:
-            stu.departure.delay = spec["delay"]  # type: ignore[assignment]
-        if "dep_offset" in spec:
-            epoch = _PROP_ANCHOR + timedelta(
-                seconds=_prop_arr_secs(i) + _PROP_DWELL + spec["dep_offset"]  # type: ignore[operator]
-            )
-            stu.departure.time = int(epoch.timestamp())
+    for i in _case_feed_order(case):
+        _write_stu(entity, i, specs[i], seq_gap, call_stops)
+    if case["extra"] is not None:
+        # A DUPLICATE STU for one call, deliberately emitted LAST so it is
+        # the one that must win its placement slot (last-wins, rt.py).
+        target, extra_spec = case["extra"]  # type: ignore[misc]
+        _write_stu(entity, target, extra_spec, seq_gap, call_stops)
     if case["ghost"]:
         ghost = entity.trip_update.stop_time_update.add()
         ghost.stop_id = "GHOST"  # matches no static call: must change nothing
         ghost.departure.delay = 999
     return msg
+
+
+def _placed_index(i: int, spec: dict[str, object], call_stops: list[str]) -> int:
+    """Which call position an STU emitted for position ``i`` lands on.
+
+    Bare stop_id addressing resolves to the FIRST call with that stop id
+    (loop trips revisit); every sequence-bearing form addresses ``i``
+    itself (stop_sequence wins over a conflicting stop_id).
+    """
+    if spec["addressing"] == "stop_id":
+        return call_stops.index(call_stops[i])
+    return i
 
 
 def _propagation_oracle(
@@ -2528,26 +2984,38 @@ def _propagation_oracle(
 
     Per stop index: ``"skipped"``, ``None`` (schedule-only), or a dict with
     the effective delay (may be None for an explicit-only stop) and the
-    explicit departure offset (None when the stop's prediction is purely
-    scheduled+delay). Walks the stops in order: last STU delay at-or-before
-    the stop propagates, NO_DATA cuts it, explicit times override at their
-    own stop, the trip-level delay covers stops no STU information reaches,
+    explicit departure/arrival epochs (None where the prediction is purely
+    scheduled+delay). Placement first: each emitted STU lands per
+    :func:`_placed_index` in feed order, the LAST one landing on a call
+    wins it. Then the walk: last STU delay at-or-before the stop
+    propagates, NO_DATA cuts it, explicit times override at their own
+    stop, the trip-level delay covers stops no STU information reaches,
     and everything else is schedule-only.
     """
     specs: dict[int, dict[str, object]] = case["specs"]  # type: ignore[assignment]
+    call_stops = _case_call_stops(case["n_stops"], case["loop"])  # type: ignore[arg-type]
+    placed: dict[int, dict[str, object]] = {}
+    for i in _case_feed_order(case):
+        spec = specs[i]
+        placed[_placed_index(i, spec, call_stops)] = spec
+    if case["extra"] is not None:
+        target, extra_spec = case["extra"]  # type: ignore[misc]
+        placed[_placed_index(target, extra_spec, call_stops)] = extra_spec
     trip_delay = case["trip_delay"]
     outcomes: dict[int, object] = {}
     covered = False
     current: object = None
     for i in range(case["n_stops"]):  # type: ignore[arg-type]
-        spec = specs.get(i)
-        if spec is None:
+        spec_at = placed.get(i)
+        if spec_at is None:
             fallback = current if covered else trip_delay
             outcomes[i] = (
-                None if fallback is None else {"delay": fallback, "dep_offset": None}
+                None
+                if fallback is None
+                else {"delay": fallback, "dep_time": None, "arr_time": None}
             )
             continue
-        kind = spec["kind"]
+        kind = spec_at["kind"]
         if kind == "skipped":
             outcomes[i] = "skipped"
             continue
@@ -2555,18 +3023,48 @@ def _propagation_oracle(
             covered, current = True, None
             outcomes[i] = None
             continue
-        own_delay = spec.get("delay")
+        own_delay = spec_at.get("delay")
         if own_delay is not None:
             covered, current = True, own_delay
         effective = (
             own_delay if own_delay is not None else (current if covered else trip_delay)
         )
-        dep_offset = spec.get("dep_offset")
-        if effective is None and dep_offset is None:
+        dep_time = spec_at.get("dep_time")
+        arr_time = spec_at.get("arr_time")
+        if effective is None and dep_time is None and arr_time is None:
             outcomes[i] = None  # an empty STU carries no realtime content
         else:
-            outcomes[i] = {"delay": effective, "dep_offset": dep_offset}
+            outcomes[i] = {
+                "delay": effective,
+                "dep_time": dep_time,
+                "arr_time": arr_time,
+            }
     return outcomes
+
+
+def _assert_prediction_matches_outcome(
+    row: StopArrival,
+    outcome: dict[str, object],
+    sched_arr: datetime,
+    sched_dep: datetime,
+) -> None:
+    """One merged row against one oracle outcome dict (explicit epochs win,
+    else scheduled+delay, else no prediction at that end)."""
+    delay = outcome["delay"]
+    assert row.realtime is True
+    assert row.delay_seconds == delay
+    if outcome["dep_time"] is not None:
+        assert row.predicted_departure == outcome["dep_time"]
+    elif delay is not None:
+        assert row.predicted_departure == sched_dep + timedelta(seconds=delay)  # type: ignore[arg-type]
+    else:
+        assert row.predicted_departure is None
+    if outcome["arr_time"] is not None:
+        assert row.predicted_arrival == outcome["arr_time"]
+    elif delay is not None:
+        assert row.predicted_arrival == sched_arr + timedelta(seconds=delay)  # type: ignore[arg-type]
+    else:
+        assert row.predicted_arrival is None
 
 
 @settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -2576,31 +3074,36 @@ def test_propagation_matches_piecewise_oracle(case: dict[str, object]) -> None:
     trip under a drawn StopTimeUpdate set, the merged arrival row equals
     the piecewise oracle computed independently from the drawn values --
     and the RT-untouched sibling trip stays schedule-only throughout.
+    Rows are keyed by scheduled departure, not stop_id: loop trips visit a
+    stop twice, and both visits must resolve independently.
     """
     n_stops: int = case["n_stops"]  # type: ignore[assignment]
+    call_stops = _case_call_stops(n_stops, case["loop"])  # type: ignore[arg-type]
     stop_ids = [f"S{i}" for i in range(n_stops)]
     arrivals, _ = _run_propagation_scenario(
-        _propagation_zip(n_stops, case["seq_gap"]),  # type: ignore[arg-type]
+        _propagation_zip(n_stops, case["seq_gap"], case["loop"]),  # type: ignore[arg-type]
         _propagation_message(case),
         stop_ids,
         [],
     )
     outcomes = _propagation_oracle(case)
-    by_key = {(a.trip_id, a.stop_id): a for a in arrivals}
+    by_key = {(a.trip_id, a.scheduled_departure): a for a in arrivals}
     assert len(by_key) == len(arrivals)
     for i in range(n_stops):
+        sched_arr = _PROP_ANCHOR + timedelta(seconds=_prop_arr_secs(i))
+        sched_dep = sched_arr + timedelta(seconds=_PROP_DWELL)
         # The RT-untouched sibling: always present, always schedule-only.
-        other = by_key[("OTHER", f"S{i}")]
+        other = by_key[("OTHER", sched_dep + timedelta(seconds=_PROP_OTHER_SHIFT))]
+        assert other.stop_id == call_stops[i]
         assert other.realtime is False
         assert other.predicted_departure is None
         assert other.delay_seconds is None
         outcome = outcomes[i]
-        sched_arr = _PROP_ANCHOR + timedelta(seconds=_prop_arr_secs(i))
-        sched_dep = sched_arr + timedelta(seconds=_PROP_DWELL)
         if outcome == "skipped":
-            assert ("TP", f"S{i}") not in by_key
+            assert ("TP", sched_dep) not in by_key
             continue
-        row = by_key[("TP", f"S{i}")]
+        row = by_key[("TP", sched_dep)]
+        assert row.stop_id == call_stops[i]
         assert row.scheduled_departure == sched_dep
         if outcome is None:
             assert row.realtime is False
@@ -2609,17 +3112,38 @@ def test_propagation_matches_piecewise_oracle(case: dict[str, object]) -> None:
             assert row.delay_seconds is None
             continue
         assert isinstance(outcome, dict)
-        assert row.realtime is True
-        delay, dep_offset = outcome["delay"], outcome["dep_offset"]
-        assert row.delay_seconds == delay
-        if dep_offset is not None:
-            assert row.predicted_departure == sched_dep + timedelta(seconds=dep_offset)
-        elif delay is not None:
-            assert row.predicted_departure == sched_dep + timedelta(seconds=delay)
-        if delay is not None:
-            assert row.predicted_arrival == sched_arr + timedelta(seconds=delay)
-        else:
-            assert row.predicted_arrival is None
+        _assert_prediction_matches_outcome(row, outcome, sched_arr, sched_dep)
+
+
+# The PURE volume property: same drawn cases and the same oracle, but run
+# straight through trip_updates_from_message + resolve_trip_predictions with
+# no server, zip build, or SQLite in the loop -- so the example budget can
+# be two orders of magnitude higher than the merged end-to-end property's.
+@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(case=_propagation_case())
+def test_propagation_pure_oracle_matches_resolver(case: dict[str, object]) -> None:
+    n_stops: int = case["n_stops"]  # type: ignore[assignment]
+    seq_gap: int = case["seq_gap"]  # type: ignore[assignment]
+    call_stops = _case_call_stops(n_stops, case["loop"])  # type: ignore[arg-type]
+    updates = trip_updates_from_message(_propagation_message(case))
+    entry = updates.trips[("TP", None, None)]
+    stop_calls = [(seq_gap * (i + 1), call_stops[i]) for i in range(n_stops)]
+    resolved = resolve_trip_predictions(entry, stop_calls)
+    outcomes = _propagation_oracle(case)
+    assert resolved.skipped == {
+        seq_gap * (i + 1) for i, outcome in outcomes.items() if outcome == "skipped"
+    }
+    for i in range(n_stops):
+        seq = seq_gap * (i + 1)
+        outcome = outcomes[i]
+        if outcome == "skipped" or outcome is None:
+            assert seq not in resolved.predictions
+            continue
+        assert isinstance(outcome, dict)
+        prediction = resolved.predictions[seq]
+        assert prediction.delay_seconds == outcome["delay"]
+        assert prediction.departure == outcome["dep_time"]
+        assert prediction.arrival == outcome["arr_time"]
 
 
 @settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -2787,7 +3311,9 @@ def _instance_day(scheduled_departure: datetime) -> date:
     return _TWO_DAY_A if scheduled_departure < _TWO_DAY_ANCHOR_B else _TWO_DAY_B
 
 
-@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+# 40+ examples: 2 variants x 2 kinds x 4 date modes x 2 reps = 32 core
+# combos (before delay/lookahead variation); 12 examples undersampled it.
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     variant=st.sampled_from(["plain", "frequency"]),
     kind=st.sampled_from(["prediction", "cancellation"]),
@@ -2984,3 +3510,475 @@ def test_build_progress_fraction_bounds(done: int, total: int | None) -> None:
         phase="index", done_bytes=done, total_bytes=total
     ).fraction
     assert fraction is None or 0.0 <= fraction <= 1.0
+
+
+# --- station grouping properties (transit.group_stations) --------------------
+
+# Names drawn from a small pool with deliberate casefold collisions (plus
+# None) so parentless same-name grouping is exercised on most examples.
+_GROUP_NAMES = (
+    st.sampled_from(
+        ["Metro Center", "metro center", "METRO CENTER", "Union Sq", "union sq"]
+    )
+    | st.none()
+)
+
+
+def _mk_stop(
+    stop_id: str,
+    name: str | None = None,
+    parent: str | None = None,
+    location_type: StopLocationType | None = None,
+) -> Stop:
+    return Stop(
+        id=stop_id,
+        name=name,
+        latitude=None,
+        longitude=None,
+        parent_station=parent,
+        location_type=location_type,
+        stop_code=None,
+        platform_code=None,
+        wheelchair_boarding=None,
+        description=None,
+        url=None,
+        zone_id=None,
+        timezone=None,
+    )
+
+
+@given(data=st.data())
+@settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_group_stations_partition_oracle(data: st.DataObject) -> None:
+    """Over drawn hierarchies -- parent links (including dangling ones),
+    every location type, casefold-colliding names -- every boarding stop
+    lands in EXACTLY one group, entrances/nodes/boarding areas and station
+    records themselves in none, the parent station's name wins over member
+    names, and the output is name-sorted. Oracle restated from the drawn
+    values: group key = parent station id, else casefolded (name or id).
+    """
+    stations = [
+        _mk_stop(
+            f"ST{k}",
+            name=data.draw(_GROUP_NAMES),
+            location_type=StopLocationType.STATION,
+        )
+        for k in range(data.draw(st.integers(0, 3)))
+    ]
+    parent_pool = [station.id for station in stations] + ["MISSING"]
+    boarding = [
+        _mk_stop(
+            f"B{k}",
+            name=data.draw(_GROUP_NAMES),
+            parent=data.draw(st.none() | st.sampled_from(parent_pool)),
+            location_type=data.draw(st.sampled_from([None, StopLocationType.STOP])),
+        )
+        for k in range(data.draw(st.integers(0, 6)))
+    ]
+    never_grouped = [
+        _mk_stop(
+            f"X{k}",
+            name=data.draw(_GROUP_NAMES),
+            parent=data.draw(st.none() | st.sampled_from(parent_pool)),
+            location_type=data.draw(
+                st.sampled_from(
+                    [
+                        StopLocationType.ENTRANCE_EXIT,
+                        StopLocationType.GENERIC_NODE,
+                        StopLocationType.BOARDING_AREA,
+                    ]
+                )
+            ),
+        )
+        for k in range(data.draw(st.integers(0, 3)))
+    ]
+    ordered = data.draw(st.permutations(stations + boarding + never_grouped))
+    groups = group_stations(ordered)
+    # Independent oracle from the drawn stops, in the same input order.
+    station_names = {station.id: station.name for station in stations}
+    expected: dict[str, tuple[str, list[str]]] = {}
+    for stop in ordered:
+        if stop.location_type not in (None, StopLocationType.STOP):
+            continue
+        if stop.parent_station:
+            key = stop.parent_station
+            name = station_names.get(stop.parent_station) or stop.name or key
+        else:
+            name = stop.name or stop.id
+            key = name.casefold()
+        if key in expected:
+            expected[key][1].append(stop.id)
+        else:
+            expected[key] = (name, [stop.id])
+    assert {g.id: (g.name, list(g.stop_ids)) for g in groups} == expected
+    assert [g.name for g in groups] == sorted(g.name for g in groups)
+    # Partition: every boarding stop in exactly one group; nothing else in any.
+    member_ids = [stop_id for g in groups for stop_id in g.stop_ids]
+    assert sorted(member_ids) == sorted(stop.id for stop in boarding)
+    assert len(member_ids) == len(set(member_ids))
+
+
+# --- multi-RT-feed aggregation properties (direct-URL, two TU sources) -------
+
+# Direct-URL handles read the timezone from agency.txt (UTC here), so the
+# 2026-07-30 service day anchors at 00:00 UTC and the TP/OTHER trips run
+# 08:00-09:1x UTC.
+_MULTI_RT_NOW = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
+
+
+def _multi_rt_message(kind: str, delay: int) -> gtfs_realtime_pb2.FeedMessage:
+    """One TU source's message about TP: a delay, a cancellation, or nothing."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    if kind == "absent":
+        return msg
+    entity = msg.entity.add()
+    entity.id = "tu"
+    entity.trip_update.trip.trip_id = "TP"
+    if kind == "cancel":
+        entity.trip_update.trip.schedule_relationship = (
+            gtfs_realtime_pb2.TripDescriptor.CANCELED
+        )
+    else:
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_id = "S0"
+        stu.departure.delay = delay
+    return msg
+
+
+def _run_multi_rt_scenario(
+    msg_one: gtfs_realtime_pb2.FeedMessage, msg_two: gtfs_realtime_pb2.FeedMessage
+) -> list[StopArrival]:
+    """Two scripted TU sources behind one DIRECT-URL handle."""
+
+    async def scenario() -> list[StopArrival]:
+        api = MockApi()
+        await api.start()
+        try:
+            api.head("/static.zip")  # no validators: the sha256 path is fine
+            api.get(
+                "/static.zip",
+                body=_propagation_zip(3, 1),
+                content_type="application/zip",
+            )
+            api.get(
+                "/rt/one",
+                body=msg_one.SerializeToString(),
+                content_type="application/octet-stream",
+            )
+            api.get(
+                "/rt/two",
+                body=msg_two.SerializeToString(),
+                content_type="application/octet-stream",
+            )
+            async with MobilityFeedsClient() as client:
+                handle = await client.get_transit_feed_from_urls(
+                    api.url("/static.zip"),
+                    trip_updates_urls=[api.url("/rt/one"), api.url("/rt/two")],
+                )
+                return await handle.get_arrivals(
+                    ["S0", "S1", "S2"],
+                    lookahead=timedelta(hours=6),
+                    limit=50,
+                    now_utc=_MULTI_RT_NOW,
+                )
+        finally:
+            await api.stop()
+
+    return asyncio.run(scenario())
+
+
+@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    kind_one=st.sampled_from(["delay", "cancel", "absent"]),
+    kind_two=st.sampled_from(["delay", "cancel", "absent"]),
+    delay_one=st.integers(-300, 900),
+    delay_gap=st.integers(1, 500),
+)
+def test_multi_rt_aggregation_last_feed_wins_and_cancellation_suppresses(
+    kind_one: str, kind_two: str, delay_one: int, delay_gap: int
+) -> None:
+    """Two TU-capable sources sharing the TP identity: when both carry an
+    entry, the LAST feed's delay wins wholesale (values drawn distinct so a
+    flip is observable); a cancellation in EITHER source suppresses the
+    rows end-to-end -- including the delay+cancel mix where the identity
+    sits in both ``trips`` and ``canceled_trips`` after aggregation -- and
+    the RT-untouched sibling trip is never affected.
+    """
+    delay_two = delay_one + delay_gap  # distinct by construction
+    arrivals = _run_multi_rt_scenario(
+        _multi_rt_message(kind_one, delay_one),
+        _multi_rt_message(kind_two, delay_two),
+    )
+    other_rows = [row for row in arrivals if row.trip_id == "OTHER"]
+    assert {row.stop_id for row in other_rows} == {"S0", "S1", "S2"}
+    assert all(row.realtime is False for row in other_rows)
+    tp_rows = [row for row in arrivals if row.trip_id == "TP"]
+    if "cancel" in (kind_one, kind_two):
+        assert tp_rows == []  # cancellation wins over any sibling entry
+        return
+    assert {row.stop_id for row in tp_rows} == {"S0", "S1", "S2"}
+    if kind_one == kind_two == "absent":
+        assert all(row.realtime is False for row in tp_rows)
+        return
+    # Exactly one or both feeds sent a delay entry: the LAST feed that sent
+    # one wins wholesale (the S0 delay propagates over the whole trip).
+    expected_delay = delay_two if kind_two == "delay" else delay_one
+    for row in tp_rows:
+        assert row.realtime is True
+        assert row.delay_seconds == expected_delay
+
+
+# --- get_arrivals route_ids filter properties --------------------------------
+
+
+def _route_filter_added_message(
+    added_route: str | None,
+) -> gtfs_realtime_pb2.FeedMessage:
+    """A TP delay plus one ADDED trip at S0 announcing ``added_route``."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "tu-tp"
+    entity.trip_update.trip.trip_id = "TP"
+    stu = entity.trip_update.stop_time_update.add()
+    stu.stop_id = "S0"
+    stu.departure.delay = 120
+    added = msg.entity.add()
+    added.id = "tu-added"
+    added.trip_update.trip.trip_id = "GEN-ADDED-R"
+    if added_route is not None:
+        added.trip_update.trip.route_id = added_route
+    added.trip_update.trip.schedule_relationship = (
+        gtfs_realtime_pb2.TripDescriptor.ADDED
+    )
+    added_stu = added.trip_update.stop_time_update.add()
+    added_stu.stop_id = "S0"
+    added_stu.departure.time = int(
+        datetime(2026, 7, 30, 15, 10, tzinfo=UTC).timestamp()
+    )
+    return msg
+
+
+def _run_route_filter_scenario(
+    msg: gtfs_realtime_pb2.FeedMessage, route_ids: list[str]
+) -> tuple[list[StopArrival], list[StopArrival]]:
+    """The catalog propagation scenario, queried unfiltered THEN filtered."""
+
+    async def scenario() -> tuple[list[StopArrival], list[StopArrival]]:
+        api = MockApi()
+        await api.start()
+        try:
+            base = api.url()
+            api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+            api.get("/v1/feeds/mdb-100", payload=with_base(GTFS_FEED, base))
+            api.get("/v1/gtfs_feeds/mdb-100", payload=with_base(GTFS_FEED, base))
+            api.get(
+                "/v1/gtfs_feeds/mdb-100/gtfs_rt_feeds",
+                payload=[with_base(GTFS_RT_FEED, base)],
+            )
+            api.get(
+                "/hosted/mdb-100.zip",
+                body=_propagation_zip(3, 1),
+                content_type="application/zip",
+            )
+            body = msg.SerializeToString()
+            for _ in range(2):  # one RT fetch per get_arrivals call
+                api.get("/rt/all", body=body, content_type="application/octet-stream")
+            async with MobilityFeedsClient("t", base_url=base) as client:
+                handle = await client.get_transit_feed("mdb-100")
+                unfiltered = await handle.get_arrivals(
+                    ["S0", "S1", "S2"],
+                    lookahead=timedelta(hours=6),
+                    limit=50,
+                    now_utc=_PROP_NOW,
+                )
+                filtered = await handle.get_arrivals(
+                    ["S0", "S1", "S2"],
+                    route_ids,
+                    lookahead=timedelta(hours=6),
+                    limit=50,
+                    now_utc=_PROP_NOW,
+                )
+                return unfiltered, filtered
+        finally:
+            await api.stop()
+
+    return asyncio.run(scenario())
+
+
+@settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    route_ids=st.sampled_from([["R1"], ["R2"], ["R1", "R2"], ["NOPE"]]),
+    added_route=st.sampled_from(["R1", "R2", None]),
+)
+def test_arrivals_route_filter_matches_oracle(
+    route_ids: list[str], added_route: str | None
+) -> None:
+    """get_arrivals(route_ids=...) returns EXACTLY the oracle-side filter of
+    the unfiltered merge: scheduled rows by their trip's route (TP on R1,
+    OTHER on R2), RT-ADDED rows by their announced route -- and an added
+    row announcing NO route never passes any filter.
+    """
+    unfiltered, filtered = _run_route_filter_scenario(
+        _route_filter_added_message(added_route), route_ids
+    )
+    # Sanity: the unfiltered merge carries both trips and the added row.
+    assert {row.trip_id for row in unfiltered} == {"TP", "OTHER", "GEN-ADDED-R"}
+    allowed = set(route_ids)
+    assert filtered == [
+        row
+        for row in unfiltered
+        if row.route_id is not None and row.route_id in allowed
+    ]
+
+
+# --- GBFS discovery-document and endpoint-preference properties --------------
+
+_DISCOVERY_FEED_ENTRY: st.SearchStrategy[object] = st.one_of(
+    st.fixed_dictionaries(
+        {
+            "name": st.sampled_from(
+                ["system_information", "station_status", "free_bike_status", ""]
+            ),
+            "url": st.sampled_from(["https://e.com/a", "https://e.com/b", ""]),
+        }
+    ),
+    st.fixed_dictionaries(
+        {"name": st.sampled_from(["system_information", "vehicle_status"])}
+    ),  # url missing entirely
+    st.just("not-a-feed-object"),
+    st.just(None),
+)
+
+
+def _draw_language_blocks(data: st.DataObject) -> dict[str, object]:
+    """Drawn 2.x ``data`` payload: language -> feeds block / junk."""
+    languages = data.draw(
+        st.lists(
+            st.sampled_from(["en", "fr", "de"]), min_size=1, max_size=3, unique=True
+        )
+    )
+    blocks: dict[str, object] = {}
+    for language in languages:
+        block_kind = data.draw(
+            st.sampled_from(["feeds", "no_feeds", "bad_feeds", "garbage"])
+        )
+        if block_kind == "feeds":
+            blocks[language] = {
+                "feeds": data.draw(st.lists(_DISCOVERY_FEED_ENTRY, max_size=4))
+            }
+        elif block_kind == "no_feeds":
+            blocks[language] = {}
+        elif block_kind == "bad_feeds":
+            blocks[language] = {"feeds": "not-a-list"}
+        else:
+            blocks[language] = "garbage-block"
+    return blocks
+
+
+def _expected_language_feeds(blocks: dict[str, object]) -> list[object]:
+    """Oracle language preference: "en" when it carries a feeds LIST, else
+    the first block (insertion order) that does, else nothing."""
+    en_block = blocks.get("en")
+    if isinstance(en_block, dict) and isinstance(en_block.get("feeds"), list):
+        return list(en_block["feeds"])
+    for block in blocks.values():
+        if isinstance(block, dict) and isinstance(block.get("feeds"), list):
+            return list(block["feeds"])
+    return []
+
+
+@given(data=st.data())
+@settings(max_examples=100, deadline=None)
+def test_endpoints_from_discovery_layouts_oracle(data: st.DataObject) -> None:
+    """Generated 3.x direct (``data.feeds``) and 2.x language-keyed
+    (``data.<lang>.feeds``) discovery layouts -- with invalid entries,
+    blank names/urls, garbage language blocks, and feeds-less blocks --
+    resolve to exactly the oracle's name->url table (preferred language
+    first, else the first block carrying a feeds list), and FeedParseError
+    is raised IFF no usable feeds remain.
+    """
+    layout = data.draw(st.sampled_from(["3.x", "2.x"]))
+    if layout == "3.x":
+        chosen = data.draw(st.lists(_DISCOVERY_FEED_ENTRY, max_size=4))
+        document: dict[str, object] = {"data": {"feeds": chosen}}
+    else:
+        blocks = _draw_language_blocks(data)
+        document = {"data": blocks}
+        chosen = _expected_language_feeds(blocks)
+    expected = {
+        str(feed["name"]): str(feed["url"])
+        for feed in chosen
+        if isinstance(feed, dict) and feed.get("name") and feed.get("url")
+    }
+    if expected:
+        assert _endpoints_from_discovery(document) == expected
+    else:
+        with pytest.raises(FeedParseError):
+            _endpoints_from_discovery(document)
+
+
+def _vehicle_handle(endpoints: dict[str, dict[str, object]]) -> GbfsFeedHandle:
+    """A detached handle whose named endpoints serve pre-cached documents."""
+    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
+    handle._doc_cache = {
+        name: (float("inf"), float("inf"), {"data": payload})
+        for name, payload in endpoints.items()
+    }
+    handle._endpoints = dict.fromkeys(endpoints, "x")
+    return handle
+
+
+@given(
+    rows=st.lists(
+        st.fixed_dictionaries(
+            {
+                "id": st.text(min_size=1, max_size=6),
+                "lat": _NEARBY_LAT | st.none(),
+                "lon": _NEARBY_LON | st.none(),
+                "is_reserved": st.booleans() | st.none(),
+                "is_disabled": st.booleans() | st.none(),
+                "vehicle_type_id": st.text(min_size=1, max_size=4) | st.none(),
+                "current_range_meters": st.floats(0, 50_000) | st.none(),
+            }
+        ),
+        max_size=6,
+    )
+)
+@settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
+    rows: list[dict[str, object]],
+) -> None:
+    """Metamorphic 3.x/2.x path law: IDENTICAL drawn rows served as
+    ``vehicle_status`` (3.x: ``vehicles``/``vehicle_id``) vs
+    ``free_bike_status`` (2.x: ``bikes``/``bike_id``) parse to identical
+    vehicles, and a system publishing BOTH endpoints reads 3.x -- proven
+    with a decoy 2.x document that must NOT surface.
+    """
+    v_rows = [
+        {**{k: v for k, v in row.items() if k != "id"}, "vehicle_id": row["id"]}
+        for row in rows
+    ]
+    b_rows = [
+        {**{k: v for k, v in row.items() if k != "id"}, "bike_id": row["id"]}
+        for row in rows
+    ]
+    via_30 = asyncio.run(
+        _vehicle_handle({"vehicle_status": {"vehicles": v_rows}}).get_vehicles()
+    )
+    via_23 = asyncio.run(
+        _vehicle_handle({"free_bike_status": {"bikes": b_rows}}).get_vehicles()
+    )
+    assert via_30 == via_23
+    decoy = [{"bike_id": "DECOY", "lat": 34.05, "lon": -118.25}]
+    via_both = asyncio.run(
+        _vehicle_handle(
+            {
+                "vehicle_status": {"vehicles": v_rows},
+                "free_bike_status": {"bikes": decoy},
+            }
+        ).get_vehicles()
+    )
+    assert via_both == via_30
+    assert all(vehicle.id != "DECOY" for vehicle in via_both)
