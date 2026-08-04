@@ -14,6 +14,7 @@ from google.transit import gtfs_realtime_pb2
 
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import ServiceAlert, VehiclePosition
+from .static_index import parse_gtfs_time
 
 _AUTH_STATUSES = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
 
@@ -180,15 +181,44 @@ class AddedStopTime:
 
 @dataclass
 class TripUpdates:
-    """Parsed index of a TripUpdates feed."""
+    """Parsed index of a TripUpdates feed.
 
-    predictions: dict[tuple[str, str], StopPrediction] = field(default_factory=dict)
-    canceled_trips: set[str] = field(default_factory=set)
+    Predictions are keyed by ``(trip_id, start_secs, stop_id)`` and
+    cancellations by ``(trip_id, start_secs)``, where ``start_secs`` is the
+    parsed ``TripDescriptor.start_time`` (None when absent or unparseable).
+    ``start_time`` is how GTFS-RT addresses ONE repetition of a
+    frequency-based trip, and the consumer-side merge matches it against
+    the static index's materialized repetitions.
+    ``TripDescriptor.start_date`` is deliberately NOT consulted in this
+    pass: a start_time repeats daily, but the arrivals lookahead window
+    plus the absolute prediction timestamps make cross-service-day
+    collisions marginal -- start_date disambiguation is a documented
+    refinement, not a correctness prerequisite here.
+    """
+
+    predictions: dict[tuple[str, int | None, str], StopPrediction] = field(
+        default_factory=dict
+    )
+    canceled_trips: set[tuple[str, int | None]] = field(default_factory=set)
     added: list[AddedStopTime] = field(default_factory=list)
 
 
+def _trip_start_secs(trip: gtfs_realtime_pb2.TripDescriptor) -> int | None:
+    """Parse TripDescriptor.start_time (hours may exceed 24) to seconds.
+
+    Absent or unparseable start_time becomes None: RT payloads are
+    best-effort, so one producer's garbage start_time must degrade to "no
+    repetition addressed" rather than failing the whole message (the same
+    leniency ``_epoch_to_utc`` applies to garbage timestamps).
+    """
+    try:
+        return parse_gtfs_time(trip.start_time)
+    except FeedParseError:
+        return None
+
+
 def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpdates:
-    """Index TripUpdate entities by (trip_id, stop_id); split canceled/added."""
+    """Index TripUpdate entities by (trip_id, start_secs, stop_id)."""
     updates = TripUpdates()
     canceled = gtfs_realtime_pb2.TripDescriptor.CANCELED
     added = gtfs_realtime_pb2.TripDescriptor.ADDED
@@ -197,9 +227,10 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
             continue
         trip_update = entity.trip_update
         trip_id = trip_update.trip.trip_id
+        start_secs = _trip_start_secs(trip_update.trip)
         vehicle_id = trip_update.vehicle.id or None
         if trip_update.trip.schedule_relationship == canceled:
-            updates.canceled_trips.add(trip_id)
+            updates.canceled_trips.add((trip_id, start_secs))
             continue
         is_added = trip_update.trip.schedule_relationship == added
         for stu in trip_update.stop_time_update:
@@ -230,27 +261,35 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
                     )
                 )
             else:
-                updates.predictions[(trip_id, stu.stop_id)] = StopPrediction(
-                    arrival=arrival,
-                    departure=departure,
-                    delay_seconds=delay,
-                    vehicle_id=vehicle_id,
+                updates.predictions[(trip_id, start_secs, stu.stop_id)] = (
+                    StopPrediction(
+                        arrival=arrival,
+                        departure=departure,
+                        delay_seconds=delay,
+                        vehicle_id=vehicle_id,
+                    )
                 )
     # Cancellation wins regardless of entity order: a producer may send a
     # CANCELED trip_update alongside stale predictions/added-stop-times for
-    # the same trip_id in either order within one message. The parsed result
+    # the same trip in either order within one message. The parsed result
     # must be self-consistent rather than relying on consumers checking
-    # canceled_trips first.
+    # canceled_trips first. Predictions are matched on the full
+    # (trip_id, start_secs) identity; ADDED stop times are matched on bare
+    # trip_id -- an added trip is identified by the id the producer minted
+    # for it, and dropping its rows on ANY cancellation of that id is the
+    # conservative "removed wins" choice (never show a trip that might not
+    # run).
     if updates.canceled_trips:
         updates.predictions = {
             key: prediction
             for key, prediction in updates.predictions.items()
-            if key[0] not in updates.canceled_trips
+            if (key[0], key[1]) not in updates.canceled_trips
         }
+        canceled_ids = {trip_id for trip_id, _ in updates.canceled_trips}
         updates.added = [
             stop_time
             for stop_time in updates.added
-            if stop_time.trip_id not in updates.canceled_trips
+            if stop_time.trip_id not in canceled_ids
         ]
     return updates
 

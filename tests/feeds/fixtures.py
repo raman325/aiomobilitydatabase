@@ -78,13 +78,27 @@ _FILES: dict[str, str] = {
 }
 
 
+# Zip members get a FIXED timestamp: ``writestr(name, ...)`` stamps the
+# current wall-clock second into each member, so two builds of the "same"
+# zip straddling a second boundary differ byte-wise -- which flakes any
+# test comparing dataset identity via content hash (the direct-URL
+# hash-fallback path re-downloads and re-hashes on every refresh).
+_ZIP_DATE_TIME = (2026, 1, 1, 0, 0, 0)
+
+
+def _writestr(zf: zipfile.ZipFile, name: str, content: str) -> None:
+    info = zipfile.ZipInfo(name, date_time=_ZIP_DATE_TIME)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    zf.writestr(info, content)
+
+
 def build_gtfs_zip_bytes(omit: frozenset[str] = frozenset()) -> bytes:
     """Return the fixture GTFS zip, optionally omitting named files."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, content in _FILES.items():
             if name not in omit:
-                zf.writestr(name, content)
+                _writestr(zf, name, content)
     return buf.getvalue()
 
 
@@ -116,7 +130,52 @@ def build_trip_query_gtfs_zip_bytes() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, content in _FILES.items():
-            zf.writestr(name, content + _TRIP_QUERY_EXTRA_ROWS.get(name, ""))
+            _writestr(zf, name, content + _TRIP_QUERY_EXTRA_ROWS.get(name, ""))
+    return buf.getvalue()
+
+
+# -- Variant zip for frequencies.txt materialization --------------------------
+# The frequency template trips live in a variant builder (never the base
+# data/gtfs files) because several arrival tests pin exact per-stop trip sets
+# against the shared zip -- same precedent as build_trip_query_gtfs_zip_bytes.
+#   F1 (R1, WKDY): 3-stop template S1 08:00:00 -> S2 08:10:00/08:10:30 ->
+#     S3 08:20:00, repeated 06:00-06:30 every 600s (3 reps; the 06:30
+#     repetition lands exactly on end_time and must NOT run) and 07:00-07:20
+#     every 600s with exact_times=1 (2 reps).
+#   F2 (R2, NIGHT): 2-stop template with a BLANK first arrival (anchor falls
+#     back to the departure) at 23:30:00 -> S2 23:40:00, repeated
+#     23:30-25:00 every 1800s (3 reps: 23:30, 24:00, 24:30 -- the last two
+#     cross the >24:00:00 boundary onto the next clock day).
+_FREQUENCY_EXTRA_ROWS: dict[str, str] = {
+    "trips.txt": "R1,WKDY,F1,Loop\nR2,NIGHT,F2,Night Loop\n",
+    "stop_times.txt": (
+        "F1,08:00:00,08:00:00,S1,1\n"
+        "F1,08:10:00,08:10:30,S2,2\n"
+        "F1,08:20:00,08:20:00,S3,3\n"
+        "F2,,23:30:00,S1,1\n"
+        "F2,23:40:00,23:40:00,S2,2\n"
+    ),
+}
+_FREQUENCIES_CONTENT = (
+    "trip_id,start_time,end_time,headway_secs,exact_times\n"
+    "F1,06:00:00,06:30:00,600,\n"
+    "F1,07:00:00,07:20:00,600,1\n"
+    "F2,23:30:00,25:00:00,1800,\n"
+)
+
+
+def build_frequencies_gtfs_zip_bytes(extra_frequency_rows: str = "") -> bytes:
+    """Return the fixture GTFS zip extended with frequencies.txt.
+
+    ``extra_frequency_rows`` (raw CSV lines) are appended to the
+    frequencies file so individual tests can add malformed, dangling, or
+    zero-repetition rows without a separate builder.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in _FILES.items():
+            _writestr(zf, name, content + _FREQUENCY_EXTRA_ROWS.get(name, ""))
+        _writestr(zf, "frequencies.txt", _FREQUENCIES_CONTENT + extra_frequency_rows)
     return buf.getvalue()
 
 
@@ -135,3 +194,12 @@ TRIP_UPDATES_T1_BOTH_ENDS: bytes = (
 ).read_bytes()
 TRIP_UPDATES_T1_CANCELED: bytes = (_RT_DIR / "trip_updates_t1_canceled.pb").read_bytes()
 ADDED_TRIPS_S1: bytes = (_RT_DIR / "added_trips_s1.pb").read_bytes()
+TRIP_UPDATES_FREQ_MATCHED: bytes = (
+    _RT_DIR / "trip_updates_freq_matched.pb"
+).read_bytes()
+TRIP_UPDATES_FREQ_UNMATCHED: bytes = (
+    _RT_DIR / "trip_updates_freq_unmatched.pb"
+).read_bytes()
+TRIP_UPDATES_FREQ_BARE_CANCEL: bytes = (
+    _RT_DIR / "trip_updates_freq_bare_cancel.pb"
+).read_bytes()

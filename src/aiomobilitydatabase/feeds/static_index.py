@@ -36,7 +36,14 @@ CREATE TABLE routes (
 );
 CREATE TABLE trips (
     id TEXT PRIMARY KEY, route_id TEXT NOT NULL,
-    service_id TEXT NOT NULL, headsign TEXT
+    service_id TEXT NOT NULL, headsign TEXT,
+    -- RT-matching identity: the GTFS trip id as a producer would reference
+    -- it, plus the repetition start for frequency-materialized trips.
+    -- Plain trips carry (their own id, NULL); synthetic repetition trips
+    -- carry (template trip id, repetition start seconds). Real columns
+    -- rather than string-parsing the synthetic "#"-suffixed id, which
+    -- would be ambiguous if a real trip id contained "#".
+    source_trip_id TEXT NOT NULL, start_secs INTEGER
 );
 CREATE TABLE stop_times (
     trip_id TEXT NOT NULL, stop_id TEXT NOT NULL,
@@ -104,7 +111,14 @@ def _reporter(
 
 @dataclass(frozen=True)
 class ScheduledDeparture:
-    """A scheduled stop event resolved to tz-aware datetimes."""
+    """A scheduled stop event resolved to tz-aware datetimes.
+
+    ``source_trip_id``/``start_secs`` form the RT-matching identity: for a
+    plain trip they are ``(trip_id, None)``; for a frequency-materialized
+    repetition (synthetic ``{trip_id}#{start_secs}`` id) they are the
+    template trip id and the repetition start in GTFS seconds -- the pair a
+    GTFS-RT ``TripDescriptor`` (trip_id + start_time) addresses.
+    """
 
     trip_id: str
     route_id: str
@@ -112,6 +126,8 @@ class ScheduledDeparture:
     stop_id: str
     arrival: datetime | None
     departure: datetime
+    source_trip_id: str
+    start_secs: int | None
 
 
 @dataclass(frozen=True)
@@ -121,6 +137,8 @@ class ScheduledTrip:
     ``departure`` is at the origin stop and ``arrival`` at the destination;
     both are non-optional because the producing query's WHERE clauses
     require the underlying GTFS times to be present.
+    ``source_trip_id``/``start_secs`` are the RT-matching identity, exactly
+    as on :class:`ScheduledDeparture`.
     """
 
     trip_id: str
@@ -130,6 +148,8 @@ class ScheduledTrip:
     destination_stop_id: str
     departure: datetime
     arrival: datetime
+    source_trip_id: str
+    start_secs: int | None
 
 
 class StaticIndex:
@@ -258,6 +278,9 @@ class StaticIndex:
             ("routes.txt", cls._load_routes),
             ("trips.txt", cls._load_trips),
             ("stop_times.txt", cls._load_stop_times),
+            # frequencies.txt MUST follow trips.txt and stop_times.txt: its
+            # loader reads both tables to materialize repetitions.
+            ("frequencies.txt", cls._load_frequencies),
             ("calendar.txt", cls._load_calendar),
             ("calendar_dates.txt", cls._load_calendar_dates),
         )
@@ -359,6 +382,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
+        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?)"
         for row in reader:
             rows.append(
                 (
@@ -366,15 +390,15 @@ class StaticIndex:
                     row["route_id"],
                     row["service_id"],
                     row.get("trip_headsign") or None,
+                    row["trip_id"],  # source_trip_id: a plain trip is its own source
+                    None,  # start_secs: only frequency repetitions carry one
                 )
             )
             if len(rows) >= _BATCH_SIZE:
-                cls._batched_insert(
-                    conn, "INSERT OR REPLACE INTO trips VALUES (?,?,?,?)", rows
-                )
+                cls._batched_insert(conn, sql, rows)
                 if report is not None:
                     report()
-        cls._batched_insert(conn, "INSERT OR REPLACE INTO trips VALUES (?,?,?,?)", rows)
+        cls._batched_insert(conn, sql, rows)
         if report is not None:
             report()
 
@@ -405,6 +429,137 @@ class StaticIndex:
         cls._batched_insert(conn, "INSERT INTO stop_times VALUES (?,?,?,?,?)", rows)
         if report is not None:
             report()
+
+    @classmethod
+    def _load_frequencies(
+        cls,
+        conn: sqlite3.Connection,
+        reader: csv.DictReader[str],
+        report: Callable[[], None] | None = None,
+    ) -> None:
+        """Materialize frequencies.txt repetitions into concrete trips.
+
+        frequencies.txt defines a trip's stop_times rows as a TEMPLATE plus
+        repetition rules; the template alone is not a real trip. Each
+        repetition becomes a full copy of the template under a synthetic
+        trip id ``{trip_id}#{start_secs}`` (e.g. ``CITY1#21600``), shifted
+        so the first stop's anchor time (its arrival, falling back to its
+        departure) lands on the repetition start while every later stop
+        keeps its elapsed offset from that anchor; the original template
+        rows are then deleted. Repetition starts are ``start_time + n *
+        headway_secs`` for n = 0.. while STRICTLY less than ``end_time``
+        (a repetition landing exactly on end_time does not run), and
+        identical start seconds produced by overlapping rows for the same
+        trip are deduplicated so synthetic ids stay unique. This applies
+        to BOTH exact_times values: exact_times=0 describes idealized
+        headway service without a fixed timetable, and materializing it at
+        the stated headway is the standard journey-planner interpretation,
+        so the column is read for neither value and the two kinds are
+        indistinguishable downstream.
+
+        A trips row is duplicated per repetition under the synthetic id
+        (INSERT..SELECT from the original row, a no-op for orphan trips)
+        so every downstream join on trips.id -- departure boards, trip
+        queries, route/headsign pickers -- works unchanged; the ORIGINAL
+        trip row is kept so RT lookups keyed by the bare template trip id
+        (e.g. vehicle positions) still resolve a route. Each duplicated
+        row carries ``(source_trip_id, start_secs)`` = (template trip id,
+        repetition start), the identity a GTFS-RT TripDescriptor
+        (trip_id + start_time) addresses, so realtime matching reads real
+        columns instead of string-parsing the synthetic id (which would be
+        ambiguous if a real trip id contained ``#``). Materialized times
+        may exceed 24:00:00 and flow through the normal service-day
+        handling. A row referencing a trip with no stop_times template is
+        skipped, matching the loaders' no-referential-checks policy. A
+        real trip id that happens to equal a synthetic one (it would need
+        a literal ``#<secs>`` suffix) would be overwritten -- accepted as
+        negligible. Malformed rows (unparseable or missing times,
+        non-positive headway) raise, mirroring stop_times.
+        """
+        spans = cls._parse_frequency_spans(reader)
+        trips_sql = (
+            "INSERT OR REPLACE INTO trips "
+            "(id, route_id, service_id, headsign, source_trip_id, start_secs) "
+            "SELECT ?, route_id, service_id, headsign, ?, ? FROM trips WHERE id = ?"
+        )
+        stop_times_sql = "INSERT INTO stop_times VALUES (?,?,?,?,?)"
+        trip_rows: list[tuple[object, ...]] = []
+        stop_time_rows: list[tuple[object, ...]] = []
+        for trip_id, trip_spans in spans.items():
+            template = conn.execute(
+                "SELECT stop_id, arrival_secs, departure_secs, stop_sequence "
+                "FROM stop_times WHERE trip_id = ? ORDER BY stop_sequence",
+                (trip_id,),
+            ).fetchall()
+            if not template:
+                continue  # dangling reference: nothing to repeat
+            first_arrival, first_departure = template[0][1], template[0][2]
+            anchor = first_arrival if first_arrival is not None else first_departure
+            if anchor is None:
+                raise ValueError(
+                    f"frequency trip {trip_id!r} has no first-stop time "
+                    "to anchor repetition offsets"
+                )
+            conn.execute("DELETE FROM stop_times WHERE trip_id = ?", (trip_id,))
+            starts: set[int] = set()
+            for start_secs, end_secs, headway_secs in trip_spans:
+                rep_start = start_secs
+                while rep_start < end_secs:
+                    starts.add(rep_start)
+                    rep_start += headway_secs
+            for rep_start in sorted(starts):
+                synthetic_id = f"{trip_id}#{rep_start}"
+                shift = rep_start - anchor
+                trip_rows.append((synthetic_id, trip_id, rep_start, trip_id))
+                for stop_id, arrival_secs, departure_secs, stop_sequence in template:
+                    stop_time_rows.append(
+                        (
+                            synthetic_id,
+                            stop_id,
+                            arrival_secs + shift if arrival_secs is not None else None,
+                            (
+                                departure_secs + shift
+                                if departure_secs is not None
+                                else None
+                            ),
+                            stop_sequence,
+                        )
+                    )
+                if len(stop_time_rows) >= _BATCH_SIZE:
+                    cls._batched_insert(conn, trips_sql, trip_rows)
+                    cls._batched_insert(conn, stop_times_sql, stop_time_rows)
+                    if report is not None:
+                        report()
+        cls._batched_insert(conn, trips_sql, trip_rows)
+        cls._batched_insert(conn, stop_times_sql, stop_time_rows)
+        if report is not None:
+            report()
+
+    @staticmethod
+    def _parse_frequency_spans(
+        reader: csv.DictReader[str],
+    ) -> dict[str, list[tuple[int, int, int]]]:
+        """Parse frequencies rows into per-trip (start, end, headway) spans.
+
+        Raises (via the ``_load_all`` wrapping into FeedParseError) on rows
+        missing a start/end time or carrying a non-positive headway.
+        """
+        spans: dict[str, list[tuple[int, int, int]]] = {}
+        for row in reader:
+            trip_id = row["trip_id"]
+            start_secs = parse_gtfs_time(row.get("start_time", ""))
+            end_secs = parse_gtfs_time(row.get("end_time", ""))
+            if start_secs is None or end_secs is None:
+                raise ValueError(
+                    f"frequencies row for trip {trip_id!r} lacks a start/end time"
+                )
+            headway_secs = int(row["headway_secs"])
+            if headway_secs <= 0:
+                raise ValueError(
+                    f"non-positive headway_secs for trip {trip_id!r}: {headway_secs}"
+                )
+            spans.setdefault(trip_id, []).append((start_secs, end_secs, headway_secs))
+        return spans
 
     @classmethod
     def _load_calendar(
@@ -628,6 +783,11 @@ class StaticIndex:
         trips (>24:00:00 times) surface on the correct clock day and long
         lookaheads are never truncated. Results are sorted by departure and
         truncated to ``per_stop_limit`` per stop.
+
+        Frequency-based trips (frequencies.txt) surface as one row per
+        materialized repetition, under synthetic ``{trip_id}#{start_secs}``
+        trip ids (see ``_load_frequencies``); the bare template trip id
+        never appears.
         """
         results: list[ScheduledDeparture] = []
         for day_start_utc, active, window_lo, window_hi in self._service_day_windows(
@@ -637,7 +797,7 @@ class StaticIndex:
             service_marks = ",".join("?" * len(active))
             sql = (
                 "SELECT st.trip_id, t.route_id, t.headsign, st.stop_id, "
-                "st.arrival_secs, st.departure_secs "
+                "st.arrival_secs, st.departure_secs, t.source_trip_id, t.start_secs "
                 "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
                 f"WHERE st.stop_id IN ({stop_marks}) "
                 f"AND t.service_id IN ({service_marks}) "
@@ -655,6 +815,8 @@ class StaticIndex:
                 stop_id,
                 arr_secs,
                 dep_secs,
+                source_trip_id,
+                start_secs,
             ) in self._conn.execute(sql, params):
                 results.append(
                     ScheduledDeparture(
@@ -668,6 +830,8 @@ class StaticIndex:
                             else None
                         ),
                         departure=day_start_utc + timedelta(seconds=dep_secs),
+                        source_trip_id=source_trip_id,
+                        start_secs=start_secs,
                     )
                 )
         # Total sort key: departure alone ties frequently (same-minute
@@ -717,7 +881,8 @@ class StaticIndex:
             # arrival at the destination) can never produce a row.
             sql = (
                 "SELECT o.trip_id, t.route_id, t.headsign, "
-                "o.departure_secs, MIN(d.arrival_secs) "
+                "o.departure_secs, MIN(d.arrival_secs), "
+                "t.source_trip_id, t.start_secs "
                 "FROM stop_times o "
                 "JOIN stop_times d ON d.trip_id = o.trip_id "
                 "JOIN trips t ON t.id = o.trip_id "
@@ -736,9 +901,15 @@ class StaticIndex:
                 window_lo,
                 window_hi,
             ]
-            for trip_id, route_id, headsign, dep_secs, arr_secs in self._conn.execute(
-                sql, params
-            ):
+            for (
+                trip_id,
+                route_id,
+                headsign,
+                dep_secs,
+                arr_secs,
+                source_trip_id,
+                start_secs,
+            ) in self._conn.execute(sql, params):
                 results.append(
                     ScheduledTrip(
                         trip_id=trip_id,
@@ -748,6 +919,8 @@ class StaticIndex:
                         destination_stop_id=destination_stop_id,
                         departure=day_start_utc + timedelta(seconds=dep_secs),
                         arrival=day_start_utc + timedelta(seconds=arr_secs),
+                        source_trip_id=source_trip_id,
+                        start_secs=start_secs,
                     )
                 )
         # Total sort key, matching upcoming_departures's rationale: arrival

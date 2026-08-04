@@ -560,6 +560,21 @@ class TransitFeedHandle:
         ``limit`` rows per stop, nearest-departure-first — RT-added rows are
         not exempt.
 
+        Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
+        ids materialized from frequencies.txt) match RT via
+        ``TripDescriptor.start_time``: a prediction or cancellation whose
+        (trip_id, start_time) equals a repetition's (template id, start)
+        applies to exactly that repetition. The matching is deliberately
+        strict in both directions: a prediction/cancellation WITHOUT
+        start_time never applies to repetitions (which repetition was meant
+        is unknowable, and guessing — or applying it to all of them — would
+        be wrong more often than not), a start_time matching no
+        materialized repetition applies to nothing, and plain
+        (non-frequency) rows only match predictions WITHOUT start_time
+        (a producer redundantly sending start_time for a regular trip does
+        not match). ``TripDescriptor.start_date`` is not consulted; see
+        :class:`aiomobilitydatabase.feeds.rt.TripUpdates` for why.
+
         ``now_utc`` exists for deterministic testing; omit it in production.
         """
         now = now_utc or datetime.now(UTC)
@@ -575,9 +590,14 @@ class TransitFeedHandle:
 
         arrivals: list[StopArrival] = []
         for dep in scheduled:
-            if dep.trip_id in canceled:
+            # RT identity: (source_trip_id, start_secs) is (trip_id, None)
+            # for plain trips and (template id, repetition start) for
+            # frequency repetitions — matching TripUpdates' key shape.
+            if (dep.source_trip_id, dep.start_secs) in canceled:
                 continue
-            prediction = predictions.get((dep.trip_id, dep.stop_id))
+            prediction = predictions.get(
+                (dep.source_trip_id, dep.start_secs, dep.stop_id)
+            )
             arrivals.append(
                 StopArrival(
                     stop_id=dep.stop_id,
@@ -665,6 +685,12 @@ class TransitFeedHandle:
         full stop sequence is unknown, so whether it serves the destination
         after the origin cannot be determined.
 
+        Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
+        ids) match RT via ``TripDescriptor.start_time`` exactly as in
+        :meth:`get_arrivals`: aligned start_time applies to that one
+        repetition; missing or unmatched start_time applies to no
+        repetition, and plain trips only match start_time-less updates.
+
         ``now_utc`` exists for deterministic testing; omit it in production.
         """
         now = now_utc or datetime.now(UTC)
@@ -680,10 +706,12 @@ class TransitFeedHandle:
         updates = await self._aggregated_trip_updates()
         trips: list[UpcomingTrip] = []
         for trip in scheduled:
-            if trip.trip_id in updates.canceled_trips:
+            # Same RT identity as get_arrivals: (source_trip_id, start_secs).
+            rt_key = (trip.source_trip_id, trip.start_secs)
+            if rt_key in updates.canceled_trips:
                 continue
-            origin_pred = updates.predictions.get((trip.trip_id, origin_stop_id))
-            dest_pred = updates.predictions.get((trip.trip_id, destination_stop_id))
+            origin_pred = updates.predictions.get((*rt_key, origin_stop_id))
+            dest_pred = updates.predictions.get((*rt_key, destination_stop_id))
             trips.append(
                 UpcomingTrip(
                     trip_id=trip.trip_id,
@@ -715,7 +743,13 @@ class TransitFeedHandle:
         return trips
 
     async def get_vehicles(self) -> list[VehiclePosition]:
-        """Live vehicle positions across the feed's VP-capable RT sources."""
+        """Live vehicle positions across the feed's VP-capable RT sources.
+
+        Vehicle (and alert) trip references keep the producer's PLAIN trip
+        ids — a display-only association resolved against the retained
+        original trip rows, with no per-repetition matching for
+        frequency-based trips.
+        """
         messages = await self._fetch_entity_messages(EntityType.VEHICLE_POSITIONS)
         trip_ids = sorted(
             {

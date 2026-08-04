@@ -28,6 +28,10 @@ _T1_S3_ARRIVAL_EPOCH = int(datetime(2026, 7, 30, 15, 20, 0, tzinfo=UTC).timestam
 # Arbitrary fixed epoch used by test_rt.py/test_models.py's non-arrivals
 # protobuf-parsing tests, unrelated to any particular "now".
 _BASELINE_EPOCH = 1_785_500_000
+# Matches test_transit_frequencies.py: the frequencies variant zip's
+# F1#22200 repetition (start_time 06:10:00 PDT) departs S1 at 13:10 UTC on
+# the fixture Thursday.
+_F1_REP_22200_S1_EPOCH = int(datetime(2026, 7, 30, 13, 10, tzinfo=UTC).timestamp())
 
 
 def _build_vehicle_positions() -> bytes:
@@ -168,6 +172,81 @@ def _build_added_trips(*, base_epoch: int, stop_id: str, count: int) -> bytes:
     return bytes(msg.SerializeToString())
 
 
+def _build_freq_trip_updates_matched() -> bytes:
+    """TripUpdates addressing SPECIFIC F1 repetitions via start_time.
+
+    Against the frequencies variant zip: the 06:10:00 repetition
+    (F1#22200) is delayed 120s at S1, and the 06:20:00 repetition
+    (F1#22800) is canceled -- each must affect exactly its own repetition.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    e1 = msg.entity.add()
+    e1.id = "tu-freq-rep"
+    tu1 = e1.trip_update
+    tu1.trip.trip_id = "F1"
+    tu1.trip.start_time = "06:10:00"
+    tu1.vehicle.id = "V9"
+    stu = tu1.stop_time_update.add()
+    stu.stop_id = "S1"
+    stu.departure.delay = 120
+    stu.departure.time = _F1_REP_22200_S1_EPOCH + 120
+    e2 = msg.entity.add()
+    e2.id = "tu-freq-cancel"
+    tu2 = e2.trip_update
+    tu2.trip.trip_id = "F1"
+    tu2.trip.start_time = "06:20:00"
+    tu2.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.CANCELED
+    return bytes(msg.SerializeToString())
+
+
+def _build_freq_trip_updates_unmatched() -> bytes:
+    """TripUpdates that must attach to NO frequency repetition.
+
+    One prediction WITHOUT start_time (repetition-ambiguous) and one with a
+    start_time (06:05:00) matching no materialized repetition.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    e1 = msg.entity.add()
+    e1.id = "tu-freq-bare"
+    tu1 = e1.trip_update
+    tu1.trip.trip_id = "F1"
+    stu1 = tu1.stop_time_update.add()
+    stu1.stop_id = "S1"
+    stu1.departure.delay = 300
+    stu1.departure.time = _F1_REP_22200_S1_EPOCH + 300
+    e2 = msg.entity.add()
+    e2.id = "tu-freq-ghost"
+    tu2 = e2.trip_update
+    tu2.trip.trip_id = "F1"
+    tu2.trip.start_time = "06:05:00"
+    stu2 = tu2.stop_time_update.add()
+    stu2.stop_id = "S1"
+    stu2.departure.delay = 300
+    stu2.departure.time = _F1_REP_22200_S1_EPOCH + 300
+    return bytes(msg.SerializeToString())
+
+
+def _build_freq_trip_updates_bare_cancel() -> bytes:
+    """Build a start_time-less cancellation of frequency trip F1.
+
+    Must cancel NO repetition: which one was meant is unknowable without
+    start_time.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-freq-bare-cancel"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "F1"
+    trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.CANCELED
+    return bytes(msg.SerializeToString())
+
+
 def _build_alerts() -> bytes:
     """Build an Alert FeedMessage with one active alert."""
     msg = gtfs_realtime_pb2.FeedMessage()
@@ -208,6 +287,9 @@ def main() -> None:
         "added_trips_s1.pb": _build_added_trips(
             base_epoch=_NOW_EPOCH, stop_id="S1", count=3
         ),
+        "trip_updates_freq_matched.pb": _build_freq_trip_updates_matched(),
+        "trip_updates_freq_unmatched.pb": _build_freq_trip_updates_unmatched(),
+        "trip_updates_freq_bare_cancel.pb": _build_freq_trip_updates_bare_cancel(),
     }
     for filename, content in fixtures.items():
         (_OUTPUT_DIR / filename).write_bytes(content)
