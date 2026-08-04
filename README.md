@@ -9,8 +9,9 @@ The core package wraps the catalog's
 with a fully typed asyncio client: search feeds, look up their metadata, find the
 hosted dataset URL. An optional `feeds` layer goes one step further and consumes
 the actual transit/bike-share data those feeds point to — scheduled and live
-arrivals, vehicle positions, service alerts, GBFS stations and vehicles — giving you
-a feed ID in and typed snapshots out.
+arrivals, origin→destination trip queries, vehicle positions, service alerts,
+GBFS stations and vehicles — giving you a feed ID (or a plain feed URL) in and
+typed snapshots out.
 
 ## Installation
 
@@ -95,10 +96,11 @@ async def main() -> None:
         # api_key authenticates with the PRODUCER (distinct from your catalog
         # refresh token); on_progress reports download/index build progress
         # for the first (uncached) fetch of a feed's static dataset.
+        # (p.fraction is None when the server doesn't announce a total.)
         transit = await client.get_transit_feed(
             "mdb-100",
             api_key="PRODUCER_API_KEY",
-            on_progress=lambda p: print(f"{p.phase}: {p.fraction:.0%}"),
+            on_progress=lambda p: print(p.phase, p.fraction),
         )
 
         # Picker-style helpers: stops in a zone, routes serving a stop.
@@ -116,6 +118,15 @@ async def main() -> None:
             when = arrival.predicted_departure or arrival.scheduled_departure
             live = "live" if arrival.realtime else "scheduled"
             print(f"{arrival.route_name} -> {arrival.headsign}: {when} ({live})")
+
+        # Origin→destination: the next departures from stop A on trips that
+        # later reach stop B, with the same realtime overlay. is_first/is_last
+        # flag the first/last such departure of the service day.
+        trips = await transit.upcoming_trips(
+            nearby_stops[0].id, nearby_stops[1].id, limit=2
+        )
+        for trip in trips:
+            print(trip.route_name, trip.scheduled_departure, trip.is_last)
 
         vehicles = await transit.get_vehicles()
         alerts = await transit.get_alerts()
@@ -186,21 +197,51 @@ Notes on direct mode:
 ## How it works
 
 - **Scheduled arrivals for every feed**: the hosted GTFS zip is indexed into
-  SQLite (stops, routes, trips, stop_times, calendars) in a worker thread — the
-  event loop is never blocked. Arrivals work with or without realtime coverage;
-  GTFS-RT TripUpdates overlay delays, cancellations, and added trips when
-  present, with cancellation always winning over stale predictions.
-- **`cache_dir` strongly recommended**: the static index is cached on disk keyed
-  by dataset ID, so restarts are instant and rebuilds only happen when the
-  agency publishes a new dataset (`await transit.refresh_static()` — call it
-  daily; it swaps in the new index only after it's built, so lookups never see
-  a half-built database). Without a `cache_dir` the index is built in memory
-  on every startup.
+  SQLite (agencies, stops, routes, trips, stop_times, calendars, frequencies,
+  feed_info) in a worker thread — the event loop is never blocked. Arrivals
+  work with or without realtime coverage; GTFS-RT TripUpdates overlay delays,
+  cancellations, and added trips when present, with cancellation always
+  winning over stale predictions.
+- **frequencies.txt is materialized at build time**: headway-based trips
+  (common for metro/BRT) expand into concrete repetitions under synthetic
+  `{trip_id}#{start_secs}` ids, so every schedule query — arrivals,
+  origin→destination, routes-serving — sees them as ordinary trips.
+- **Spec-correct realtime matching**: GTFS-RT updates are matched by
+  `(trip_id, start_date, start_time)`, so an update addresses exactly one
+  repetition of a frequency trip and exactly one service-day instance — a
+  "trip X is canceled tomorrow" posting never cancels today's run. A
+  StopTimeUpdate's delay propagates to subsequent stops until newer
+  information, `NO_DATA` makes a stop schedule-only, `SKIPPED` suppresses it
+  (and any origin→destination row boarding or alighting there), and the
+  trip-level delay covers stops no StopTimeUpdate reaches.
+- **The full descriptive surface is exposed, typed by shape**: closed GTFS
+  vocabularies are enums (`WheelchairAccess`, `BikesAllowed`,
+  `PickupDropOffType`, `StopLocationType`, alert cause/effect/severity,
+  vehicle status/congestion/occupancy), `timepoint` is a bool with the spec's
+  absent-means-exact default, and open vocabularies (`route_type`,
+  `direction_id`) stay raw ints. Out-of-vocabulary values degrade to `None` —
+  descriptive metadata never fails a build. Consumers decide what to keep.
+- **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
+  (publisher, version, validity dates — useful for staleness checks), and
+  `headsigns_serving()` alongside the stop/route helpers.
+- **Alert scoping**: `ServiceAlert` carries `route_ids`, `stop_ids`, and
+  `trip_ids`; an alert is agency-wide only when all three are empty.
+  `is_active(at)` evaluates its active periods.
+- **GBFS extras**: `rental_uris` deep links on stations and vehicles,
+  `get_system_info()`, and TTL-based document caching.
+- **`cache_dir` strongly recommended**: the static index is cached on disk
+  keyed by feed, validated against the dataset ID, so restarts are instant and
+  rebuilds only happen when the agency publishes a new dataset
+  (`await transit.refresh_static()` — call it daily; it swaps in the new index
+  only after it's built, so lookups never see a half-built database). Without
+  a `cache_dir` the index is built in memory on every startup.
 - **Pull, not push**: `TransitFeedHandle`/`GbfsFeedHandle` return snapshots on
   demand — there's no built-in polling loop or scheduler. Bring your own (e.g.
   Home Assistant's `DataUpdateCoordinator`).
 - **`purge_cache()`** deletes a feed's cached static data (or all feeds' when
   called with no argument) — call it on cleanup/removal of a configured feed.
+  `transit.close()` releases a handle's SQLite connection — call it when you
+  are done with a handle; the client's `close()` does not do it for you.
 - **Producer authentication**: pass `api_key=` to `get_transit_feed()`; it is
   applied per the catalog's `authentication_type` (query parameter or header) —
   distinct from the refresh token used to authenticate with the catalog itself.
@@ -242,21 +283,28 @@ feeds fetches (GTFS-RT polls, GBFS documents, dataset zip downloads) when
 passed to `MobilityFeedsClient`:
 
 ```python
+import asyncio
+
 import aiohttp
 
 from aiomobilitydatabase import MobilityDatabaseClient
 
-session = aiohttp.ClientSession()
-client = MobilityDatabaseClient("YOUR_REFRESH_TOKEN", session)
-try:
-    metadata = await client.get_metadata()
-finally:
-    await client.close()  # session remains open; you own it
+
+async def main() -> None:
+    async with aiohttp.ClientSession() as session:
+        client = MobilityDatabaseClient("YOUR_REFRESH_TOKEN", session)
+        try:
+            metadata = await client.get_metadata()
+        finally:
+            await client.close()  # session remains open; you own it
+
+
+asyncio.run(main())
 ```
 
 ## Testing methodology
 
-The suite (231 tests) combines example-based and property-based testing:
+The suite combines example-based, property-based, and conformance testing:
 
 - **Example-based tests** cover the catalog's endpoint methods and the feeds
   layer's client/transit/GBFS/static-index modules against a real
@@ -273,6 +321,11 @@ The suite (231 tests) combines example-based and property-based testing:
     arithmetic against a naive oracle, calendar/calendar_dates service-id
     resolution, DST-transition handling) — this is where the original
     hardcoded `±1 day` scan-window bug was found;
+  - frequencies.txt materialization (arithmetic-progression oracles,
+    descriptor carry-through), GTFS-RT delay propagation (an independent
+    piecewise oracle over generated StopTimeUpdate sets, run against the pure
+    resolver at volume), and `start_date`/`start_time` instance matching over
+    windows containing two service-day instances of the same trip;
   - the circular-zone geometry (`in_circle`'s bbox prefilter is checked
     against the exact haversine distance at generated boundary points);
   - GBFS field parsing (`_localized`, `_version_key`, station/vehicle merging)
@@ -286,6 +339,10 @@ The suite (231 tests) combines example-based and property-based testing:
 
   Hypothesis is a `dev` dependency and part of the default suite (no separate
   opt-in marker); `.hypothesis/` (its example database) is gitignored.
+- **Conformance tests** (`tests/feeds/test_sample_feed.py`) run the index
+  against Google's canonical GTFS sample feed — the feed the rest of the GTFS
+  ecosystem validates against — with hand-computed expected schedules,
+  frequency repetitions, and calendar exceptions pinned from the raw CSVs.
 
 ## Development
 
