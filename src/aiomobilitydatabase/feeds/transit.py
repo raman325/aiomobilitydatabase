@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import shutil
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -60,11 +60,6 @@ _CACHE_KEY_HASH_CHARS = 16
 # Direct-URL RT feeds advertise every entity type: capabilities are unknown
 # without a catalog record, so every fetch tries all parsers and absent
 # types simply yield nothing.
-_ALL_ENTITY_TYPES = (
-    EntityType.TRIP_UPDATES,
-    EntityType.VEHICLE_POSITIONS,
-    EntityType.SERVICE_ALERTS,
-)
 
 
 def _direct_cache_key(static_url: str) -> str:
@@ -246,31 +241,47 @@ class TransitFeedHandle:
         cls,
         client: MobilityFeedsClient,
         static_url: str,
-        rt_urls: list[str] | None,
-        headers: Mapping[str, str] | None,
+        *,
+        trip_updates_urls: Sequence[str] | None = None,
+        vehicle_positions_urls: Sequence[str] | None = None,
+        service_alerts_urls: Sequence[str] | None = None,
+        headers: Mapping[str, str] | None = None,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
     ) -> TransitFeedHandle:
         """Build a handle from user-supplied URLs, bypassing the catalog.
 
-        Each rt_url is synthesized into a :class:`GtfsRtFeed` whose id IS
-        the url, advertising every entity type (capabilities are unknown
-        without a catalog record; parsers naturally yield nothing for
-        absent types) with ``SourceInfo(producer_url=url,
-        authentication_type=0)`` — so the shared RT fetch/merge machinery
-        runs unchanged. ``headers`` apply to the static download and every
-        RT fetch made through this handle.
+        RT URLs are declared per layer so each operation fetches only the
+        sources that can serve it (and so consumers can see real
+        trip-updates capability instead of an assumption). A URL listed
+        under several layers — a combined feed — is deduplicated into ONE
+        synthesized :class:`GtfsRtFeed` carrying the union of its declared
+        entity types, so it is fetched once per operation, never twice.
+        Each synthesized feed's id IS the url, with
+        ``SourceInfo(producer_url=url, authentication_type=0)`` — the
+        shared RT fetch/merge machinery runs unchanged. ``headers`` apply
+        to the static download and every RT fetch made through this
+        handle.
         """
         _require_http_url(static_url, "static GTFS dataset URL")
-        for rt_url in rt_urls or []:
-            _require_http_url(rt_url, "GTFS-RT producer URL")
+        url_types: dict[str, list[EntityType]] = {}
+        for urls, entity_type in (
+            (trip_updates_urls, EntityType.TRIP_UPDATES),
+            (vehicle_positions_urls, EntityType.VEHICLE_POSITIONS),
+            (service_alerts_urls, EntityType.SERVICE_ALERTS),
+        ):
+            for rt_url in urls or []:
+                _require_http_url(rt_url, "GTFS-RT producer URL")
+                types = url_types.setdefault(rt_url, [])
+                if entity_type not in types:
+                    types.append(entity_type)
         rt_feeds = [
             GtfsRtFeed(
                 id=rt_url,
                 data_type=DataType.GTFS_RT,
-                entity_types=list(_ALL_ENTITY_TYPES),
+                entity_types=types,
                 source_info=SourceInfo(producer_url=rt_url, authentication_type=0),
             )
-            for rt_url in rt_urls or []
+            for rt_url, types in url_types.items()
         ]
         direct = _DirectUrls(static_url=static_url, headers=headers)
         source = _StaticSource(

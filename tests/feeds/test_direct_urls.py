@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from aiomobilitydatabase import EntityType
 from aiomobilitydatabase.exceptions import MobilityDatabaseError
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import (
@@ -223,7 +224,7 @@ async def test_direct_transit_rejects_non_http_urls(
     # An offending RT url is rejected up front too: before any HTTP at all.
     with pytest.raises(SourceConnectionError, match="scheme"):
         await direct_client.get_transit_feed_from_urls(
-            mock_api.url(STATIC_PATH), ["ftp://rt.example/feed"]
+            mock_api.url(STATIC_PATH), trip_updates_urls=["ftp://rt.example/feed"]
         )
     assert mock_api.requests == []
 
@@ -248,27 +249,23 @@ async def test_purge_cache_accepts_url_derived_key(
 # -- Transit: synthesized RT sources -----------------------------------------
 
 
-async def test_direct_rt_merge_and_vehicles(
+async def test_direct_rt_typed_layers(
     mock_api: MockApi, direct_client: MobilityFeedsClient
 ) -> None:
-    """Two direct RT urls: a TU producer merges into arrivals; a VP-only
-    producer contributes nothing there (its protobuf simply has no
-    trip_update entities) but serves get_vehicles. Both feeds advertise all
-    entity types, so each snapshot method polls both urls.
+    """Per-layer RT urls: get_arrivals polls ONLY the trip-updates url and
+    get_vehicles ONLY the vehicle-positions url — one scripted response per
+    url proves nothing polls a layer it wasn't declared for.
     """
     mock_api.head(STATIC_PATH, headers={"ETag": '"v1"'})
     mock_api.get(
         STATIC_PATH, body=build_gtfs_zip_bytes(), content_type="application/zip"
     )
-    # get_arrivals polls both urls for TripUpdates; get_vehicles polls both
-    # for VehiclePositions: two scripted responses per url.
     mock_api.get(TU_PATH, body=TRIP_UPDATES_T1_DELAYED, content_type=PB)
-    mock_api.get(TU_PATH, body=TRIP_UPDATES_T1_DELAYED, content_type=PB)
-    mock_api.get(VP_PATH, body=VEHICLE_POSITIONS, content_type=PB)
     mock_api.get(VP_PATH, body=VEHICLE_POSITIONS, content_type=PB)
     handle = await direct_client.get_transit_feed_from_urls(
         mock_api.url(STATIC_PATH),
-        [mock_api.url(TU_PATH), mock_api.url(VP_PATH)],
+        trip_updates_urls=[mock_api.url(TU_PATH)],
+        vehicle_positions_urls=[mock_api.url(VP_PATH)],
         headers=HDRS,
     )
     assert [feed.id for feed in handle.rt_feeds] == [
@@ -286,14 +283,47 @@ async def test_direct_rt_merge_and_vehicles(
     assert ("ADDED-9", "S2") in by_key  # RT-added trip came through
     vehicles = await handle.get_vehicles()
     assert {vehicle.vehicle_id for vehicle in vehicles} == {"V1", "V2"}
-    # Every RT fetch (both urls, both snapshot methods) carried the headers.
+    # Exactly one fetch per url — arrivals never touched the VP url and
+    # vice versa — and every RT fetch carried the headers.
     for path in (TU_PATH, VP_PATH):
         rt_requests = _requests_for(mock_api, "GET", path)
-        assert len(rt_requests) == 2
+        assert len(rt_requests) == 1
         assert all(
             req.headers.get("X-Custom-Token") == "abc123"  # type: ignore[attr-defined]
             for req in rt_requests
         )
+
+
+async def test_direct_rt_combined_url_deduplicated(
+    mock_api: MockApi, direct_client: MobilityFeedsClient
+) -> None:
+    """The same url declared for several layers — a combined feed — is
+    synthesized into ONE source carrying the union of entity types, so each
+    operation fetches it exactly once, never twice.
+    """
+    mock_api.head(STATIC_PATH, headers={"ETag": '"v1"'})
+    mock_api.get(
+        STATIC_PATH, body=build_gtfs_zip_bytes(), content_type="application/zip"
+    )
+    mock_api.get(TU_PATH, body=TRIP_UPDATES_T1_DELAYED, content_type=PB)
+    combined_url = mock_api.url(TU_PATH)
+    handle = await direct_client.get_transit_feed_from_urls(
+        mock_api.url(STATIC_PATH),
+        trip_updates_urls=[combined_url],
+        vehicle_positions_urls=[combined_url],
+        service_alerts_urls=[combined_url],
+    )
+    assert len(handle.rt_feeds) == 1
+    assert handle.rt_feeds[0].entity_types == [
+        EntityType.TRIP_UPDATES,
+        EntityType.VEHICLE_POSITIONS,
+        EntityType.SERVICE_ALERTS,
+    ]
+    arrivals = await handle.get_arrivals(
+        ["S1"], lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert any(arrival.realtime for arrival in arrivals)
+    assert len(_requests_for(mock_api, "GET", TU_PATH)) == 1
 
 
 # -- Tokenless catalog access -------------------------------------------------

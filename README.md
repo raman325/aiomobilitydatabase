@@ -147,7 +147,8 @@ async def main() -> None:
     async with MobilityFeedsClient(cache_dir="/path/to/cache") as client:
         transit = await client.get_transit_feed_from_urls(
             "https://agency.example/gtfs.zip",
-            ["https://agency.example/gtfs-rt/trip-updates.pb"],
+            trip_updates_urls=["https://agency.example/gtfs-rt/trip-updates.pb"],
+            vehicle_positions_urls=["https://agency.example/gtfs-rt/positions.pb"],
             headers={"Authorization": "Bearer PRODUCER_TOKEN"},  # optional
         )
         arrivals = await transit.get_arrivals([transit.stops[0].id])
@@ -167,10 +168,11 @@ Notes on direct mode:
   storage; direct mode fetches **your** URL, with the optional `headers`
   applied to the static download and every GTFS-RT/GBFS fetch the handle
   makes.
-- Each RT URL is assumed capable of every entity type (TripUpdates,
-  VehiclePositions, ServiceAlerts) since there's no catalog record to say
-  otherwise — parsers simply yield nothing for types a producer doesn't
-  publish.
+- RT URLs are declared per layer (`trip_updates_urls`,
+  `vehicle_positions_urls`, `service_alerts_urls`), so each operation only
+  fetches sources that can serve it. A combined feed listed under several
+  layers is deduplicated and fetched once per operation; if you don't know
+  a producer's layer split, pass the same URL to every layer.
 - Dataset identity comes from HTTP validators (`ETag`, then
   `Last-Modified`, via a `HEAD` probe) instead of catalog dataset IDs;
   servers offering neither fall back to hashing the downloaded bytes, so

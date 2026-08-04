@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -170,20 +170,23 @@ class MobilityFeedsClient:
     async def get_transit_feed_from_urls(
         self,
         static_url: str,
-        rt_urls: list[str] | None = None,
         *,
+        trip_updates_urls: Sequence[str] | None = None,
+        vehicle_positions_urls: Sequence[str] | None = None,
+        service_alerts_urls: Sequence[str] | None = None,
         headers: Mapping[str, str] | None = None,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
     ) -> TransitFeedHandle:
         """Build a TransitFeedHandle from user-supplied URLs (no catalog).
 
         Returns the same handle type as :meth:`get_transit_feed`, so
-        consumers built against catalog handles work unchanged. Each
-        ``rt_urls`` entry is synthesized into an RT source that advertises
-        every entity type (capabilities are unknown without a catalog
-        record; parsers yield nothing for types a producer doesn't
-        publish). ``headers`` apply to the static download and every RT
-        fetch for the handle.
+        consumers built against catalog handles work unchanged. RT URLs
+        are declared per layer, so each operation fetches only the sources
+        that can serve it; a combined feed listed under several layers is
+        deduplicated and fetched once per operation. If you don't know a
+        producer's layer split, pass the same URL to every layer.
+        ``headers`` apply to the static download and every RT fetch for
+        the handle.
 
         Dataset identity without a catalog: the static URL is HEAD-probed
         for an ETag (preferred) or Last-Modified validator; servers
@@ -194,7 +197,13 @@ class MobilityFeedsClient:
         :meth:`get_transit_feed`.
         """
         return await TransitFeedHandle.create_from_urls(
-            self, static_url, rt_urls, headers, on_progress
+            self,
+            static_url,
+            trip_updates_urls=trip_updates_urls,
+            vehicle_positions_urls=vehicle_positions_urls,
+            service_alerts_urls=service_alerts_urls,
+            headers=headers,
+            on_progress=on_progress,
         )
 
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeedHandle:
