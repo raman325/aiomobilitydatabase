@@ -167,6 +167,8 @@ def test_upcoming_departures_basic_window(tmp_path: Path) -> None:
     assert first.headsign == "Downtown"
     # 08:00:30 PDT == 15:00:30 UTC
     assert first.departure == datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC)
+    # The RT service-day identity: this row belongs to Thursday's service day.
+    assert first.service_date == date(2026, 7, 30)
     index.close()
 
 
@@ -191,6 +193,10 @@ def test_past_midnight_trip_from_previous_service_day(tmp_path: Path) -> None:
     )
     assert [dep.trip_id for dep in departures] == ["T3"]
     assert departures[0].departure == datetime(2026, 7, 31, 8, 31, tzinfo=UTC)
+    # service_date pins the GENERATING service day across the >24:00:00
+    # boundary: Thursday, even though the departure lands on Friday's clock
+    # day -- the date a producer's TripDescriptor.start_date would name.
+    assert departures[0].service_date == date(2026, 7, 30)
     index.close()
 
 

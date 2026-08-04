@@ -6,9 +6,9 @@ import asyncio
 import hashlib
 import shutil
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -45,6 +45,7 @@ from .models import (
 )
 from .rt import (
     TripPredictions,
+    TripUpdateKey,
     TripUpdates,
     _require_http_url,  # deliberate friend access: shared data-origin URL guard
     alerts_from_message,
@@ -131,6 +132,72 @@ def _predicted_time(
         return explicit
     if scheduled is not None and delay_seconds is not None:
         return scheduled + timedelta(seconds=delay_seconds)
+    return None
+
+
+# A scheduled row's date-less RT identity: (source_trip_id, start_secs) --
+# (trip_id, None) for plain trips, (template id, repetition start) for
+# frequency repetitions. Adjacent service days repeat the same identity
+# exactly 24h apart; the service day disambiguates between them.
+_RtIdentity = tuple[str, int | None]
+
+# One scheduled trip instance in a query result: the CONCRETE trip id
+# (synthetic repetition ids included) plus its service day. The same
+# concrete trip id recurs across service days, so the id alone cannot key
+# resolved predictions in windows spanning 24h or more.
+_TripInstance = tuple[str, date]
+
+
+def _current_service_dates(
+    rows: Iterable[tuple[str, int | None, date]],
+) -> dict[_RtIdentity, date]:
+    """Earliest in-window service day per RT identity.
+
+    Defines the "currently active" instance a date-less update addresses
+    when several service days' instances of one identity share the query
+    window (see :func:`_rt_key_for_row`).
+    """
+    current: dict[_RtIdentity, date] = {}
+    for source_trip_id, start_secs, service_date in rows:
+        identity = (source_trip_id, start_secs)
+        held = current.get(identity)
+        if held is None or service_date < held:
+            current[identity] = service_date
+    return current
+
+
+def _rt_key_for_row(
+    identity: _RtIdentity,
+    service_date: date,
+    keys: Collection[TripUpdateKey],
+    current_dates: Mapping[_RtIdentity, date],
+) -> TripUpdateKey | None:
+    """Resolve which RT key in ``keys`` (if any) addresses one scheduled row.
+
+    A key WITH a start_date matches only the row whose service day equals
+    it -- AND-ed with the start_time rules, which are unchanged: frequency
+    rows need an aligned start_secs, plain rows need start_secs None. A
+    key WITHOUT a start_date follows the spec's "assume the trip is
+    running on the day it is currently active on": it matches only the
+    CURRENT instance of its identity, defined precisely as the earliest
+    in-window service day for that identity (``current_dates`` holds that
+    minimum over the scheduled rows; ``identity`` always appears in it
+    because the queried row is itself in the window). With exactly one
+    instance in the window -- every sub-24h lookahead -- this is the
+    identity's only row, so date-less behavior is unchanged from before
+    start_date existed. When a dated and a date-less key both exist for
+    one row, the dated key wins (it is strictly more specific); the
+    date-less key never falls through to a sibling day's instance. A
+    garbage start_date parses to None (see ``rt._trip_start_date``), so
+    it behaves exactly like an absent one.
+    """
+    source_trip_id, start_secs = identity
+    dated: TripUpdateKey = (source_trip_id, service_date, start_secs)
+    if dated in keys:
+        return dated
+    dateless: TripUpdateKey = (source_trip_id, None, start_secs)
+    if dateless in keys and current_dates[identity] == service_date:
+        return dateless
     return None
 
 
@@ -561,8 +628,9 @@ class TransitFeedHandle:
         """Merge TripUpdates across every TU-capable sibling RT source.
 
         Deliberate tiebreak: when multiple TU-capable sibling feeds report
-        the same (trip_id, start_secs) identity, the last feed in catalog
-        order wins wholesale (no freshness reconciliation in v1).
+        the same (trip_id, start_date, start_secs) identity, the last feed
+        in catalog order wins wholesale (no freshness reconciliation in
+        v1).
         """
         aggregate = TripUpdates()
         for message in await self._fetch_entity_messages(EntityType.TRIP_UPDATES):
@@ -573,27 +641,34 @@ class TransitFeedHandle:
         return aggregate
 
     async def _resolve_predictions(
-        self, updates: TripUpdates, rt_keys: Mapping[str, tuple[str, int | None]]
-    ) -> dict[str, TripPredictions]:
-        """Resolve STU propagation for every matched concrete trip.
+        self, updates: TripUpdates, rt_keys: Mapping[_TripInstance, TripUpdateKey]
+    ) -> dict[_TripInstance, TripPredictions]:
+        """Resolve STU propagation for every matched scheduled trip instance.
 
-        ``rt_keys`` maps each scheduled row's CONCRETE trip id (synthetic
-        repetition ids included) to its RT identity; trips with a matching
-        TripUpdate entry get their static stop order fetched in one query
-        and resolved via :func:`resolve_trip_predictions`, so propagation
-        happens against the exact repetition the update addressed. Every
-        matched trip is guaranteed a stop-calls entry: scheduled rows only
-        exist because the trip has stop_times rows.
+        ``rt_keys`` maps each matched instance -- CONCRETE trip id
+        (synthetic repetition ids included) plus service day -- to the
+        ``updates.trips`` key that addresses it, as resolved per row by
+        :func:`_rt_key_for_row` (callers pass matched instances only).
+        Instances are the unit here, not bare trip ids, because a window
+        of 24h or more holds several service days' rows for one concrete
+        trip id and a dated update must reach exactly one of them. The
+        static stop order is fetched once per concrete trip id (it is
+        service-day independent) and each instance resolves via
+        :func:`resolve_trip_predictions`, so propagation happens against
+        the exact instance the update addressed. Every matched trip is
+        guaranteed a stop-calls entry: scheduled rows only exist because
+        the trip has stop_times rows.
         """
-        matched = {
-            trip_id: key for trip_id, key in rt_keys.items() if key in updates.trips
-        }
-        if not matched:
+        if not rt_keys:
             return {}
-        calls = await asyncio.to_thread(self._index.trip_stop_calls, sorted(matched))
+        calls = await asyncio.to_thread(
+            self._index.trip_stop_calls, sorted({trip_id for trip_id, _ in rt_keys})
+        )
         return {
-            trip_id: resolve_trip_predictions(updates.trips[key], calls[trip_id])
-            for trip_id, key in matched.items()
+            (trip_id, service_date): resolve_trip_predictions(
+                updates.trips[key], calls[trip_id]
+            )
+            for (trip_id, service_date), key in rt_keys.items()
         }
 
     async def get_arrivals(
@@ -638,8 +713,16 @@ class TransitFeedHandle:
         materialized repetition applies to nothing, and plain
         (non-frequency) rows only match predictions WITHOUT start_time
         (a producer redundantly sending start_time for a regular trip does
-        not match). ``TripDescriptor.start_date`` is not consulted; see
-        :class:`aiomobilitydatabase.feeds.rt.TripUpdates` for why.
+        not match).
+
+        ``TripDescriptor.start_date`` picks the SERVICE DAY instance the
+        start_time rules then apply within (see :func:`_rt_key_for_row`):
+        a dated prediction or cancellation affects only the instance whose
+        service day it names — an early-posted "trip X canceled tomorrow"
+        never cancels today's departure — while a date-less one affects
+        only the currently-active (earliest in-window) instance, which
+        with a sub-24h lookahead is the only instance and preserves the
+        pre-start_date behavior exactly.
 
         ``now_utc`` exists for deterministic testing; omit it in production.
         """
@@ -652,19 +735,43 @@ class TransitFeedHandle:
         updates = await self._aggregated_trip_updates()
         canceled = updates.canceled_trips
         added_rows = updates.added
-        # RT identity: (source_trip_id, start_secs) is (trip_id, None)
-        # for plain trips and (template id, repetition start) for
-        # frequency repetitions — matching TripUpdates' key shape.
+        # Per-row RT matching: each scheduled row's (identity, service day)
+        # resolves to at most one TripUpdates key via _rt_key_for_row —
+        # dated keys hit exactly their service day's instance, date-less
+        # keys only the earliest in-window one.
+        current_dates = _current_service_dates(
+            (dep.source_trip_id, dep.start_secs, dep.service_date) for dep in scheduled
+        )
         resolved = await self._resolve_predictions(
             updates,
-            {dep.trip_id: (dep.source_trip_id, dep.start_secs) for dep in scheduled},
+            {
+                (dep.trip_id, dep.service_date): key
+                for dep in scheduled
+                if (
+                    key := _rt_key_for_row(
+                        (dep.source_trip_id, dep.start_secs),
+                        dep.service_date,
+                        updates.trips,
+                        current_dates,
+                    )
+                )
+                is not None
+            },
         )
 
         arrivals: list[StopArrival] = []
         for dep in scheduled:
-            if (dep.source_trip_id, dep.start_secs) in canceled:
+            if (
+                _rt_key_for_row(
+                    (dep.source_trip_id, dep.start_secs),
+                    dep.service_date,
+                    canceled,
+                    current_dates,
+                )
+                is not None
+            ):
                 continue
-            trip_rt = resolved.get(dep.trip_id)
+            trip_rt = resolved.get((dep.trip_id, dep.service_date))
             prediction = None
             if trip_rt is not None:
                 if dep.stop_sequence in trip_rt.skipped:
@@ -806,6 +913,10 @@ class TransitFeedHandle:
         :meth:`get_arrivals`: aligned start_time applies to that one
         repetition; missing or unmatched start_time applies to no
         repetition, and plain trips only match start_time-less updates.
+        ``TripDescriptor.start_date`` service-day matching also follows
+        :meth:`get_arrivals` exactly: a dated update or cancellation
+        affects only its named service day's instance, a date-less one
+        only the earliest in-window instance (see :func:`_rt_key_for_row`).
 
         ``now_utc`` exists for deterministic testing; omit it in production.
         """
@@ -820,19 +931,42 @@ class TransitFeedHandle:
         )
         route_names = await asyncio.to_thread(self._index.route_display_names)
         updates = await self._aggregated_trip_updates()
-        # Same RT identity as get_arrivals: (source_trip_id, start_secs).
+        # Same per-instance RT matching as get_arrivals (_rt_key_for_row):
+        # dated keys hit their service day's row, date-less keys only the
+        # earliest in-window instance of the identity.
+        current_dates = _current_service_dates(
+            (trip.source_trip_id, trip.start_secs, trip.service_date)
+            for trip in scheduled
+        )
         resolved = await self._resolve_predictions(
             updates,
             {
-                trip.trip_id: (trip.source_trip_id, trip.start_secs)
+                (trip.trip_id, trip.service_date): key
                 for trip in scheduled
+                if (
+                    key := _rt_key_for_row(
+                        (trip.source_trip_id, trip.start_secs),
+                        trip.service_date,
+                        updates.trips,
+                        current_dates,
+                    )
+                )
+                is not None
             },
         )
         trips: list[UpcomingTrip] = []
         for trip in scheduled:
-            if (trip.source_trip_id, trip.start_secs) in updates.canceled_trips:
+            if (
+                _rt_key_for_row(
+                    (trip.source_trip_id, trip.start_secs),
+                    trip.service_date,
+                    updates.canceled_trips,
+                    current_dates,
+                )
+                is not None
+            ):
                 continue
-            trip_rt = resolved.get(trip.trip_id)
+            trip_rt = resolved.get((trip.trip_id, trip.service_date))
             origin_pred = dest_pred = None
             if trip_rt is not None:
                 if (

@@ -224,6 +224,15 @@ TRIP_UPDATES_T1_NO_DATA_CUT: bytes = (
 TRIP_UPDATES_T1_TRIP_DELAY: bytes = (
     _RT_DIR / "trip_updates_t1_trip_delay.pb"
 ).read_bytes()
+TRIP_UPDATES_T1_CANCELED_TOMORROW: bytes = (
+    _RT_DIR / "trip_updates_t1_canceled_tomorrow.pb"
+).read_bytes()
+TRIP_UPDATES_T1_DATED_TOMORROW_DELAY: bytes = (
+    _RT_DIR / "trip_updates_t1_dated_tomorrow_delay.pb"
+).read_bytes()
+TRIP_UPDATES_FREQ_CANCELED_TOMORROW: bytes = (
+    _RT_DIR / "trip_updates_freq_canceled_tomorrow.pb"
+).read_bytes()
 ADDED_TRIPS_S1: bytes = (_RT_DIR / "added_trips_s1.pb").read_bytes()
 TRIP_UPDATES_FREQ_MATCHED: bytes = (
     _RT_DIR / "trip_updates_freq_matched.pb"

@@ -1,6 +1,6 @@
 """Tests for origin→destination scheduled trip queries (upcoming_trips)."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from aiomobilitydatabase.feeds.static_index import StaticIndex
@@ -93,6 +93,12 @@ def test_limit_truncates_after_sort(tmp_path: Path) -> None:
     both = index.upcoming_trips("S1", "S3", NOW, timedelta(hours=26), 10)
     assert [trip.trip_id for trip in both] == ["T1", "T1"]
     assert both[0].departure < both[1].departure
+    # The two instances of one trip_id differ ONLY by service day -- the
+    # component a dated RT update disambiguates on.
+    assert [trip.service_date for trip in both] == [
+        date(2026, 7, 30),
+        date(2026, 7, 31),
+    ]
     limited = index.upcoming_trips("S1", "S3", NOW, timedelta(hours=26), 1)
     assert limited == [both[0]]
     index.close()
@@ -108,6 +114,9 @@ def test_past_midnight_trip_crosses_service_day(tmp_path: Path) -> None:
     assert [trip.trip_id for trip in trips] == ["T3"]
     assert trips[0].departure == datetime(2026, 7, 31, 8, 31, tzinfo=UTC)
     assert trips[0].arrival == datetime(2026, 7, 31, 8, 40, tzinfo=UTC)
+    # service_date is the ORIGIN's (generating) service day -- Thursday --
+    # even though both calls land on Friday's clock day.
+    assert trips[0].service_date == date(2026, 7, 30)
     # Legacy-sensor parity for the service-day boundary: the flags are
     # relative to T3's OWN service day (Thursday), whose S1->S2 candidates
     # are T1 (08:00:30) and T3 (25:31) -- so this >24:00:00 departure is

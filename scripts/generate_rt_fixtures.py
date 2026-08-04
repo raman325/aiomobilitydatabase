@@ -306,6 +306,65 @@ def _build_freq_trip_updates_bare_cancel() -> bytes:
     return bytes(msg.SerializeToString())
 
 
+def _build_trip_updates_t1_canceled_tomorrow() -> bytes:
+    """TripUpdates: T1 canceled with start_date NAMING THE NEXT SERVICE DAY.
+
+    The motivating start_date case: an early-posted "T1 is canceled
+    tomorrow" (2026-07-31, the fixture Friday) must cancel ONLY Friday's
+    instance -- never the in-window Thursday departure.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-cancel-tomorrow"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "T1"
+    trip_update.trip.start_date = "20260731"
+    trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.CANCELED
+    return bytes(msg.SerializeToString())
+
+
+def _build_trip_updates_t1_dated_tomorrow_delay() -> bytes:
+    """TripUpdates: T1 delayed 300s at S1, start_date = the NEXT service day.
+
+    In a 30h arrivals window holding both the Thursday and Friday
+    instances of T1, the dated prediction must attach to Friday's
+    (second) instance only.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-dated-tomorrow"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "T1"
+    trip_update.trip.start_date = "20260731"
+    stu = trip_update.stop_time_update.add()
+    stu.stop_id = "S1"
+    stu.departure.delay = 300
+    return bytes(msg.SerializeToString())
+
+
+def _build_freq_trip_updates_canceled_tomorrow() -> bytes:
+    """TripUpdates: the F1 06:10:00 repetition canceled FOR TOMORROW only.
+
+    start_time addresses the repetition and start_date (2026-07-31) the
+    service day: today's in-window F1#22200 repetition must survive.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-freq-cancel-tomorrow"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "F1"
+    trip_update.trip.start_time = "06:10:00"
+    trip_update.trip.start_date = "20260731"
+    trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.CANCELED
+    return bytes(msg.SerializeToString())
+
+
 def _build_alerts() -> bytes:
     """Build an Alert FeedMessage with one active alert."""
     msg = gtfs_realtime_pb2.FeedMessage()
@@ -356,6 +415,15 @@ def main() -> None:
         "trip_updates_t1_trip_delay.pb": _build_trip_updates_t1_trip_delay(),
         "added_trips_s1.pb": _build_added_trips(
             base_epoch=_NOW_EPOCH, stop_id="S1", count=3
+        ),
+        "trip_updates_t1_canceled_tomorrow.pb": (
+            _build_trip_updates_t1_canceled_tomorrow()
+        ),
+        "trip_updates_t1_dated_tomorrow_delay.pb": (
+            _build_trip_updates_t1_dated_tomorrow_delay()
+        ),
+        "trip_updates_freq_canceled_tomorrow.pb": (
+            _build_freq_trip_updates_canceled_tomorrow()
         ),
         "trip_updates_freq_matched.pb": _build_freq_trip_updates_matched(),
         "trip_updates_freq_unmatched.pb": _build_freq_trip_updates_unmatched(),

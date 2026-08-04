@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from http import HTTPStatus
 from typing import Any
@@ -31,6 +31,15 @@ _AUTH_TYPE_QUERY_PARAM = 1
 _AUTH_TYPE_HEADER = 2
 
 _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
+
+# The RT identity a TripDescriptor addresses: (trip_id, start_date,
+# start_secs). start_date pins ONE service day's instance of the trip
+# (adjacent daily instances are exactly 24h apart); start_secs pins ONE
+# repetition of a frequency-based trip. Either component is None when the
+# producer omitted it or sent garbage (parsing is lenient, never raising).
+TripUpdateKey = tuple[str, date | None, int | None]
+
+_START_DATE_LENGTH = 8  # YYYYMMDD
 
 
 def _require_http_url(url: str, context: str) -> None:
@@ -259,7 +268,7 @@ class TripStopUpdate:
 
 @dataclass(frozen=True)
 class TripUpdateEntry:
-    """All StopTimeUpdate-level data for one (trip_id, start_secs) identity.
+    """All StopTimeUpdate-level data for one :data:`TripUpdateKey` identity.
 
     ``stop_updates`` keeps feed order (resolution re-orders by static stop
     position anyway); ``delay_seconds`` is the trip-level
@@ -290,26 +299,26 @@ class TripPredictions:
 class TripUpdates:
     """Parsed index of a TripUpdates feed.
 
-    Trip entries are keyed by ``(trip_id, start_secs)`` -- also the
-    cancellation key -- where ``start_secs`` is the parsed
-    ``TripDescriptor.start_time`` (None when absent or unparseable).
-    ``start_time`` is how GTFS-RT addresses ONE repetition of a
-    frequency-based trip, and the consumer-side merge matches it against
-    the static index's materialized repetitions; propagation therefore
-    happens within one matched repetition only.
-    ``TripDescriptor.start_date`` is deliberately NOT consulted in this
-    pass: a start_time repeats daily, but the arrivals lookahead window
-    plus the absolute prediction timestamps make cross-service-day
-    collisions marginal -- start_date disambiguation is a documented
-    refinement, not a correctness prerequisite here.
+    Trip entries are keyed by :data:`TripUpdateKey` --
+    ``(trip_id, start_date, start_secs)``, also the cancellation key --
+    where ``start_date`` is the parsed ``TripDescriptor.start_date``
+    (None when absent or unparseable) and ``start_secs`` is the parsed
+    ``TripDescriptor.start_time`` (likewise None). ``start_date`` is how
+    GTFS-RT addresses ONE service day's instance of a trip (an update
+    posted today for tomorrow's instance must not touch today's);
+    ``start_time`` is how it addresses ONE repetition of a
+    frequency-based trip. The consumer-side merge matches both against
+    the static index's per-service-day rows and materialized
+    repetitions; propagation therefore happens within one matched
+    instance only.
 
     A producer sending several TripUpdate entities for one identity is
     out of spec ("at most one trip_update per actual trip"); the last
     entity wins wholesale rather than attempting a field-level merge.
     """
 
-    trips: dict[tuple[str, int | None], TripUpdateEntry] = field(default_factory=dict)
-    canceled_trips: set[tuple[str, int | None]] = field(default_factory=set)
+    trips: dict[TripUpdateKey, TripUpdateEntry] = field(default_factory=dict)
+    canceled_trips: set[TripUpdateKey] = field(default_factory=set)
     added: list[AddedStopTime] = field(default_factory=list)
 
 
@@ -413,8 +422,27 @@ def _trip_start_secs(trip: gtfs_realtime_pb2.TripDescriptor) -> int | None:
         return None
 
 
+def _trip_start_date(trip: gtfs_realtime_pb2.TripDescriptor) -> date | None:
+    """Parse TripDescriptor.start_date (``YYYYMMDD``) to a date.
+
+    Absent or garbage start_date becomes None -- the same leniency
+    ``_trip_start_secs`` applies to start_time: one producer's malformed
+    date must degrade to "no service day addressed" (behaving exactly
+    like an absent date downstream) rather than failing the whole
+    message. ASCII digits only; calendar-invalid dates (month 13, day 32,
+    year 0) are garbage too.
+    """
+    raw = trip.start_date
+    if len(raw) != _START_DATE_LENGTH or not (raw.isascii() and raw.isdigit()):
+        return None
+    try:
+        return date(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
+    except ValueError:
+        return None
+
+
 def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpdates:
-    """Index TripUpdate entities by their (trip_id, start_secs) identity."""
+    """Index TripUpdate entities by their (trip_id, start_date, start_secs) key."""
     updates = TripUpdates()
     canceled = gtfs_realtime_pb2.TripDescriptor.CANCELED
     added = gtfs_realtime_pb2.TripDescriptor.ADDED
@@ -423,10 +451,11 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
             continue
         trip_update = entity.trip_update
         trip_id = trip_update.trip.trip_id
+        start_date = _trip_start_date(trip_update.trip)
         start_secs = _trip_start_secs(trip_update.trip)
         vehicle_id = trip_update.vehicle.id or None
         if trip_update.trip.schedule_relationship == canceled:
-            updates.canceled_trips.add((trip_id, start_secs))
+            updates.canceled_trips.add((trip_id, start_date, start_secs))
             continue
         is_added = trip_update.trip.schedule_relationship == added
         stop_updates: list[TripStopUpdate] = []
@@ -476,7 +505,7 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
         if not is_added:
             # An entry is recorded even with zero StopTimeUpdates: a bare
             # TripUpdate.delay with no STUs is a valid trip-wide fallback.
-            updates.trips[(trip_id, start_secs)] = TripUpdateEntry(
+            updates.trips[(trip_id, start_date, start_secs)] = TripUpdateEntry(
                 stop_updates=tuple(stop_updates),
                 delay_seconds=(
                     trip_update.delay if trip_update.HasField("delay") else None
@@ -488,18 +517,18 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
     # the same trip in either order within one message. The parsed result
     # must be self-consistent rather than relying on consumers checking
     # canceled_trips first. Trip entries are matched on the full
-    # (trip_id, start_secs) identity; ADDED stop times are matched on bare
-    # trip_id -- an added trip is identified by the id the producer minted
-    # for it, and dropping its rows on ANY cancellation of that id is the
-    # conservative "removed wins" choice (never show a trip that might not
-    # run).
+    # (trip_id, start_date, start_secs) identity; ADDED stop times are
+    # matched on bare trip_id -- an added trip is identified by the id the
+    # producer minted for it, and dropping its rows on ANY cancellation of
+    # that id is the conservative "removed wins" choice (never show a trip
+    # that might not run).
     if updates.canceled_trips:
         updates.trips = {
             key: entry
             for key, entry in updates.trips.items()
             if key not in updates.canceled_trips
         }
-        canceled_ids = {trip_id for trip_id, _ in updates.canceled_trips}
+        canceled_ids = {trip_id for trip_id, _, _ in updates.canceled_trips}
         updates.added = [
             stop_time
             for stop_time in updates.added
