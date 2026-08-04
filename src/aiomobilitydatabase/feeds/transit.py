@@ -419,7 +419,7 @@ class TransitFeedHandle:
             ) as resp:
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
-                        f"Hosted dataset fetch failed ({resp.status})",
+                        f"Dataset fetch failed ({resp.status}) for {source.url}",
                         status=resp.status,
                     )
                 total_bytes = resp.content_length
