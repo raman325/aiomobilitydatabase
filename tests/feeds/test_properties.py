@@ -46,6 +46,7 @@ from tests.feeds.fixtures import (
     GTFS_FEED,
     GTFS_RT_FEED,
     TOKEN_RESPONSE,
+    build_frequencies_gtfs_zip_bytes,
     build_gtfs_zip_bytes,
     with_base,
 )
@@ -488,22 +489,36 @@ def _maybe_fill_vehicle_entity(
     return has_position
 
 
+# Sampled TripDescriptor.start_time values with their expected parsed
+# start_secs component: absent and garbage both key as None.
+_START_TIME_SAMPLES: dict[str, int | None] = {
+    "": None,
+    "06:10:00": 22200,
+    "25:00:00": 90000,
+    "not-a-time": None,
+}
+
+
 def _maybe_fill_trip_update_entity(
     entity: gtfs_realtime_pb2.FeedEntity, data: st.DataObject
-) -> set[tuple[str, str]]:
-    """Fill a trip_update entity; return the (trip_id, stop_id) pairs it
-    could contribute as predictions (empty when canceled or added, since
-    those entities never populate ``updates.predictions``).
+) -> set[tuple[str, int | None, str]]:
+    """Fill a trip_update entity; return the (trip_id, start_secs, stop_id)
+    keys it could contribute as predictions (empty when canceled or added,
+    since those entities never populate ``updates.predictions``).
     """
     trip_id = data.draw(st.text(max_size=6))
     entity.trip_update.trip.trip_id = trip_id
+    start_time = data.draw(st.sampled_from(sorted(_START_TIME_SAMPLES)))
+    if start_time:
+        entity.trip_update.trip.start_time = start_time
+    start_secs = _START_TIME_SAMPLES[start_time]
     relationship = data.draw(st.sampled_from([0, 1, 2, 3, 5]))
     entity.trip_update.trip.schedule_relationship = relationship
     is_prediction_eligible = relationship not in (
         gtfs_realtime_pb2.TripDescriptor.CANCELED,
         gtfs_realtime_pb2.TripDescriptor.ADDED,
     )
-    possible_keys: set[tuple[str, str]] = set()
+    possible_keys: set[tuple[str, int | None, str]] = set()
     for _ in range(data.draw(st.integers(0, 2))):
         stu = entity.trip_update.stop_time_update.add()
         stop_id = ""
@@ -515,7 +530,7 @@ def _maybe_fill_trip_update_entity(
         if data.draw(st.booleans()):
             stu.departure.delay = data.draw(st.integers(-3600, 3600))
         if is_prediction_eligible:
-            possible_keys.add((trip_id, stop_id))
+            possible_keys.add((trip_id, start_secs, stop_id))
     return possible_keys
 
 
@@ -543,7 +558,7 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         "empty": None,
     }
     expected_vehicle_count = 0
-    possible_prediction_keys: set[tuple[str, str]] = set()
+    possible_prediction_keys: set[tuple[str, int | None, str]] = set()
     for i in range(data.draw(st.integers(0, 4))):
         entity = msg.entity.add()
         entity.id = f"e{i}"
@@ -563,7 +578,7 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         assert vehicle.latitude is not None and vehicle.longitude is not None
     updates = trip_updates_from_message(msg)
     assert updates.canceled_trips.isdisjoint(
-        {trip_id for trip_id, _ in updates.predictions}
+        {(trip_id, start_secs) for trip_id, start_secs, _ in updates.predictions}
     )
     assert set(updates.predictions.keys()) <= possible_prediction_keys
     alerts_from_message(msg)  # must simply not raise
@@ -1242,6 +1257,372 @@ def test_first_translation_prefers_en_else_first(
         entry.language = language
     result = _first_translation(translated)
     assert result == (en_text if include_en else entries[0][0])
+
+
+# --- frequencies.txt materialization properties -----------------------------
+
+# One UTC service day (2026-07-30) so the oracle is a plain arithmetic
+# progression from a single anchor -- no adjacent-day instances to model.
+_FREQ_ANCHOR = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
+_FREQ_TEMPLATE_BASE = 28800  # templates anchored at 08:00:00 (arbitrary)
+_FREQ_LOOKAHEAD = timedelta(hours=48)
+
+
+def _format_gtfs_time(secs: int) -> str:
+    hours, rem = divmod(secs, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _frequency_index(
+    template: list[tuple[int, int]], freq_rows: list[tuple[int, int, int, str]]
+) -> StaticIndex:
+    """One frequency trip F1 over the single UTC service day 2026-07-30.
+
+    ``template`` holds per-stop (arrival, departure) offsets from the
+    template's first arrival; ``freq_rows`` are (start, end, headway,
+    exact_times) with start/end in absolute seconds.
+    """
+    stop_rows = "".join(f"S{i},Stop {i},0,0\n" for i in range(len(template)))
+    stop_time_rows = "".join(
+        f"F1,{_format_gtfs_time(_FREQ_TEMPLATE_BASE + arr)},"
+        f"{_format_gtfs_time(_FREQ_TEMPLATE_BASE + dep)},S{i},{i + 1}\n"
+        for i, (arr, dep) in enumerate(template)
+    )
+    frequency_rows = "".join(
+        f"F1,{_format_gtfs_time(start)},{_format_gtfs_time(end)},{headway},{exact}\n"
+        for start, end, headway, exact in freq_rows
+    )
+    files = {
+        "agency.txt": (
+            "agency_id,agency_name,agency_url,agency_timezone\nA1,T,https://e.com,UTC\n"
+        ),
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n" + stop_rows,
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\nR1,ONE,F1,H\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            + stop_time_rows
+        ),
+        "calendar.txt": (
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+            "start_date,end_date\nONE,1,1,1,1,1,1,1,20260730,20260730\n"
+        ),
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs,exact_times\n" + frequency_rows
+        ),
+    }
+    return _build_index_from_files(files)
+
+
+def _expected_rep_starts(freq_rows: list[tuple[int, int, int, str]]) -> set[int]:
+    """Independent restatement of the GTFS rule: start + n*headway, n while
+    STRICTLY under end_time, deduplicated across overlapping rows.
+    """
+    starts: set[int] = set()
+    for start, end, headway, _ in freq_rows:
+        rep = start
+        while rep < end:
+            starts.add(rep)
+            rep += headway
+    return starts
+
+
+@st.composite
+def _frequency_template_strategy(draw: st.DrawFn) -> list[tuple[int, int]]:
+    """Per-stop (arrival, departure) offsets: non-decreasing, first arrival 0."""
+    template: list[tuple[int, int]] = []
+    current = 0
+    for i in range(draw(st.integers(1, 4))):
+        if i:
+            current += draw(st.integers(30, 600))
+        dwell = draw(st.integers(0, 60))
+        template.append((current, current + dwell))
+        current += dwell
+    return template
+
+
+# end = start + span; span may be non-positive, producing a degenerate
+# [start, end) window that must contribute zero repetitions.
+_FREQ_ROW_STRATEGY = st.builds(
+    lambda start, span, headway, exact: (start, max(0, start + span), headway, exact),
+    st.integers(0, 26 * 3600),
+    st.integers(-600, 5400),
+    st.integers(60, 1800),
+    st.sampled_from(["", "0", "1"]),
+)
+
+
+@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    template=_frequency_template_strategy(),
+    freq_rows=st.lists(_FREQ_ROW_STRATEGY, min_size=1, max_size=3),
+)
+def test_frequency_departures_match_progression_oracle(
+    template: list[tuple[int, int]], freq_rows: list[tuple[int, int, int, str]]
+) -> None:
+    """Materialized first-stop departures are EXACTLY the union of each row's
+    arithmetic progression within [start, end), shifted by the first stop's
+    dwell -- one row per repetition, so synthetic ids never duplicate. The
+    oracle restates the GTFS rule in pure Python arithmetic, independent of
+    the parse/SQL/service-day path under test.
+    """
+    index = _frequency_index(template, freq_rows)
+    try:
+        departures = index.upcoming_departures(
+            ["S0"], None, _FREQ_ANCHOR, _FREQ_LOOKAHEAD, 100_000
+        )
+        dwell0 = template[0][1] - template[0][0]
+        expected = {
+            (f"F1#{s}", _FREQ_ANCHOR + timedelta(seconds=s + dwell0))
+            for s in _expected_rep_starts(freq_rows)
+        }
+        assert {(d.trip_id, d.departure) for d in departures} == expected
+        assert len(departures) == len(expected)  # no duplicated repetitions
+    finally:
+        index.close()
+
+
+@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    template=_frequency_template_strategy(),
+    freq_rows=st.lists(_FREQ_ROW_STRATEGY, min_size=1, max_size=2),
+)
+def test_frequency_offsets_preserved_on_every_repetition(
+    template: list[tuple[int, int]], freq_rows: list[tuple[int, int, int, str]]
+) -> None:
+    """EVERY stop of EVERY repetition keeps the template's elapsed offset
+    from the first-stop anchor: arrival/departure at stop i equal
+    repetition_start + template offset, for all repetitions.
+    """
+    index = _frequency_index(template, freq_rows)
+    try:
+        stop_ids = [f"S{i}" for i in range(len(template))]
+        departures = index.upcoming_departures(
+            stop_ids, None, _FREQ_ANCHOR, _FREQ_LOOKAHEAD, 100_000
+        )
+        by_key = {(d.trip_id, d.stop_id): d for d in departures}
+        assert len(by_key) == len(departures)
+        for start in _expected_rep_starts(freq_rows):
+            for i, (arr, dep) in enumerate(template):
+                row = by_key[(f"F1#{start}", f"S{i}")]
+                assert row.arrival == _FREQ_ANCHOR + timedelta(seconds=start + arr)
+                assert row.departure == _FREQ_ANCHOR + timedelta(seconds=start + dep)
+    finally:
+        index.close()
+
+
+@settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    template=_frequency_template_strategy(),
+    rows=st.lists(
+        st.tuples(
+            st.integers(0, 24 * 3600), st.integers(1, 5400), st.integers(60, 1800)
+        ),
+        min_size=1,
+        max_size=2,
+    ),
+)
+def test_frequency_exact_times_values_materialize_identically(
+    template: list[tuple[int, int]], rows: list[tuple[int, int, int]]
+) -> None:
+    """Pin the documented equivalence: exact_times=0 (idealized headway
+    service) and exact_times=1 (exact schedule) materialize identical
+    repetitions -- the column changes nothing downstream.
+    """
+    results = []
+    for exact in ("0", "1"):
+        freq_rows = [
+            (start, start + span, headway, exact) for start, span, headway in rows
+        ]
+        index = _frequency_index(template, freq_rows)
+        try:
+            results.append(
+                index.upcoming_departures(
+                    ["S0"], None, _FREQ_ANCHOR, _FREQ_LOOKAHEAD, 100_000
+                )
+            )
+        finally:
+            index.close()
+    assert results[0] == results[1]
+
+
+@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    template=_frequency_template_strategy(),
+    start=st.integers(0, 24 * 3600),
+    spans=st.tuples(st.integers(1, 3600), st.integers(1, 3600)),
+    headways=st.tuples(st.integers(60, 900), st.integers(60, 900)),
+)
+def test_frequency_overlapping_rows_dedupe_shared_repetitions(
+    template: list[tuple[int, int]],
+    start: int,
+    spans: tuple[int, int],
+    headways: tuple[int, int],
+) -> None:
+    """Two rows sharing a start (guaranteed overlap: both progressions begin
+    at ``start``) must yield UNIQUE synthetic ids covering the union of both
+    progressions -- never a duplicated repetition row.
+    """
+    freq_rows: list[tuple[int, int, int, str]] = [
+        (start, start + spans[0], headways[0], ""),
+        (start, start + spans[1], headways[1], ""),
+    ]
+    index = _frequency_index(template, freq_rows)
+    try:
+        departures = index.upcoming_departures(
+            ["S0"], None, _FREQ_ANCHOR, _FREQ_LOOKAHEAD, 100_000
+        )
+        trip_ids = [d.trip_id for d in departures]
+        assert len(trip_ids) == len(set(trip_ids))
+        assert set(trip_ids) == {f"F1#{s}" for s in _expected_rep_starts(freq_rows)}
+    finally:
+        index.close()
+
+
+@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    template=_frequency_template_strategy(),
+    start=st.integers(85_800, 86_399),  # 23:50:00 .. 23:59:59
+    span=st.integers(1200, 10_800),
+    headway=st.integers(60, 600),
+)
+def test_frequency_repetitions_cross_midnight_correctly(
+    template: list[tuple[int, int]], start: int, span: int, headway: int
+) -> None:
+    """Repetitions whose start crosses 24:00:00 stay on the GENERATING
+    service day's timeline (anchor + seconds, landing on the next clock
+    day), match the progression oracle, and the board stays sorted. The
+    parameter ranges guarantee at least one repetition at or past 24:00:00,
+    so the crossing is exercised on every example (asserted, not assumed).
+    """
+    freq_rows: list[tuple[int, int, int, str]] = [(start, start + span, headway, "")]
+    index = _frequency_index(template, freq_rows)
+    try:
+        departures = index.upcoming_departures(
+            ["S0"], None, _FREQ_ANCHOR, _FREQ_LOOKAHEAD, 100_000
+        )
+        dwell0 = template[0][1] - template[0][0]
+        expected = {
+            (f"F1#{s}", _FREQ_ANCHOR + timedelta(seconds=s + dwell0))
+            for s in _expected_rep_starts(freq_rows)
+        }
+        assert {(d.trip_id, d.departure) for d in departures} == expected
+        instants = [d.departure for d in departures]
+        assert instants == sorted(instants)
+        assert any(t >= _FREQ_ANCHOR + timedelta(days=1) for t in instants)
+    finally:
+        index.close()
+
+
+def _run_frequencies_rt_scenario(
+    msg: gtfs_realtime_pb2.FeedMessage,
+) -> list[StopArrival]:
+    """Serve the frequencies fixture zip plus one scripted RT message."""
+
+    async def scenario() -> list[StopArrival]:
+        api = MockApi()
+        await api.start()
+        try:
+            base = api.url()
+            api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+            api.get("/v1/feeds/mdb-100", payload=with_base(GTFS_FEED, base))
+            api.get("/v1/gtfs_feeds/mdb-100", payload=with_base(GTFS_FEED, base))
+            api.get(
+                "/v1/gtfs_feeds/mdb-100/gtfs_rt_feeds",
+                payload=[with_base(GTFS_RT_FEED, base)],
+            )
+            api.get(
+                "/hosted/mdb-100.zip",
+                body=build_frequencies_gtfs_zip_bytes(),
+                content_type="application/zip",
+            )
+            api.get(
+                "/rt/all",
+                body=msg.SerializeToString(),
+                content_type="application/octet-stream",
+            )
+            async with MobilityFeedsClient("t", base_url=base) as client:
+                handle = await client.get_transit_feed("mdb-100")
+                return await handle.get_arrivals(
+                    ["S1", "S2", "S3"],
+                    lookahead=timedelta(hours=2),
+                    limit=10,
+                    now_utc=datetime(2026, 7, 30, 12, 45, tzinfo=UTC),
+                )
+        finally:
+            await api.stop()
+
+    return asyncio.run(scenario())
+
+
+# The frequencies fixture zip's F1 repetition starts (see fixtures.py).
+_F1_REP_STARTS = (21600, 22200, 22800, 25200, 25800)
+
+
+@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    rep=st.sampled_from(_F1_REP_STARTS),
+    mode=st.sampled_from(["aligned", "misaligned", "missing"]),
+    kind=st.sampled_from(["prediction", "cancellation"]),
+    stop_id=st.sampled_from(["S1", "S2", "S3"]),
+    delay=st.integers(-600, 1800),
+    misalign=st.integers(1, 599),
+)
+def test_frequency_rt_start_time_matches_exactly_one_repetition(
+    *, rep: int, mode: str, kind: str, stop_id: str, delay: int, misalign: int
+) -> None:
+    """Over generated updates against the frequencies fixture: a prediction
+    or cancellation whose start_time is ALIGNED to a materialized
+    repetition affects exactly that one repetition; a MISALIGNED start_time
+    (off by 1..599s -- repetitions are >=600s apart, so it never lands on a
+    sibling) or a MISSING start_time affects none. The window holds 15
+    synthetic rows (5 F1 repetitions x 3 stops) when nothing is canceled.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "tu-gen"
+    entity.trip_update.trip.trip_id = "F1"
+    if mode == "aligned":
+        entity.trip_update.trip.start_time = _format_gtfs_time(rep)
+    elif mode == "misaligned":
+        entity.trip_update.trip.start_time = _format_gtfs_time(rep + misalign)
+    if kind == "cancellation":
+        entity.trip_update.trip.schedule_relationship = (
+            gtfs_realtime_pb2.TripDescriptor.CANCELED
+        )
+    else:
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_id = stop_id
+        stu.departure.delay = delay
+        stu.departure.time = (
+            int(datetime(2026, 7, 30, 13, 0, tzinfo=UTC).timestamp()) + delay
+        )
+    arrivals = _run_frequencies_rt_scenario(msg)
+    all_ids = {f"F1#{start}" for start in _F1_REP_STARTS}
+    got_ids = {row.trip_id for row in arrivals}
+    if kind == "cancellation":
+        dropped = {f"F1#{rep}"} if mode == "aligned" else set()
+        assert got_ids == all_ids - dropped
+        assert len(arrivals) == 15 - 3 * len(dropped)
+        assert all(row.realtime is False for row in arrivals)
+    else:
+        assert got_ids == all_ids
+        assert len(arrivals) == 15
+        for row in arrivals:
+            expected_rt = (
+                mode == "aligned"
+                and row.trip_id == f"F1#{rep}"
+                and row.stop_id == stop_id
+            )
+            assert row.realtime is expected_rt
+            if expected_rt:
+                assert row.delay_seconds == delay
+            else:
+                assert row.predicted_departure is None
 
 
 @given(done=st.integers(0, 2**40), total=st.integers(0, 2**40) | st.none())

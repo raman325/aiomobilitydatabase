@@ -199,6 +199,12 @@ def test_loaders_flush_mid_loop_past_batch_size(tmp_path: Path) -> None:
         + "".join(f"SVC{i},1,1,1,1,1,1,1,20260101,20271231\n" for i in range(n)),
         "calendar_dates.txt": "service_id,date,exception_type\n"
         + "".join("SVC,20260704,1\n" for _ in range(n)),
+        # One frequency row whose 5400 one-stop repetitions (00:00-01:30
+        # every second) push the materialized stop_times batch past the
+        # mid-loop flush threshold inside _load_frequencies too.
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs\nT0,00:00:00,01:30:00,1\n"
+        ),
     }
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:

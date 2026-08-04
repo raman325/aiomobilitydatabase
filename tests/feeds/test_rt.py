@@ -112,8 +112,8 @@ def test_trip_updates_from_message() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(TRIP_UPDATES_BASELINE)
     updates = trip_updates_from_message(msg)
-    assert updates.canceled_trips == {"T2"}
-    prediction = updates.predictions[("T1", "S1")]
+    assert updates.canceled_trips == {("T2", None)}
+    prediction = updates.predictions[("T1", None, "S1")]
     assert prediction.delay_seconds == 300
     assert prediction.departure == datetime.fromtimestamp(1_785_500_330, tz=UTC)
     assert prediction.vehicle_id == "V1"
@@ -182,9 +182,41 @@ def test_trip_updates_cancellation_wins_regardless_of_entity_order(
     """
     msg = _build_conflicting_trip_update(canceled_first=canceled_first)
     updates = trip_updates_from_message(msg)
-    assert updates.canceled_trips == {"STALE-TRIP"}
-    assert ("STALE-TRIP", "S1") not in updates.predictions
+    assert updates.canceled_trips == {("STALE-TRIP", None)}
+    assert ("STALE-TRIP", None, "S1") not in updates.predictions
     assert all(added.trip_id != "STALE-TRIP" for added in updates.added)
+
+
+def test_trip_updates_start_time_keys() -> None:
+    """TripDescriptor.start_time becomes the start_secs key component:
+    parsed for predictions AND cancellations (>24:00:00 supported), while a
+    garbage start_time degrades to None instead of failing the message.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    cases = [("F1", "06:10:00"), ("F2", "25:00:00"), ("F3", "not-a-time")]
+    for i, (trip_id, start_time) in enumerate(cases):
+        entity = msg.entity.add()
+        entity.id = f"tu-{i}"
+        entity.trip_update.trip.trip_id = trip_id
+        entity.trip_update.trip.start_time = start_time
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_id = "S1"
+        stu.departure.time = 1_785_500_000
+    cancel = msg.entity.add()
+    cancel.id = "tu-cancel"
+    cancel.trip_update.trip.trip_id = "F1"
+    cancel.trip_update.trip.start_time = "06:20:00"
+    cancel.trip_update.trip.schedule_relationship = (
+        gtfs_realtime_pb2.TripDescriptor.CANCELED
+    )
+    updates = trip_updates_from_message(msg)
+    assert set(updates.predictions) == {
+        ("F1", 22200, "S1"),
+        ("F2", 90000, "S1"),
+        ("F3", None, "S1"),
+    }
+    assert updates.canceled_trips == {("F1", 22800)}
 
 
 def test_alerts_from_message() -> None:
