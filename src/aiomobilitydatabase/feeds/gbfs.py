@@ -20,6 +20,17 @@ if TYPE_CHECKING:
     from .client import MobilityFeedsClient
 
 
+def _entry_text(entry: dict[str, Any]) -> str | None:
+    """One localized entry's ``text``: an absent/null text is None.
+
+    ``str(entry.get("text"))`` would render a missing text as the literal
+    string ``"None"`` — the selected entry must instead degrade to "no
+    text available".
+    """
+    text = entry.get("text")
+    return None if text is None else str(text)
+
+
 def _localized(value: Any) -> str | None:
     """Normalize GBFS text: 3.x localized lists vs 2.x plain strings."""
     if value is None or isinstance(value, str):
@@ -30,9 +41,9 @@ def _localized(value: Any) -> str | None:
                 isinstance(entry, dict)
                 and entry.get("language") == GBFS_LANGUAGE_PREFERENCE
             ):
-                return str(entry.get("text"))
+                return _entry_text(entry)
         if value and isinstance(value[0], dict):
-            return str(value[0].get("text"))
+            return _entry_text(value[0])
     return None
 
 
