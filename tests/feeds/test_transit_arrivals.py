@@ -9,6 +9,8 @@ from tests.feeds.fixtures import (
     GTFS_FEED,
     GTFS_RT_FEED,
     TOKEN_RESPONSE,
+    TRIP_UPDATES_T1_CANCELED_TOMORROW,
+    TRIP_UPDATES_T1_DATED_TOMORROW_DELAY,
     TRIP_UPDATES_T1_DELAYED,
     build_gtfs_zip_bytes,
     with_base,
@@ -173,3 +175,79 @@ async def test_limit_caps_merged_rows_per_stop(
     s1_arrivals = [a for a in arrivals if a.stop_id == "S1"]
     assert len(s1_arrivals) == 2
     assert [a.trip_id for a in s1_arrivals] == ["ADDED-A", "ADDED-B"]
+
+
+# The Thursday and Friday instances of T1's S1 departure (08:00:30 PDT).
+T1_S1_THURSDAY = datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC)
+T1_S1_FRIDAY = datetime(2026, 7, 31, 15, 0, 30, tzinfo=UTC)
+
+
+async def test_tomorrow_cancellation_spares_todays_instance(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """THE motivating start_date case: a cancellation posted today with
+    start_date naming TOMORROW (2026-07-31) must not cancel today's
+    in-window T1 departure -- pre-start_date matching keyed on bare
+    (trip_id, start_secs) and would have dropped it.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_CANCELED_TOMORROW, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    arrivals = await handle.get_arrivals(
+        ["S1"], lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert [a.trip_id for a in arrivals] == ["T1", "T2"]
+    assert all(a.realtime is False for a in arrivals)
+
+
+async def test_tomorrow_cancellation_drops_only_tomorrows_instance(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """With a 30h window holding BOTH daily instances of T1, the dated
+    cancellation removes exactly Friday's row; Thursday's T1, both T2
+    instances, Thursday's T3 spillover, and Friday's T4 all survive.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_CANCELED_TOMORROW, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    arrivals = await handle.get_arrivals(
+        ["S1"], lookahead=timedelta(hours=30), now_utc=NOW
+    )
+    assert [(a.trip_id, a.scheduled_departure) for a in arrivals] == [
+        ("T1", T1_S1_THURSDAY),
+        ("T2", datetime(2026, 7, 30, 15, 30, 30, tzinfo=UTC)),
+        ("T3", datetime(2026, 7, 31, 8, 31, tzinfo=UTC)),
+        # Friday's T1 (15:00:30) is canceled; T2/T4 keep Friday rows.
+        ("T2", datetime(2026, 7, 31, 15, 30, 30, tzinfo=UTC)),
+        ("T4", datetime(2026, 7, 31, 16, 0, 30, tzinfo=UTC)),
+    ]
+    assert all(a.realtime is False for a in arrivals)
+
+
+async def test_dated_prediction_attaches_to_second_instance_only(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A prediction with start_date=2026-07-31 in a 30h window attaches to
+    Friday's (second) T1 instance only: Thursday's identical (trip_id,
+    start_secs) row stays schedule-only.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_DATED_TOMORROW_DELAY, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    arrivals = await handle.get_arrivals(
+        ["S1"], lookahead=timedelta(hours=30), now_utc=NOW
+    )
+    by_departure = {(a.trip_id, a.scheduled_departure): a for a in arrivals}
+    today = by_departure[("T1", T1_S1_THURSDAY)]
+    assert today.realtime is False
+    assert today.predicted_departure is None
+    assert today.delay_seconds is None
+    tomorrow = by_departure[("T1", T1_S1_FRIDAY)]
+    assert tomorrow.realtime is True
+    assert tomorrow.delay_seconds == 300
+    assert tomorrow.predicted_departure == T1_S1_FRIDAY + timedelta(seconds=300)
+    assert all(
+        a.realtime is False
+        for a in arrivals
+        if (a.trip_id, a.scheduled_departure) != ("T1", T1_S1_FRIDAY)
+    )

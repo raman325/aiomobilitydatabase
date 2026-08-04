@@ -199,6 +199,10 @@ class ScheduledDeparture:
     ``stop_sequence`` positions this call within its trip so RT delay
     propagation (resolved per stop_sequence) can address it unambiguously,
     including on loop trips where stop_id repeats.
+    ``service_date`` is the GTFS service day this row runs on -- the date
+    a GTFS-RT ``TripDescriptor.start_date`` addresses. For a >24:00:00
+    spillover row it is the GENERATING service day, not the clock day the
+    departure lands on.
 
     The descriptive tail mirrors :class:`~.models.StopArrival`:
     trip-level wheelchair/bikes flags plus this stop_time row's
@@ -214,6 +218,7 @@ class ScheduledDeparture:
     departure: datetime
     source_trip_id: str
     start_secs: int | None
+    service_date: date
     wheelchair_accessible: WheelchairAccess | None
     bikes_allowed: BikesAllowed | None
     pickup_type: PickupDropOffType | None
@@ -230,7 +235,10 @@ class ScheduledTrip:
     both are non-optional because the producing query's WHERE clauses
     require the underlying GTFS times to be present.
     ``source_trip_id``/``start_secs`` are the RT-matching identity, exactly
-    as on :class:`ScheduledDeparture`;
+    as on :class:`ScheduledDeparture`; ``service_date`` is the journey's
+    service day (an origin->destination row is one trip, so one service
+    day -- the ORIGIN's, which for >24:00:00 rows is the generating
+    service day, not the clock day);
     ``origin_stop_sequence``/``destination_stop_sequence`` position the two
     calls for RT delay propagation (the destination sequence belongs to the
     earliest-arrival destination call the MIN aggregate selected).
@@ -249,6 +257,7 @@ class ScheduledTrip:
     arrival: datetime
     source_trip_id: str
     start_secs: int | None
+    service_date: date
     origin_stop_sequence: int
     destination_stop_sequence: int
     wheelchair_accessible: WheelchairAccess | None
@@ -965,8 +974,8 @@ class StaticIndex:
 
     def _service_day_windows(
         self, now_utc: datetime, lookahead: timedelta
-    ) -> Iterator[tuple[datetime, set[str], float, float]]:
-        """Yield one ``(day_start_utc, active_ids, window_lo, window_hi)`` per day.
+    ) -> Iterator[tuple[date, datetime, set[str], float, float]]:
+        """Yield ``(service_date, day_start_utc, active_ids, window_lo, window_hi)``.
 
         Shared by ``upcoming_departures`` and ``upcoming_trips`` so the
         DST-safe day-window arithmetic exists exactly once. Scans every
@@ -998,7 +1007,7 @@ class StaticIndex:
             window_hi = window_lo + lookahead.total_seconds()
             if window_hi < 0:
                 continue
-            yield day_start_utc, active, window_lo, window_hi
+            yield service_date, day_start_utc, active, window_lo, window_hi
 
     def upcoming_departures(
         self,
@@ -1022,9 +1031,13 @@ class StaticIndex:
         never appears.
         """
         results: list[ScheduledDeparture] = []
-        for day_start_utc, active, window_lo, window_hi in self._service_day_windows(
-            now_utc, lookahead
-        ):
+        for (
+            service_date,
+            day_start_utc,
+            active,
+            window_lo,
+            window_hi,
+        ) in self._service_day_windows(now_utc, lookahead):
             stop_marks = ",".join("?" * len(stop_ids))
             service_marks = ",".join("?" * len(active))
             sql = (
@@ -1075,6 +1088,7 @@ class StaticIndex:
                         departure=day_start_utc + timedelta(seconds=dep_secs),
                         source_trip_id=source_trip_id,
                         start_secs=start_secs,
+                        service_date=service_date,
                         wheelchair_accessible=_enum_or_none(
                             WheelchairAccess, wheelchair
                         ),
@@ -1179,9 +1193,13 @@ class StaticIndex:
         frequency-materialized repetitions count as ordinary trips.
         """
         results: list[ScheduledTrip] = []
-        for day_start_utc, active, window_lo, window_hi in self._service_day_windows(
-            now_utc, lookahead
-        ):
+        for (
+            service_date,
+            day_start_utc,
+            active,
+            window_lo,
+            window_hi,
+        ) in self._service_day_windows(now_utc, lookahead):
             service_marks = ",".join("?" * len(active))
             candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
             # The IS NOT NULL clauses (in the shared candidate predicate)
@@ -1250,6 +1268,7 @@ class StaticIndex:
                         arrival=day_start_utc + timedelta(seconds=arr_secs),
                         source_trip_id=source_trip_id,
                         start_secs=start_secs,
+                        service_date=service_date,
                         origin_stop_sequence=o_sequence,
                         destination_stop_sequence=d_sequence,
                         wheelchair_accessible=_enum_or_none(

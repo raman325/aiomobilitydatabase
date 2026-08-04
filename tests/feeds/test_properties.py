@@ -45,6 +45,7 @@ from aiomobilitydatabase.feeds.models import (
 from aiomobilitydatabase.feeds.rt import (
     _epoch_to_utc,
     _first_translation,
+    _trip_start_date,
     alerts_from_message,
     fetch_feed_message,
     resolve_trip_predictions,
@@ -515,16 +516,30 @@ _START_TIME_SAMPLES: dict[str, int | None] = {
     "not-a-time": None,
 }
 
+# Sampled TripDescriptor.start_date values with their expected parsed
+# start_date component: absent, wrong-length, non-digit, and
+# calendar-invalid cells all key as None (garbage behaves as absent).
+_START_DATE_SAMPLES: dict[str, date | None] = {
+    "": None,
+    "20260730": date(2026, 7, 30),
+    "20261332": None,
+    "2026073": None,
+    "garbage!": None,
+    "00000101": None,
+}
+
 
 def _maybe_fill_trip_update_entity(
     entity: gtfs_realtime_pb2.FeedEntity, data: st.DataObject
-) -> set[tuple[str, int | None]]:
-    """Fill a trip_update entity; return the (trip_id, start_secs) key it
-    could contribute as a trip entry (empty when canceled or added, since
-    those entities never populate ``updates.trips``). Draws exercise the
-    full StopTimeUpdate surface: per-stop schedule_relationship (all valid
-    values), stop_id and/or stop_sequence presence, delays, explicit
-    times, and the trip-level TripUpdate.delay.
+) -> set[tuple[str, date | None, int | None]]:
+    """Fill a trip_update entity; return the (trip_id, start_date,
+    start_secs) key it could contribute as a trip entry (empty when
+    canceled or added, since those entities never populate
+    ``updates.trips``). Draws exercise the full StopTimeUpdate surface:
+    per-stop schedule_relationship (all valid values), stop_id and/or
+    stop_sequence presence, delays, explicit times, the trip-level
+    TripUpdate.delay, and start_date/start_time cells across valid,
+    invalid, and absent forms.
     """
     trip_id = data.draw(st.text(max_size=6))
     entity.trip_update.trip.trip_id = trip_id
@@ -532,6 +547,10 @@ def _maybe_fill_trip_update_entity(
     if start_time:
         entity.trip_update.trip.start_time = start_time
     start_secs = _START_TIME_SAMPLES[start_time]
+    start_date_cell = data.draw(st.sampled_from(sorted(_START_DATE_SAMPLES)))
+    if start_date_cell:
+        entity.trip_update.trip.start_date = start_date_cell
+    start_date = _START_DATE_SAMPLES[start_date_cell]
     relationship = data.draw(st.sampled_from([0, 1, 2, 3, 5]))
     entity.trip_update.trip.schedule_relationship = relationship
     if data.draw(st.booleans()):
@@ -551,7 +570,7 @@ def _maybe_fill_trip_update_entity(
             stu.arrival.time = data.draw(st.integers(0, 2_000_000_000))
         if data.draw(st.booleans()):
             stu.departure.delay = data.draw(st.integers(-3600, 3600))
-    return {(trip_id, start_secs)} if is_entry_eligible else set()
+    return {(trip_id, start_date, start_secs)} if is_entry_eligible else set()
 
 
 def _maybe_fill_alert_entity(
@@ -594,7 +613,7 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         "empty": None,
     }
     expected_vehicle_count = 0
-    possible_entry_keys: set[tuple[str, int | None]] = set()
+    possible_entry_keys: set[tuple[str, date | None, int | None]] = set()
     for i in range(data.draw(st.integers(0, 4))):
         entity = msg.entity.add()
         entity.id = f"e{i}"
@@ -2160,6 +2179,9 @@ def _run_propagation_scenario(
     msg: gtfs_realtime_pb2.FeedMessage,
     stop_ids: list[str],
     pairs: list[tuple[str, str]],
+    *,
+    lookahead: timedelta = timedelta(hours=6),
+    now: datetime = _PROP_NOW,
 ) -> tuple[list[StopArrival], dict[tuple[str, str], list[UpcomingTrip]]]:
     """Serve a generated zip + one RT message; run arrivals and pair queries."""
 
@@ -2187,17 +2209,17 @@ def _run_propagation_scenario(
                 handle = await client.get_transit_feed("mdb-100")
                 arrivals = await handle.get_arrivals(
                     stop_ids,
-                    lookahead=timedelta(hours=6),
+                    lookahead=lookahead,
                     limit=50,
-                    now_utc=_PROP_NOW,
+                    now_utc=now,
                 )
                 trips = {}
                 for origin, destination in pairs:
                     trips[(origin, destination)] = await handle.upcoming_trips(
                         origin,
                         destination,
-                        lookahead=timedelta(hours=6),
-                        now_utc=_PROP_NOW,
+                        lookahead=lookahead,
+                        now_utc=now,
                     )
                 return arrivals, trips
         finally:
@@ -2452,6 +2474,307 @@ def test_skipped_totality_over_arrivals_and_trips(
                 # surviving TP journey row is realtime with delay 240.
                 assert row.realtime is True
                 assert row.delay_seconds == 240
+
+
+# --- TripDescriptor.start_date service-day matching properties ---------------
+
+# Garbage start_date cells: wrong lengths, non-digits, calendar-invalid
+# dates, year zero -- all must parse to None and behave as absent.
+_GARBAGE_START_DATES = ["20261332", "2026073", "202607301", "garbage!", "00000000"]
+
+
+@given(raw=st.text(max_size=12))
+def test_trip_start_date_parse_is_total(raw: str) -> None:
+    """Any producer string in start_date parses to a date or None -- never
+    raises (totality over the full unicode input space).
+    """
+    trip = gtfs_realtime_pb2.TripDescriptor()
+    trip.start_date = raw
+    result = _trip_start_date(trip)
+    assert result is None or isinstance(result, date)
+
+
+@given(day=st.dates())
+def test_trip_start_date_round_trips_valid_dates(day: date) -> None:
+    """Every valid YYYYMMDD cell parses back to exactly its date."""
+    trip = gtfs_realtime_pb2.TripDescriptor()
+    trip.start_date = f"{day.year:04d}{day.month:02d}{day.day:02d}"
+    assert _trip_start_date(trip) == day
+
+
+# Two-service-day schedule for the disambiguation oracle: plain trip TP and
+# frequency trip FQ (repetitions FQ#32400 / FQ#33000), each running on BOTH
+# 2026-07-30 and 2026-07-31 (America/Los_Angeles via the catalog fixture, so
+# anchors are 07:00 UTC). Any two same-identity instances are exactly 24h
+# apart -- the collision start_date exists to resolve.
+_TWO_DAY_ANCHOR_A = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
+_TWO_DAY_ANCHOR_B = datetime(2026, 7, 31, 7, 0, tzinfo=UTC)
+_TWO_DAY_A = date(2026, 7, 30)
+_TWO_DAY_B = date(2026, 7, 31)
+_TWO_DAY_NOW = datetime(2026, 7, 30, 14, 0, tzinfo=UTC)
+_TWO_DAY_CONCRETE_IDS = ("TP", "FQ#32400", "FQ#33000")
+# Per-stop departure offsets from the service-day anchor, per concrete trip.
+_TWO_DAY_DEP_OFFSETS = {
+    "TP": {"S0": 28810, "S1": 29410},
+    "FQ#32400": {"S0": 32410, "S1": 33010},
+    "FQ#33000": {"S0": 33010, "S1": 33610},
+}
+
+
+def _two_instance_zip() -> bytes:
+    files = {
+        "agency.txt": _UTC_AGENCY,  # catalog fixture overrides tz to LA
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": (
+            "route_id,service_id,trip_id,trip_headsign\nR1,TWO,TP,H\nR1,TWO,FQ,H\n"
+        ),
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "TP,08:00:00,08:00:10,S0,1\n"
+            "TP,08:10:00,08:10:10,S1,2\n"
+            "FQ,09:00:00,09:00:10,S0,1\n"
+            "FQ,09:10:00,09:10:10,S1,2\n"
+        ),
+        "calendar.txt": (
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+            "start_date,end_date\nTWO,1,1,1,1,1,1,1,20260730,20260731\n"
+        ),
+        # Repetitions 09:00:00 (32400) and 09:10:00 (33000); 09:20:00 lands
+        # on end_time and does not run.
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs\nFQ,09:00:00,09:20:00,600\n"
+        ),
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+def _two_instance_message(
+    *,
+    variant: str,
+    kind: str,
+    start_date_cell: str,
+    rep: int,
+    delay: int,
+) -> gtfs_realtime_pb2.FeedMessage:
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "tu-two-day"
+    trip = entity.trip_update.trip
+    trip.trip_id = "TP" if variant == "plain" else "FQ"
+    if variant == "frequency":
+        trip.start_time = _format_gtfs_time(rep)
+    if start_date_cell:
+        trip.start_date = start_date_cell
+    if kind == "cancellation":
+        trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.CANCELED
+    else:
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_id = "S0"
+        stu.departure.delay = delay
+    return msg
+
+
+def _instance_day(scheduled_departure: datetime) -> date:
+    return _TWO_DAY_A if scheduled_departure < _TWO_DAY_ANCHOR_B else _TWO_DAY_B
+
+
+@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    variant=st.sampled_from(["plain", "frequency"]),
+    kind=st.sampled_from(["prediction", "cancellation"]),
+    date_mode=st.sampled_from(["day_a", "day_b", "absent", "garbage"]),
+    rep=st.sampled_from([32400, 33000]),
+    delay=st.integers(-600, 1800),
+    lookahead_hours=st.integers(27, 48),
+    garbage=st.sampled_from(_GARBAGE_START_DATES),
+)
+def test_two_instance_start_date_disambiguation_oracle(
+    *,
+    variant: str,
+    kind: str,
+    date_mode: str,
+    rep: int,
+    delay: int,
+    lookahead_hours: int,
+    garbage: str,
+) -> None:
+    """THE start_date property: with BOTH daily instances of every identity
+    in a >=27h window, a drawn prediction or cancellation affects exactly
+    one instance and never its 24h-apart sibling. A date naming day A or
+    day B affects that day's instance; an absent date affects the
+    currently-active (earliest in-window) instance -- day A; a garbage
+    date parses to None and behaves exactly as absent. Every other trip
+    instance -- the sibling day AND the sibling repetition/plain trip --
+    stays schedule-only, in both the arrivals merge and the
+    origin->destination overlay.
+    """
+    start_date_cell = {
+        "day_a": "20260730",
+        "day_b": "20260731",
+        "absent": "",
+        "garbage": garbage,
+    }[date_mode]
+    target_id = "TP" if variant == "plain" else f"FQ#{rep}"
+    affected_day = _TWO_DAY_B if date_mode == "day_b" else _TWO_DAY_A
+    msg = _two_instance_message(
+        variant=variant,
+        kind=kind,
+        start_date_cell=start_date_cell,
+        rep=rep,
+        delay=delay,
+    )
+    arrivals, trips_by_pair = _run_propagation_scenario(
+        _two_instance_zip(),
+        msg,
+        ["S0", "S1"],
+        [("S0", "S1")],
+        lookahead=timedelta(hours=lookahead_hours),
+        now=_TWO_DAY_NOW,
+    )
+    all_rows = {
+        (trip_id, day, stop)
+        for trip_id in _TWO_DAY_CONCRETE_IDS
+        for day in (_TWO_DAY_A, _TWO_DAY_B)
+        for stop in ("S0", "S1")
+    }
+    got_rows = {
+        (a.trip_id, _instance_day(a.scheduled_departure), a.stop_id)
+        for a in arrivals
+        if a.scheduled_departure is not None and a.trip_id is not None
+    }
+    assert len(got_rows) == len(arrivals)
+    if kind == "cancellation":
+        # Exactly the affected instance's rows disappear; nothing else is
+        # touched (all survivors schedule-only).
+        assert got_rows == all_rows - {
+            (target_id, affected_day, stop) for stop in ("S0", "S1")
+        }
+        assert all(a.realtime is False for a in arrivals)
+    else:
+        assert got_rows == all_rows
+        anchor = {
+            _TWO_DAY_A: _TWO_DAY_ANCHOR_A,
+            _TWO_DAY_B: _TWO_DAY_ANCHOR_B,
+        }
+        for row in arrivals:
+            assert row.trip_id is not None
+            assert row.scheduled_departure is not None
+            inst_day = _instance_day(row.scheduled_departure)
+            is_target = row.trip_id == target_id and inst_day == affected_day
+            assert row.realtime is is_target
+            if is_target:
+                # S0 carries the STU's own delay; S1 the propagated one.
+                assert row.delay_seconds == delay
+                offset = _TWO_DAY_DEP_OFFSETS[row.trip_id][row.stop_id]
+                assert row.predicted_departure == anchor[inst_day] + timedelta(
+                    seconds=offset + delay
+                )
+            else:
+                assert row.predicted_departure is None
+                assert row.delay_seconds is None
+    # The origin->destination overlay resolves instances identically.
+    journeys = trips_by_pair[("S0", "S1")]
+    got_journeys = {(t.trip_id, _instance_day(t.scheduled_departure)) for t in journeys}
+    all_journeys = {
+        (trip_id, day)
+        for trip_id in _TWO_DAY_CONCRETE_IDS
+        for day in (_TWO_DAY_A, _TWO_DAY_B)
+    }
+    if kind == "cancellation":
+        assert got_journeys == all_journeys - {(target_id, affected_day)}
+        assert all(t.realtime is False for t in journeys)
+    else:
+        assert got_journeys == all_journeys
+        for journey in journeys:
+            inst_day = _instance_day(journey.scheduled_departure)
+            is_target = journey.trip_id == target_id and inst_day == affected_day
+            assert journey.realtime is is_target
+            if is_target:
+                assert journey.delay_seconds == delay
+
+
+def _short_window_message(
+    kind: str, start_date_cell: str, delay: int
+) -> gtfs_realtime_pb2.FeedMessage:
+    """One TP update against the one-day propagation zip, optionally dated."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "tu-short"
+    entity.trip_update.trip.trip_id = "TP"
+    if start_date_cell:
+        entity.trip_update.trip.start_date = start_date_cell
+    if kind == "cancellation":
+        entity.trip_update.trip.schedule_relationship = (
+            gtfs_realtime_pb2.TripDescriptor.CANCELED
+        )
+    else:
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_id = "S0"
+        stu.departure.delay = delay
+    return msg
+
+
+@settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    kind=st.sampled_from(["prediction", "cancellation"]),
+    absent_form=st.sampled_from(["absent", "garbage"]),
+    garbage=st.sampled_from(_GARBAGE_START_DATES),
+    delay=st.integers(-600, 1800),
+)
+def test_short_window_start_date_invariance(
+    kind: str, absent_form: str, garbage: str, delay: int
+) -> None:
+    """With a <24h window (single instance per identity, the pre-start_date
+    regime), a matching date (2026-07-30, the propagation fixture's only
+    service day) and an absent date -- or a garbage one, which parses to
+    None -- behave IDENTICALLY, pinning that single-instance behavior did
+    not change; a different day's date attaches nowhere: no prediction, no
+    cancellation.
+    """
+    zip_bytes = _propagation_zip(3, 1)
+    stop_ids = ["S0", "S1", "S2"]
+    absent_cell = "" if absent_form == "absent" else garbage
+    matching, matching_trips = _run_propagation_scenario(
+        zip_bytes,
+        _short_window_message(kind, "20260730", delay),
+        stop_ids,
+        [("S0", "S2")],
+    )
+    absent, absent_trips = _run_propagation_scenario(
+        zip_bytes,
+        _short_window_message(kind, absent_cell, delay),
+        stop_ids,
+        [("S0", "S2")],
+    )
+    assert matching == absent
+    assert matching_trips == absent_trips
+    # Guard against vacuous equality: the matching-date run really attached.
+    tp_rows = [a for a in matching if a.trip_id == "TP"]
+    if kind == "cancellation":
+        assert tp_rows == []
+    else:
+        assert tp_rows and all(a.realtime is True for a in tp_rows)
+    wrong_day, wrong_day_trips = _run_propagation_scenario(
+        zip_bytes,
+        _short_window_message(kind, "20260731", delay),
+        stop_ids,
+        [("S0", "S2")],
+    )
+    assert {(a.trip_id, a.stop_id) for a in wrong_day} == {
+        (trip_id, stop) for trip_id in ("TP", "OTHER") for stop in stop_ids
+    }
+    assert all(a.realtime is False for a in wrong_day)
+    assert {t.trip_id for t in wrong_day_trips[("S0", "S2")]} == {"TP", "OTHER"}
+    assert all(t.realtime is False for t in wrong_day_trips[("S0", "S2")])
 
 
 @given(done=st.integers(0, 2**40), total=st.integers(0, 2**40) | st.none())

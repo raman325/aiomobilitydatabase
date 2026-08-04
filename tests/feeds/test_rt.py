@@ -1,6 +1,6 @@
 """Tests for GTFS-RT fetching (auth, errors) and protobuf parsing."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import aiohttp
 import pytest
@@ -125,8 +125,8 @@ def test_trip_updates_from_message() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(TRIP_UPDATES_BASELINE)
     updates = trip_updates_from_message(msg)
-    assert updates.canceled_trips == {("T2", None)}
-    entry = updates.trips[("T1", None)]
+    assert updates.canceled_trips == {("T2", None, None)}
+    entry = updates.trips[("T1", None, None)]
     assert entry.vehicle_id == "V1"
     assert entry.delay_seconds is None  # no trip-level TripUpdate.delay set
     (stu,) = entry.stop_updates
@@ -140,7 +140,7 @@ def test_trip_updates_from_message() -> None:
     assert added.route_id == "R1"
     assert added.stop_id == "S2"
     assert added.departure == datetime.fromtimestamp(1_785_500_630, tz=UTC)
-    assert ("ADDED-9", None) not in updates.trips  # ADDED rows never form entries
+    assert ("ADDED-9", None, None) not in updates.trips  # ADDED rows never form entries
 
 
 def _build_conflicting_trip_update(
@@ -201,8 +201,8 @@ def test_trip_updates_cancellation_wins_regardless_of_entity_order(
     """
     msg = _build_conflicting_trip_update(canceled_first=canceled_first)
     updates = trip_updates_from_message(msg)
-    assert updates.canceled_trips == {("STALE-TRIP", None)}
-    assert ("STALE-TRIP", None) not in updates.trips
+    assert updates.canceled_trips == {("STALE-TRIP", None, None)}
+    assert ("STALE-TRIP", None, None) not in updates.trips
     assert all(added.trip_id != "STALE-TRIP" for added in updates.added)
 
 
@@ -231,11 +231,54 @@ def test_trip_updates_start_time_keys() -> None:
     )
     updates = trip_updates_from_message(msg)
     assert set(updates.trips) == {
-        ("F1", 22200),
-        ("F2", 90000),
-        ("F3", None),
+        ("F1", None, 22200),
+        ("F2", None, 90000),
+        ("F3", None, None),
     }
-    assert updates.canceled_trips == {("F1", 22800)}
+    assert updates.canceled_trips == {("F1", None, 22800)}
+
+
+def test_trip_updates_start_date_keys() -> None:
+    """TripDescriptor.start_date becomes the start_date key component:
+    parsed for trip entries AND cancellations, while garbage (bad length,
+    non-digits, calendar-invalid dates) degrades to None -- behaving
+    exactly like an absent date -- instead of failing the message.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    cases = [
+        ("D1", "20260730"),  # valid
+        ("D2", "20261332"),  # calendar-invalid month/day
+        ("D3", "2026073"),  # wrong length
+        ("D4", "2026073a"),  # non-digit
+        ("D5", ""),  # absent
+    ]
+    for i, (trip_id, start_date) in enumerate(cases):
+        entity = msg.entity.add()
+        entity.id = f"tu-{i}"
+        entity.trip_update.trip.trip_id = trip_id
+        if start_date:
+            entity.trip_update.trip.start_date = start_date
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_id = "S1"
+        stu.departure.time = 1_785_500_000
+    cancel = msg.entity.add()
+    cancel.id = "tu-cancel"
+    cancel.trip_update.trip.trip_id = "D1"
+    cancel.trip_update.trip.start_date = "20260731"
+    cancel.trip_update.trip.start_time = "06:10:00"
+    cancel.trip_update.trip.schedule_relationship = (
+        gtfs_realtime_pb2.TripDescriptor.CANCELED
+    )
+    updates = trip_updates_from_message(msg)
+    assert set(updates.trips) == {
+        ("D1", date(2026, 7, 30), None),
+        ("D2", None, None),
+        ("D3", None, None),
+        ("D4", None, None),
+        ("D5", None, None),
+    }
+    assert updates.canceled_trips == {("D1", date(2026, 7, 31), 22200)}
 
 
 def test_alerts_from_message() -> None:
@@ -287,7 +330,7 @@ def test_trip_updates_delay_field_and_departure_preference() -> None:
     stu.arrival.delay = 100
     stu.departure.delay = 200
     updates = trip_updates_from_message(msg)
-    entry = updates.trips[("T1", None)]
+    entry = updates.trips[("T1", None, None)]
     assert entry.delay_seconds == -60
     (parsed,) = entry.stop_updates
     assert parsed.stop_sequence == 2
@@ -342,7 +385,7 @@ def test_out_of_range_enums_on_the_wire_never_raise() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(raw)
     updates = trip_updates_from_message(msg)
-    entry = updates.trips[("T9", None)]
+    entry = updates.trips[("T9", None, None)]
     assert entry.delay_seconds == 7
     (parsed,) = entry.stop_updates
     # Both unknown relationships degraded to the SCHEDULED default.

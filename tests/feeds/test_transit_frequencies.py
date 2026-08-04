@@ -16,6 +16,7 @@ from tests.feeds.fixtures import (
     GTFS_RT_FEED,
     TOKEN_RESPONSE,
     TRIP_UPDATES_FREQ_BARE_CANCEL,
+    TRIP_UPDATES_FREQ_CANCELED_TOMORROW,
     TRIP_UPDATES_FREQ_MATCHED,
     TRIP_UPDATES_FREQ_UNMATCHED,
     build_frequencies_gtfs_zip_bytes,
@@ -148,3 +149,20 @@ async def test_bare_cancellation_cancels_no_repetition(
         "S1", "S3", lookahead=timedelta(hours=2), now_utc=NOW
     )
     assert [t.trip_id for t in trips] == F1_SYNTHETIC_IDS
+
+
+async def test_tomorrow_repetition_cancellation_spares_todays(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """The motivating start_date case, frequency variant: canceling the
+    06:10:00 repetition FOR TOMORROW (start_time=06:10:00 plus
+    start_date=2026-07-31) must not drop today's in-window F1#22200 row --
+    the start_time alone aligns with it, but the date does not.
+    """
+    _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_CANCELED_TOMORROW)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    arrivals = await handle.get_arrivals(
+        ["S1"], lookahead=timedelta(hours=2), now_utc=NOW
+    )
+    assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
+    assert all(a.realtime is False for a in arrivals)
