@@ -104,7 +104,7 @@ async def test_hosted_dataset_fetch_error_status_raises(
     mock_api.get("/v1/gtfs_feeds/mdb-100", payload=with_base(GTFS_FEED, base))
     mock_api.get("/v1/gtfs_feeds/mdb-100/gtfs_rt_feeds", payload=[])
     mock_api.get(ZIP_PATH, status=500, body=b"boom", content_type="text/plain")
-    with pytest.raises(SourceConnectionError, match="Hosted dataset fetch failed"):
+    with pytest.raises(SourceConnectionError, match="Dataset fetch failed"):
         await feeds_client.get_transit_feed("mdb-100")
 
 

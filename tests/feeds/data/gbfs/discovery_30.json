@@ -1,0 +1,17 @@
+{
+  "last_updated": "2026-07-31T00:00:00Z",
+  "ttl": 60,
+  "version": "3.0",
+  "data": {
+    "feeds": [
+      {
+        "name": "system_information",
+        "url": "__MOCK__/gbfs3/system_information.json"
+      },
+      {
+        "name": "vehicle_status",
+        "url": "__MOCK__/gbfs3/vehicle_status.json"
+      }
+    ]
+  }
+}
