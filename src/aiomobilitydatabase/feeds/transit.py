@@ -44,10 +44,12 @@ from .models import (
     VehiclePosition,
 )
 from .rt import (
+    TripPredictions,
     TripUpdates,
     _require_http_url,  # deliberate friend access: shared data-origin URL guard
     alerts_from_message,
     fetch_feed_message,
+    resolve_trip_predictions,
     trip_updates_from_message,
     vehicles_from_message,
 )
@@ -112,6 +114,24 @@ class _DirectUrls:
 
     static_url: str
     headers: Mapping[str, str] | None
+
+
+def _predicted_time(
+    explicit: datetime | None, scheduled: datetime | None, delay_seconds: int | None
+) -> datetime | None:
+    """One end's predicted instant: explicit epoch wins over scheduled+delay.
+
+    An explicit ``arrival.time``/``departure.time`` from the stop's own
+    StopTimeUpdate takes precedence exactly as before this seam existed;
+    otherwise a known (possibly propagated or trip-level) delay shifts the
+    scheduled instant. No prediction when neither applies (e.g. a delay
+    with no scheduled time at that end).
+    """
+    if explicit is not None:
+        return explicit
+    if scheduled is not None and delay_seconds is not None:
+        return scheduled + timedelta(seconds=delay_seconds)
+    return None
 
 
 def group_stations(stops: list[Stop]) -> list[StationGroup]:
@@ -541,16 +561,40 @@ class TransitFeedHandle:
         """Merge TripUpdates across every TU-capable sibling RT source.
 
         Deliberate tiebreak: when multiple TU-capable sibling feeds report
-        the same (trip, stop), the last feed in catalog order wins (no
-        freshness reconciliation in v1).
+        the same (trip_id, start_secs) identity, the last feed in catalog
+        order wins wholesale (no freshness reconciliation in v1).
         """
         aggregate = TripUpdates()
         for message in await self._fetch_entity_messages(EntityType.TRIP_UPDATES):
             updates = trip_updates_from_message(message)
-            aggregate.predictions.update(updates.predictions)
+            aggregate.trips.update(updates.trips)
             aggregate.canceled_trips |= updates.canceled_trips
             aggregate.added.extend(updates.added)
         return aggregate
+
+    async def _resolve_predictions(
+        self, updates: TripUpdates, rt_keys: Mapping[str, tuple[str, int | None]]
+    ) -> dict[str, TripPredictions]:
+        """Resolve STU propagation for every matched concrete trip.
+
+        ``rt_keys`` maps each scheduled row's CONCRETE trip id (synthetic
+        repetition ids included) to its RT identity; trips with a matching
+        TripUpdate entry get their static stop order fetched in one query
+        and resolved via :func:`resolve_trip_predictions`, so propagation
+        happens against the exact repetition the update addressed. Every
+        matched trip is guaranteed a stop-calls entry: scheduled rows only
+        exist because the trip has stop_times rows.
+        """
+        matched = {
+            trip_id: key for trip_id, key in rt_keys.items() if key in updates.trips
+        }
+        if not matched:
+            return {}
+        calls = await asyncio.to_thread(self._index.trip_stop_calls, sorted(matched))
+        return {
+            trip_id: resolve_trip_predictions(updates.trips[key], calls[trip_id])
+            for trip_id, key in matched.items()
+        }
 
     async def get_arrivals(
         self,
@@ -566,6 +610,21 @@ class TransitFeedHandle:
         ``limit`` caps the MERGED result (scheduled + RT-added) to at most
         ``limit`` rows per stop, nearest-departure-first — RT-added rows are
         not exempt.
+
+        Delay propagation (GTFS-RT spec): a StopTimeUpdate's delay applies
+        to its own stop AND propagates to every subsequent stop of the
+        trip until the next StopTimeUpdate provides newer information; a
+        NO_DATA StopTimeUpdate cuts propagation (subsequent stops are
+        schedule-only until a later update resumes); a SKIPPED
+        StopTimeUpdate suppresses its stop's row entirely (the vehicle
+        will not serve it); the trip-level ``TripUpdate.delay`` applies
+        only where no StopTimeUpdate-derived information covers a stop.
+        ``realtime`` is True for propagated-only and trip-delay-only stops
+        too — a propagated delay IS realtime information — with
+        ``predicted_*`` computed as scheduled + delay wherever the stop's
+        own update supplies no explicit epoch time (explicit times always
+        win). RT-ADDED trips get no propagation: with no static schedule
+        to propagate over, only their explicit StopTimeUpdates surface.
 
         Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
         ids materialized from frequencies.txt) match RT via
@@ -591,20 +650,26 @@ class TransitFeedHandle:
         stop_names = await asyncio.to_thread(self._index.stop_names)
         route_names = await asyncio.to_thread(self._index.route_display_names)
         updates = await self._aggregated_trip_updates()
-        predictions = updates.predictions
         canceled = updates.canceled_trips
         added_rows = updates.added
+        # RT identity: (source_trip_id, start_secs) is (trip_id, None)
+        # for plain trips and (template id, repetition start) for
+        # frequency repetitions — matching TripUpdates' key shape.
+        resolved = await self._resolve_predictions(
+            updates,
+            {dep.trip_id: (dep.source_trip_id, dep.start_secs) for dep in scheduled},
+        )
 
         arrivals: list[StopArrival] = []
         for dep in scheduled:
-            # RT identity: (source_trip_id, start_secs) is (trip_id, None)
-            # for plain trips and (template id, repetition start) for
-            # frequency repetitions — matching TripUpdates' key shape.
             if (dep.source_trip_id, dep.start_secs) in canceled:
                 continue
-            prediction = predictions.get(
-                (dep.source_trip_id, dep.start_secs, dep.stop_id)
-            )
+            trip_rt = resolved.get(dep.trip_id)
+            prediction = None
+            if trip_rt is not None:
+                if dep.stop_sequence in trip_rt.skipped:
+                    continue  # SKIPPED: the vehicle will not serve this stop
+                prediction = trip_rt.predictions.get(dep.stop_sequence)
             arrivals.append(
                 StopArrival(
                     stop_id=dep.stop_id,
@@ -615,8 +680,22 @@ class TransitFeedHandle:
                     headsign=dep.headsign,
                     scheduled_arrival=dep.arrival,
                     scheduled_departure=dep.departure,
-                    predicted_arrival=prediction.arrival if prediction else None,
-                    predicted_departure=prediction.departure if prediction else None,
+                    predicted_arrival=(
+                        _predicted_time(
+                            prediction.arrival, dep.arrival, prediction.delay_seconds
+                        )
+                        if prediction
+                        else None
+                    ),
+                    predicted_departure=(
+                        _predicted_time(
+                            prediction.departure,
+                            dep.departure,
+                            prediction.delay_seconds,
+                        )
+                        if prediction
+                        else None
+                    ),
                     delay_seconds=prediction.delay_seconds if prediction else None,
                     realtime=prediction is not None,
                     vehicle_id=prediction.vehicle_id if prediction else None,
@@ -705,12 +784,22 @@ class TransitFeedHandle:
         (see :class:`~.models.UpcomingTrip`).
 
         ``limit`` caps the SCHEDULED candidates, nearest origin departure
-        first; RT cancellations then remove rows without backfilling, so
-        fewer than ``limit`` rows may come back even when later scheduled
-        trips exist (same behavior as :meth:`get_arrivals`). RT-added trips
-        (schedule_relationship ADDED) are never included: an added trip's
-        full stop sequence is unknown, so whether it serves the destination
-        after the origin cannot be determined.
+        first; RT cancellations — and SKIPPED stops: a skipped origin or
+        skipped destination kills the row (the rider cannot board or
+        alight there), while a skipped intermediate stop changes nothing —
+        then remove rows without backfilling, so fewer than ``limit`` rows
+        may come back even when later scheduled trips exist (same behavior
+        as :meth:`get_arrivals`). RT-added trips (schedule_relationship
+        ADDED) are never included: an added trip's full stop sequence is
+        unknown, so whether it serves the destination after the origin
+        cannot be determined.
+
+        Delay propagation follows :meth:`get_arrivals` exactly: each end's
+        prediction comes from its own StopTimeUpdate, a propagated
+        last-known delay, or the trip-level fallback — so one early-stop
+        update predicts both ends. ``realtime`` is True whenever either
+        end carries any RT-derived prediction, propagated ones included;
+        ``delay_seconds`` reports the origin's effective delay.
 
         Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
         ids) match RT via ``TripDescriptor.start_time`` exactly as in
@@ -731,14 +820,28 @@ class TransitFeedHandle:
         )
         route_names = await asyncio.to_thread(self._index.route_display_names)
         updates = await self._aggregated_trip_updates()
+        # Same RT identity as get_arrivals: (source_trip_id, start_secs).
+        resolved = await self._resolve_predictions(
+            updates,
+            {
+                trip.trip_id: (trip.source_trip_id, trip.start_secs)
+                for trip in scheduled
+            },
+        )
         trips: list[UpcomingTrip] = []
         for trip in scheduled:
-            # Same RT identity as get_arrivals: (source_trip_id, start_secs).
-            rt_key = (trip.source_trip_id, trip.start_secs)
-            if rt_key in updates.canceled_trips:
+            if (trip.source_trip_id, trip.start_secs) in updates.canceled_trips:
                 continue
-            origin_pred = updates.predictions.get((*rt_key, origin_stop_id))
-            dest_pred = updates.predictions.get((*rt_key, destination_stop_id))
+            trip_rt = resolved.get(trip.trip_id)
+            origin_pred = dest_pred = None
+            if trip_rt is not None:
+                if (
+                    trip.origin_stop_sequence in trip_rt.skipped
+                    or trip.destination_stop_sequence in trip_rt.skipped
+                ):
+                    continue  # SKIPPED boarding or alighting kills the journey
+                origin_pred = trip_rt.predictions.get(trip.origin_stop_sequence)
+                dest_pred = trip_rt.predictions.get(trip.destination_stop_sequence)
             trips.append(
                 UpcomingTrip(
                     trip_id=trip.trip_id,
@@ -749,10 +852,22 @@ class TransitFeedHandle:
                     destination_stop_id=destination_stop_id,
                     scheduled_departure=trip.departure,
                     predicted_departure=(
-                        origin_pred.departure if origin_pred else None
+                        _predicted_time(
+                            origin_pred.departure,
+                            trip.departure,
+                            origin_pred.delay_seconds,
+                        )
+                        if origin_pred
+                        else None
                     ),
                     scheduled_arrival=trip.arrival,
-                    predicted_arrival=dest_pred.arrival if dest_pred else None,
+                    predicted_arrival=(
+                        _predicted_time(
+                            dest_pred.arrival, trip.arrival, dest_pred.delay_seconds
+                        )
+                        if dest_pred
+                        else None
+                    ),
                     delay_seconds=(origin_pred.delay_seconds if origin_pred else None),
                     realtime=origin_pred is not None or dest_pred is not None,
                     wheelchair_accessible=trip.wheelchair_accessible,

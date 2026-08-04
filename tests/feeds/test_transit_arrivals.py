@@ -79,20 +79,29 @@ async def test_rt_merge_delay_cancellation_and_added(
     by_key = {(a.trip_id, a.stop_id): a for a in arrivals}
     # T2 canceled by RT: dropped entirely (no row at any stop).
     assert not any(trip_id == "T2" for trip_id, _ in by_key)
-    # T1 delayed 300s at S1 (the TU names S1 only).
+    # T1 delayed 300s at S1 (the TU names S1 only). The producer ALSO sent
+    # explicit epoch times that differ from scheduled+delay (departure
+    # epoch+330 vs 15:00:30+300 = 15:05:30): the explicit time must win.
     t1_s1 = by_key[("T1", "S1")]
     assert t1_s1.realtime is True
     assert t1_s1.delay_seconds == 300
     assert t1_s1.predicted_departure == datetime.fromtimestamp(
         T1_DEPARTURE_EPOCH + 330, tz=UTC
     )
+    assert t1_s1.predicted_departure != datetime(2026, 7, 30, 15, 5, 30, tzinfo=UTC)
     assert t1_s1.scheduled_departure == datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC)
     assert t1_s1.vehicle_id == "V1"
-    # Same trip at S2: no TU entry for that stop -> schedule-only row.
+    # Same trip at S2: no STU of its own, so the S1 delay PROPAGATES (GTFS-RT
+    # spec: an STU's delay applies to all subsequent stops until newer
+    # information). Propagated stops count as realtime -- a propagated delay
+    # IS realtime information -- with predicted times = scheduled + delay.
     t1_s2 = by_key[("T1", "S2")]
-    assert t1_s2.realtime is False
-    assert t1_s2.predicted_departure is None
+    assert t1_s2.realtime is True
+    assert t1_s2.delay_seconds == 300
+    assert t1_s2.predicted_arrival == datetime(2026, 7, 30, 15, 15, 0, tzinfo=UTC)
+    assert t1_s2.predicted_departure == datetime(2026, 7, 30, 15, 15, 30, tzinfo=UTC)
     assert t1_s2.scheduled_departure == datetime(2026, 7, 30, 15, 10, 30, tzinfo=UTC)
+    assert t1_s2.vehicle_id == "V1"
     # RT-added trip at S2 with no schedule.
     added = by_key[("ADDED-9", "S2")]
     assert added.realtime is True

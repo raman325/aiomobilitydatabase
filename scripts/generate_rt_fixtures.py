@@ -134,6 +134,65 @@ def _build_trip_updates_both_ends() -> bytes:
     return bytes(msg.SerializeToString())
 
 
+def _build_trip_updates_t1_skipped(*, skipped_stop_id: str, delay_at_s1: bool) -> bytes:
+    """TripUpdates: T1 has one stop SKIPPED (optionally plus a 300s S1 delay).
+
+    Against the trip-query variant zip (T1: S1 -> S2 -> S3). The S1 delay
+    variant is used for the skipped-INTERMEDIATE case so the test can prove
+    propagation continues past a skipped stop (S3 still turns realtime).
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-skip"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "T1"
+    if delay_at_s1:
+        stu = trip_update.stop_time_update.add()
+        stu.stop_id = "S1"
+        stu.departure.delay = 300
+    skipped = trip_update.stop_time_update.add()
+    skipped.stop_id = skipped_stop_id
+    skipped.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
+    return bytes(msg.SerializeToString())
+
+
+def _build_trip_updates_t1_no_data_cut() -> bytes:
+    """TripUpdates: T1 delayed 300s at S1, NO_DATA at S2.
+
+    Against the trip-query variant zip: S1 gets scheduled+300 predictions,
+    while S2 AND S3 (propagation cut) stay schedule-only.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-no-data"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "T1"
+    stu = trip_update.stop_time_update.add()
+    stu.stop_id = "S1"
+    stu.departure.delay = 300
+    no_data = trip_update.stop_time_update.add()
+    no_data.stop_id = "S2"
+    no_data.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
+    return bytes(msg.SerializeToString())
+
+
+def _build_trip_updates_t1_trip_delay() -> bytes:
+    """TripUpdates: T1 carries ONLY a trip-level delay of 180s (no STUs)."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = _NOW_EPOCH
+    entity = msg.entity.add()
+    entity.id = "tu-trip-delay"
+    trip_update = entity.trip_update
+    trip_update.trip.trip_id = "T1"
+    trip_update.delay = 180
+    return bytes(msg.SerializeToString())
+
+
 def _build_trip_updates_t1_canceled() -> bytes:
     """TripUpdates: T1 canceled outright (no stop_time_updates)."""
     msg = gtfs_realtime_pb2.FeedMessage()
@@ -284,6 +343,17 @@ def main() -> None:
         "trip_updates_t1_dest_arrival.pb": _build_trip_updates_dest_arrival(),
         "trip_updates_t1_both_ends.pb": _build_trip_updates_both_ends(),
         "trip_updates_t1_canceled.pb": _build_trip_updates_t1_canceled(),
+        "trip_updates_t1_skip_s1.pb": _build_trip_updates_t1_skipped(
+            skipped_stop_id="S1", delay_at_s1=False
+        ),
+        "trip_updates_t1_skip_s2.pb": _build_trip_updates_t1_skipped(
+            skipped_stop_id="S2", delay_at_s1=True
+        ),
+        "trip_updates_t1_skip_s3.pb": _build_trip_updates_t1_skipped(
+            skipped_stop_id="S3", delay_at_s1=False
+        ),
+        "trip_updates_t1_no_data_cut.pb": _build_trip_updates_t1_no_data_cut(),
+        "trip_updates_t1_trip_delay.pb": _build_trip_updates_t1_trip_delay(),
         "added_trips_s1.pb": _build_added_trips(
             base_epoch=_NOW_EPOCH, stop_id="S1", count=3
         ),
