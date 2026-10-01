@@ -113,6 +113,10 @@ async def main() -> None:
 
         # Scheduled arrivals merged with realtime (delays, cancellations,
         # RT-added trips) when the feed publishes GTFS-RT TripUpdates.
+        # Pass several ArrivalsQuery objects to get several boards (each
+        # with its own stops, route/headsign filters, and limit) from one
+        # realtime fetch; the result has one list per query, in order.
+        # Delayed trips stay listed until their prediction passes.
         [arrivals] = await transit.get_arrivals(
             [ArrivalsQuery([nearby_stops[0].id], limit=2)]
         )
