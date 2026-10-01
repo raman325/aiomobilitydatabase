@@ -33,6 +33,7 @@ from .exceptions import (
 from .geo import Circle, in_circle
 from .models import (
     Agency,
+    ArrivalsQuery,
     FeedInfo,
     Route,
     ServiceAlert,
@@ -200,6 +201,32 @@ def _rt_key_for_row(
     if dateless in keys and current_dates[identity] == service_date:
         return dateless
     return None
+
+
+def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
+    """Effective departure instant for ordering and the past-row drop.
+
+    Predicted departure if any, else scheduled; ``fallback`` for RT-added
+    rows that announced an arrival but no departure.
+    """
+    return arrival.predicted_departure or arrival.scheduled_departure or fallback
+
+
+def _select_arrivals(
+    arrivals: Sequence[StopArrival], query: ArrivalsQuery
+) -> list[StopArrival]:
+    """Apply one query's stop, route, and headsign filters, then its limit."""
+    stop_ids = set(query.stop_ids)
+    route_ids = set(query.route_ids) if query.route_ids else None
+    headsigns = set(query.headsigns) if query.headsigns else None
+    selected = [
+        arrival
+        for arrival in arrivals
+        if arrival.stop_id in stop_ids
+        and (route_ids is None or arrival.route_id in route_ids)
+        and (headsigns is None or arrival.headsign in headsigns)
+    ]
+    return selected[: query.limit]
 
 
 def group_stations(stops: list[Stop]) -> list[StationGroup]:
@@ -676,18 +703,26 @@ class TransitFeedHandle:
 
     async def get_arrivals(
         self,
-        stop_ids: list[str],
-        route_ids: list[str] | None = None,
+        queries: Sequence[ArrivalsQuery],
         *,
         lookahead: timedelta = timedelta(hours=2),
-        limit: int = 10,
+        grace: timedelta = timedelta(hours=1),
         now_utc: datetime | None = None,
-    ) -> list[StopArrival]:
-        """Upcoming arrivals at the given stops: schedule merged with RT.
+    ) -> list[list[StopArrival]]:
+        """Upcoming arrivals for each query: schedule merged with RT.
 
-        ``limit`` caps the MERGED result (scheduled + RT-added) to at most
-        ``limit`` rows per stop, nearest-departure-first — RT-added rows are
-        not exempt.
+        One scheduled query over the union of every query's stops, one
+        TripUpdates fetch, one merge; then each query's route and headsign
+        filters and ``limit`` apply to the merged rows, so a filter can
+        never see an empty board because other routes crowded out the
+        limit. Returns one list per query, in order.
+
+        ``grace`` reaches that far BEFORE ``now`` when collecting scheduled
+        candidates, so a trip whose scheduled time has passed still picks
+        up its realtime prediction. After the merge, rows whose effective
+        departure (predicted if present, else scheduled) is before ``now``
+        are dropped: a schedule-only row past its time is gone, a delayed
+        one stays until its prediction passes.
 
         Delay propagation (GTFS-RT spec): a StopTimeUpdate's delay applies
         to its own stop AND propagates to every subsequent stop of the
@@ -730,8 +765,19 @@ class TransitFeedHandle:
         ``now_utc`` exists for deterministic testing; omit it in production.
         """
         now = now_utc or datetime.now(UTC)
+        all_stop_ids = sorted(
+            {stop_id for query in queries for stop_id in query.stop_ids}
+        )
+        if not all_stop_ids:
+            return [[] for _ in queries]
         scheduled = await asyncio.to_thread(
-            self._index.upcoming_departures, stop_ids, route_ids, now, lookahead, limit
+            self._index.upcoming_departures,
+            all_stop_ids,
+            None,
+            now,
+            lookahead,
+            None,
+            grace=grace,
         )
         stop_names = await asyncio.to_thread(self._index.stop_names)
         route_names = await asyncio.to_thread(self._index.route_display_names)
@@ -819,11 +865,9 @@ class TransitFeedHandle:
                     block_id=dep.block_id,
                 )
             )
-        wanted_stops = set(stop_ids)
+        wanted_stops = set(all_stop_ids)
         for row in added_rows:
             if row.stop_id not in wanted_stops:
-                continue
-            if route_ids and row.route_id not in route_ids:
                 continue
             arrivals.append(
                 StopArrival(
@@ -854,27 +898,17 @@ class TransitFeedHandle:
                     block_id=None,
                 )
             )
+        # The grace window admitted scheduled rows before `now` so their
+        # predictions could attach; now only rows still ahead survive.
+        arrivals = [
+            arrival for arrival in arrivals if _effective_departure(arrival, now) >= now
+        ]
         # Total sort key, matching upcoming_departures: effective time alone
         # ties frequently, so trip_id/stop_id break ties deterministically.
         arrivals.sort(
-            key=lambda a: (
-                a.predicted_departure or a.scheduled_departure or now,
-                a.trip_id or "",
-                a.stop_id,
-            )
+            key=lambda a: (_effective_departure(a, now), a.trip_id or "", a.stop_id)
         )
-        # Scheduled rows already respect `limit` per stop via
-        # upcoming_departures's per_stop_limit, but RT-added rows don't go
-        # through that query — cap the merged (scheduled + added) result per
-        # stop here too, same nearest-first truncation pattern.
-        limited: list[StopArrival] = []
-        per_stop_counts: dict[str, int] = {}
-        for arrival in arrivals:
-            count = per_stop_counts.get(arrival.stop_id, 0)
-            if count < limit:
-                limited.append(arrival)
-                per_stop_counts[arrival.stop_id] = count + 1
-        return limited
+        return [_select_arrivals(arrivals, query) for query in queries]
 
     async def upcoming_trips(
         self,

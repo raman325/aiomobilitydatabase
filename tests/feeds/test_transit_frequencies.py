@@ -10,6 +10,7 @@ start_time affects no repetition at all.
 from datetime import UTC, datetime, timedelta
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
+from aiomobilitydatabase.feeds.models import ArrivalsQuery
 
 from tests.feeds.fixtures import (
     GTFS_FEED,
@@ -59,8 +60,8 @@ async def test_start_time_prediction_and_cancellation_hit_one_repetition(
     """
     _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_MATCHED)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    arrivals = await handle.get_arrivals(
-        ["S1"], lookahead=timedelta(hours=2), now_utc=NOW
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=2), now_utc=NOW
     )
     assert [a.trip_id for a in arrivals] == [
         "F1#21600",
@@ -120,8 +121,8 @@ async def test_unmatched_predictions_attach_to_no_repetition(
     """
     _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_UNMATCHED)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    arrivals = await handle.get_arrivals(
-        ["S1"], lookahead=timedelta(hours=2), now_utc=NOW
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=2), now_utc=NOW
     )
     assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
     for arrival in arrivals:
@@ -141,8 +142,8 @@ async def test_bare_cancellation_cancels_no_repetition(
     # Second scripted RT response: this test drains one per RT-merging call.
     mock_api.get("/rt/all", body=TRIP_UPDATES_FREQ_BARE_CANCEL, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    arrivals = await handle.get_arrivals(
-        ["S1"], lookahead=timedelta(hours=2), now_utc=NOW
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=2), now_utc=NOW
     )
     assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
     trips = await handle.upcoming_trips(
@@ -161,8 +162,8 @@ async def test_tomorrow_repetition_cancellation_spares_todays(
     """
     _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_CANCELED_TOMORROW)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    arrivals = await handle.get_arrivals(
-        ["S1"], lookahead=timedelta(hours=2), now_utc=NOW
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=2), now_utc=NOW
     )
     assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
     assert all(a.realtime is False for a in arrivals)

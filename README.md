@@ -80,7 +80,7 @@ aiomobilitydatabase[feeds]`.
 ```python
 import asyncio
 
-from aiomobilitydatabase.feeds import Circle, MobilityFeedsClient
+from aiomobilitydatabase.feeds import ArrivalsQuery, Circle, MobilityFeedsClient
 
 
 async def main() -> None:
@@ -113,7 +113,9 @@ async def main() -> None:
 
         # Scheduled arrivals merged with realtime (delays, cancellations,
         # RT-added trips) when the feed publishes GTFS-RT TripUpdates.
-        arrivals = await transit.get_arrivals([nearby_stops[0].id], limit=2)
+        [arrivals] = await transit.get_arrivals(
+            [ArrivalsQuery([nearby_stops[0].id], limit=2)]
+        )
         for arrival in arrivals:
             when = arrival.predicted_departure or arrival.scheduled_departure
             live = "live" if arrival.realtime else "scheduled"
@@ -150,7 +152,7 @@ catalog methods, so everything above works unchanged:
 ```python
 import asyncio
 
-from aiomobilitydatabase.feeds import MobilityFeedsClient
+from aiomobilitydatabase.feeds import ArrivalsQuery, MobilityFeedsClient
 
 
 async def main() -> None:
@@ -162,7 +164,7 @@ async def main() -> None:
             vehicle_positions_urls=["https://agency.example/gtfs-rt/positions.pb"],
             headers={"Authorization": "Bearer PRODUCER_TOKEN"},  # optional
         )
-        arrivals = await transit.get_arrivals([transit.stops[0].id])
+        [arrivals] = await transit.get_arrivals([ArrivalsQuery([transit.stops[0].id])])
 
         bikes = await client.get_gbfs_feed_from_url(
             "https://bikes.example/gbfs/gbfs.json"

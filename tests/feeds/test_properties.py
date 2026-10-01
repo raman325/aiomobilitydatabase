@@ -35,6 +35,7 @@ from aiomobilitydatabase.feeds.models import (
     AlertCause,
     AlertEffect,
     AlertSeverity,
+    ArrivalsQuery,
     BikesAllowed,
     CongestionLevel,
     FeedInfo,
@@ -2035,17 +2036,17 @@ def _run_arrivals_merge_scenario(
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
                 # limit=10 keeps every scheduled AND generated ADDED row
-                # inside the per-stop cap (at most 2 scheduled + 3 added at
-                # S1), so the exactly-once ADDED assertions below can never
-                # be masked by truncation; the per-stop-limit law itself is
-                # pinned by the elapsed-seconds oracle property and the
-                # end-to-end totality property.
-                return await handle.get_arrivals(
-                    ["S1", "S2"],
+                # inside the query's cap (at most 2 scheduled + 3 added at S1
+                # plus S2's single scheduled row), so the exactly-once ADDED
+                # assertions below can never be masked by truncation; the
+                # limit law itself is pinned by the elapsed-seconds oracle
+                # property and the end-to-end totality property.
+                [arrivals] = await handle.get_arrivals(
+                    [ArrivalsQuery(["S1", "S2"], limit=10)],
                     lookahead=timedelta(hours=1),
-                    limit=10,
                     now_utc=datetime(2026, 7, 30, 14, 45, tzinfo=UTC),
                 )
+                return arrivals
         finally:
             await api.stop()
 
@@ -2056,7 +2057,7 @@ def _run_arrivals_merge_scenario(
 @settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_arrivals_merge_invariants(data: st.DataObject) -> None:
     """Over random cancellation/prediction/added sets: canceled trips absent,
-    realtime <=> prediction existed, rows sorted, per-stop <= limit, and
+    realtime <=> prediction existed, rows sorted, row count <= limit, and
     every NON-canceled generated ADDED trip surfaces EXACTLY once, at its
     announced stop, carrying its drawn epoch as the predicted departure
     (deleting the ADDED-row merge loop entirely once survived the suite).
@@ -2562,12 +2563,18 @@ def _run_frequencies_rt_scenario(
             )
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
-                return await handle.get_arrivals(
-                    ["S1", "S2", "S3"],
+                # One query per stop: the 10-row limit is per query, and the
+                # property counts all 15 rows the window holds across the
+                # three stops.
+                per_stop = await handle.get_arrivals(
+                    [
+                        ArrivalsQuery([stop_id], limit=10)
+                        for stop_id in ("S1", "S2", "S3")
+                    ],
                     lookahead=timedelta(hours=2),
-                    limit=10,
                     now_utc=datetime(2026, 7, 30, 12, 45, tzinfo=UTC),
                 )
+                return [row for rows in per_stop for row in rows]
         finally:
             await api.stop()
 
@@ -2777,10 +2784,9 @@ def _run_propagation_scenario(
                 api.get("/rt/all", body=body, content_type="application/octet-stream")
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
-                arrivals = await handle.get_arrivals(
-                    stop_ids,
+                [arrivals] = await handle.get_arrivals(
+                    [ArrivalsQuery(stop_ids, limit=50)],
                     lookahead=lookahead,
-                    limit=50,
                     now_utc=now,
                 )
                 trips = {}
@@ -3676,12 +3682,12 @@ def _run_multi_rt_scenario(
                     api.url("/static.zip"),
                     trip_updates_urls=[api.url("/rt/one"), api.url("/rt/two")],
                 )
-                return await handle.get_arrivals(
-                    ["S0", "S1", "S2"],
+                [arrivals] = await handle.get_arrivals(
+                    [ArrivalsQuery(["S0", "S1", "S2"], limit=50)],
                     lookahead=timedelta(hours=6),
-                    limit=50,
                     now_utc=_MULTI_RT_NOW,
                 )
+                return arrivals
         finally:
             await api.stop()
 
@@ -3787,17 +3793,14 @@ def _run_route_filter_scenario(
                 api.get("/rt/all", body=body, content_type="application/octet-stream")
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
-                unfiltered = await handle.get_arrivals(
-                    ["S0", "S1", "S2"],
+                [unfiltered] = await handle.get_arrivals(
+                    [ArrivalsQuery(["S0", "S1", "S2"], limit=50)],
                     lookahead=timedelta(hours=6),
-                    limit=50,
                     now_utc=_PROP_NOW,
                 )
-                filtered = await handle.get_arrivals(
-                    ["S0", "S1", "S2"],
-                    route_ids,
+                [filtered] = await handle.get_arrivals(
+                    [ArrivalsQuery(["S0", "S1", "S2"], route_ids, limit=50)],
                     lookahead=timedelta(hours=6),
-                    limit=50,
                     now_utc=_PROP_NOW,
                 )
                 return unfiltered, filtered
@@ -3815,7 +3818,7 @@ def _run_route_filter_scenario(
 def test_arrivals_route_filter_matches_oracle(
     route_ids: list[str], added_route: str | None
 ) -> None:
-    """get_arrivals(route_ids=...) returns EXACTLY the oracle-side filter of
+    """An ArrivalsQuery's route_ids returns EXACTLY the oracle-side filter of
     the unfiltered merge: scheduled rows by their trip's route (TP on R1,
     OTHER on R2), RT-ADDED rows by their announced route -- and an added
     row announcing NO route never passes any filter.

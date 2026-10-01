@@ -3,6 +3,7 @@
 from datetime import UTC, datetime, timedelta
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
+from aiomobilitydatabase.feeds.models import ArrivalsQuery
 
 from tests.feeds.fixtures import (
     GTFS_FEED,
@@ -230,8 +231,8 @@ async def test_skipped_intermediate_changes_nothing_for_the_ends(
         )
         == []
     )
-    arrivals = await handle.get_arrivals(
-        ["S1", "S2"], lookahead=timedelta(hours=1), now_utc=NOW
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2"])], lookahead=timedelta(hours=1), now_utc=NOW
     )
     t1_rows = [(a.stop_id, a.realtime) for a in arrivals if a.trip_id == "T1"]
     assert t1_rows == [("S1", True)]  # the S2 call is suppressed entirely
@@ -257,8 +258,8 @@ async def test_no_data_cuts_propagation_at_and_after_its_stop(
     assert trip.delay_seconds == 300
     assert trip.predicted_departure == datetime(2026, 7, 30, 15, 5, 30, tzinfo=UTC)
     assert trip.predicted_arrival is None
-    arrivals = await handle.get_arrivals(
-        ["S1", "S2"], lookahead=timedelta(hours=1), now_utc=NOW
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2"])], lookahead=timedelta(hours=1), now_utc=NOW
     )
     by_key = {(a.trip_id, a.stop_id): a for a in arrivals}
     assert by_key[("T1", "S1")].realtime is True
@@ -288,8 +289,8 @@ async def test_trip_level_delay_fallback_covers_every_stop(
     assert trip.delay_seconds == 180
     assert trip.predicted_departure == datetime(2026, 7, 30, 15, 3, 30, tzinfo=UTC)
     assert trip.predicted_arrival == datetime(2026, 7, 30, 15, 23, tzinfo=UTC)
-    arrivals = await handle.get_arrivals(
-        ["S1", "S2"], lookahead=timedelta(hours=1), now_utc=NOW
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2"])], lookahead=timedelta(hours=1), now_utc=NOW
     )
     t1_rows = {a.stop_id: a for a in arrivals if a.trip_id == "T1"}
     assert t1_rows["S1"].delay_seconds == 180
