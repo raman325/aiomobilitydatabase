@@ -17,6 +17,7 @@ from tests.feeds.fixtures import (
     TRIP_UPDATES_T1_CANCELED_TOMORROW,
     TRIP_UPDATES_T1_DATED_TOMORROW_DELAY,
     TRIP_UPDATES_T1_DELAYED,
+    _writestr,
     build_gtfs_zip_bytes,
     with_base,
 )
@@ -91,9 +92,9 @@ def _busy_stop_zip_bytes() -> bytes:
         ),
     }
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, content in files.items():
-            zf.writestr(name, content)
+            _writestr(zf, name, content)
     return buf.getvalue()
 
 

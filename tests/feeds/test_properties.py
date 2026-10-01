@@ -2785,7 +2785,7 @@ def _run_propagation_scenario(
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
                 [arrivals] = await handle.get_arrivals(
-                    [ArrivalsQuery(stop_ids, limit=50)],
+                    [ArrivalsQuery(stop_ids, limit=150)],
                     lookahead=lookahead,
                     now_utc=now,
                 )
@@ -3683,7 +3683,7 @@ def _run_multi_rt_scenario(
                     trip_updates_urls=[api.url("/rt/one"), api.url("/rt/two")],
                 )
                 [arrivals] = await handle.get_arrivals(
-                    [ArrivalsQuery(["S0", "S1", "S2"], limit=50)],
+                    [ArrivalsQuery(["S0", "S1", "S2"], limit=150)],
                     lookahead=timedelta(hours=6),
                     now_utc=_MULTI_RT_NOW,
                 )
@@ -3794,12 +3794,12 @@ def _run_route_filter_scenario(
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
                 [unfiltered] = await handle.get_arrivals(
-                    [ArrivalsQuery(["S0", "S1", "S2"], limit=50)],
+                    [ArrivalsQuery(["S0", "S1", "S2"], limit=150)],
                     lookahead=timedelta(hours=6),
                     now_utc=_PROP_NOW,
                 )
                 [filtered] = await handle.get_arrivals(
-                    [ArrivalsQuery(["S0", "S1", "S2"], route_ids, limit=50)],
+                    [ArrivalsQuery(["S0", "S1", "S2"], route_ids, limit=150)],
                     lookahead=timedelta(hours=6),
                     now_utc=_PROP_NOW,
                 )

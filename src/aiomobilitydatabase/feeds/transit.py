@@ -226,6 +226,11 @@ def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
     )
 
 
+def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
+    """Predicted origin departure if any, else scheduled."""
+    return trip.predicted_departure or trip.scheduled_departure
+
+
 def _select_arrivals(
     arrivals: Sequence[StopArrival], query: ArrivalsQuery
 ) -> list[StopArrival]:
@@ -772,7 +777,8 @@ class TransitFeedHandle:
         TripUpdates fetch, one merge; then each query's route and headsign
         filters and ``limit`` apply to the merged rows, so a filter can
         never see an empty board because other routes crowded out the
-        limit. Returns one list per query, in order.
+        limit. ``limit`` caps each query's merged result as a whole, not
+        per stop. Returns one list per query, in order.
 
         ``grace`` reaches that far BEFORE ``now`` when collecting scheduled
         candidates, so a trip whose scheduled time has passed still picks
@@ -1134,17 +1140,13 @@ class TransitFeedHandle:
                         block_id=trip.block_id,
                     )
                 )
-            trips = [
-                row
-                for row in trips
-                if (row.predicted_departure or row.scheduled_departure) >= now
-            ]
+            trips = [row for row in trips if _effective_trip_departure(row) >= now]
             # Total sort key, matching get_arrivals: origin predictions can
             # reorder rows relative to the scheduled ordering, and trip_id /
             # scheduled_arrival break effective-departure ties deterministically.
             trips.sort(
                 key=lambda row: (
-                    row.predicted_departure or row.scheduled_departure,
+                    _effective_trip_departure(row),
                     row.trip_id,
                     row.scheduled_arrival,
                 )
