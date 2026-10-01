@@ -14,6 +14,7 @@ from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.geo import Circle
 from aiomobilitydatabase.feeds.models import ArrivalsQuery, ServiceAlert, StationGroup
 from aiomobilitydatabase.feeds.static_index import StaticIndex
+from aiomobilitydatabase.feeds.transit import TransitFeedHandle
 
 from tests.feeds.fixtures import (
     _FILES,
@@ -32,6 +33,15 @@ PB = "application/octet-stream"
 ZIP_PATH = "/hosted/mdb-100.zip"
 NOW = datetime(2026, 7, 30, 14, 45, tzinfo=UTC)  # Thursday 07:45 PDT
 NEW_DATASET = "mdb-100-202608010000"
+
+
+async def _wait_until_swap_is_waiting(handle: TransitFeedHandle) -> None:
+    """Block until a refresh has reached the swap and is parked on readers."""
+    async with asyncio.timeout(5):
+        # Polling, not an Event wait: asyncio.Event can be awaited until set,
+        # never until cleared, and a cleared gate is what marks the swap.
+        while handle._guard._open.is_set():  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
 
 
 def _empty_trip_updates() -> bytes:
@@ -317,19 +327,19 @@ async def test_in_flight_query_blocks_index_swap(
     release = threading.Event()
     original = StaticIndex.upcoming_departures
 
-    def parked(self: StaticIndex, *args: object, **kwargs: object) -> object:
+    def parked(*args: object, **kwargs: object) -> object:
         entered.set()
         assert release.wait(timeout=5)
-        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+        return original(handle._index, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(StaticIndex, "upcoming_departures", parked)
+    monkeypatch.setattr(handle._index, "upcoming_departures", parked)
     query = asyncio.create_task(
         handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
     )
     await asyncio.to_thread(entered.wait, 5)
     _mock_newer_dataset(mock_api)
     refresh = asyncio.create_task(handle.refresh_static())
-    await asyncio.sleep(0.2)
+    await _wait_until_swap_is_waiting(handle)
     assert not refresh.done()
     assert handle._index.dataset_id == old_dataset
     release.set()
@@ -350,13 +360,16 @@ async def test_index_swap_blocks_new_query_until_old_index_closed(
     closing = threading.Event()
     release = threading.Event()
     original_close = StaticIndex.close
+    # Bound to the index being closed: _swap_index has already published the
+    # new one by the time the old one's close runs.
+    old_index = handle._index
 
-    def parked_close(self: StaticIndex) -> None:
+    def parked_close() -> None:
         closing.set()
         assert release.wait(timeout=5)
-        original_close(self)
+        original_close(old_index)
 
-    monkeypatch.setattr(StaticIndex, "close", parked_close)
+    monkeypatch.setattr(handle._index, "close", parked_close)
     _mock_newer_dataset(mock_api)
     refresh = asyncio.create_task(handle.refresh_static())
     await asyncio.to_thread(closing.wait, 5)
@@ -402,19 +415,19 @@ async def test_cancelled_swap_wait_releases_the_guard(
     release = threading.Event()
     original = StaticIndex.upcoming_departures
 
-    def parked(self: StaticIndex, *args: object, **kwargs: object) -> object:
+    def parked(*args: object, **kwargs: object) -> object:
         entered.set()
         assert release.wait(timeout=5)
-        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+        return original(handle._index, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(StaticIndex, "upcoming_departures", parked)
+    monkeypatch.setattr(handle._index, "upcoming_departures", parked)
     query = asyncio.create_task(
         handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
     )
     await asyncio.to_thread(entered.wait, 5)
     _mock_newer_dataset(mock_api)
     refresh = asyncio.create_task(handle.refresh_static())
-    await asyncio.sleep(0.2)
+    await _wait_until_swap_is_waiting(handle)
     assert not refresh.done()
     refresh.cancel()
     with pytest.raises(asyncio.CancelledError):

@@ -293,45 +293,41 @@ class _IndexGuard:
     :meth:`TransitFeedHandle.refresh_static` enters as the writer: it
     parks new readers, waits for in-flight ones to drain, swaps and closes
     the old index, then releases. Only the swap itself blocks; the
-    download and build that precede it run outside the guard.
+    download and build that precede it run outside the guard. Writers
+    never overlap because the only one runs under the refresh lock.
+
+    Built on events rather than a condition so that no teardown path
+    awaits: a cancelled reader or writer always restores the gate.
     """
 
     def __init__(self) -> None:
-        self._cond = asyncio.Condition()
         self._readers = 0
-        self._writing = False
+        self._open = asyncio.Event()
+        self._open.set()
+        self._drained = asyncio.Event()
+        self._drained.set()
 
     @asynccontextmanager
     async def reader(self) -> AsyncIterator[None]:
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._writing)
-            self._readers += 1
+        while not self._open.is_set():
+            await self._open.wait()
+        self._readers += 1
+        self._drained.clear()
         try:
             yield
         finally:
-            async with self._cond:
-                self._readers -= 1
-                self._cond.notify_all()
+            self._readers -= 1
+            if not self._readers:
+                self._drained.set()
 
     @asynccontextmanager
     async def writer(self) -> AsyncIterator[None]:
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._writing)
-            self._writing = True
-            try:
-                await self._cond.wait_for(lambda: self._readers == 0)
-            except BaseException:
-                # Cancelled while draining: the flag is set but the body never
-                # ran, so the finally below will not clear it.
-                self._writing = False
-                self._cond.notify_all()
-                raise
+        self._open.clear()
         try:
+            await self._drained.wait()
             yield
         finally:
-            async with self._cond:
-                self._writing = False
-                self._cond.notify_all()
+            self._open.set()
 
 
 class TransitFeedHandle:
