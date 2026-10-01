@@ -263,6 +263,12 @@ class ArrivalsQuery:
     headsigns: Sequence[str] | None = None
     limit: int = 10
 
+    def __post_init__(self) -> None:
+        """Reject a bare str, which is a Sequence[str] of single characters."""
+        for name in ("stop_ids", "route_ids", "headsigns"):
+            if isinstance(getattr(self, name), str):
+                raise TypeError(f"{name} must be a sequence of ids, not a str")
+
 
 @dataclass(frozen=True)
 class StopArrival:

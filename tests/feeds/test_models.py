@@ -237,3 +237,10 @@ def test_arrivals_query_accepts_a_tuple_of_stop_ids() -> None:
     # StationGroup.stop_ids is a tuple, so the canonical flow passes one in.
     query = ArrivalsQuery(("S1", "S2"))
     assert tuple(query.stop_ids) == ("S1", "S2")
+
+
+@pytest.mark.parametrize("field", ["stop_ids", "route_ids", "headsigns"])
+def test_arrivals_query_rejects_a_bare_string(field: str) -> None:
+    kwargs: dict[str, object] = {"stop_ids": ["S1"], field: "S1"}
+    with pytest.raises(TypeError, match=field):
+        ArrivalsQuery(**kwargs)  # type: ignore[arg-type]
