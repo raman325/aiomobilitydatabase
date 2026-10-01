@@ -293,8 +293,10 @@ class _IndexGuard:
     :meth:`TransitFeedHandle.refresh_static` enters as the writer: it
     parks new readers, waits for in-flight ones to drain, swaps and closes
     the old index, then releases. Only the swap itself blocks; the
-    download and build that precede it run outside the guard. Writers
-    never overlap because the only one runs under the refresh lock.
+    download and build that precede it run outside the guard. Readers cover
+    index reads only, never the realtime HTTP fetch, so a swap waits on
+    SQLite work, not on a producer's network latency. Writers never
+    overlap because the only one runs under the refresh lock.
 
     Built on events rather than a condition so that no teardown path
     awaits: a cancelled reader or writer always restores the gate.
@@ -836,6 +838,9 @@ class TransitFeedHandle:
         )
         if not all_stop_ids:
             return [[] for _ in queries]
+        updates = await self._aggregated_trip_updates()
+        canceled = updates.canceled_trips
+        added_rows = updates.added
         async with self._guard.reader():
             scheduled = await asyncio.to_thread(
                 self._index.upcoming_departures,
@@ -848,9 +853,6 @@ class TransitFeedHandle:
             )
             stop_names = await asyncio.to_thread(self._index.stop_names)
             route_names = await asyncio.to_thread(self._index.route_display_names)
-            updates = await self._aggregated_trip_updates()
-            canceled = updates.canceled_trips
-            added_rows = updates.added
             # Per-row RT matching: each scheduled row's (identity, service day)
             # resolves to at most one TripUpdates key via _rt_key_for_row —
             # dated keys hit exactly their service day's instance, date-less
@@ -1039,6 +1041,7 @@ class TransitFeedHandle:
         ``now_utc`` exists for deterministic testing; omit it in production.
         """
         now = now_utc or datetime.now(UTC)
+        updates = await self._aggregated_trip_updates()
         async with self._guard.reader():
             scheduled = await asyncio.to_thread(
                 self._index.upcoming_trips,
@@ -1050,7 +1053,6 @@ class TransitFeedHandle:
                 grace=grace,
             )
             route_names = await asyncio.to_thread(self._index.route_display_names)
-            updates = await self._aggregated_trip_updates()
             # Same per-instance RT matching as get_arrivals (_rt_key_for_row):
             # dated keys hit their service day's row, date-less keys only the
             # earliest in-window instance of the identity.
@@ -1164,16 +1166,16 @@ class TransitFeedHandle:
         original trip rows, with no per-repetition matching for
         frequency-based trips.
         """
+        messages = await self._fetch_entity_messages(EntityType.VEHICLE_POSITIONS)
+        trip_ids = sorted(
+            {
+                entity.vehicle.trip.trip_id
+                for message in messages
+                for entity in message.entity
+                if entity.HasField("vehicle") and entity.vehicle.trip.trip_id
+            }
+        )
         async with self._guard.reader():
-            messages = await self._fetch_entity_messages(EntityType.VEHICLE_POSITIONS)
-            trip_ids = sorted(
-                {
-                    entity.vehicle.trip.trip_id
-                    for message in messages
-                    for entity in message.entity
-                    if entity.HasField("vehicle") and entity.vehicle.trip.trip_id
-                }
-            )
             trip_routes = await asyncio.to_thread(
                 self._index.routes_for_trips, trip_ids
             )
@@ -1233,8 +1235,8 @@ class TransitFeedHandle:
         if dataset is None or not dataset.id or dataset.id == self._index.dataset_id:
             return False
         new_index = await self._ensure_index(self._client, fresh)
-        self._static_feed = fresh
         await self._swap_index(new_index)
+        self._static_feed = fresh
         return True
 
     async def _refresh_static_direct(self, direct: _DirectUrls) -> bool:
@@ -1265,13 +1267,25 @@ class TransitFeedHandle:
         return True
 
     async def _swap_index(self, new_index: StaticIndex) -> None:
-        """Publish the new index, then close the old one, with no reader inside."""
+        """Publish the new index atomically, then close the old one.
+
+        The new index's own reads need no exclusion, and the publish is a
+        single assignment so no caller can observe mixed-dataset
+        attributes; the old index closes with no reader inside.
+        """
+        stops = await asyncio.to_thread(new_index.stops)
+        routes = await asyncio.to_thread(new_index.routes)
+        agencies = await asyncio.to_thread(new_index.agencies)
+        feed_info = await asyncio.to_thread(new_index.feed_info)
         async with self._guard.writer():
-            old_index, self._index = self._index, new_index
-            self.stops = await asyncio.to_thread(new_index.stops)
-            self.routes = await asyncio.to_thread(new_index.routes)
-            self.agencies = await asyncio.to_thread(new_index.agencies)
-            self.feed_info = await asyncio.to_thread(new_index.feed_info)
+            old_index = self._index
+            self._index, self.stops, self.routes, self.agencies, self.feed_info = (
+                new_index,
+                stops,
+                routes,
+                agencies,
+                feed_info,
+            )
             await asyncio.to_thread(old_index.close)
 
     def stops_in(self, zone: Circle) -> list[Stop]:
@@ -1308,5 +1322,8 @@ class TransitFeedHandle:
             )
 
     def close(self) -> None:
-        """Release the SQLite connection."""
+        """Release the SQLite connection.
+
+        Not safe with queries in flight; stop polling before closing.
+        """
         self._index.close()
