@@ -244,6 +244,26 @@ class Route:
 
 
 @dataclass(frozen=True)
+class ArrivalsQuery:
+    """One stop-board request inside a :meth:`TransitFeedHandle.get_arrivals` batch.
+
+    ``stop_ids`` is the set of GTFS stops the board covers (a station's
+    platforms, a direction pair). ``route_ids`` and ``headsigns`` narrow
+    the rows; ``None`` or an empty list means no narrowing. ``headsigns``
+    matches the trip-level headsign (the same values
+    :meth:`TransitFeedHandle.headsigns_serving` offers), so RT-added trips,
+    which announce no headsign, never pass a headsign filter. ``limit``
+    caps the merged, filtered result for this query as a whole,
+    nearest effective departure first.
+    """
+
+    stop_ids: list[str]
+    route_ids: list[str] | None = None
+    headsigns: list[str] | None = None
+    limit: int = 10
+
+
+@dataclass(frozen=True)
 class StopArrival:
     """An upcoming (or realtime-added) arrival/departure at a stop.
 
