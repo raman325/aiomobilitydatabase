@@ -170,3 +170,15 @@ def test_flags_reset_per_service_day(tmp_path: Path) -> None:
     ]
     assert both[0].departure < both[2].departure
     index.close()
+
+
+def test_upcoming_trips_grace_reaches_before_now(tmp_path: Path) -> None:
+    index = _index(tmp_path)
+    now_late = datetime(2026, 7, 30, 15, 1, 30, tzinfo=UTC)
+    without = index.upcoming_trips("S1", "S3", now_late, timedelta(hours=1))
+    assert [trip.trip_id for trip in without] == []
+    with_grace = index.upcoming_trips(
+        "S1", "S3", now_late, timedelta(hours=1), grace=timedelta(hours=1)
+    )
+    assert [trip.trip_id for trip in with_grace] == ["T1"]
+    index.close()

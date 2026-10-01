@@ -295,3 +295,37 @@ def test_trip_stop_calls_ordering_and_empty(tmp_path: Path) -> None:
     }
     assert index.trip_stop_calls([]) == {}
     index.close()
+
+
+NOW_LATE = datetime(2026, 7, 30, 15, 1, 30, tzinfo=UTC)  # one minute after T1 at S1
+
+
+def test_grace_reaches_before_now(tmp_path: Path) -> None:
+    """A grace window keeps rows whose scheduled departure just passed, so a
+    realtime delay can still attach to them downstream."""
+    index = _index(tmp_path)
+    without = index.upcoming_departures(["S1"], None, NOW_LATE, timedelta(hours=1))
+    assert [dep.trip_id for dep in without] == ["T2"]
+    with_grace = index.upcoming_departures(
+        ["S1"], None, NOW_LATE, timedelta(hours=1), grace=timedelta(hours=1)
+    )
+    assert [dep.trip_id for dep in with_grace] == ["T1", "T2"]
+    index.close()
+
+
+def test_grace_does_not_extend_upper_bound(tmp_path: Path) -> None:
+    index = _index(tmp_path)
+    # Lookahead ends at 15:31:30 UTC; T2 at 15:30:30 is in, nothing later.
+    departures = index.upcoming_departures(
+        ["S1"], None, NOW_LATE, timedelta(minutes=30), grace=timedelta(hours=1)
+    )
+    assert [dep.trip_id for dep in departures] == ["T1", "T2"]
+    index.close()
+
+
+def test_no_per_stop_limit_returns_every_row(tmp_path: Path) -> None:
+    index = _index(tmp_path)
+    now = datetime(2026, 7, 30, 14, 45, tzinfo=UTC)
+    departures = index.upcoming_departures(["S1"], None, now, timedelta(hours=24))
+    assert [dep.trip_id for dep in departures] == ["T1", "T2", "T3"]
+    index.close()

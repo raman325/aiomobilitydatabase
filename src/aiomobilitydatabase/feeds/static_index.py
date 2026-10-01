@@ -1085,10 +1085,11 @@ class StaticIndex:
         return noon - timedelta(hours=12)
 
     def _service_day_windows(
-        self, now_utc: datetime, lookahead: timedelta
+        self, now_utc: datetime, lookahead: timedelta, grace: timedelta
     ) -> Iterator[tuple[date, datetime, set[str], float, float]]:
         """Yield ``(service_date, day_start_utc, active_ids, window_lo, window_hi)``.
 
+        The window runs from ``now_utc - grace`` to ``now_utc + lookahead``.
         Shared by ``upcoming_departures`` and ``upcoming_trips`` so the
         DST-safe day-window arithmetic exists exactly once. Scans every
         service day that could contribute: one day BEFORE the window
@@ -1098,8 +1099,10 @@ class StaticIndex:
         departures (hypothesis-found bug, 2026-07-31: the old hardcoded
         local_today +/- 1 day tuple ignored `lookahead` entirely).
         """
-        local_today = now_utc.astimezone(self._tz).date()
-        end_local = (now_utc + lookahead).astimezone(self._tz).date()
+        window_start = now_utc - grace
+        window_end = now_utc + lookahead
+        local_today = window_start.astimezone(self._tz).date()
+        end_local = window_end.astimezone(self._tz).date()
         scan_start = local_today - timedelta(days=1)
         scan_end = end_local + timedelta(days=1)
         num_scan_days = (scan_end - scan_start).days + 1
@@ -1115,8 +1118,8 @@ class StaticIndex:
             # addition Python resolves via wall-clock semantics and would
             # drift by an hour across a DST transition.
             day_start_utc = day_start.astimezone(UTC)
-            window_lo = (now_utc - day_start).total_seconds()
-            window_hi = window_lo + lookahead.total_seconds()
+            window_lo = (window_start - day_start).total_seconds()
+            window_hi = (window_end - day_start).total_seconds()
             if window_hi < 0:
                 continue
             yield service_date, day_start_utc, active, window_lo, window_hi
@@ -1127,15 +1130,21 @@ class StaticIndex:
         route_ids: list[str] | None,
         now_utc: datetime,
         lookahead: timedelta,
-        per_stop_limit: int,
+        per_stop_limit: int | None = None,
+        *,
+        grace: timedelta = timedelta(0),
     ) -> list[ScheduledDeparture]:
-        """Scheduled departures at the given stops within the lookahead window.
+        """Scheduled departures at the given stops within the query window.
 
-        Considers every local service day from one day before ``now_utc``
-        through one day after the window's local end date, so past-midnight
-        trips (>24:00:00 times) surface on the correct clock day and long
-        lookaheads are never truncated. Results are sorted by departure and
-        truncated to ``per_stop_limit`` per stop.
+        The window runs from ``now_utc - grace`` through ``now_utc +
+        lookahead``; ``grace`` lets callers that overlay realtime
+        predictions keep rows whose scheduled time has passed but whose
+        vehicle may still be coming. Considers every local service day
+        from one day before the window start through one day after its
+        local end date, so past-midnight trips (>24:00:00 times) surface
+        on the correct clock day and long lookaheads are never truncated.
+        Results are sorted by departure and, when ``per_stop_limit`` is
+        given, truncated to that many rows per stop.
 
         Frequency-based trips (frequencies.txt) surface as one row per
         materialized repetition, under synthetic ``{trip_id}#{start_secs}``
@@ -1149,7 +1158,7 @@ class StaticIndex:
             active,
             window_lo,
             window_hi,
-        ) in self._service_day_windows(now_utc, lookahead):
+        ) in self._service_day_windows(now_utc, lookahead, grace):
             stop_marks = ",".join("?" * len(stop_ids))
             service_marks = ",".join("?" * len(active))
             sql = (
@@ -1224,6 +1233,8 @@ class StaticIndex:
         # stable pre-fix across 500+ generated feeds, 2026-07-31 — but
         # stability was never guaranteed by the SQL, so fix it anyway).
         results.sort(key=lambda dep: (dep.departure, dep.trip_id, dep.stop_id))
+        if per_stop_limit is None:
+            return results
         limited: list[ScheduledDeparture] = []
         per_stop_counts: dict[str, int] = {}
         for dep in results:
@@ -1286,7 +1297,9 @@ class StaticIndex:
         destination_stop_id: str,
         now_utc: datetime,
         lookahead: timedelta,
-        limit: int,
+        limit: int | None = None,
+        *,
+        grace: timedelta = timedelta(0),
     ) -> list[ScheduledTrip]:
         """Scheduled trips departing the origin that later serve the destination.
 
@@ -1297,8 +1310,9 @@ class StaticIndex:
         destination call precedes its origin call. A loop trip serving the
         destination more than once after the origin collapses to its
         earliest destination arrival (MIN) — ride until the vehicle first
-        reaches the destination. Results are sorted by origin departure and
-        truncated to ``limit``.
+        reaches the destination. The window runs from ``now_utc - grace``
+        to ``now_utc + lookahead``. Results are sorted by origin departure
+        and, when ``limit`` is given, truncated to it.
 
         ``is_first``/``is_last`` are computed per SERVICE DAY, over the
         whole day rather than the query window (legacy ``gtfs`` sensor
@@ -1316,7 +1330,7 @@ class StaticIndex:
             active,
             window_lo,
             window_hi,
-        ) in self._service_day_windows(now_utc, lookahead):
+        ) in self._service_day_windows(now_utc, lookahead, grace):
             service_marks = ",".join("?" * len(active))
             candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
             # The IS NOT NULL clauses (in the shared candidate predicate)
