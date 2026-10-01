@@ -4,6 +4,8 @@ import io
 import zipfile
 from datetime import UTC, datetime, timedelta
 
+from google.transit import gtfs_realtime_pb2
+
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.models import ArrivalsQuery
 
@@ -41,6 +43,24 @@ def _mock_catalog(
         body=zip_bytes if zip_bytes is not None else build_gtfs_zip_bytes(),
         content_type="application/zip",
     )
+
+
+def _added_arrival_only(arrival: datetime) -> bytes:
+    """TripUpdates with one RT-added trip whose only S1 call has an arrival
+    and no departure, the shape of a terminal stop."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = int(NOW.timestamp())
+    entity = msg.entity.add()
+    entity.id = "tu-terminal"
+    update = entity.trip_update
+    update.trip.trip_id = "ADDED-TERMINAL"
+    update.trip.route_id = "R1"
+    update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.ADDED
+    stu = update.stop_time_update.add()
+    stu.stop_id = "S1"
+    stu.arrival.time = int(arrival.timestamp())
+    return msg.SerializeToString()
 
 
 def _busy_stop_zip_bytes() -> bytes:
@@ -423,3 +443,39 @@ async def test_empty_batch_returns_empty_lists(
     handle = await feeds_client.get_transit_feed("mdb-100")
     assert await handle.get_arrivals([]) == []
     assert await handle.get_arrivals([ArrivalsQuery([])]) == [[]]
+
+
+async def test_arrival_only_added_row_orders_by_its_arrival(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    # Arrives between T1 (15:00:30) and T2 (15:30:30): must sort between them,
+    # not at the front as a row with "no time" would.
+    mock_api.get(
+        "/rt/all",
+        body=_added_arrival_only(datetime(2026, 7, 30, 15, 10, tzinfo=UTC)),
+        content_type=PB,
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert [a.trip_id for a in arrivals] == ["T1", "ADDED-TERMINAL", "T2"]
+    assert arrivals[1].predicted_departure is None
+    assert arrivals[1].predicted_arrival == datetime(2026, 7, 30, 15, 10, tzinfo=UTC)
+
+
+async def test_arrival_only_added_row_is_dropped_once_past(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all",
+        body=_added_arrival_only(NOW - timedelta(minutes=5)),
+        content_type=PB,
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=1), now_utc=NOW
+    )
+    assert [a.trip_id for a in arrivals] == ["T1", "T2"]

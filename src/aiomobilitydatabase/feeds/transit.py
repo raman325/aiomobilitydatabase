@@ -214,10 +214,16 @@ def _rt_key_for_row(
 def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
     """Effective departure instant for ordering and the past-row drop.
 
-    Predicted departure if any, else scheduled; ``fallback`` for RT-added
-    rows that announced an arrival but no departure.
+    Predicted departure if any, else scheduled, else the predicted arrival
+    (an RT-added terminal call announces only an arrival), else
+    ``fallback`` for a row with no time at all.
     """
-    return arrival.predicted_departure or arrival.scheduled_departure or fallback
+    return (
+        arrival.predicted_departure
+        or arrival.scheduled_departure
+        or arrival.predicted_arrival
+        or fallback
+    )
 
 
 def _select_arrivals(
