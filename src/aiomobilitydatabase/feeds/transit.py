@@ -916,6 +916,7 @@ class TransitFeedHandle:
         destination_stop_id: str,
         *,
         lookahead: timedelta = timedelta(hours=2),
+        grace: timedelta = timedelta(hours=1),
         limit: int = 10,
         now_utc: datetime | None = None,
     ) -> list[UpcomingTrip]:
@@ -931,16 +932,18 @@ class TransitFeedHandle:
         departure is the first/last OF ITS SERVICE DAY for this stop pair
         (see :class:`~.models.UpcomingTrip`).
 
-        ``limit`` caps the SCHEDULED candidates, nearest origin departure
-        first; RT cancellations — and SKIPPED stops: a skipped origin or
-        skipped destination kills the row (the rider cannot board or
-        alight there), while a skipped intermediate stop changes nothing —
-        then remove rows without backfilling, so fewer than ``limit`` rows
-        may come back even when later scheduled trips exist (same behavior
-        as :meth:`get_arrivals`). RT-added trips (schedule_relationship
-        ADDED) are never included: an added trip's full stop sequence is
-        unknown, so whether it serves the destination after the origin
-        cannot be determined.
+        ``grace`` reaches that far before ``now`` for scheduled candidates
+        and rows whose effective origin departure is before ``now`` are
+        dropped after the realtime merge, exactly as in
+        :meth:`get_arrivals`. ``limit`` then caps the merged result,
+        nearest effective origin departure first. RT cancellations — and
+        SKIPPED stops: a skipped origin or skipped destination kills the
+        row (the rider cannot board or alight there), while a skipped
+        intermediate stop changes nothing — are removed before the limit
+        applies. RT-added trips (schedule_relationship ADDED) are never
+        included: an added trip's full stop sequence is unknown, so
+        whether it serves the destination after the origin cannot be
+        determined.
 
         Delay propagation follows :meth:`get_arrivals` exactly: each end's
         prediction comes from its own StopTimeUpdate, a propagated
@@ -968,7 +971,8 @@ class TransitFeedHandle:
             destination_stop_id,
             now,
             lookahead,
-            limit,
+            None,
+            grace=grace,
         )
         route_names = await asyncio.to_thread(self._index.route_display_names)
         updates = await self._aggregated_trip_updates()
@@ -1062,6 +1066,11 @@ class TransitFeedHandle:
                     block_id=trip.block_id,
                 )
             )
+        trips = [
+            row
+            for row in trips
+            if (row.predicted_departure or row.scheduled_departure) >= now
+        ]
         # Total sort key, matching get_arrivals: origin predictions can
         # reorder rows relative to the scheduled ordering, and trip_id /
         # scheduled_arrival break effective-departure ties deterministically.
@@ -1072,7 +1081,7 @@ class TransitFeedHandle:
                 row.scheduled_arrival,
             )
         )
-        return trips
+        return trips[:limit]
 
     async def get_vehicles(self) -> list[VehiclePosition]:
         """Live vehicle positions across the feed's VP-capable RT sources.

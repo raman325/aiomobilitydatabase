@@ -298,3 +298,42 @@ async def test_trip_level_delay_fallback_covers_every_stop(
     assert t1_rows["S2"].predicted_departure == datetime(
         2026, 7, 30, 15, 13, 30, tzinfo=UTC
     )
+
+
+NOW_LATE = datetime(2026, 7, 30, 15, 1, 30, tzinfo=UTC)  # one minute after T1 at S1
+
+
+async def test_delayed_trip_survives_its_scheduled_origin_time(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_DELAYED, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    trips = await handle.upcoming_trips(
+        "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW_LATE
+    )
+    assert [trip.trip_id for trip in trips] == ["T1"]
+    assert trips[0].predicted_departure == datetime(2026, 7, 30, 15, 6, 0, tzinfo=UTC)
+
+
+async def test_zero_grace_drops_delayed_trip_at_origin_time(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=TRIP_UPDATES_T1_DELAYED, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    trips = await handle.upcoming_trips(
+        "S1", "S3", lookahead=timedelta(hours=1), grace=timedelta(0), now_utc=NOW_LATE
+    )
+    assert trips == []
+
+
+async def test_past_schedule_only_trip_is_dropped(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=False)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    trips = await handle.upcoming_trips(
+        "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW_LATE
+    )
+    assert trips == []
