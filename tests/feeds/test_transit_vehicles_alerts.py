@@ -386,3 +386,45 @@ async def test_concurrent_refresh_calls_serialize(
     results = await asyncio.gather(handle.refresh_static(), handle.refresh_static())
     assert results == [True, False]
     assert len([r for r in mock_api.requests if r.path == ZIP_PATH]) == 2
+
+
+async def test_cancelled_swap_wait_releases_the_guard(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a refresh while it waits for a query to drain must not
+    leave the index locked against every later query."""
+    _mock_catalog(mock_api)
+    mock_api.get("/rt/all", body=_empty_trip_updates(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    entered = threading.Event()
+    release = threading.Event()
+    original = StaticIndex.upcoming_departures
+
+    def parked(self: StaticIndex, *args: object, **kwargs: object) -> object:
+        entered.set()
+        assert release.wait(timeout=5)
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(StaticIndex, "upcoming_departures", parked)
+    query = asyncio.create_task(
+        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+    )
+    await asyncio.to_thread(entered.wait, 5)
+    _mock_newer_dataset(mock_api)
+    refresh = asyncio.create_task(handle.refresh_static())
+    await asyncio.sleep(0.2)
+    assert not refresh.done()
+    refresh.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh
+    release.set()
+    [arrivals] = await query
+    assert [a.trip_id for a in arrivals] == ["T1", "T2"]
+    monkeypatch.undo()
+    mock_api.get("/rt/all", body=_empty_trip_updates(), content_type=PB)
+    [later] = await asyncio.wait_for(
+        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW), timeout=2
+    )
+    assert [a.trip_id for a in later] == ["T1", "T2"]

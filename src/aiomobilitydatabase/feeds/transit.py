@@ -318,7 +318,14 @@ class _IndexGuard:
         async with self._cond:
             await self._cond.wait_for(lambda: not self._writing)
             self._writing = True
-            await self._cond.wait_for(lambda: self._readers == 0)
+            try:
+                await self._cond.wait_for(lambda: self._readers == 0)
+            except BaseException:
+                # Cancelled while draining: the flag is set but the body never
+                # ran, so the finally below will not clear it.
+                self._writing = False
+                self._cond.notify_all()
+                raise
         try:
             yield
         finally:
