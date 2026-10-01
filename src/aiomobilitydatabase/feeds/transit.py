@@ -6,7 +6,15 @@ import asyncio
 import hashlib
 import shutil
 import tempfile
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from http import HTTPStatus
@@ -267,6 +275,47 @@ def group_stations(stops: list[Stop]) -> list[StationGroup]:
     )
 
 
+class _IndexGuard:
+    """Readers-writer gate around the live :class:`StaticIndex`.
+
+    Queries enter as readers and may overlap freely. The index swap in
+    :meth:`TransitFeedHandle.refresh_static` enters as the writer: it
+    parks new readers, waits for in-flight ones to drain, swaps and closes
+    the old index, then releases. Only the swap itself blocks; the
+    download and build that precede it run outside the guard.
+    """
+
+    def __init__(self) -> None:
+        self._cond = asyncio.Condition()
+        self._readers = 0
+        self._writing = False
+
+    @asynccontextmanager
+    async def reader(self) -> AsyncIterator[None]:
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._writing)
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._readers -= 1
+                self._cond.notify_all()
+
+    @asynccontextmanager
+    async def writer(self) -> AsyncIterator[None]:
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._writing)
+            self._writing = True
+            await self._cond.wait_for(lambda: self._readers == 0)
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._writing = False
+                self._cond.notify_all()
+
+
 class TransitFeedHandle:
     """Snapshot access to one transit feed (GTFS + its GTFS-RT siblings).
 
@@ -302,6 +351,8 @@ class TransitFeedHandle:
         self.rt_feeds = rt_feeds
         self._index = index
         self._api_key = api_key
+        self._guard = _IndexGuard()
+        self._refresh_lock = asyncio.Lock()
         self.stops: list[Stop] = index.stops()
         self.routes: list[Route] = index.routes()
         self.agencies: list[Agency] = index.agencies()
@@ -770,145 +821,153 @@ class TransitFeedHandle:
         )
         if not all_stop_ids:
             return [[] for _ in queries]
-        scheduled = await asyncio.to_thread(
-            self._index.upcoming_departures,
-            all_stop_ids,
-            None,
-            now,
-            lookahead,
-            None,
-            grace=grace,
-        )
-        stop_names = await asyncio.to_thread(self._index.stop_names)
-        route_names = await asyncio.to_thread(self._index.route_display_names)
-        updates = await self._aggregated_trip_updates()
-        canceled = updates.canceled_trips
-        added_rows = updates.added
-        # Per-row RT matching: each scheduled row's (identity, service day)
-        # resolves to at most one TripUpdates key via _rt_key_for_row —
-        # dated keys hit exactly their service day's instance, date-less
-        # keys only the earliest in-window one.
-        current_dates = _current_service_dates(
-            (dep.source_trip_id, dep.start_secs, dep.service_date) for dep in scheduled
-        )
-        resolved = await self._resolve_predictions(
-            updates,
-            {
-                (dep.trip_id, dep.service_date): key
+        async with self._guard.reader():
+            scheduled = await asyncio.to_thread(
+                self._index.upcoming_departures,
+                all_stop_ids,
+                None,
+                now,
+                lookahead,
+                None,
+                grace=grace,
+            )
+            stop_names = await asyncio.to_thread(self._index.stop_names)
+            route_names = await asyncio.to_thread(self._index.route_display_names)
+            updates = await self._aggregated_trip_updates()
+            canceled = updates.canceled_trips
+            added_rows = updates.added
+            # Per-row RT matching: each scheduled row's (identity, service day)
+            # resolves to at most one TripUpdates key via _rt_key_for_row —
+            # dated keys hit exactly their service day's instance, date-less
+            # keys only the earliest in-window one.
+            current_dates = _current_service_dates(
+                (dep.source_trip_id, dep.start_secs, dep.service_date)
                 for dep in scheduled
+            )
+            resolved = await self._resolve_predictions(
+                updates,
+                {
+                    (dep.trip_id, dep.service_date): key
+                    for dep in scheduled
+                    if (
+                        key := _rt_key_for_row(
+                            (dep.source_trip_id, dep.start_secs),
+                            dep.service_date,
+                            updates.trips,
+                            current_dates,
+                        )
+                    )
+                    is not None
+                },
+            )
+
+            arrivals: list[StopArrival] = []
+            for dep in scheduled:
                 if (
-                    key := _rt_key_for_row(
+                    _rt_key_for_row(
                         (dep.source_trip_id, dep.start_secs),
                         dep.service_date,
-                        updates.trips,
+                        canceled,
                         current_dates,
                     )
+                    is not None
+                ):
+                    continue
+                trip_rt = resolved.get((dep.trip_id, dep.service_date))
+                prediction = None
+                if trip_rt is not None:
+                    if dep.stop_sequence in trip_rt.skipped:
+                        continue  # SKIPPED: the vehicle will not serve this stop
+                    prediction = trip_rt.predictions.get(dep.stop_sequence)
+                arrivals.append(
+                    StopArrival(
+                        stop_id=dep.stop_id,
+                        stop_name=stop_names.get(dep.stop_id),
+                        route_id=dep.route_id,
+                        route_name=route_names.get(dep.route_id),
+                        trip_id=dep.trip_id,
+                        headsign=dep.headsign,
+                        scheduled_arrival=dep.arrival,
+                        scheduled_departure=dep.departure,
+                        predicted_arrival=(
+                            _predicted_time(
+                                prediction.arrival,
+                                dep.arrival,
+                                prediction.delay_seconds,
+                            )
+                            if prediction
+                            else None
+                        ),
+                        predicted_departure=(
+                            _predicted_time(
+                                prediction.departure,
+                                dep.departure,
+                                prediction.delay_seconds,
+                            )
+                            if prediction
+                            else None
+                        ),
+                        delay_seconds=prediction.delay_seconds if prediction else None,
+                        realtime=prediction is not None,
+                        vehicle_id=prediction.vehicle_id if prediction else None,
+                        wheelchair_accessible=dep.wheelchair_accessible,
+                        bikes_allowed=dep.bikes_allowed,
+                        pickup_type=dep.pickup_type,
+                        drop_off_type=dep.drop_off_type,
+                        timepoint_exact=dep.timepoint_exact,
+                        stop_headsign=dep.stop_headsign,
+                        trip_short_name=dep.trip_short_name,
+                        block_id=dep.block_id,
+                    )
                 )
-                is not None
-            },
-        )
-
-        arrivals: list[StopArrival] = []
-        for dep in scheduled:
-            if (
-                _rt_key_for_row(
-                    (dep.source_trip_id, dep.start_secs),
-                    dep.service_date,
-                    canceled,
-                    current_dates,
+            wanted_stops = set(all_stop_ids)
+            for row in added_rows:
+                if row.stop_id not in wanted_stops:
+                    continue
+                arrivals.append(
+                    StopArrival(
+                        stop_id=row.stop_id,
+                        stop_name=stop_names.get(row.stop_id),
+                        route_id=row.route_id,
+                        route_name=route_names.get(row.route_id)
+                        if row.route_id
+                        else None,
+                        trip_id=row.trip_id,
+                        headsign=None,
+                        scheduled_arrival=None,
+                        scheduled_departure=None,
+                        predicted_arrival=row.arrival,
+                        predicted_departure=row.departure,
+                        delay_seconds=None,
+                        realtime=True,
+                        vehicle_id=row.vehicle_id,
+                        # RT-added trips have no static schedule row, so every
+                        # descriptive field is unknown — including timepoint,
+                        # whose absent-means-exact default only applies to rows
+                        # that exist in stop_times.
+                        wheelchair_accessible=None,
+                        bikes_allowed=None,
+                        pickup_type=None,
+                        drop_off_type=None,
+                        timepoint_exact=None,
+                        stop_headsign=None,
+                        trip_short_name=None,
+                        block_id=None,
+                    )
                 )
-                is not None
-            ):
-                continue
-            trip_rt = resolved.get((dep.trip_id, dep.service_date))
-            prediction = None
-            if trip_rt is not None:
-                if dep.stop_sequence in trip_rt.skipped:
-                    continue  # SKIPPED: the vehicle will not serve this stop
-                prediction = trip_rt.predictions.get(dep.stop_sequence)
-            arrivals.append(
-                StopArrival(
-                    stop_id=dep.stop_id,
-                    stop_name=stop_names.get(dep.stop_id),
-                    route_id=dep.route_id,
-                    route_name=route_names.get(dep.route_id),
-                    trip_id=dep.trip_id,
-                    headsign=dep.headsign,
-                    scheduled_arrival=dep.arrival,
-                    scheduled_departure=dep.departure,
-                    predicted_arrival=(
-                        _predicted_time(
-                            prediction.arrival, dep.arrival, prediction.delay_seconds
-                        )
-                        if prediction
-                        else None
-                    ),
-                    predicted_departure=(
-                        _predicted_time(
-                            prediction.departure,
-                            dep.departure,
-                            prediction.delay_seconds,
-                        )
-                        if prediction
-                        else None
-                    ),
-                    delay_seconds=prediction.delay_seconds if prediction else None,
-                    realtime=prediction is not None,
-                    vehicle_id=prediction.vehicle_id if prediction else None,
-                    wheelchair_accessible=dep.wheelchair_accessible,
-                    bikes_allowed=dep.bikes_allowed,
-                    pickup_type=dep.pickup_type,
-                    drop_off_type=dep.drop_off_type,
-                    timepoint_exact=dep.timepoint_exact,
-                    stop_headsign=dep.stop_headsign,
-                    trip_short_name=dep.trip_short_name,
-                    block_id=dep.block_id,
-                )
+            # The grace window admitted scheduled rows before `now` so their
+            # predictions could attach; now only rows still ahead survive.
+            arrivals = [
+                arrival
+                for arrival in arrivals
+                if _effective_departure(arrival, now) >= now
+            ]
+            # Total sort key, matching upcoming_departures: effective time alone
+            # ties frequently, so trip_id/stop_id break ties deterministically.
+            arrivals.sort(
+                key=lambda a: (_effective_departure(a, now), a.trip_id or "", a.stop_id)
             )
-        wanted_stops = set(all_stop_ids)
-        for row in added_rows:
-            if row.stop_id not in wanted_stops:
-                continue
-            arrivals.append(
-                StopArrival(
-                    stop_id=row.stop_id,
-                    stop_name=stop_names.get(row.stop_id),
-                    route_id=row.route_id,
-                    route_name=route_names.get(row.route_id) if row.route_id else None,
-                    trip_id=row.trip_id,
-                    headsign=None,
-                    scheduled_arrival=None,
-                    scheduled_departure=None,
-                    predicted_arrival=row.arrival,
-                    predicted_departure=row.departure,
-                    delay_seconds=None,
-                    realtime=True,
-                    vehicle_id=row.vehicle_id,
-                    # RT-added trips have no static schedule row, so every
-                    # descriptive field is unknown — including timepoint,
-                    # whose absent-means-exact default only applies to rows
-                    # that exist in stop_times.
-                    wheelchair_accessible=None,
-                    bikes_allowed=None,
-                    pickup_type=None,
-                    drop_off_type=None,
-                    timepoint_exact=None,
-                    stop_headsign=None,
-                    trip_short_name=None,
-                    block_id=None,
-                )
-            )
-        # The grace window admitted scheduled rows before `now` so their
-        # predictions could attach; now only rows still ahead survive.
-        arrivals = [
-            arrival for arrival in arrivals if _effective_departure(arrival, now) >= now
-        ]
-        # Total sort key, matching upcoming_departures: effective time alone
-        # ties frequently, so trip_id/stop_id break ties deterministically.
-        arrivals.sort(
-            key=lambda a: (_effective_departure(a, now), a.trip_id or "", a.stop_id)
-        )
-        return [_select_arrivals(arrivals, query) for query in queries]
+            return [_select_arrivals(arrivals, query) for query in queries]
 
     async def upcoming_trips(
         self,
@@ -965,123 +1024,126 @@ class TransitFeedHandle:
         ``now_utc`` exists for deterministic testing; omit it in production.
         """
         now = now_utc or datetime.now(UTC)
-        scheduled = await asyncio.to_thread(
-            self._index.upcoming_trips,
-            origin_stop_id,
-            destination_stop_id,
-            now,
-            lookahead,
-            None,
-            grace=grace,
-        )
-        route_names = await asyncio.to_thread(self._index.route_display_names)
-        updates = await self._aggregated_trip_updates()
-        # Same per-instance RT matching as get_arrivals (_rt_key_for_row):
-        # dated keys hit their service day's row, date-less keys only the
-        # earliest in-window instance of the identity.
-        current_dates = _current_service_dates(
-            (trip.source_trip_id, trip.start_secs, trip.service_date)
-            for trip in scheduled
-        )
-        resolved = await self._resolve_predictions(
-            updates,
-            {
-                (trip.trip_id, trip.service_date): key
+        async with self._guard.reader():
+            scheduled = await asyncio.to_thread(
+                self._index.upcoming_trips,
+                origin_stop_id,
+                destination_stop_id,
+                now,
+                lookahead,
+                None,
+                grace=grace,
+            )
+            route_names = await asyncio.to_thread(self._index.route_display_names)
+            updates = await self._aggregated_trip_updates()
+            # Same per-instance RT matching as get_arrivals (_rt_key_for_row):
+            # dated keys hit their service day's row, date-less keys only the
+            # earliest in-window instance of the identity.
+            current_dates = _current_service_dates(
+                (trip.source_trip_id, trip.start_secs, trip.service_date)
                 for trip in scheduled
+            )
+            resolved = await self._resolve_predictions(
+                updates,
+                {
+                    (trip.trip_id, trip.service_date): key
+                    for trip in scheduled
+                    if (
+                        key := _rt_key_for_row(
+                            (trip.source_trip_id, trip.start_secs),
+                            trip.service_date,
+                            updates.trips,
+                            current_dates,
+                        )
+                    )
+                    is not None
+                },
+            )
+            trips: list[UpcomingTrip] = []
+            for trip in scheduled:
                 if (
-                    key := _rt_key_for_row(
+                    _rt_key_for_row(
                         (trip.source_trip_id, trip.start_secs),
                         trip.service_date,
-                        updates.trips,
+                        updates.canceled_trips,
                         current_dates,
                     )
-                )
-                is not None
-            },
-        )
-        trips: list[UpcomingTrip] = []
-        for trip in scheduled:
-            if (
-                _rt_key_for_row(
-                    (trip.source_trip_id, trip.start_secs),
-                    trip.service_date,
-                    updates.canceled_trips,
-                    current_dates,
-                )
-                is not None
-            ):
-                continue
-            trip_rt = resolved.get((trip.trip_id, trip.service_date))
-            origin_pred = dest_pred = None
-            if trip_rt is not None:
-                if (
-                    trip.origin_stop_sequence in trip_rt.skipped
-                    or trip.destination_stop_sequence in trip_rt.skipped
+                    is not None
                 ):
-                    continue  # SKIPPED boarding or alighting kills the journey
-                origin_pred = trip_rt.predictions.get(trip.origin_stop_sequence)
-                dest_pred = trip_rt.predictions.get(trip.destination_stop_sequence)
-            trips.append(
-                UpcomingTrip(
-                    trip_id=trip.trip_id,
-                    route_id=trip.route_id,
-                    route_name=route_names.get(trip.route_id),
-                    headsign=trip.headsign,
-                    origin_stop_id=origin_stop_id,
-                    destination_stop_id=destination_stop_id,
-                    scheduled_departure=trip.departure,
-                    predicted_departure=(
-                        _predicted_time(
-                            origin_pred.departure,
-                            trip.departure,
-                            origin_pred.delay_seconds,
-                        )
-                        if origin_pred
-                        else None
-                    ),
-                    scheduled_arrival=trip.arrival,
-                    predicted_arrival=(
-                        _predicted_time(
-                            dest_pred.arrival, trip.arrival, dest_pred.delay_seconds
-                        )
-                        if dest_pred
-                        else None
-                    ),
-                    delay_seconds=(origin_pred.delay_seconds if origin_pred else None),
-                    realtime=origin_pred is not None or dest_pred is not None,
-                    wheelchair_accessible=trip.wheelchair_accessible,
-                    bikes_allowed=trip.bikes_allowed,
-                    direction_id=trip.direction_id,
-                    origin_pickup_type=trip.origin_pickup_type,
-                    origin_drop_off_type=trip.origin_drop_off_type,
-                    origin_timepoint_exact=trip.origin_timepoint_exact,
-                    origin_stop_headsign=trip.origin_stop_headsign,
-                    destination_pickup_type=trip.destination_pickup_type,
-                    destination_drop_off_type=trip.destination_drop_off_type,
-                    destination_timepoint_exact=trip.destination_timepoint_exact,
-                    destination_stop_headsign=trip.destination_stop_headsign,
-                    is_first=trip.is_first,
-                    is_last=trip.is_last,
-                    trip_short_name=trip.trip_short_name,
-                    block_id=trip.block_id,
+                    continue
+                trip_rt = resolved.get((trip.trip_id, trip.service_date))
+                origin_pred = dest_pred = None
+                if trip_rt is not None:
+                    if (
+                        trip.origin_stop_sequence in trip_rt.skipped
+                        or trip.destination_stop_sequence in trip_rt.skipped
+                    ):
+                        continue  # SKIPPED boarding or alighting kills the journey
+                    origin_pred = trip_rt.predictions.get(trip.origin_stop_sequence)
+                    dest_pred = trip_rt.predictions.get(trip.destination_stop_sequence)
+                trips.append(
+                    UpcomingTrip(
+                        trip_id=trip.trip_id,
+                        route_id=trip.route_id,
+                        route_name=route_names.get(trip.route_id),
+                        headsign=trip.headsign,
+                        origin_stop_id=origin_stop_id,
+                        destination_stop_id=destination_stop_id,
+                        scheduled_departure=trip.departure,
+                        predicted_departure=(
+                            _predicted_time(
+                                origin_pred.departure,
+                                trip.departure,
+                                origin_pred.delay_seconds,
+                            )
+                            if origin_pred
+                            else None
+                        ),
+                        scheduled_arrival=trip.arrival,
+                        predicted_arrival=(
+                            _predicted_time(
+                                dest_pred.arrival, trip.arrival, dest_pred.delay_seconds
+                            )
+                            if dest_pred
+                            else None
+                        ),
+                        delay_seconds=(
+                            origin_pred.delay_seconds if origin_pred else None
+                        ),
+                        realtime=origin_pred is not None or dest_pred is not None,
+                        wheelchair_accessible=trip.wheelchair_accessible,
+                        bikes_allowed=trip.bikes_allowed,
+                        direction_id=trip.direction_id,
+                        origin_pickup_type=trip.origin_pickup_type,
+                        origin_drop_off_type=trip.origin_drop_off_type,
+                        origin_timepoint_exact=trip.origin_timepoint_exact,
+                        origin_stop_headsign=trip.origin_stop_headsign,
+                        destination_pickup_type=trip.destination_pickup_type,
+                        destination_drop_off_type=trip.destination_drop_off_type,
+                        destination_timepoint_exact=trip.destination_timepoint_exact,
+                        destination_stop_headsign=trip.destination_stop_headsign,
+                        is_first=trip.is_first,
+                        is_last=trip.is_last,
+                        trip_short_name=trip.trip_short_name,
+                        block_id=trip.block_id,
+                    )
+                )
+            trips = [
+                row
+                for row in trips
+                if (row.predicted_departure or row.scheduled_departure) >= now
+            ]
+            # Total sort key, matching get_arrivals: origin predictions can
+            # reorder rows relative to the scheduled ordering, and trip_id /
+            # scheduled_arrival break effective-departure ties deterministically.
+            trips.sort(
+                key=lambda row: (
+                    row.predicted_departure or row.scheduled_departure,
+                    row.trip_id,
+                    row.scheduled_arrival,
                 )
             )
-        trips = [
-            row
-            for row in trips
-            if (row.predicted_departure or row.scheduled_departure) >= now
-        ]
-        # Total sort key, matching get_arrivals: origin predictions can
-        # reorder rows relative to the scheduled ordering, and trip_id /
-        # scheduled_arrival break effective-departure ties deterministically.
-        trips.sort(
-            key=lambda row: (
-                row.predicted_departure or row.scheduled_departure,
-                row.trip_id,
-                row.scheduled_arrival,
-            )
-        )
-        return trips[:limit]
+            return trips[:limit]
 
     async def get_vehicles(self) -> list[VehiclePosition]:
         """Live vehicle positions across the feed's VP-capable RT sources.
@@ -1091,25 +1153,28 @@ class TransitFeedHandle:
         original trip rows, with no per-repetition matching for
         frequency-based trips.
         """
-        messages = await self._fetch_entity_messages(EntityType.VEHICLE_POSITIONS)
-        trip_ids = sorted(
-            {
-                entity.vehicle.trip.trip_id
-                for message in messages
-                for entity in message.entity
-                if entity.HasField("vehicle") and entity.vehicle.trip.trip_id
-            }
-        )
-        trip_routes = await asyncio.to_thread(self._index.routes_for_trips, trip_ids)
-        route_names = await asyncio.to_thread(self._index.route_display_names)
-        vehicles: list[VehiclePosition] = []
-        for message in messages:
-            vehicles.extend(
-                vehicles_from_message(
-                    message, route_names=route_names, trip_routes=trip_routes
-                )
+        async with self._guard.reader():
+            messages = await self._fetch_entity_messages(EntityType.VEHICLE_POSITIONS)
+            trip_ids = sorted(
+                {
+                    entity.vehicle.trip.trip_id
+                    for message in messages
+                    for entity in message.entity
+                    if entity.HasField("vehicle") and entity.vehicle.trip.trip_id
+                }
             )
-        return vehicles
+            trip_routes = await asyncio.to_thread(
+                self._index.routes_for_trips, trip_ids
+            )
+            route_names = await asyncio.to_thread(self._index.route_display_names)
+            vehicles: list[VehiclePosition] = []
+            for message in messages:
+                vehicles.extend(
+                    vehicles_from_message(
+                        message, route_names=route_names, trip_routes=trip_routes
+                    )
+                )
+            return vehicles
 
     async def get_alerts(self) -> list[ServiceAlert]:
         """Service alerts across the feed's SA-capable RT sources.
@@ -1138,19 +1203,17 @@ class TransitFeedHandle:
         True if the index was rebuilt. Stale-while-revalidate: the old
         index keeps serving until the new one is ready, then swaps.
 
-        Concurrency contract: this method is intended for one consumer at a
-        time (the Home Assistant coordinator pattern — a single scheduled
-        refresh loop). It is not safe to call concurrently with itself, nor
-        with queries that may still be in flight when it completes: a query
-        captured against the old index (e.g. via a reference grabbed before
-        the swap) can execute after the swap-and-close and hit a closed
-        SQLite connection. Callers that need concurrent queries during a
-        refresh must serialize access externally (e.g. a lock around both
-        the refresh and the queries it might race).
+        Safe to call concurrently with queries and with itself. Queries
+        keep running against the old index while a new dataset downloads
+        and builds; the swap waits for in-flight queries to finish and
+        parks new ones only for the swap-and-close itself. Overlapping
+        refresh calls run back to back; the second re-checks the catalog
+        and finds nothing new.
         """
-        if self._direct is not None:
-            return await self._refresh_static_direct(self._direct)
-        return await self._refresh_static_catalog()
+        async with self._refresh_lock:
+            if self._direct is not None:
+                return await self._refresh_static_direct(self._direct)
+            return await self._refresh_static_catalog()
 
     async def _refresh_static_catalog(self) -> bool:
         """Catalog strategy: compare the latest dataset ID against ours."""
@@ -1191,13 +1254,14 @@ class TransitFeedHandle:
         return True
 
     async def _swap_index(self, new_index: StaticIndex) -> None:
-        """Publish the new index, then close the old one (see refresh_static)."""
-        old_index, self._index = self._index, new_index
-        self.stops = await asyncio.to_thread(new_index.stops)
-        self.routes = await asyncio.to_thread(new_index.routes)
-        self.agencies = await asyncio.to_thread(new_index.agencies)
-        self.feed_info = await asyncio.to_thread(new_index.feed_info)
-        await asyncio.to_thread(old_index.close)
+        """Publish the new index, then close the old one, with no reader inside."""
+        async with self._guard.writer():
+            old_index, self._index = self._index, new_index
+            self.stops = await asyncio.to_thread(new_index.stops)
+            self.routes = await asyncio.to_thread(new_index.routes)
+            self.agencies = await asyncio.to_thread(new_index.agencies)
+            self.feed_info = await asyncio.to_thread(new_index.feed_info)
+            await asyncio.to_thread(old_index.close)
 
     def stops_in(self, zone: Circle) -> list[Stop]:
         """Return stops within a circular zone (config-flow stop picker)."""
@@ -1220,13 +1284,17 @@ class TransitFeedHandle:
 
     async def routes_serving(self, stop_id: str) -> list[Route]:
         """Routes with scheduled service at the stop (route-filter picker)."""
-        return await asyncio.to_thread(self._index.routes_serving, stop_id)
+        async with self._guard.reader():
+            return await asyncio.to_thread(self._index.routes_serving, stop_id)
 
     async def headsigns_serving(
         self, stop_id: str, route_id: str | None = None
     ) -> list[str]:
         """Distinct headsigns at the stop (direction-filter picker options)."""
-        return await asyncio.to_thread(self._index.headsigns_serving, stop_id, route_id)
+        async with self._guard.reader():
+            return await asyncio.to_thread(
+                self._index.headsigns_serving, stop_id, route_id
+            )
 
     def close(self) -> None:
         """Release the SQLite connection."""

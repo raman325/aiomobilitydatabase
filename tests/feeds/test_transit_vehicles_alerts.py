@@ -1,15 +1,19 @@
 """Tests for get_vehicles, get_alerts, and refresh_static."""
 
+import asyncio
 import io
 import sqlite3
+import threading
 import zipfile
 from datetime import UTC, datetime
 
 import pytest
+from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.geo import Circle
-from aiomobilitydatabase.feeds.models import ServiceAlert, StationGroup
+from aiomobilitydatabase.feeds.models import ArrivalsQuery, ServiceAlert, StationGroup
+from aiomobilitydatabase.feeds.static_index import StaticIndex
 
 from tests.feeds.fixtures import (
     _FILES,
@@ -26,6 +30,25 @@ from tests.mock_server import MockApi
 
 PB = "application/octet-stream"
 ZIP_PATH = "/hosted/mdb-100.zip"
+NOW = datetime(2026, 7, 30, 14, 45, tzinfo=UTC)  # Thursday 07:45 PDT
+NEW_DATASET = "mdb-100-202608010000"
+
+
+def _empty_trip_updates() -> bytes:
+    """A valid TripUpdates payload with no entities, so the merged board
+    is the pure schedule."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    return message.SerializeToString()
+
+
+def _mock_newer_dataset(mock_api: MockApi) -> None:
+    """Script one catalog response announcing a new dataset plus its zip."""
+    base = mock_api.url()
+    newer = with_base(GTFS_FEED, base)
+    newer["latest_dataset"] = {**newer["latest_dataset"], "id": NEW_DATASET}
+    mock_api.get("/v1/gtfs_feeds/mdb-100", payload=newer)
+    mock_api.get(ZIP_PATH, body=build_gtfs_zip_bytes(), content_type="application/zip")
 
 
 def _mock_catalog(mock_api: MockApi) -> None:
@@ -277,3 +300,89 @@ def test_service_alert_is_active() -> None:
     # Exact-boundary inclusivity: both endpoints use <=, not strict < / >.
     assert alert_with([(now, None)]).is_active(now)  # start == at
     assert alert_with([(None, now)]).is_active(now)  # at == end
+
+
+async def test_in_flight_query_blocks_index_swap(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh that finds a new dataset must not swap and close the old
+    index while a query is still reading it."""
+    _mock_catalog(mock_api)
+    mock_api.get("/rt/all", body=_empty_trip_updates(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    old_dataset = handle._index.dataset_id
+    entered = threading.Event()
+    release = threading.Event()
+    original = StaticIndex.upcoming_departures
+
+    def parked(self: StaticIndex, *args: object, **kwargs: object) -> object:
+        entered.set()
+        assert release.wait(timeout=5)
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(StaticIndex, "upcoming_departures", parked)
+    query = asyncio.create_task(
+        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+    )
+    await asyncio.to_thread(entered.wait, 5)
+    _mock_newer_dataset(mock_api)
+    refresh = asyncio.create_task(handle.refresh_static())
+    await asyncio.sleep(0.2)
+    assert not refresh.done()
+    assert handle._index.dataset_id == old_dataset
+    release.set()
+    [arrivals] = await query
+    assert [a.trip_id for a in arrivals] == ["T1", "T2"]
+    assert await refresh is True
+    assert handle._index.dataset_id == NEW_DATASET
+
+
+async def test_index_swap_blocks_new_query_until_old_index_closed(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_catalog(mock_api)
+    mock_api.get("/rt/all", body=_empty_trip_updates(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    closing = threading.Event()
+    release = threading.Event()
+    original_close = StaticIndex.close
+
+    def parked_close(self: StaticIndex) -> None:
+        closing.set()
+        assert release.wait(timeout=5)
+        original_close(self)
+
+    monkeypatch.setattr(StaticIndex, "close", parked_close)
+    _mock_newer_dataset(mock_api)
+    refresh = asyncio.create_task(handle.refresh_static())
+    await asyncio.to_thread(closing.wait, 5)
+    query = asyncio.create_task(
+        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+    )
+    await asyncio.sleep(0.2)
+    assert not query.done()
+    release.set()
+    assert await refresh is True
+    [arrivals] = await query
+    assert [a.trip_id for a in arrivals] == ["T1", "T2"]
+
+
+async def test_concurrent_refresh_calls_serialize(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    _mock_newer_dataset(mock_api)
+    # The second refresh re-reads the catalog after the first finishes and
+    # sees the dataset it already holds: no second download.
+    base = mock_api.url()
+    same = with_base(GTFS_FEED, base)
+    same["latest_dataset"] = {**same["latest_dataset"], "id": NEW_DATASET}
+    mock_api.get("/v1/gtfs_feeds/mdb-100", payload=same)
+    results = await asyncio.gather(handle.refresh_static(), handle.refresh_static())
+    assert results == [True, False]
+    assert len([r for r in mock_api.requests if r.path == ZIP_PATH]) == 2
