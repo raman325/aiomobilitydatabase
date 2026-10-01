@@ -1137,7 +1137,8 @@ class StaticIndex:
         """Scheduled departures at the given stops within the query window.
 
         The window runs from ``now_utc - grace`` through ``now_utc +
-        lookahead``; ``grace`` lets callers that overlay realtime
+        lookahead`` (the handle layer defaults ``grace`` to one hour);
+        ``grace`` lets callers that overlay realtime
         predictions keep rows whose scheduled time has passed but whose
         vehicle may still be coming. Considers every local service day
         from one day before the window start through one day after its
@@ -1311,7 +1312,8 @@ class StaticIndex:
         destination more than once after the origin collapses to its
         earliest destination arrival (MIN) — ride until the vehicle first
         reaches the destination. The window runs from ``now_utc - grace``
-        to ``now_utc + lookahead``. Results are sorted by origin departure
+        to ``now_utc + lookahead`` (the handle layer defaults ``grace`` to
+        one hour). Results are sorted by origin departure
         and, when ``limit`` is given, truncated to it.
 
         ``is_first``/``is_last`` are computed per SERVICE DAY, over the

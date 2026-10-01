@@ -783,7 +783,10 @@ class TransitFeedHandle:
         filters and ``limit`` apply to the merged rows, so a filter can
         never see an empty board because other routes crowded out the
         limit. ``limit`` caps each query's merged result as a whole, not
-        per stop. Returns one list per query, in order.
+        per stop. RT-added rows carry no headsign and so never pass a
+        headsign filter; a row that announces neither arrival nor
+        departure keeps every time field ``None`` and sorts at ``now``.
+        Returns one list per query, in order.
 
         ``grace`` reaches that far BEFORE ``now`` when collecting scheduled
         candidates, so a trip whose scheduled time has passed still picks

@@ -454,13 +454,15 @@ async def test_concurrent_refresh_calls_serialize(
     handle = await feeds_client.get_transit_feed("mdb-100")
     _mock_newer_dataset(mock_api)
     # The second refresh re-reads the catalog after the first finishes and
-    # sees the dataset it already holds: no second download.
+    # sees the dataset it already holds.
     base = mock_api.url()
     same = with_base(GTFS_FEED, base)
     same["latest_dataset"] = {**same["latest_dataset"], "id": NEW_DATASET}
     mock_api.get("/v1/gtfs_feeds/mdb-100", payload=same)
     results = await asyncio.gather(handle.refresh_static(), handle.refresh_static())
-    assert results == [True, False]
+    assert list(results) == [True, False]
+    # Two downloads: the initial build and the first refresh. The second
+    # refresh adds none.
     assert len([r for r in mock_api.requests if r.path == ZIP_PATH]) == 2
 
 
