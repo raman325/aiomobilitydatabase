@@ -231,3 +231,9 @@ def test_arrivals_query_is_frozen() -> None:
     query = ArrivalsQuery(["S1"])
     with pytest.raises(dataclasses.FrozenInstanceError):
         query.limit = 5  # type: ignore[misc]
+
+
+def test_arrivals_query_accepts_a_tuple_of_stop_ids() -> None:
+    # StationGroup.stop_ids is a tuple, so the canonical flow passes one in.
+    query = ArrivalsQuery(("S1", "S2"))
+    assert tuple(query.stop_ids) == ("S1", "S2")

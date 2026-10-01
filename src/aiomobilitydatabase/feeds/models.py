@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import IntEnum, StrEnum
@@ -257,9 +258,9 @@ class ArrivalsQuery:
     nearest effective departure first.
     """
 
-    stop_ids: list[str]
-    route_ids: list[str] | None = None
-    headsigns: list[str] | None = None
+    stop_ids: Sequence[str]
+    route_ids: Sequence[str] | None = None
+    headsigns: Sequence[str] | None = None
     limit: int = 10
 
 
