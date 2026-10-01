@@ -5,6 +5,7 @@ import io
 import sqlite3
 import threading
 import zipfile
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 import pytest
@@ -345,6 +346,68 @@ async def test_in_flight_query_blocks_index_swap(
     release.set()
     [arrivals] = await query
     assert [a.trip_id for a in arrivals] == ["T1", "T2"]
+    assert await refresh is True
+    assert handle._index.dataset_id == NEW_DATASET
+
+
+@pytest.mark.parametrize(
+    ("index_method", "call"),
+    [
+        pytest.param(
+            "upcoming_trips",
+            lambda handle: handle.upcoming_trips("S1", "S2", now_utc=NOW),
+            id="upcoming_trips",
+        ),
+        pytest.param(
+            "routes_for_trips",
+            lambda handle: handle.get_vehicles(),
+            id="get_vehicles",
+        ),
+        pytest.param(
+            "routes_serving",
+            lambda handle: handle.routes_serving("S1"),
+            id="routes_serving",
+        ),
+        pytest.param(
+            "headsigns_serving",
+            lambda handle: handle.headsigns_serving("S1"),
+            id="headsigns_serving",
+        ),
+    ],
+)
+async def test_every_query_method_holds_the_guard(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    monkeypatch: pytest.MonkeyPatch,
+    index_method: str,
+    call: Callable[[TransitFeedHandle], Awaitable[object]],
+) -> None:
+    """Every guarded query method, not just get_arrivals, keeps a swap out."""
+    _mock_catalog(mock_api)
+    # Only get_vehicles consumes this; a TripUpdates fetch over the same body
+    # simply finds no trip updates, and the picker methods fetch nothing.
+    mock_api.get("/rt/all", body=VEHICLE_POSITIONS, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    old_dataset = handle._index.dataset_id
+    entered = threading.Event()
+    release = threading.Event()
+    original = getattr(StaticIndex, index_method)
+
+    def parked(*args: object, **kwargs: object) -> object:
+        entered.set()
+        assert release.wait(timeout=5)
+        return original(handle._index, *args, **kwargs)
+
+    monkeypatch.setattr(handle._index, index_method, parked)
+    query = asyncio.create_task(call(handle))  # type: ignore[arg-type]
+    await asyncio.to_thread(entered.wait, 5)
+    _mock_newer_dataset(mock_api)
+    refresh = asyncio.create_task(handle.refresh_static())
+    await _wait_until_swap_is_waiting(handle)
+    assert not refresh.done()
+    assert handle._index.dataset_id == old_dataset
+    release.set()
+    await query
     assert await refresh is True
     assert handle._index.dataset_id == NEW_DATASET
 
