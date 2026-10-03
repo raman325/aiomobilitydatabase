@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import IntEnum, StrEnum
@@ -241,6 +242,35 @@ class Route:
         if self.short_name and self.long_name:
             return f"{self.short_name} {self.long_name}"
         return self.short_name or self.long_name or self.id
+
+
+@dataclass(frozen=True)
+class ArrivalsQuery:
+    """One stop-board request inside a :meth:`TransitFeedHandle.get_arrivals` batch.
+
+    ``stop_ids`` is the set of GTFS stops the board covers (a station's
+    platforms, a direction pair). ``route_ids`` and ``headsigns`` narrow
+    the rows; ``None`` or an empty list means no narrowing. ``headsigns``
+    matches the trip-level headsign (the same values
+    :meth:`TransitFeedHandle.headsigns_serving` offers), so RT-added trips,
+    which announce no headsign, never pass a headsign filter. ``limit``
+    caps the merged, filtered result for this query as a whole,
+    nearest effective departure first; zero asks for an empty board.
+    """
+
+    stop_ids: Sequence[str]
+    route_ids: Sequence[str] | None = None
+    headsigns: Sequence[str] | None = None
+    limit: int = 10
+
+    def __post_init__(self) -> None:
+        """Reject inputs a slice or an id-iteration would silently misread."""
+        for name in ("stop_ids", "route_ids", "headsigns"):
+            if isinstance(getattr(self, name), str):
+                raise TypeError(f"{name} must be a sequence of ids, not a str")
+        # A negative limit would slice rows off the END of the board.
+        if self.limit < 0:
+            raise ValueError(f"limit must be non-negative, got {self.limit}")
 
 
 @dataclass(frozen=True)

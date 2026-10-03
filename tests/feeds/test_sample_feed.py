@@ -45,7 +45,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
-from aiomobilitydatabase.feeds.models import Agency, FeedInfo
+from aiomobilitydatabase.feeds.models import Agency, ArrivalsQuery, FeedInfo
 from aiomobilitydatabase.feeds.static_index import ScheduledDeparture, StaticIndex
 
 from tests.feeds.fixtures import (
@@ -493,8 +493,8 @@ async def test_handle_answers_from_canonical_feed(
     # 06:30 follow-ups, and CITY2#21600's terminal STAGECOACH call at
     # 06:30 (start + 30:00). CITY2#23400 reaches STAGECOACH only at
     # 07:00 -- outside the window.
-    arrivals = await handle.get_arrivals(
-        ["STAGECOACH"],
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["STAGECOACH"])],
         lookahead=timedelta(hours=1),
         now_utc=datetime(2007, 6, 1, 12, 45, tzinfo=UTC),
     )

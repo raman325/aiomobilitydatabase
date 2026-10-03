@@ -15,7 +15,7 @@ from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
     SourceConnectionError,
 )
-from aiomobilitydatabase.feeds.models import StaticBuildProgress
+from aiomobilitydatabase.feeds.models import ArrivalsQuery, StaticBuildProgress
 
 from tests.feeds.fixtures import (
     _FILES,
@@ -272,8 +272,8 @@ async def test_direct_rt_typed_layers(
         mock_api.url(TU_PATH),
         mock_api.url(VP_PATH),
     ]
-    arrivals = await handle.get_arrivals(
-        ["S1", "S2"], lookahead=timedelta(hours=1), now_utc=NOW
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2"])], lookahead=timedelta(hours=1), now_utc=NOW
     )
     by_key = {(a.trip_id, a.stop_id): a for a in arrivals}
     assert not any(trip_id == "T2" for trip_id, _ in by_key)  # canceled by RT
@@ -319,8 +319,8 @@ async def test_direct_rt_combined_url_deduplicated(
         EntityType.VEHICLE_POSITIONS,
         EntityType.SERVICE_ALERTS,
     ]
-    arrivals = await handle.get_arrivals(
-        ["S1"], lookahead=timedelta(hours=1), now_utc=NOW
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert any(arrival.realtime for arrival in arrivals)
     assert len(_requests_for(mock_api, "GET", TU_PATH)) == 1

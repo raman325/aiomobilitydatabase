@@ -1,15 +1,18 @@
 """Tests for public snapshot models."""
 
+import dataclasses
 import io
 import zipfile
 from datetime import UTC, datetime
 
+import pytest
 from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.models import (
     Agency,
     AlertCause,
     AlertEffect,
+    ArrivalsQuery,
     BikesAllowed,
     CongestionLevel,
     GbfsVehicle,
@@ -214,3 +217,40 @@ def test_fixtures_are_valid() -> None:
         msg = gtfs_realtime_pb2.FeedMessage()
         msg.ParseFromString(raw)
         assert msg.entity
+
+
+def test_arrivals_query_defaults() -> None:
+    query = ArrivalsQuery(["S1", "S2"])
+    assert query.stop_ids == ["S1", "S2"]
+    assert query.route_ids is None
+    assert query.headsigns is None
+    assert query.limit == 10
+
+
+def test_arrivals_query_is_frozen() -> None:
+    query = ArrivalsQuery(["S1"])
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        query.limit = 5  # type: ignore[misc]
+
+
+def test_arrivals_query_accepts_a_tuple_of_stop_ids() -> None:
+    # StationGroup.stop_ids is a tuple, so the canonical flow passes one in.
+    query = ArrivalsQuery(("S1", "S2"))
+    assert tuple(query.stop_ids) == ("S1", "S2")
+
+
+@pytest.mark.parametrize("field", ["stop_ids", "route_ids", "headsigns"])
+def test_arrivals_query_rejects_a_bare_string(field: str) -> None:
+    kwargs: dict[str, object] = {"stop_ids": ["S1"], field: "S1"}
+    with pytest.raises(TypeError, match=field):
+        ArrivalsQuery(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("limit", [-1, -10])
+def test_arrivals_query_rejects_a_negative_limit(limit: int) -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        ArrivalsQuery(["S1"], limit=limit)
+
+
+def test_arrivals_query_allows_a_zero_limit() -> None:
+    assert ArrivalsQuery(["S1"], limit=0).limit == 0
