@@ -137,3 +137,39 @@ async def test_purge_cache_rejects_symlink_escape(
     assert victim.exists()
     assert (victim / "data").exists()
     await client.close()
+
+
+@pytest.mark.parametrize("feed_id", ["", ".", "./", "nested/inner"])
+async def test_purge_cache_rejects_non_child_feed_ids(
+    mock_api: MockApi, tmp_path: Path, feed_id: str
+) -> None:
+    """A feed_id that does not name a direct child of cache_dir must raise
+    rather than resolve to (and delete) the cache root itself: ``""`` and
+    ``"."`` both resolve to cache_dir, which the containment check accepts
+    because a path is relative to itself -- wiping every other feed's cache.
+    """
+    root = tmp_path / "cache"
+    (root / "mdb-200").mkdir(parents=True)
+    (root / "mdb-200" / "static.db").write_bytes(b"x")
+    (root / "sentinel").write_bytes(b"s")
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(ValueError, match="escapes"):
+        await client.purge_cache(feed_id)
+    assert (root / "mdb-200" / "static.db").exists()
+    assert (root / "sentinel").exists()
+    await client.close()
+
+
+async def test_purge_cache_is_idempotent(mock_api: MockApi, tmp_path: Path) -> None:
+    root = tmp_path / "cache"
+    (root / "mdb-100").mkdir(parents=True)
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    await client.purge_cache("mdb-100")
+    await client.purge_cache("mdb-100")
+    assert not (root / "mdb-100").exists()
+    assert root.exists()
+    await client.close()

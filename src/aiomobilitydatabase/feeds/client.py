@@ -124,18 +124,29 @@ class MobilityFeedsClient:
         storage at a different feed). ``feed_id`` is either a catalog feed
         ID or a direct handle's url-derived ``url-<sha256(url)[:16]>`` key
         — exactly what :attr:`TransitFeedHandle.static_feed_id` returns in
-        both cases. No-op without a cache_dir. Raises ``ValueError`` if
-        ``feed_id`` would resolve outside the cache directory (e.g. an
-        absolute path or one containing ``..`` components). Missing
-        targets are silently skipped; other filesystem errors (e.g.
-        permissions) propagate to the caller.
+        both cases. No-op without a cache_dir. Purging a feed that has no
+        cache directory is a silent no-op, so repeated calls are
+        idempotent; other filesystem errors (e.g. permissions) propagate
+        to the caller.
+
+        Raises ``ValueError`` unless ``feed_id`` resolves to a direct
+        child of the cache directory. That rejects absolute paths, ``..``
+        components and symlinked entries, but also the degenerate ids
+        (``""``, ``"."``) that resolve to the cache root itself — a
+        containment-only check accepts those, because every path is
+        relative to itself, and would delete every feed's cache.
         """
         if self.cache_dir is None:
             return
         if feed_id is not None:
             target = self.cache_dir / feed_id
-            if not target.resolve().is_relative_to(self.cache_dir.resolve()):
-                raise ValueError(f"feed_id {feed_id!r} escapes the cache directory")
+            root = self.cache_dir.resolve()
+            resolved = target.resolve()
+            if resolved == root or resolved.parent != root:
+                raise ValueError(
+                    f"feed_id {feed_id!r} escapes the cache directory: "
+                    "it does not name a direct child"
+                )
             targets = [target]
         else:
             targets = [path for path in self.cache_dir.iterdir() if path.is_dir()]
