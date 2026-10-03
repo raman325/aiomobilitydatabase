@@ -2869,7 +2869,10 @@ def _propagation_case(draw: st.DrawFn) -> dict[str, object]:
     unplaceable "ghost" STU, optional DUPLICATE trailing STU for one call
     (the last one in feed order must win), drawn feed order.
     """
-    n_stops = draw(st.integers(3, 8))
+    # Up to 14 calls: the deep-structure regime where a propagated delay
+    # has to survive many intervening stops, which an 8-stop cap never
+    # reached.
+    n_stops = draw(st.integers(3, 14))
     loop: tuple[int, int] | None = None
     if draw(st.booleans()):
         dup_at = draw(st.integers(2, n_stops - 1))
@@ -3075,7 +3078,7 @@ def _assert_prediction_matches_outcome(
         assert row.predicted_arrival is None
 
 
-@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(case=_propagation_case())
 def test_propagation_matches_piecewise_oracle(case: dict[str, object]) -> None:
     """THE load-bearing propagation property: for EVERY stop of a generated
@@ -3127,7 +3130,9 @@ def test_propagation_matches_piecewise_oracle(case: dict[str, object]) -> None:
 # straight through trip_updates_from_message + resolve_trip_predictions with
 # no server, zip build, or SQLite in the loop -- so the example budget can
 # be two orders of magnitude higher than the merged end-to-end property's.
-@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=1000, deadline=None, suppress_health_check=[HealthCheck.too_slow]
+)
 @given(case=_propagation_case())
 def test_propagation_pure_oracle_matches_resolver(case: dict[str, object]) -> None:
     n_stops: int = case["n_stops"]  # type: ignore[assignment]
@@ -3154,7 +3159,7 @@ def test_propagation_pure_oracle_matches_resolver(case: dict[str, object]) -> No
         assert prediction.arrival == outcome["arr_time"]
 
 
-@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     n_stops=st.integers(3, 5),
     data=st.data(),
@@ -3167,9 +3172,17 @@ def test_skipped_totality_over_arrivals_and_trips(
     kills exactly the origin->destination rows whose boarding OR alighting
     stop is skipped -- every other row, including the whole RT-untouched
     sibling trip, is unaffected.
+
+    The delay update and the SKIPPED marker are allowed to land on the
+    SAME call (S0), the case this property used to exclude: both address
+    stop S0, the SKIPPED one is emitted later, and last-wins placement
+    therefore DISCARDS the delay entirely -- so no stop of the trip is
+    realtime. That silent discard is asserted rather than avoided.
     """
     skipped = data.draw(st.sets(st.integers(0, n_stops - 1), max_size=n_stops))
-    with_delay = data.draw(st.booleans()) and 0 not in skipped
+    with_delay = data.draw(st.booleans())
+    # The S0 delay survives only when no SKIPPED marker takes its call.
+    delay_applies = with_delay and 0 not in skipped
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
     entity = msg.entity.add()
@@ -3200,13 +3213,13 @@ def test_skipped_totality_over_arrivals_and_trips(
             expected.add("TP")
         assert got == expected
         for row in rows:
-            if row.trip_id == "OTHER":
-                assert row.realtime is False
-            elif with_delay:
-                # The S0 delay propagates over the whole trip, so every
-                # surviving TP journey row is realtime with delay 240.
-                assert row.realtime is True
-                assert row.delay_seconds == 240
+            expected_delay = 240 if delay_applies and row.trip_id == "TP" else None
+            assert row.realtime is (expected_delay is not None)
+            assert row.delay_seconds == expected_delay
+    for arrival in arrivals:
+        expected_delay = 240 if delay_applies and arrival.trip_id == "TP" else None
+        assert arrival.realtime is (expected_delay is not None)
+        assert arrival.delay_seconds == expected_delay
 
 
 # --- TripDescriptor.start_date service-day matching properties ---------------
@@ -3353,15 +3366,17 @@ def _instance_day(scheduled_departure: datetime) -> date:
     return _TWO_DAY_A if scheduled_departure < _TWO_DAY_ANCHOR_B else _TWO_DAY_B
 
 
-# 40+ examples: 2 variants x 2 kinds x 4 date modes x 2 reps = 32 core
-# combos (before delay/lookahead variation); 12 examples undersampled it.
-@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+# The four discrete dimensions are PARAMETRIZED (2 variants x 2 kinds x 4
+# date modes x 2 reps = all 32 combinations run every time); sampling them
+# inside @given left about 9 combinations untouched on a typical run.
+# @given keeps the continuous dimensions.
+@pytest.mark.parametrize("variant", ["plain", "frequency"])
+@pytest.mark.parametrize("kind", ["prediction", "cancellation"])
+@pytest.mark.parametrize("date_mode", ["day_a", "day_b", "absent", "garbage"])
+@pytest.mark.parametrize("rep", [32400, 33000])
+@settings(max_examples=8, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
-    variant=st.sampled_from(["plain", "frequency"]),
-    kind=st.sampled_from(["prediction", "cancellation"]),
-    date_mode=st.sampled_from(["day_a", "day_b", "absent", "garbage"]),
-    rep=st.sampled_from([32400, 33000]),
-    delay=st.integers(-600, 1800),
+    delay=st.integers(-600, 1800) | st.just(0),
     lookahead_hours=st.integers(27, 48),
     garbage=st.sampled_from(_GARBAGE_START_DATES),
 )
@@ -3492,12 +3507,14 @@ def _short_window_message(
     return msg
 
 
-@settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+# delay=0 is unioned in explicitly: a PRESENT but zero delay must still
+# mark a row realtime, and a range strategy picks it only by luck.
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     kind=st.sampled_from(["prediction", "cancellation"]),
     absent_form=st.sampled_from(["absent", "garbage"]),
     garbage=st.sampled_from(_GARBAGE_START_DATES),
-    delay=st.integers(-600, 1800),
+    delay=st.integers(-600, 1800) | st.just(0),
 )
 def test_short_window_start_date_invariance(
     kind: str, absent_form: str, garbage: str, delay: int
