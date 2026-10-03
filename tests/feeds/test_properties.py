@@ -6,6 +6,7 @@ import io
 import math
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
@@ -2006,12 +2007,139 @@ def test_generated_feeds_end_to_end_totality(
 
 
 _FIXTURE_TRIPS = ["T1", "T2", "T4"]
+_FIXTURE_HEADSIGNS = {"T1": "Downtown", "T2": "Downtown", "T4": "Holiday"}
+_MERGE_STOPS = ["S1", "S2"]
+# 2026-07-30 is a Thursday, so WKDY runs and SPECIAL does not: the fixture
+# board holds exactly these three scheduled rows (08:00:30 PDT = 15:00:30Z).
+_MERGE_BASE = datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC)
+_MERGE_SCHEDULE = [
+    ("T1", "S1", _MERGE_BASE),
+    ("T1", "S2", _MERGE_BASE + timedelta(minutes=10)),
+    ("T2", "S1", _MERGE_BASE + timedelta(minutes=30)),
+]
+# The one explicit S1 departure prediction every drawn "predicted" trip gets.
+_MERGE_PREDICTED_AT = _MERGE_BASE + timedelta(minutes=5)
+# Each candidate `now` sits inside the one-hour grace window of all three
+# scheduled rows, so which rows are CANDIDATES never varies with the draw --
+# only whether the post-merge past-row drop fires on them.
+_MERGE_NOWS = [
+    datetime(2026, 7, 30, 14, 45, tzinfo=UTC),  # ahead of every row
+    datetime(2026, 7, 30, 15, 1, 30, tzinfo=UTC),
+    datetime(2026, 7, 30, 15, 5, 30, tzinfo=UTC),
+    datetime(2026, 7, 30, 15, 11, tzinfo=UTC),
+]
+_MERGE_NOW = _MERGE_NOWS[0]
+# A limit big enough that it can never bind on these scenarios, used to read
+# the whole merged board as the oracle input for the limited queries.
+_UNLIMITED = 100
+# The fixture's own trips all run on R1, so ADDED rows announcing R2 are what
+# make a route filter discriminate.
+_ADDED_ROUTES = ["R1", "R2"]
+
+
+def _expected_route(trip_id: str | None, added_routes: dict[str, str]) -> str | None:
+    """The route a row MUST carry, read off the fixture rather than the row.
+
+    Keeping the oracle independent of ``row.route_id`` means a plumbing bug
+    that mislabels a row's route cannot agree with the filter oracle.
+    """
+    if trip_id is None:
+        return None
+    return added_routes.get(trip_id, "R1")
+
+
+def _expected_headsign(trip_id: str | None, added_ids: set[str]) -> str | None:
+    """The TRIP-level headsign the fixture gives ``trip_id``; RT-added: None."""
+    if trip_id is None or trip_id in added_ids:
+        return None
+    return _FIXTURE_HEADSIGNS[trip_id]
+
+
+def _model_effective_departure(row: StopArrival, now: datetime) -> datetime:
+    """The documented fallback chain, written out independently of the source.
+
+    Predicted departure, else scheduled departure, else the predicted
+    arrival of an arrival-only RT-added call, else ``now`` for a row that
+    announces no time at all.
+    """
+    for candidate in (
+        row.predicted_departure,
+        row.scheduled_departure,
+        row.predicted_arrival,
+    ):
+        if candidate is not None:
+            return candidate
+    return now
+
+
+def _model_sort_key(row: StopArrival, now: datetime) -> tuple[datetime, str, str]:
+    """The documented total order: effective departure, trip id, stop id."""
+    return (_model_effective_departure(row, now), row.trip_id or "", row.stop_id)
+
+
+# An ADDED stop call: (trip_id, route_id, stop_id, arrival, departure).
+_AddedCall = tuple[str, str | None, str, datetime | None, datetime | None]
+
+
+def _arrivals_rt_message(
+    canceled: list[str],
+    predicted: list[tuple[str, datetime]],
+    added: list[_AddedCall],
+) -> gtfs_realtime_pb2.FeedMessage:
+    """Cancellations, explicit S1 departure predictions, and ADDED stop calls.
+
+    A None arrival/departure in an ADDED call leaves that field off the
+    StopTimeUpdate entirely, so a call with neither announces no time at all.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    for trip_id in canceled:
+        entity = msg.entity.add()
+        entity.id = f"c-{trip_id}"
+        entity.trip_update.trip.trip_id = trip_id
+        entity.trip_update.trip.schedule_relationship = (
+            gtfs_realtime_pb2.TripDescriptor.CANCELED
+        )
+    for trip_id, predicted_at in predicted:
+        entity = msg.entity.add()
+        entity.id = f"p-{trip_id}"
+        entity.trip_update.trip.trip_id = trip_id
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_id = "S1"
+        stu.departure.time = int(predicted_at.timestamp())
+    for index, (trip_id, route_id, stop_id, arrival, departure) in enumerate(added):
+        entity = msg.entity.add()
+        entity.id = f"a-{index}"
+        entity.trip_update.trip.trip_id = trip_id
+        if route_id is not None:
+            entity.trip_update.trip.route_id = route_id
+        entity.trip_update.trip.schedule_relationship = (
+            gtfs_realtime_pb2.TripDescriptor.ADDED
+        )
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_id = stop_id
+        if arrival is not None:
+            stu.arrival.time = int(arrival.timestamp())
+        if departure is not None:
+            stu.departure.time = int(departure.timestamp())
+    return msg
 
 
 def _run_arrivals_merge_scenario(
     msg: gtfs_realtime_pb2.FeedMessage,
-) -> list[StopArrival]:
-    async def scenario() -> list[StopArrival]:
+    batches: list[list[ArrivalsQuery]],
+    now: datetime,
+    lookahead: timedelta = timedelta(hours=1),
+) -> tuple[list[list[list[StopArrival]]], list[int]]:
+    """Serve the fixture feed plus ``msg``, then one get_arrivals call per batch.
+
+    Returns each call's per-query boards and how many realtime TripUpdates
+    fetches that call issued -- the realtime route is scripted with spare
+    responses, so an implementation that fetches per query records a higher
+    count instead of erroring on an exhausted queue.
+    """
+
+    async def scenario() -> tuple[list[list[list[StopArrival]]], list[int]]:
         api = MockApi()
         await api.start()
         try:
@@ -2028,120 +2156,186 @@ def _run_arrivals_merge_scenario(
                 body=build_gtfs_zip_bytes(),
                 content_type="application/zip",
             )
-            api.get(
-                "/rt/all",
-                body=msg.SerializeToString(),
-                content_type="application/octet-stream",
-            )
+            body = msg.SerializeToString()
+            spare = sum(len(queries) for queries in batches) + len(batches)
+            for _ in range(spare):
+                api.get("/rt/all", body=body, content_type="application/octet-stream")
+            boards: list[list[list[StopArrival]]] = []
+            fetches: list[int] = []
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
-                # limit=10 keeps every scheduled AND generated ADDED row
-                # inside the query's cap (at most 2 scheduled + 3 added at S1
-                # plus S2's single scheduled row), so the exactly-once ADDED
-                # assertions below can never be masked by truncation; the
-                # limit law itself is pinned by the elapsed-seconds oracle
-                # property and the end-to-end totality property.
-                [arrivals] = await handle.get_arrivals(
-                    [ArrivalsQuery(["S1", "S2"], limit=10)],
-                    lookahead=timedelta(hours=1),
-                    now_utc=datetime(2026, 7, 30, 14, 45, tzinfo=UTC),
-                )
-                return arrivals
+                for queries in batches:
+                    before = _rt_fetch_count(api)
+                    boards.append(
+                        await handle.get_arrivals(
+                            queries, lookahead=lookahead, now_utc=now
+                        )
+                    )
+                    fetches.append(_rt_fetch_count(api) - before)
+            return boards, fetches
         finally:
             await api.stop()
 
     return asyncio.run(scenario())
 
 
-@given(data=st.data())
-@settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_arrivals_merge_invariants(data: st.DataObject) -> None:
-    """Over random cancellation/prediction/added sets: canceled trips absent,
-    realtime <=> prediction existed, rows sorted, row count <= limit, and
-    every NON-canceled generated ADDED trip surfaces EXACTLY once, at its
-    announced stop, carrying its drawn epoch as the predicted departure
-    (deleting the ADDED-row merge loop entirely once survived the suite).
+def _rt_fetch_count(api: MockApi) -> int:
+    """How many realtime TripUpdates fetches the mock server has served."""
+    return sum(1 for request in api.requests if request.path == "/rt/all")
 
-    The cancelable pool includes the generated ADDED trip ids too (not just
-    the fixture trips) — otherwise cancellation-over-added can never be
-    exercised, since ``GEN-ADDED-*`` ids are disjoint from ``_FIXTURE_TRIPS``.
-    A forced boolean additionally guarantees GEN-ADDED-0 is canceled on some
-    fraction of examples rather than relying on sampling luck.
+
+@dataclass(frozen=True)
+class _MergeScenario:
+    """One drawn merge example: the RT message plus what it must imply."""
+
+    msg: gtfs_realtime_pb2.FeedMessage
+    canceled: list[str]
+    predicted: list[str]
+    added_routes: dict[str, str]
+    added_departures: dict[str, datetime]
+    now: datetime
+    limit: int
+
+
+@st.composite
+def _merge_scenarios(draw: st.DrawFn) -> _MergeScenario:
+    """A cancellation/prediction/ADDED draw over the fixture feed.
+
+    The cancelable pool includes the generated ADDED ids (which are disjoint
+    from ``_FIXTURE_TRIPS``), so cancellation-over-added is reachable at all;
+    a forced boolean cancels GEN-ADDED-0 on a fraction of examples rather
+    than leaving that case to sampling luck.
     """
-    added_count = data.draw(st.integers(0, 3))
+    added_count = draw(st.integers(0, 3))
     added_ids = [f"GEN-ADDED-{i}" for i in range(added_count)]
-    cancelable_pool = [*_FIXTURE_TRIPS, *added_ids]
-    canceled = set(
-        data.draw(st.lists(st.sampled_from(cancelable_pool), max_size=3, unique=True))
-    )
-    cancel_first_added = data.draw(st.booleans())
-    if added_count > 0 and cancel_first_added:
-        canceled.add(added_ids[0])
-    predicted = set(
-        data.draw(st.lists(st.sampled_from(_FIXTURE_TRIPS), max_size=3, unique=True))
-    )
-    base_epoch = int(datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC).timestamp())
-    msg = gtfs_realtime_pb2.FeedMessage()
-    msg.header.gtfs_realtime_version = "2.0"
-    for trip_id in canceled:
-        entity = msg.entity.add()
-        entity.id = f"c-{trip_id}"
-        entity.trip_update.trip.trip_id = trip_id
-        entity.trip_update.trip.schedule_relationship = (
-            gtfs_realtime_pb2.TripDescriptor.CANCELED
+    added_routes = {
+        trip_id: draw(st.sampled_from(_ADDED_ROUTES)) for trip_id in added_ids
+    }
+    added_departures = {
+        trip_id: _MERGE_BASE + timedelta(seconds=60 * (index + 1))
+        for index, trip_id in enumerate(added_ids)
+    }
+    cancel_first_added = draw(st.booleans())
+    canceled = draw(
+        st.lists(
+            st.sampled_from([*_FIXTURE_TRIPS, *added_ids]), max_size=3, unique=True
         )
-    for trip_id in predicted:
-        entity = msg.entity.add()
-        entity.id = f"p-{trip_id}"
-        entity.trip_update.trip.trip_id = trip_id
-        stu = entity.trip_update.stop_time_update.add()
-        stu.stop_id = "S1"
-        stu.departure.time = base_epoch + 300
-    for i, trip_id in enumerate(added_ids):
-        entity = msg.entity.add()
-        entity.id = f"a-{i}"
-        entity.trip_update.trip.trip_id = trip_id
-        entity.trip_update.trip.route_id = "R1"
-        entity.trip_update.trip.schedule_relationship = (
-            gtfs_realtime_pb2.TripDescriptor.ADDED
-        )
-        stu = entity.trip_update.stop_time_update.add()
-        stu.stop_id = "S1"
-        stu.departure.time = base_epoch + 60 * (i + 1)
+    )
+    if added_ids and cancel_first_added and added_ids[0] not in canceled:
+        canceled.append(added_ids[0])
+    predicted = draw(st.lists(st.sampled_from(_FIXTURE_TRIPS), max_size=3, unique=True))
+    return _MergeScenario(
+        msg=_arrivals_rt_message(
+            canceled,
+            [(trip_id, _MERGE_PREDICTED_AT) for trip_id in predicted],
+            [
+                (trip_id, added_routes[trip_id], "S1", None, added_departures[trip_id])
+                for trip_id in added_ids
+            ],
+        ),
+        canceled=canceled,
+        predicted=predicted,
+        added_routes=added_routes,
+        added_departures=added_departures,
+        now=draw(st.sampled_from(_MERGE_NOWS)),
+        limit=draw(st.integers(0, len(_MERGE_SCHEDULE) + 3)),
+    )
 
-    arrivals = _run_arrivals_merge_scenario(msg)
-    for row in arrivals:
-        assert row.trip_id not in canceled
-        if row.scheduled_departure is not None:
-            expected_rt = (
-                row.trip_id in predicted
-                and row.stop_id == "S1"
-                and row.trip_id not in canceled
+
+@given(scenario=_merge_scenarios())
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_arrivals_merge_invariants(scenario: _MergeScenario) -> None:
+    """The merged board equals a FULL independent model of it: canceled trips
+    (fixture and ADDED alike) absent, each predicted trip's S1 row at its
+    announced epoch, every non-canceled ADDED call present exactly once at
+    its announced stop, rows whose effective departure is before ``now``
+    dropped, and the whole list in documented sort order.
+
+    ``limit`` is then pinned as a cap on the board AS A WHOLE -- drawn small
+    enough to bind, asserted equal to a plain truncation of the unlimited
+    board, so per-stop limiting cannot pass -- and a route-filtered sibling
+    query in the SAME batch pins filter-before-limit: it keeps its own R1
+    rows even where the unfiltered board's limit crowded them out.
+
+    Deleting the ADDED-row merge loop entirely once survived the suite,
+    hence the exactly-once ADDED claims; the realtime flag claim stays
+    one-sided-free (``==``, not ``is True``) so a flag that spreads to
+    unpredicted rows fails too.
+    """
+    now = scenario.now
+    added_ids = set(scenario.added_departures)
+    boards, fetches = _run_arrivals_merge_scenario(
+        scenario.msg,
+        [
+            [
+                ArrivalsQuery(_MERGE_STOPS, limit=_UNLIMITED),
+                ArrivalsQuery(_MERGE_STOPS, limit=scenario.limit),
+                ArrivalsQuery(_MERGE_STOPS, ["R1"], limit=scenario.limit),
+            ]
+        ],
+        now,
+    )
+    [[unlimited, limited, route_limited]] = boards
+    assert fetches == [1]  # one TripUpdates fetch for the whole batch
+
+    candidates = [
+        (
+            trip_id,
+            stop_id,
+            _MERGE_PREDICTED_AT
+            if trip_id in scenario.predicted and stop_id == "S1"
+            else scheduled,
+        )
+        for trip_id, stop_id, scheduled in _MERGE_SCHEDULE
+        if trip_id not in scenario.canceled
+    ] + [
+        (trip_id, "S1", departure)
+        for trip_id, departure in scenario.added_departures.items()
+        if trip_id not in scenario.canceled
+    ]
+    expected = sorted(
+        (row for row in candidates if row[2] >= now),
+        key=lambda row: (row[2], row[0], row[1]),
+    )
+    event(f"past-row drop fired: {len(expected) < len(candidates)}")
+    event(f"limit binds: {scenario.limit < len(unlimited)}")
+    assert [
+        (row.trip_id, row.stop_id, _model_effective_departure(row, now))
+        for row in unlimited
+    ] == expected
+
+    for row in unlimited:
+        assert row.route_id == _expected_route(row.trip_id, scenario.added_routes)
+        assert row.headsign == _expected_headsign(row.trip_id, added_ids)
+        if row.trip_id in added_ids:
+            assert row.realtime is True
+            assert row.scheduled_departure is None
+        else:
+            assert row.realtime == (
+                row.trip_id in scenario.predicted and row.stop_id == "S1"
             )
-            assert row.realtime == expected_rt
-    # Every surviving generated ADDED trip merges in exactly once, at its
-    # announced stop, with its drawn epoch as the explicit prediction.
-    for i, trip_id in enumerate(added_ids):
-        rows = [row for row in arrivals if row.trip_id == trip_id]
-        if trip_id in canceled:
+    for trip_id, departure in scenario.added_departures.items():
+        rows = [row for row in unlimited if row.trip_id == trip_id]
+        if trip_id in scenario.canceled or departure < now:
             assert rows == []
             continue
         (row,) = rows
         assert row.stop_id == "S1"
-        assert row.realtime is True
-        assert row.scheduled_departure is None
-        assert row.predicted_departure == datetime.fromtimestamp(
-            base_epoch + 60 * (i + 1), tz=UTC
-        )
-    keys = [
-        ((a.predicted_departure or a.scheduled_departure), a.trip_id or "", a.stop_id)
-        for a in arrivals
-    ]
-    assert keys == sorted(keys)
-    per_stop: dict[str, int] = {}
-    for row in arrivals:
-        per_stop[row.stop_id] = per_stop.get(row.stop_id, 0) + 1
-    assert all(count <= 10 for count in per_stop.values())
+        assert row.predicted_departure == departure
+
+    assert len(limited) <= scenario.limit
+    assert limited == unlimited[: scenario.limit]
+    assert (
+        route_limited
+        == [
+            row
+            for row in unlimited
+            if _expected_route(row.trip_id, scenario.added_routes) == "R1"
+        ][: scenario.limit]
+    )
+    for board in (unlimited, limited, route_limited):
+        keys = [_model_sort_key(row, now) for row in board]
+        assert keys == sorted(keys)
 
 
 _GBFS_ZONE = Circle(latitude=34.05, longitude=-118.25, radius_m=2_000.0)
