@@ -1884,21 +1884,54 @@ def test_exactly_one_first_and_one_last_per_service_day_pair(
         index.close()
 
 
-@given(zip_bytes=_random_gtfs_zip(), data=st.data())
-@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_cache_roundtrip_equivalent(zip_bytes: bytes, data: st.DataObject) -> None:
-    """A reopened cached index answers every query identically to the builder."""
+def _with_agency_timezone(zip_bytes: bytes, tz_name: str) -> bytes:
+    """Re-emit a generated feed carrying ``tz_name`` in agency.txt.
+
+    ``_random_gtfs_zip`` hard-codes UTC and is shared with other
+    properties, so the cache roundtrip substitutes the timezone here
+    instead of widening the generator.
+    """
+    buf = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(zip_bytes)) as src,
+        zipfile.ZipFile(buf, "w") as dst,
+    ):
+        for name in src.namelist():
+            content = src.read(name)
+            if name == "agency.txt":
+                content = (
+                    "agency_id,agency_name,agency_url,agency_timezone\n"
+                    f"A1,T,https://e.com,{tz_name}\n"
+                ).encode()
+            dst.writestr(name, content)
+    return buf.getvalue()
+
+
+@given(zip_bytes=_random_gtfs_zip(), tz_name=st.sampled_from(TIMEZONES), data=st.data())
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_cache_roundtrip_equivalent(
+    zip_bytes: bytes, tz_name: str, data: st.DataObject
+) -> None:
+    """A reopened cached index answers every query identically to the builder.
+
+    The stored timezone is the DB's most important piece of non-table
+    state and is drawn rather than fixed: with a hard-coded UTC feed, an
+    index that failed to persist it and defaulted to UTC would still pass.
+    """
     with tempfile.TemporaryDirectory() as tmp_dir:
         zip_path = Path(tmp_dir) / "feed.zip"
-        zip_path.write_bytes(zip_bytes)
+        zip_path.write_bytes(_with_agency_timezone(zip_bytes, tz_name))
         db_path = Path(tmp_dir) / "static.db"
         try:
             built = StaticIndex.build(zip_path, str(db_path), "ds-rt", None)
         except FeedParseError:
             return
         try:
+            assert built.timezone_name == tz_name
             baseline_stops = built.stops()
             baseline_routes = built.routes()
+            baseline_agencies = built.agencies()
+            baseline_feed_info = built.feed_info()
             stops = [s.id for s in baseline_stops]
             queried = (
                 data.draw(
@@ -1909,25 +1942,36 @@ def test_cache_roundtrip_equivalent(zip_bytes: bytes, data: st.DataObject) -> No
                 if stops
                 else ["none"]
             )
+            origin, destination = queried[0], queried[-1]
             now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
             baseline_deps = built.upcoming_departures(
                 queried, None, now, timedelta(hours=30), 5
+            )
+            baseline_trips = built.upcoming_trips(
+                origin, destination, now, timedelta(hours=30), 5
             )
         finally:
             built.close()
         reopened = StaticIndex.open_cached(db_path, "ds-rt")
         assert reopened is not None
         try:
+            assert reopened.timezone_name == tz_name
             assert reopened.stops() == baseline_stops
             assert reopened.routes() == baseline_routes
+            assert reopened.agencies() == baseline_agencies
+            assert reopened.feed_info() == baseline_feed_info
             assert (
                 reopened.upcoming_departures(queried, None, now, timedelta(hours=30), 5)
                 == baseline_deps
             )
+            assert (
+                reopened.upcoming_trips(
+                    origin, destination, now, timedelta(hours=30), 5
+                )
+                == baseline_trips
+            )
         finally:
             reopened.close()
-
-
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
 @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_generated_feeds_end_to_end_totality(
