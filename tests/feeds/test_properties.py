@@ -258,34 +258,118 @@ def test_departures_match_elapsed_seconds_oracle(
         index.close()
 
 
+# Garbage for ONE time component: letters, non-ASCII digits (the
+# ASCII-only hole), sign prefixes, a decimal point, and whitespace. ASCII
+# digits are excluded because any count of them in any component is VALID
+# GTFS ("8:0:0", "0008:00:00") -- generating them would be a broken oracle.
+_TIME_GARBAGE = st.one_of(
+    st.text(
+        alphabet=st.characters(
+            categories=["L", "N"],
+            exclude_characters="0123456789",
+            include_characters="+-. \t",
+        ),
+        min_size=1,
+        max_size=8,
+    ),
+    # Sampled explicitly as well: free text draws non-ASCII digits and sign
+    # prefixes only rarely, and those are the exact forms a bare int()
+    # silently accepted.
+    st.sampled_from(
+        ["\u0660\u0668", "\uff10\uff18", "+8", "-1", "-0", "1_0", "0 8", " 8 "]
+    ),
+)
+
+
 @given(
-    hours=st.integers(min_value=0, max_value=47),
+    hours=st.integers(min_value=0, max_value=500),
     minutes=st.integers(min_value=0, max_value=59),
     seconds=st.integers(min_value=0, max_value=59),
-    pad_hours=st.booleans(),
+    pad=st.tuples(st.booleans(), st.booleans(), st.booleans()),
 )
-def test_parse_gtfs_time_round_trip(
-    hours: int, minutes: int, seconds: int, pad_hours: bool
+def test_parse_gtfs_time_matches_component_oracle(
+    hours: int, minutes: int, seconds: int, pad: tuple[bool, bool, bool]
 ) -> None:
-    # Single-digit UNPADDED hours ("8:00:00") are valid GTFS the spec calls
-    # out explicitly; the suite previously only ever generated "08:00:00".
-    hour_cell = f"{hours:02d}" if pad_hours else str(hours)
-    value = f"{hour_cell}:{minutes:02d}:{seconds:02d}"
-    assert parse_gtfs_time(value) == hours * 3600 + minutes * 60 + seconds
+    """Oracle test (there is no formatter inverse to round-trip against):
+    any zero-padding combination of any in-range components parses to the
+    arithmetic the GTFS spec defines.
+    """
+    # Single-digit UNPADDED components ("8:0:0") are valid GTFS -- int()
+    # accepts them and real feeds ship them. Hours are deliberately drawn
+    # well past 47: a service day may run arbitrarily far past midnight,
+    # so the function has no hour ceiling to find.
+    cells = tuple(
+        f"{component:02d}" if padded else str(component)
+        for component, padded in zip((hours, minutes, seconds), pad, strict=True)
+    )
+    assert parse_gtfs_time(":".join(cells)) == hours * 3600 + minutes * 60 + seconds
 
 
-@given(text=st.text(alphabet=st.characters(categories=["L"]), min_size=1, max_size=8))
-def test_parse_gtfs_time_rejects_garbage(text: str) -> None:
-    # Letters-only: "0:00:00"-style single-digit hours are VALID GTFS, so the
-    # original numeric-string strategy was a broken oracle (found 2026-07-31).
+@given(garbage=_TIME_GARBAGE, position=st.integers(min_value=0, max_value=2))
+def test_parse_gtfs_time_rejects_garbage_in_any_component(
+    garbage: str, position: int
+) -> None:
+    """Garbage in ANY of the three components is rejected, not just the hour
+    -- a validation gap in minutes or seconds would otherwise be invisible.
+    """
+    cells = ["00", "00", "00"]
+    cells[position] = garbage
     with pytest.raises(FeedParseError):
-        parse_gtfs_time(f"{text}:00:00")
+        parse_gtfs_time(":".join(cells))
 
 
-def test_parse_gtfs_time_rejects_out_of_range_components() -> None:
-    for bad in ("08:75:00", "08:00:99", "-1:00:00", "08:-5:00"):
-        with pytest.raises(FeedParseError):
-            parse_gtfs_time(bad)
+@given(
+    value=st.integers(min_value=60, max_value=999),
+    in_seconds=st.booleans(),
+    pad=st.booleans(),
+)
+def test_parse_gtfs_time_rejects_out_of_range_minutes_and_seconds(
+    value: int, in_seconds: bool, pad: bool
+) -> None:
+    """Minutes and seconds are bounded to [0, 60) even though they are
+    spelled in valid ASCII digits (subsumes the hand-written "08:75:00"/
+    "08:00:99" cases). Hours have no such bound.
+    """
+    cell = f"{value:02d}" if pad else str(value)
+    bad = f"08:{cell}:00" if not in_seconds else f"08:00:{cell}"
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(bad)
+
+
+@given(
+    components=st.lists(
+        st.integers(min_value=0, max_value=59).map(lambda n: f"{n:02d}"),
+        min_size=0,
+        max_size=6,
+    ).filter(lambda parts: len(parts) != 3)
+)
+def test_parse_gtfs_time_rejects_wrong_arity(components: list[str]) -> None:
+    """Exactly three colon-separated components, by explicit check rather
+    than by an incidental generator-unpack ValueError: "08:00" and
+    "1:2:3:4" are rejected, and a blank cell stays None (not an arity
+    failure).
+    """
+    value = ":".join(components)
+    if not value:
+        assert parse_gtfs_time(value) is None
+        return
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(value)
+
+
+@given(
+    whole=st.integers(min_value=0, max_value=59),
+    frac=st.integers(min_value=1, max_value=999),
+    position=st.integers(min_value=0, max_value=2),
+)
+def test_parse_gtfs_time_rejects_fractional_components(
+    whole: int, frac: int, position: int
+) -> None:
+    """GTFS times have no sub-second resolution in any component."""
+    cells = ["00", "00", "00"]
+    cells[position] = f"{whole}.{frac}"
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(":".join(cells))
 
 
 @given(
