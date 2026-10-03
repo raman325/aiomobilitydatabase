@@ -3216,15 +3216,49 @@ def test_skipped_totality_over_arrivals_and_trips(
 _GARBAGE_START_DATES = ["20261332", "2026073", "202607301", "garbage!", "00000000"]
 
 
-@given(raw=st.text(max_size=12))
+# Arms that actually REACH the date() call: eight ASCII digits is the only
+# input shape that gets past the guard, and st.text over the default
+# alphabet essentially never produces one. The Arabic-Indic arm probes the
+# ``raw.isascii() and raw.isdigit()`` ordering specifically -- isdigit() is
+# True for those code points while isascii() is False, and int() accepts
+# them, so dropping the isascii() half yields a date that cannot re-render
+# to the cell it came from.
+_ASCII_DIGITS = "0123456789"
+_ARABIC_INDIC_DIGITS = "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"
+_CALENDAR_INVALID_START_DATES = [
+    "20261332",
+    "00000000",
+    "20260230",
+    "20260100",
+    "20261301",
+]
+_START_DATE_RAW = st.one_of(
+    st.text(max_size=12),
+    st.text(alphabet=_ASCII_DIGITS, max_size=12),
+    st.text(alphabet=_ASCII_DIGITS, min_size=8, max_size=8),
+    st.text(alphabet=_ARABIC_INDIC_DIGITS, min_size=8, max_size=8),
+    st.text(alphabet=_ASCII_DIGITS + _ARABIC_INDIC_DIGITS, min_size=8, max_size=8),
+    st.sampled_from(_GARBAGE_START_DATES + _CALENDAR_INVALID_START_DATES),
+    st.dates().map(lambda day: f"{day.year:04d}{day.month:02d}{day.day:02d}"),
+)
+
+
+@settings(max_examples=500, deadline=None)
+@given(raw=_START_DATE_RAW)
 def test_trip_start_date_parse_is_total(raw: str) -> None:
     """Any producer string in start_date parses to a date or None -- never
-    raises (totality over the full unicode input space).
+    raises -- and a parsed date re-renders to EXACTLY the cell it came
+    from, so a calendar-invalid cell, a non-ASCII digit cell, or any other
+    garbage can only yield None.
     """
     trip = gtfs_realtime_pb2.TripDescriptor()
     trip.start_date = raw
     result = _trip_start_date(trip)
+    event(f"reaches date(): {len(raw) == 8 and raw.isascii() and raw.isdigit()}")
     assert result is None or isinstance(result, date)
+    assert (
+        result is None or f"{result.year:04d}{result.month:02d}{result.day:02d}" == raw
+    )
 
 
 @given(day=st.dates())
