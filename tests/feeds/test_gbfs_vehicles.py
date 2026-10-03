@@ -78,3 +78,45 @@ async def test_vehicles_absent_endpoint_returns_empty(
     mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=stations_only)
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     assert await handle.get_vehicles() == []
+
+
+async def test_vehicle_flags_coerce_like_station_flags(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A vehicle's is_reserved/is_disabled go through the same coercion as
+    the station flags: bool("false") is True in Python, so a string flag is
+    UNKNOWN (None) rather than a truthy string on a bool-typed field.
+    """
+    base = mock_api.url()
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=with_base(GBFS_FEED, base))
+    mock_api.get(
+        "/gbfs/free_bike_status.json",
+        payload={
+            "ttl": 60,
+            "data": {
+                "bikes": [
+                    {
+                        "bike_id": "stringy",
+                        "lat": 34.05,
+                        "lon": -118.25,
+                        "is_reserved": "false",
+                        "is_disabled": "true",
+                    },
+                    {
+                        "bike_id": "numeric",
+                        "lat": 34.05,
+                        "lon": -118.25,
+                        "is_reserved": 1,
+                        "is_disabled": 0,
+                    },
+                ]
+            },
+        },
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    by_id = {v.id: v for v in await handle.get_vehicles()}
+    assert by_id["stringy"].is_reserved is None
+    assert by_id["stringy"].is_disabled is None
+    assert by_id["numeric"].is_reserved is True
+    assert by_id["numeric"].is_disabled is False
