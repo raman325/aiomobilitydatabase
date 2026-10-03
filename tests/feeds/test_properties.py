@@ -1972,6 +1972,102 @@ def test_cache_roundtrip_equivalent(
             )
         finally:
             reopened.close()
+
+
+# Degenerate, traversal, separator, unicode and percent-encoded feed ids.
+# Every arm stays inside the per-example sandbox and absolute ids are
+# filtered out of the free-text arms, so even a broken containment guard
+# could only damage the sandbox. Root-like ids ("/" and friends) are too
+# destructive to hand to a real rmtree and are covered instead by
+# test_purge_cache_rejects_root_like_feed_ids, which stubs rmtree out.
+_HOSTILE_FEED_IDS = [
+    "",
+    " ",
+    ".",
+    "./",
+    "..",
+    "../",
+    "../victim",
+    "..\\victim",
+    "mdb-100",
+    "mdb-100/",
+    "./mdb-100",
+    "mdb-100/..",
+    "mdb-100/nested",
+    "nested/mdb-100",
+    "a/../b",
+    "..//..",
+    "%2e%2e",
+    "%2e%2e%2f",
+    "..%2fvictim",
+    "\u002e\u002e",
+    "\uff0e\uff0e",  # fullwidth full stops
+    "mdb\u2011100",  # non-breaking hyphen
+    "\x00",
+]
+
+
+@given(
+    feed_id=st.one_of(
+        st.sampled_from(_HOSTILE_FEED_IDS),
+        st.text(max_size=12),
+        st.text(alphabet=st.characters(categories=["L", "N", "P", "Zs"]), max_size=12),
+    ).filter(lambda drawn: not drawn.startswith("/")),
+    absolute=st.booleans(),
+)
+@settings(
+    max_examples=200,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+def test_purge_cache_removes_only_the_named_feed(
+    tmp_path: Path, feed_id: str, absolute: bool
+) -> None:
+    """purge_cache either removes exactly ``cache_dir/<feed_id>`` or raises
+    ValueError, never touches another entry under cache_dir, and is
+    idempotent. This is the property that would have caught
+    ``purge_cache("")`` deleting the whole cache root.
+    """
+    sandbox = Path(tempfile.mkdtemp(dir=tmp_path))
+    root = sandbox / "cache"
+    root.mkdir()
+    siblings = ("mdb-100", "mdb-200", "url-abcdef0123456789")
+    for name in siblings:
+        (root / name).mkdir()
+        (root / name / "static.db").write_bytes(b"x")
+    (root / "sentinel").write_bytes(b"s")
+    victim = sandbox / "victim"
+    victim.mkdir()
+    (victim / "data").write_bytes(b"precious")
+    # The absolute arm points inside the sandbox, keeping the generator
+    # incapable of naming anything outside tmp_path.
+    drawn = str(victim / "data") if absolute else feed_id
+    assert not Path(drawn.replace("\x00", "")).is_absolute() or drawn.startswith(
+        str(tmp_path)
+    )
+
+    async def scenario() -> bool:
+        async with MobilityFeedsClient(cache_dir=root) as client:
+            try:
+                await client.purge_cache(drawn)
+            except ValueError:
+                return True
+            await client.purge_cache(drawn)  # idempotent: same effect as once
+            return False
+
+    rejected = asyncio.run(scenario())
+    event(f"purge_cache rejected={rejected}")
+    assert (root / "sentinel").read_bytes() == b"s"
+    assert (victim / "data").read_bytes() == b"precious"
+    survivors = {name for name in siblings if (root / name / "static.db").is_file()}
+    if rejected:
+        assert survivors == set(siblings)
+        return
+    assert not (root / drawn).exists()
+    assert len(survivors) >= len(siblings) - 1
+    assert survivors >= {name for name in siblings if name != Path(drawn).name}
+
+
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
 @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_generated_feeds_end_to_end_totality(

@@ -1,5 +1,6 @@
 """Tests for MobilityFeedsClient construction, catalog access, and close()."""
 
+import shutil
 from pathlib import Path
 
 import aiohttp
@@ -172,4 +173,28 @@ async def test_purge_cache_is_idempotent(mock_api: MockApi, tmp_path: Path) -> N
     await client.purge_cache("mdb-100")
     assert not (root / "mdb-100").exists()
     assert root.exists()
+    await client.close()
+
+
+@pytest.mark.parametrize("feed_id", ["/", "//", "/.", "/etc"])
+async def test_purge_cache_rejects_root_like_feed_ids(
+    mock_api: MockApi,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    feed_id: str,
+) -> None:
+    """Root-like ids must be rejected before any deletion happens. rmtree is
+    stubbed to a recorder so a regression in the guard cannot delete real
+    filesystem contents while this test runs.
+    """
+    removed: list[object] = []
+    monkeypatch.setattr(shutil, "rmtree", lambda *args, **kwargs: removed.append(args))
+    root = tmp_path / "cache"
+    root.mkdir()
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(ValueError, match="escapes"):
+        await client.purge_cache(feed_id)
+    assert not removed
     await client.close()
