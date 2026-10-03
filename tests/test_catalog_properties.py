@@ -11,6 +11,7 @@ import contextlib
 import copy
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -19,6 +20,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from mashumaro.exceptions import InvalidFieldValue
 
+from aiomobilitydatabase import client as client_module
 from aiomobilitydatabase.client import MobilityDatabaseClient, encode_params
 from aiomobilitydatabase.exceptions import MobilityDatabaseError
 from aiomobilitydatabase.models import (
@@ -301,28 +303,43 @@ def test_encode_params_comma_join_is_ambiguous_for_commas_in_values() -> None:
 # segment "/v1/feeds/a%2Fb" a real API would need to look up the literal ID.
 
 _PATH_ID_CHARS = "/?#% "
-_PATH_ID_TEXT = st.text(
-    alphabet=st.characters(
-        categories=["L", "N"],
-        include_characters=_PATH_ID_CHARS + "–_🚌",  # noqa: RUF001
-    ),
+# Constructive rather than "bury the interesting characters in all of Unicode":
+# drawing each character from a 5-way special-character pool OR the letter/
+# number space puts a "/" in 78 of 150 draws, against 3 of 150 for the
+# previous st.text(categories=["L", "N"], include_characters=...) form (both
+# measured). The special characters are what the quoting bug lives in.
+_PATH_ID_TEXT = st.lists(
+    st.sampled_from(_PATH_ID_CHARS)
+    | st.characters(categories=["L", "N"], include_characters="–_🚌"),  # noqa: RUF001
     min_size=1,
     max_size=12,
-)
+).map("".join)
 
-# feed_id/license_id/dataset_id path-taking methods named by the plan item.
-_PATH_METHODS: dict[str, str] = {
-    "get_feed": "/v1/feeds/",
-    "get_license": "/v1/licenses/",
-    "get_dataset_gtfs": "/v1/datasets/gtfs/",
+# EVERY id-interpolating call site in client.py, as
+# method name -> (path prefix, path suffix). The suffixed ones
+# (.../datasets, .../gtfs_rt_feeds, .../availability) matter most: there the
+# id sits in the MIDDLE of the path, so an unquoted "/" shifts the trailing
+# segment the server routes on, not just the lookup key.
+_PATH_METHODS: dict[str, tuple[str, str]] = {
+    "get_feed": ("/v1/feeds/", ""),
+    "get_gtfs_feed": ("/v1/gtfs_feeds/", ""),
+    "get_gtfs_rt_feed": ("/v1/gtfs_rt_feeds/", ""),
+    "get_gbfs_feed": ("/v1/gbfs_feeds/", ""),
+    "get_gtfs_feed_datasets": ("/v1/gtfs_feeds/", "/datasets"),
+    "get_gtfs_feed_gtfs_rt_feeds": ("/v1/gtfs_feeds/", "/gtfs_rt_feeds"),
+    "get_gtfs_feed_availability": ("/v1/gtfs_feeds/", "/availability"),
+    "get_dataset_gtfs": ("/v1/datasets/gtfs/", ""),
+    "get_license": ("/v1/licenses/", ""),
 }
 
 
-def _run_path_quoting_probe(kind: str, id_value: str) -> tuple[str, list[str]]:
-    """Call one id-taking catalog method against a mock server and return
-    (raw wire path of the GET request actually sent, every GET raw_path
-    seen) -- regardless of whether the call raised, since the mock records
-    a request before it can 599/404 on a route mismatch.
+def _run_path_quoting_probe(method_name: str, id_value: str) -> str:
+    """Call one id-taking catalog method against a mock server and return the
+    raw wire path of the GET request actually sent.
+
+    The scripted response is a 404 so the probe stays independent of each
+    endpoint's response shape; the mock records the request before replying,
+    and the resulting error is suppressed.
 
     The mock is registered at the DEcoded path (aiohttp always decodes
     percent-escapes back into ``request.path`` before routing, verified
@@ -330,33 +347,37 @@ def _run_path_quoting_probe(kind: str, id_value: str) -> tuple[str, list[str]]:
     a mock artifact.
     """
 
-    async def scenario() -> tuple[str, list[str]]:
+    async def scenario() -> str:
         api = MockApi()
         await api.start()
         try:
             api.post("/v1/tokens", payload=TOKEN_RESPONSE)
-            prefix = _PATH_METHODS[kind]
-            api.get(f"{prefix}{id_value}", payload={"id": id_value})
+            prefix, suffix = _PATH_METHODS[method_name]
+            api.get(f"{prefix}{id_value}{suffix}", status=404, payload={})
             async with MobilityDatabaseClient("t", base_url=api.url()) as client:
                 with contextlib.suppress(MobilityDatabaseError):
-                    if kind == "get_feed":
-                        await client.get_feed(id_value)
-                    elif kind == "get_license":
-                        await client.get_license(id_value)
-                    else:
-                        await client.get_dataset_gtfs(id_value)
+                    await getattr(client, method_name)(id_value)
             get_requests = [r for r in api.requests if r.method == "GET"]
             assert len(get_requests) == 1, get_requests
-            return get_requests[0].raw_path, [r.raw_path for r in get_requests]
+            return get_requests[0].raw_path
         finally:
             await api.stop()
 
     return asyncio.run(scenario())
 
 
-@given(kind=st.sampled_from(list(_PATH_METHODS)), id_value=_PATH_ID_TEXT)
-@settings(max_examples=150, deadline=None)
-def test_catalog_path_ids_are_quoted(kind: str, id_value: str) -> None:
-    recorded_raw_path, _all = _run_path_quoting_probe(kind, id_value)
-    expected = f"{_PATH_METHODS[kind]}{quote(id_value, safe='')}"
-    assert recorded_raw_path == expected
+@given(method_name=st.sampled_from(list(_PATH_METHODS)), id_value=_PATH_ID_TEXT)
+@settings(max_examples=300, deadline=None)
+def test_catalog_path_ids_are_quoted(method_name: str, id_value: str) -> None:
+    recorded_raw_path = _run_path_quoting_probe(method_name, id_value)
+    prefix, suffix = _PATH_METHODS[method_name]
+    assert recorded_raw_path == f"{prefix}{quote(id_value, safe='')}{suffix}"
+
+
+def test_every_quoted_call_site_is_covered() -> None:
+    """Fail when a new endpoint interpolates an id into its path without
+    being added to _PATH_METHODS above, which is how the previous version of
+    this test ended up protecting 3 of the 9 call sites.
+    """
+    source = Path(client_module.__file__).read_text(encoding="utf-8")
+    assert source.count("{_quote_segment(") == len(_PATH_METHODS)
