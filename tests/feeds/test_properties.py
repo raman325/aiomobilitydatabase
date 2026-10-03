@@ -211,6 +211,11 @@ def _boundary_dep_secs(target: datetime, tz: ZoneInfo, query_date: date) -> int:
     # tested strictly inside the window.
     pin=st.sampled_from(["none", "lower", "upper"]),
     limit=st.integers(min_value=1, max_value=3),
+    # A hardcoded 03:00 UTC `now` never lands on a US wall-clock DST
+    # transition (10:00 UTC), so the "now straddles the transition" case was
+    # unreachable despite query_date deliberately sampling transition days.
+    now_hour=st.integers(min_value=0, max_value=23),
+    now_minute=st.sampled_from([0, 30, 59]),
 )
 def test_departures_match_elapsed_seconds_oracle(
     *,
@@ -220,9 +225,11 @@ def test_departures_match_elapsed_seconds_oracle(
     lookahead_hours: int,
     pin: str,
     limit: int,
+    now_hour: int,
+    now_minute: int,
 ) -> None:
     tz = ZoneInfo(tz_name)
-    now = datetime.combine(query_date, time(3, 0), tzinfo=UTC)
+    now = datetime.combine(query_date, time(now_hour, now_minute), tzinfo=UTC)
     lookahead = timedelta(hours=lookahead_hours)
     if pin == "lower":
         dep_secs = _boundary_dep_secs(now, tz, query_date)
@@ -414,23 +421,45 @@ def test_in_circle_admits_points_across_the_antimeridian(
     assert in_circle(zone, lat, lon)
 
 
-@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+# Each drawn exception date carries a ROLE, so the added/removed/both
+# partition is constructed rather than left to two independent date draws
+# colliding by chance (which put a date in both lists on ~4% of examples).
+_EXCEPTION_ROLES = st.lists(
+    st.tuples(
+        st.dates(min_value=CAL_START, max_value=CAL_END),
+        st.sampled_from(["added", "removed", "both"]),
+    ),
+    max_size=3,
+    unique_by=lambda pair: pair[0],
+)
+
+
+@settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     weekdays=st.lists(st.booleans(), min_size=7, max_size=7),
-    added=st.lists(
-        st.dates(min_value=CAL_START, max_value=CAL_END), max_size=3, unique=True
-    ),
-    removed=st.lists(
-        st.dates(min_value=CAL_START, max_value=CAL_END), max_size=3, unique=True
-    ),
-    probe=st.dates(min_value=date(2025, 12, 1), max_value=date(2028, 1, 31)),
+    exceptions=_EXCEPTION_ROLES,
+    free_probe=st.dates(min_value=date(2025, 12, 1), max_value=date(2028, 1, 31)),
+    # Probe an EXCEPTION date on a drawn majority of examples (same trick as
+    # test_departures_match_elapsed_seconds_oracle's `pin`): a free date draw
+    # landed on one of at most three exception dates in a two-year range on
+    # ~7% of examples, so the override paths were almost never reached.
+    probe_on_exception=st.integers(min_value=0, max_value=9),
+    probe_pick=st.integers(min_value=0, max_value=2),
 )
 def test_active_service_ids_matches_naive_oracle(
     weekdays: list[bool],
-    added: list[date],
-    removed: list[date],
-    probe: date,
+    exceptions: list[tuple[date, str]],
+    free_probe: date,
+    probe_on_exception: int,
+    probe_pick: int,
 ) -> None:
+    added = [d for d, role in exceptions if role in ("added", "both")]
+    removed = [d for d, role in exceptions if role in ("removed", "both")]
+    probe = free_probe
+    if exceptions and probe_on_exception < 7:
+        probe = exceptions[probe_pick % len(exceptions)][0]
+    event(f"probe on exception date: {probe in set(added) | set(removed)}")
+    event(f"probe added AND removed: {probe in set(added) & set(removed)}")
     bits = ",".join("1" if flag else "0" for flag in weekdays)
     # A date may be drawn as BOTH added and removed -- a real producer error
     # GTFS leaves undefined. The oracle below encodes the library's
