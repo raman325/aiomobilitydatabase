@@ -2486,23 +2486,31 @@ def test_frequency_offsets_preserved_on_every_repetition(
         index.close()
 
 
-@settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-@given(
-    template=_frequency_template_strategy(),
-    rows=st.lists(
-        st.tuples(
-            st.integers(0, 24 * 3600), st.integers(1, 5400), st.integers(60, 1800)
-        ),
-        min_size=1,
-        max_size=2,
-    ),
+@pytest.mark.parametrize(
+    ("template", "rows"),
+    [
+        pytest.param(
+            [(0, 0), (300, 330), (900, 900)],
+            [(21_600, 3_600, 600), (43_200, 1_800, 900)],
+            id="two-spans-three-stops",
+        )
+    ],
 )
 def test_frequency_exact_times_values_materialize_identically(
     template: list[tuple[int, int]], rows: list[tuple[int, int, int]]
 ) -> None:
-    """Pin the documented equivalence: exact_times=0 (idealized headway
-    service) and exact_times=1 (exact schedule) materialize identical
-    repetitions -- the column changes nothing downstream.
+    """Regression guard for the documented equivalence: exact_times=0
+    (idealized headway service) and exact_times=1 (exact schedule)
+    materialize identical repetitions.
+
+    Deliberately ONE fixed example rather than a @given property. The
+    column is read by no production code path -- _parse_frequency_spans
+    destructures only trip_id/start_time/end_time/headway_secs, and
+    static_index's docstring says the column is ignored for both values --
+    so the assertion cannot fail for any drawn input, and drawn variety
+    bought nothing but two extra full index builds per example. It stays
+    as a guard that would fail if someone later started branching on the
+    column without saying so.
     """
     results = []
     for exact in ("0", "1"):
@@ -2519,6 +2527,8 @@ def test_frequency_exact_times_values_materialize_identically(
         finally:
             index.close()
     assert results[0] == results[1]
+    # Not vacuous: the fixed feed really materializes repetitions.
+    assert results[0]
 
 
 @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
