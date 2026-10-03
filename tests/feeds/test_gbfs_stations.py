@@ -325,3 +325,124 @@ async def test_system_info_without_system_id_raises(
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     with pytest.raises(FeedParseError, match="system_id"):
         await handle.get_system_info()
+
+
+_STATION_ROW = {"station_id": "real", "lat": 34.05, "lon": -118.25}
+
+
+@pytest.mark.parametrize(
+    ("info_data", "status_data", "expected_ids"),
+    [
+        pytest.param([], {}, [], id="info-data-is-a-list"),
+        pytest.param({"stations": "nope"}, {}, [], id="stations-not-a-list"),
+        pytest.param(
+            {"stations": [1, "x", None, _STATION_ROW]},
+            {},
+            ["real"],
+            id="non-dict-info-entries",
+        ),
+        pytest.param(
+            {"stations": [_STATION_ROW]},
+            [],
+            ["real"],
+            id="status-data-is-a-list",
+        ),
+        pytest.param(
+            {"stations": [_STATION_ROW]},
+            {"stations": [3, None, {"station_id": "orphan"}]},
+            ["real"],
+            id="non-dict-status-entries-and-orphans",
+        ),
+    ],
+)
+async def test_get_stations_total_over_malformed_envelopes(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    info_data: object,
+    status_data: object,
+    expected_ids: list[str],
+) -> None:
+    """get_stations() is total over arbitrary JSON-shaped documents: a
+    wrongly typed data envelope, station list, or station entry yields the
+    usable rows rather than AttributeError/TypeError.
+    """
+    _mock_catalog(mock_api)
+    mock_api.get("/gbfs/station_information.json", payload={"data": info_data})
+    mock_api.get("/gbfs/station_status.json", payload={"data": status_data})
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    assert [s.id for s in await handle.get_stations()] == expected_ids
+
+
+@pytest.mark.parametrize(
+    ("available", "expected"),
+    [
+        pytest.param([{"vehicle_type_id": "bike", "count": 4}], {"bike": 4}, id="ok"),
+        pytest.param([{"vehicle_type_id": "bike"}], {"bike": 0}, id="absent-count"),
+        pytest.param(
+            [{"vehicle_type_id": "bike", "count": "4"}], {"bike": 4}, id="str"
+        ),
+        pytest.param([{"vehicle_type_id": "bike", "count": None}], None, id="null"),
+        pytest.param([{"count": 4}], None, id="no-type-id"),
+        pytest.param({"bike": 4}, None, id="object-not-a-list"),
+        pytest.param("bike", None, id="string"),
+        pytest.param([], None, id="empty"),
+    ],
+)
+async def test_vehicle_types_available_shapes(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    available: object,
+    expected: dict[str, int] | None,
+) -> None:
+    """vehicle_types_available: int(entry.get("count", 0)) raised on a null
+    count and iterating an object yielded its keys. Unusable entries drop;
+    an empty result is None (the documented "not published" value).
+    """
+    _mock_catalog(mock_api)
+    mock_api.get(
+        "/gbfs/station_information.json", payload={"data": {"stations": [_STATION_ROW]}}
+    )
+    mock_api.get(
+        "/gbfs/station_status.json",
+        payload={
+            "data": {
+                "stations": [
+                    {"station_id": "real", "vehicle_types_available": available}
+                ]
+            }
+        },
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    (station,) = await handle.get_stations()
+    assert station.vehicle_types_available == expected
+
+
+async def test_station_coordinates_normalized_and_zone_filter_stays_total(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Coordinates are normalized before in_circle() ever sees them: a
+    numeric string is a usable coordinate, anything else is unknown (and
+    an unknown coordinate is excluded when filtering, never a TypeError).
+    """
+    _mock_catalog(mock_api)
+    rows = [
+        {"station_id": "stringy", "lat": "34.05", "lon": "-118.25"},
+        {"station_id": "junk", "lat": "near the pier", "lon": -118.25},
+        {"station_id": "boolean", "lat": True, "lon": -118.25},
+    ]
+    mock_api.get(
+        "/gbfs/station_information.json",
+        payload={"ttl": 60, "data": {"stations": rows}},
+    )
+    mock_api.get(
+        "/gbfs/station_status.json", payload={"ttl": 60, "data": {"stations": []}}
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    by_id = {s.id: s for s in await handle.get_stations()}
+    assert by_id["stringy"].latitude == 34.05
+    assert by_id["junk"].latitude is None
+    assert by_id["boolean"].latitude is None
+    zoned = await handle.get_stations(
+        zone=Circle(latitude=34.05, longitude=-118.25, radius_m=1000)
+    )
+    assert [s.id for s in zoned] == ["stringy"]

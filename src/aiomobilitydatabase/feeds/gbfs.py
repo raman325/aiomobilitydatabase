@@ -84,6 +84,61 @@ def _rental_uris(value: Any) -> dict[str, str] | None:
     return uris or None
 
 
+def _coordinate(value: Any) -> float | None:
+    """Normalize one ``lat``/``lon`` cell to a finite float, else None (unknown).
+
+    :func:`~.geo.in_circle` compares the value and takes its cosine, so a
+    string coordinate would raise and a NaN would answer every comparison
+    False; both are UNKNOWN instead. Numeric strings are accepted because
+    producers ship them.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return None
+    try:
+        coordinate = float(value)
+    except ValueError:
+        return None
+    return coordinate if math.isfinite(coordinate) else None
+
+
+def _vehicle_types(value: Any) -> dict[str, int] | None:
+    """Normalize a station's ``vehicle_types_available`` to id -> count.
+
+    Entries without a usable type id, and counts that aren't parseable as
+    an int (``int(None)`` used to raise), are dropped rather than
+    coerced; an absent count is the spec's 0. Anything that isn't a list
+    with at least one usable entry is None, i.e. "not published".
+    """
+    if not isinstance(value, list):
+        return None
+    types: dict[str, int] = {}
+    for entry in value:
+        if not isinstance(entry, Mapping):
+            continue
+        type_id = _record_id(entry.get("vehicle_type_id"))
+        try:
+            count = int(entry.get("count", 0))
+        except (TypeError, ValueError):
+            continue
+        if type_id is not None:
+            types[type_id] = count
+    return types or None
+
+
+def _rows(document: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
+    """Extract the ``data.<key>`` row list, keeping object-shaped rows only.
+
+    A GBFS document's envelope is producer data: ``data`` may be a list,
+    the row list a string, a row an int. Every non-conforming shape
+    degrades to "no rows" so the snapshot methods stay total.
+    """
+    data = document.get("data")
+    rows = data.get(key) if isinstance(data, Mapping) else None
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, Mapping)]
+
+
 def _as_bool(value: Any) -> bool | None:
     """Coerce a GBFS status flag to bool without lying on ambiguous input.
 
@@ -291,38 +346,28 @@ class GbfsFeedHandle:
         Information rows without a usable ``station_id`` are skipped: the
         merge and the returned ``id`` both key on it.
         """
-        info_rows = (await self._document("station_information"))["data"].get(
-            "stations", []
-        )
-        status_rows = (await self._document("station_status"))["data"].get(
-            "stations", []
-        )
+        info_rows = _rows(await self._document("station_information"), "stations")
+        status_rows = _rows(await self._document("station_status"), "stations")
         status_by_id = {_record_id(row.get("station_id")): row for row in status_rows}
         stations: list[Station] = []
         for info in info_rows:
+            latitude = _coordinate(info.get("lat"))
+            longitude = _coordinate(info.get("lon"))
             if zone is not None:
-                lat, lon = info.get("lat"), info.get("lon")
-                if lat is None or lon is None or not in_circle(zone, lat, lon):
+                if latitude is None or longitude is None:
+                    continue
+                if not in_circle(zone, latitude, longitude):
                     continue
             station_id = _record_id(info.get("station_id"))
             if station_id is None:
                 continue
-            status = status_by_id.get(station_id, {})
-            types_list = status.get("vehicle_types_available")
-            types = (
-                {
-                    str(entry.get("vehicle_type_id")): int(entry.get("count", 0))
-                    for entry in types_list
-                }
-                if types_list
-                else None
-            )
+            status: Mapping[str, Any] = status_by_id.get(station_id, {})
             stations.append(
                 Station(
                     id=station_id,
                     name=_localized(info.get("name")),
-                    latitude=info.get("lat"),
-                    longitude=info.get("lon"),
+                    latitude=latitude,
+                    longitude=longitude,
                     capacity=info.get("capacity"),
                     bikes_available=status.get(
                         "num_bikes_available", status.get("num_vehicles_available")
@@ -330,7 +375,9 @@ class GbfsFeedHandle:
                     docks_available=status.get("num_docks_available"),
                     is_renting=_as_bool(status.get("is_renting")),
                     is_returning=_as_bool(status.get("is_returning")),
-                    vehicle_types_available=types,
+                    vehicle_types_available=_vehicle_types(
+                        status.get("vehicle_types_available")
+                    ),
                     rental_uris=_rental_uris(info.get("rental_uris")),
                 )
             )
@@ -346,17 +393,18 @@ class GbfsFeedHandle:
         coordinates (a free-floating vehicle IS its position).
         """
         if "vehicle_status" in self._endpoints:
-            rows = (await self._document("vehicle_status"))["data"].get("vehicles", [])
+            rows = _rows(await self._document("vehicle_status"), "vehicles")
             id_key = "vehicle_id"
         elif "free_bike_status" in self._endpoints:
-            rows = (await self._document("free_bike_status"))["data"].get("bikes", [])
+            rows = _rows(await self._document("free_bike_status"), "bikes")
             id_key = "bike_id"
         else:
             return []
         vehicles: list[GbfsVehicle] = []
         for row in rows:
             vehicle_id = _record_id(row.get(id_key))
-            latitude, longitude = row.get("lat"), row.get("lon")
+            latitude = _coordinate(row.get("lat"))
+            longitude = _coordinate(row.get("lon"))
             if vehicle_id is None or latitude is None or longitude is None:
                 continue
             if zone is not None and not in_circle(zone, latitude, longitude):
