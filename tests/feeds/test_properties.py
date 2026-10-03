@@ -4250,3 +4250,126 @@ def test_first_translation_without_text_entries_is_none(
     # Entries with empty text still COUNT as text (the producer sent a
     # translation); only an absent list is "no text".
     assert _first_translation(translated) == ("" if languages else None)
+
+
+# --- trip_updates_from_message laws ------------------------------------------
+
+_TU_RELATIONSHIPS = [
+    gtfs_realtime_pb2.TripDescriptor.SCHEDULED,
+    gtfs_realtime_pb2.TripDescriptor.ADDED,
+    gtfs_realtime_pb2.TripDescriptor.UNSCHEDULED,
+    gtfs_realtime_pb2.TripDescriptor.CANCELED,
+]
+
+
+def _draw_tu_entity_specs(
+    draw: st.DrawFn, *, distinct_keys: bool
+) -> list[dict[str, object]]:
+    """Draw TripUpdate entity specs over a two-id, few-date identity space.
+
+    ``distinct_keys`` gives every entity its own service day, so the
+    TripUpdateKeys are pairwise distinct by construction (what the
+    order-independence law needs); otherwise dates collide and duplicate
+    identities -- the documented last-wins exception -- occur.
+    """
+    count = draw(st.integers(1, 5))
+    return [
+        {
+            "trip_id": draw(st.sampled_from(["T0", "T1"])),
+            "start_date": (
+                f"2026080{index + 1}"
+                if distinct_keys
+                else draw(st.sampled_from(["", "20260801", "20260802"]))
+            ),
+            "relationship": draw(st.sampled_from(_TU_RELATIONSHIPS)),
+            "delay": draw(st.none() | st.integers(-300, 900)),
+            "stops": draw(st.lists(st.sampled_from(["S0", "S1", "S2"]), max_size=3)),
+        }
+        for index in range(count)
+    ]
+
+
+def _tu_message(specs: list[dict[str, object]]) -> gtfs_realtime_pb2.FeedMessage:
+    """Encode entity specs in list order."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    for index, spec in enumerate(specs):
+        entity = msg.entity.add()
+        entity.id = f"tu{index}"
+        trip = entity.trip_update.trip
+        trip.trip_id = spec["trip_id"]  # type: ignore[assignment]
+        if spec["start_date"]:
+            trip.start_date = spec["start_date"]  # type: ignore[assignment]
+        trip.schedule_relationship = spec["relationship"]  # type: ignore[assignment]
+        if spec["delay"] is not None:
+            entity.trip_update.delay = spec["delay"]  # type: ignore[assignment]
+        for stop_id in spec["stops"]:  # type: ignore[attr-defined]
+            stu = entity.trip_update.stop_time_update.add()
+            stu.stop_id = stop_id
+            stu.departure.delay = 60
+    return msg
+
+
+@settings(max_examples=200, deadline=None)
+@given(data=st.data())
+def test_trip_updates_cancellation_wins_as_an_invariant(data: st.DataObject) -> None:
+    """Cancellation-wins stated as an invariant of ANY message rather than
+    one hand-built message in two orderings: ``canceled_trips`` and
+    ``trips`` are disjoint, and no added stop time belongs to a trip id
+    that any cancellation in the message named.
+
+    Note the scope: this is the PER-MESSAGE law. An identity delayed in
+    one feed and canceled in another is reconciled only at the merge
+    layer, which the multi-RT aggregation property covers.
+    """
+    specs = _draw_tu_entity_specs(data.draw, distinct_keys=False)
+    updates = trip_updates_from_message(_tu_message(specs))
+    assert updates.canceled_trips.isdisjoint(set(updates.trips))
+    canceled_ids = {trip_id for trip_id, _, _ in updates.canceled_trips}
+    assert all(row.trip_id not in canceled_ids for row in updates.added)
+    # Exactness, so the law cannot pass on an empty parse: every drawn
+    # cancellation key is present, and every uncanceled non-ADDED entity
+    # keeps its entry.
+    expected_canceled = {
+        (spec["trip_id"], _trip_start_date_of(spec), None)
+        for spec in specs
+        if spec["relationship"] == gtfs_realtime_pb2.TripDescriptor.CANCELED
+    }
+    assert updates.canceled_trips == expected_canceled
+    expected_trips = {
+        (spec["trip_id"], _trip_start_date_of(spec), None)
+        for spec in specs
+        if spec["relationship"]
+        not in (
+            gtfs_realtime_pb2.TripDescriptor.CANCELED,
+            gtfs_realtime_pb2.TripDescriptor.ADDED,
+        )
+    }
+    assert set(updates.trips) == expected_trips - expected_canceled
+
+
+def _trip_start_date_of(spec: dict[str, object]) -> date | None:
+    cell: str = spec["start_date"]  # type: ignore[assignment]
+    return date.fromisoformat(cell) if cell else None
+
+
+@settings(max_examples=200, deadline=None)
+@given(data=st.data())
+def test_trip_updates_parse_is_entity_order_independent(data: st.DataObject) -> None:
+    """For a message whose TripUpdateKeys are pairwise distinct, parsing is
+    invariant under shuffling the entity list (``added`` rows modulo
+    order, since they are a list).
+
+    This documents where order DOES matter as the single intentional
+    exception -- duplicate keys resolve last-wins -- instead of leaving it
+    folklore. ADDED-vs-cancellation interactions are included: added rows
+    are dropped on a bare trip-id match, which a per-entity (rather than
+    post-pass) implementation would resolve order-dependently.
+    """
+    specs = _draw_tu_entity_specs(data.draw, distinct_keys=True)
+    order = data.draw(st.permutations(range(len(specs))))
+    baseline = trip_updates_from_message(_tu_message(specs))
+    shuffled = trip_updates_from_message(_tu_message([specs[i] for i in order]))
+    assert shuffled.trips == baseline.trips
+    assert shuffled.canceled_trips == baseline.canceled_trips
+    assert sorted(shuffled.added, key=repr) == sorted(baseline.added, key=repr)
