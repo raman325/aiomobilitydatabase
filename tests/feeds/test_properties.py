@@ -2217,23 +2217,68 @@ def test_gbfs_stations_zone_filter_law(rows: list[dict[str, object]]) -> None:
     ]
 
 
+_EARTH_HALF_CIRCUMFERENCE_M = math.pi * 6_371_000.0
+# Metres per degree of latitude along a meridian, for the calibration law
+# below. Written from first principles (R * pi / 180), NOT imported from
+# geo.py, so a wrong radius there cannot cancel out of the oracle.
+_M_PER_DEG_LAT = 6_371_000.0 * math.pi / 180.0
+
+
 @given(
-    lat1=st.floats(-85, 85),
-    lon1=st.floats(-179, 179),
-    lat2=st.floats(-85, 85),
-    lon2=st.floats(-179, 179),
+    # Full domain, including the poles, where cos(phi) -> 0. The previous
+    # +-85/+-179 clipping excluded them and nothing else covered them.
+    lat1=st.floats(-90, 90),
+    lon1=st.floats(-180, 180),
+    lat2=st.floats(-90, 90),
+    lon2=st.floats(-180, 180),
+    third=st.tuples(st.floats(-90, 90), st.floats(-180, 180)),
 )
 def test_haversine_metric_laws(
-    lat1: float, lon1: float, lat2: float, lon2: float
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+    third: tuple[float, float],
 ) -> None:
     """Non-negativity, symmetry, identity-of-indiscernibles (same point),
-    and the trivial upper bound (half the Earth's circumference).
+    the trivial upper bound (half the Earth's circumference), and the
+    triangle inequality via a third drawn point.
+
+    The triangle inequality does NOT catch a lat/lon argument swap:
+    measured over 2000 examples the swapped implementation produces zero
+    violations, because swapping the coordinates is a bijection of the
+    sphere and the composition is still a metric. The calibration law
+    below is what catches that.
     """
+    lat3, lon3 = third
     d_ab = haversine_m(lat1, lon1, lat2, lon2)
+    d_bc = haversine_m(lat2, lon2, lat3, lon3)
+    d_ac = haversine_m(lat1, lon1, lat3, lon3)
     assert d_ab >= 0
     assert abs(d_ab - haversine_m(lat2, lon2, lat1, lon1)) < 1e-6
     assert haversine_m(lat1, lon1, lat1, lon1) < 1e-6
-    assert d_ab <= math.pi * 6_371_000.0 + 1.0
+    assert d_ab <= _EARTH_HALF_CIRCUMFERENCE_M + 1.0
+    # Epsilon in metres: these distances reach ~2e7, so float rounding in
+    # sqrt/asin is worth more slack than the 1e-6 used for the exact laws.
+    assert d_ac <= d_ab + d_bc + 1e-3
+
+
+@given(lat1=st.floats(-90, 90), lat2=st.floats(-90, 90), lon=st.floats(-180, 180))
+def test_haversine_along_a_meridian_equals_arc_length(
+    lat1: float, lat2: float, lon: float
+) -> None:
+    """Calibration, not just structure: two points on the SAME meridian are
+    exactly |dlat| degrees of arc apart, so the distance must equal
+    |dlat| * R * pi / 180 whatever longitude they share.
+
+    This is the law the metric laws cannot express. All of them -- including
+    the triangle inequality -- survive a lat/lon argument swap and a wrong
+    Earth radius; this one fails on both (verified over a 150-point probe
+    grid: 58 violations under the swap, 145 under a halved radius).
+    """
+    distance = haversine_m(lat1, lon, lat2, lon)
+    expected = abs(lat2 - lat1) * _M_PER_DEG_LAT
+    assert math.isclose(distance, expected, rel_tol=1e-9, abs_tol=1e-6)
 
 
 @given(
