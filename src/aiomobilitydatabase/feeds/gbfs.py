@@ -32,6 +32,20 @@ def _entry_text(entry: dict[str, Any]) -> str | None:
     return None if text is None else str(text)
 
 
+def _record_id(value: Any) -> str | None:
+    """One record's own id as a string, or None when it has none.
+
+    ``str(value)`` would synthesize the literal id ``"None"`` for an
+    id-less record — and those synthetic ids COLLIDE across records,
+    corrupting any consumer that keys on them (an entity registry, say).
+    A blank id collides identically, so it is None too. Same motivation
+    as :func:`_entry_text`: never surface a stringified None.
+    """
+    if value is None:
+        return None
+    return str(value) or None
+
+
 def _localized(value: Any) -> str | None:
     """Normalize GBFS text: 3.x localized lists vs 2.x plain strings."""
     if value is None or isinstance(value, str):
@@ -249,10 +263,20 @@ class GbfsFeedHandle:
         return document
 
     async def get_system_info(self) -> SystemInfo:
-        """GBFS system information."""
+        """GBFS system information.
+
+        A document without a usable ``system_id`` raises
+        :class:`FeedParseError`: the id is this system's identity, and a
+        synthesized one would silently key consumer state to nothing.
+        """
         data = (await self._document("system_information"))["data"]
+        system_id = _record_id(
+            data.get("system_id") if isinstance(data, Mapping) else None
+        )
+        if system_id is None:
+            raise FeedParseError("GBFS system_information document has no system_id")
         return SystemInfo(
-            system_id=str(data.get("system_id")),
+            system_id=system_id,
             name=_localized(data.get("name")),
             operator=_localized(data.get("operator")),
             timezone=data.get("timezone"),
@@ -264,6 +288,8 @@ class GbfsFeedHandle:
         With ``zone``, only stations inside the circle are returned (stations
         without coordinates are excluded when filtering) — this powers both
         the config-flow station multi-select and zone-scoped station sensors.
+        Information rows without a usable ``station_id`` are skipped: the
+        merge and the returned ``id`` both key on it.
         """
         info_rows = (await self._document("station_information"))["data"].get(
             "stations", []
@@ -271,14 +297,16 @@ class GbfsFeedHandle:
         status_rows = (await self._document("station_status"))["data"].get(
             "stations", []
         )
-        status_by_id = {row.get("station_id"): row for row in status_rows}
+        status_by_id = {_record_id(row.get("station_id")): row for row in status_rows}
         stations: list[Station] = []
         for info in info_rows:
             if zone is not None:
                 lat, lon = info.get("lat"), info.get("lon")
                 if lat is None or lon is None or not in_circle(zone, lat, lon):
                     continue
-            station_id = info.get("station_id")
+            station_id = _record_id(info.get("station_id"))
+            if station_id is None:
+                continue
             status = status_by_id.get(station_id, {})
             types_list = status.get("vehicle_types_available")
             types = (
@@ -291,7 +319,7 @@ class GbfsFeedHandle:
             )
             stations.append(
                 Station(
-                    id=str(station_id),
+                    id=station_id,
                     name=_localized(info.get("name")),
                     latitude=info.get("lat"),
                     longitude=info.get("lon"),
@@ -314,6 +342,8 @@ class GbfsFeedHandle:
         Uses ``vehicle_status`` (GBFS 3.x) when published, else falls back to
         ``free_bike_status`` (2.x). Returns [] for docked-only systems.
         Filtering is client-side: GBFS has no server-side geo-query.
+        Rows without a usable id are skipped, as are rows without
+        coordinates (a free-floating vehicle IS its position).
         """
         if "vehicle_status" in self._endpoints:
             rows = (await self._document("vehicle_status"))["data"].get("vehicles", [])
@@ -325,14 +355,15 @@ class GbfsFeedHandle:
             return []
         vehicles: list[GbfsVehicle] = []
         for row in rows:
+            vehicle_id = _record_id(row.get(id_key))
             latitude, longitude = row.get("lat"), row.get("lon")
-            if latitude is None or longitude is None:
+            if vehicle_id is None or latitude is None or longitude is None:
                 continue
             if zone is not None and not in_circle(zone, latitude, longitude):
                 continue
             vehicles.append(
                 GbfsVehicle(
-                    id=str(row.get(id_key)),
+                    id=vehicle_id,
                     latitude=latitude,
                     longitude=longitude,
                     is_reserved=_as_bool(row.get("is_reserved")),

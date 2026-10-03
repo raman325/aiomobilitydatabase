@@ -120,3 +120,31 @@ async def test_vehicle_flags_coerce_like_station_flags(
     assert by_id["stringy"].is_disabled is None
     assert by_id["numeric"].is_reserved is True
     assert by_id["numeric"].is_disabled is False
+
+
+async def test_vehicles_without_an_id_are_skipped(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """str(row.get("bike_id")) synthesized the literal id "None" for an
+    id-less row, and those synthetic ids COLLIDE: two id-less rows became
+    two vehicles with the same id. Such rows are dropped instead.
+    """
+    base = mock_api.url()
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=with_base(GBFS_FEED, base))
+    mock_api.get(
+        "/gbfs/free_bike_status.json",
+        payload={
+            "ttl": 60,
+            "data": {
+                "bikes": [
+                    {"lat": 34.05, "lon": -118.25},
+                    {"bike_id": None, "lat": 34.05, "lon": -118.25},
+                    {"bike_id": "", "lat": 34.05, "lon": -118.25},
+                    {"bike_id": "real", "lat": 34.05, "lon": -118.25},
+                ]
+            },
+        },
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    assert [v.id for v in await handle.get_vehicles()] == ["real"]

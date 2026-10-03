@@ -283,3 +283,45 @@ async def test_numeric_string_ttl_still_caches(
     await handle.get_system_info()
     hits = [r for r in mock_api.requests if r.path == "/gbfs/system_information.json"]
     assert len(hits) == 1
+
+
+async def test_stations_without_an_id_are_skipped(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """An id-less station row would synthesize the colliding literal id
+    "None" (and an empty id collides identically), so it is dropped.
+    """
+    _mock_catalog(mock_api)
+    mock_api.get(
+        "/gbfs/station_information.json",
+        payload={
+            "ttl": 60,
+            "data": {
+                "stations": [
+                    {"lat": 34.05, "lon": -118.25},
+                    {"station_id": None, "lat": 34.05, "lon": -118.25},
+                    {"station_id": "", "lat": 34.05, "lon": -118.25},
+                    {"station_id": "real", "lat": 34.05, "lon": -118.25},
+                ]
+            },
+        },
+    )
+    mock_api.get("/gbfs/station_status.json", payload={"ttl": 60, "data": {}})
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    assert [s.id for s in await handle.get_stations()] == ["real"]
+
+
+async def test_system_info_without_system_id_raises(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """system_id is the identity consumers key a device/config entry on;
+    a document that omits it is unusable, not a system named "None".
+    """
+    _mock_catalog(mock_api)
+    mock_api.get(
+        "/gbfs/system_information.json",
+        payload={"ttl": 60, "data": {"name": "Nameless"}},
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    with pytest.raises(FeedParseError, match="system_id"):
+        await handle.get_system_info()
