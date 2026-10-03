@@ -241,3 +241,45 @@ def test_endpoints_from_discovery_bad_feeds_still_tries_language_blocks() -> Non
     assert _endpoints_from_discovery(document) == {
         "system_information": "https://e.com/s"
     }
+
+
+@pytest.mark.parametrize(
+    "ttl",
+    [
+        pytest.param("60s", id="unit-suffixed-string"),
+        pytest.param({"seconds": 60}, id="object"),
+        pytest.param([60], id="list"),
+        pytest.param("nan", id="nan-string"),
+        pytest.param(-5, id="negative"),
+    ],
+)
+async def test_malformed_ttl_degrades_to_no_caching(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient, ttl: object
+) -> None:
+    """A ttl that isn't a usable number must not escape as ValueError or
+    TypeError: the document still parses and simply isn't cached.
+    """
+    _mock_catalog(mock_api)
+    payload = {**SYSTEM_INFO_23, "ttl": ttl}
+    mock_api.get("/gbfs/system_information.json", payload=payload)
+    mock_api.get("/gbfs/system_information.json", payload=payload)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    assert (await handle.get_system_info()).system_id == "test-bikes"
+    await handle.get_system_info()
+    hits = [r for r in mock_api.requests if r.path == "/gbfs/system_information.json"]
+    assert len(hits) == 2  # no usable ttl -> no micro-cache
+
+
+async def test_numeric_string_ttl_still_caches(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Producers do ship ttl as a string; a parseable one keeps caching."""
+    _mock_catalog(mock_api)
+    mock_api.get(
+        "/gbfs/system_information.json", payload={**SYSTEM_INFO_23, "ttl": "60"}
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    await handle.get_system_info()
+    await handle.get_system_info()
+    hits = [r for r in mock_api.requests if r.path == "/gbfs/system_information.json"]
+    assert len(hits) == 1

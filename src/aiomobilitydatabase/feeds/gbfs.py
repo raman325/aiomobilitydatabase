@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Mapping
 from http import HTTPStatus
@@ -79,6 +80,23 @@ def _as_bool(value: Any) -> bool | None:
     if isinstance(value, bool | int | float):
         return bool(value)
     return None
+
+
+def _ttl_seconds(value: Any) -> float:
+    """Micro-cache lifetime from a document's ``ttl``, leniently.
+
+    A ttl that isn't a usable, finite, non-negative number degrades to 0
+    (no caching) like every other malformed scalar at this boundary: a
+    bad cache HINT must not fail a document that otherwise parsed. Plain
+    numeric strings are accepted because producers do ship them.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return 0.0
+    try:
+        ttl = float(value)
+    except ValueError:
+        return 0.0
+    return ttl if math.isfinite(ttl) and ttl > 0 else 0.0
 
 
 def _endpoints_from_discovery(document: Any) -> dict[str, str]:
@@ -226,7 +244,7 @@ class GbfsFeedHandle:
         document = await self._fetch_json_document(
             self._client, url, self._headers, f"GBFS {name} endpoint URL"
         )
-        ttl = float(document.get("ttl") or 0)
+        ttl = _ttl_seconds(document.get("ttl"))
         self._doc_cache[name] = (time.monotonic(), ttl, document)
         return document
 
