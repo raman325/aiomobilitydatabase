@@ -8,6 +8,7 @@ import tempfile
 import zipfile
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
+from http import HTTPStatus
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -945,22 +946,30 @@ def test_build_error_contract_on_garbage_values(
 # --- status-code totality (Task 13c): the input space is NOT finite, so prove
 # --- totality over it instead of enumerating the handled subset.
 
-_FEED_FETCH_ALLOWED = (SourceAuthenticationError, SourceConnectionError, FeedParseError)
 
+def _run_fetch_probe(status: int, body: bytes) -> str:
+    """Serve one scripted response and CLASSIFY the fetch outcome.
 
-def _run_fetch_probe(status: int, body: bytes, content_type: str) -> str:
-    """Serve one scripted response and classify the fetch outcome."""
+    A connection failure reports its status too, so the 4xx/5xx branch is
+    pinned to the response that produced it rather than just to "one of
+    our three exception types" -- which is what let the 401 and 500
+    branches be swapped without any test noticing.
+    """
 
     async def scenario() -> str:
         api = MockApi()
         await api.start()
         try:
-            api.get("/rt", status=status, body=body, content_type=content_type)
+            api.get("/rt", status=status, body=body, content_type="application/x-pb")
             async with aiohttp.ClientSession() as session:
                 try:
                     await fetch_feed_message(session, api.url("/rt"))
-                except _FEED_FETCH_ALLOWED:
-                    return "ours"
+                except SourceAuthenticationError:
+                    return "auth"
+                except SourceConnectionError as err:
+                    return f"connection:{err.status}"
+                except FeedParseError:
+                    return "parse"
                 return "success"
         finally:
             await api.stop()
@@ -968,24 +977,92 @@ def _run_fetch_probe(status: int, body: bytes, content_type: str) -> str:
     return asyncio.run(scenario())
 
 
+def _valid_rt_bytes() -> bytes:
+    """A serialized FeedMessage covering all three entity kinds."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = 1_784_000_000
+    vehicle = msg.entity.add()
+    vehicle.id = "v1"
+    vehicle.vehicle.trip.trip_id = "TP"
+    vehicle.vehicle.position.latitude = 34.05
+    vehicle.vehicle.position.longitude = -118.25
+    vehicle.vehicle.current_stop_sequence = 3
+    trip_update = msg.entity.add()
+    trip_update.id = "tu1"
+    trip_update.trip_update.trip.trip_id = "TP"
+    trip_update.trip_update.trip.start_date = "20260730"
+    stu = trip_update.trip_update.stop_time_update.add()
+    stu.stop_id = "S0"
+    stu.departure.delay = 120
+    alert = msg.entity.add()
+    alert.id = "a1"
+    alert.alert.informed_entity.add().route_id = "R1"
+    alert.alert.header_text.translation.add().text = "Delays"
+    return msg.SerializeToString()
+
+
+_VALID_RT_BYTES = _valid_rt_bytes()
+
+
+@st.composite
+def _rt_response_body(draw: st.DrawFn) -> tuple[str, bytes]:
+    """A response body plus its kind: arbitrary binary, a pristine
+    serialized FeedMessage, or that message with drawn bytes flipped.
+
+    Flipped-byte bodies probe the protobuf parser far harder than
+    st.binary, which is almost never even plausibly a wire message: they
+    keep the tag/length structure mostly intact, so they reach deeper
+    decode paths (truncated submessages, bogus wire types, lengths that
+    overrun) instead of failing on the first byte.
+    """
+    kind = draw(st.sampled_from(["binary", "valid", "flipped"]))
+    if kind == "binary":
+        return kind, draw(st.binary(max_size=64))
+    if kind == "valid":
+        return kind, _VALID_RT_BYTES
+    raw = bytearray(_VALID_RT_BYTES)
+    for _ in range(draw(st.integers(1, 6))):
+        raw[draw(st.integers(0, len(raw) - 1))] ^= draw(st.integers(1, 255))
+    return kind, bytes(raw)
+
+
 # 1xx statuses are excluded: aiohttp's web.Response (which the in-repo mock
 # server uses) does not support serving informational responses as a normal
 # handler return value, so status < 200 is untestable through a real HTTP
 # round-trip here. 200-599 is the servable range and is what a real producer
-# can actually send.
+# can actually send. content_type is NOT drawn: fetch_feed_message never
+# inspects it, so varying it only spent budget on an axis that provably
+# cannot change the outcome.
 @given(
     status=st.integers(min_value=200, max_value=599),
-    body=st.binary(max_size=64),
-    content_type=st.sampled_from(
-        ["application/octet-stream", "application/json", "text/html", "text/plain"]
-    ),
+    body=_rt_response_body(),
 )
-@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_rt_fetch_total_over_status_and_body(
-    status: int, body: bytes, content_type: str
+    status: int, body: tuple[str, bytes]
 ) -> None:
-    outcome = _run_fetch_probe(status, body, content_type)
-    assert outcome in ("success", "ours")  # anything else already raised out
+    """Every servable status maps to its DOCUMENTED classification: 401 and
+    403 are authentication failures, any other status at or above 400 is a
+    connection failure carrying that status, and a sub-400 response either
+    parses or raises FeedParseError -- never anything else, and never a
+    crash.
+    """
+    kind, raw = body
+    outcome = _run_fetch_probe(status, raw)
+    if status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+        assert outcome == "auth"
+    elif status >= HTTPStatus.BAD_REQUEST:
+        assert outcome == f"connection:{status}"
+    else:
+        # 204/304 carry no body on the wire, so the parser sees b"" and
+        # succeeds whatever was queued; a pristine message always parses.
+        allowed = (
+            {"success"}
+            if kind == "valid" or status in (HTTPStatus.NO_CONTENT, 304)
+            else {"success", "parse"}
+        )
+        assert outcome in allowed
 
 
 def _run_gbfs_probe(status: int, body: bytes, content_type: str) -> str:
