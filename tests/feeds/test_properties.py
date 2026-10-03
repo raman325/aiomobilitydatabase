@@ -3985,3 +3985,69 @@ def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
     )
     assert via_both == via_30
     assert all(vehicle.id != "DECOY" for vehicle in via_both)
+
+
+# --- VehiclePosition.current_status tri-rule oracle --------------------------
+
+
+def _status_vehicle_message(
+    *,
+    status_value: int | None,
+    has_sequence: bool,
+    has_stop_id: bool,
+) -> gtfs_realtime_pb2.FeedMessage:
+    """One positioned vehicle with the drawn current_status presence lattice."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "v"
+    entity.vehicle.position.latitude = 34.05
+    entity.vehicle.position.longitude = -118.25
+    if status_value is not None:
+        entity.vehicle.current_status = status_value
+    if has_sequence:
+        entity.vehicle.current_stop_sequence = 7
+    if has_stop_id:
+        entity.vehicle.stop_id = "S0"
+    return msg
+
+
+@pytest.mark.parametrize("has_sequence", [True, False])
+@pytest.mark.parametrize("has_stop_id", [True, False])
+@settings(max_examples=40, deadline=None)
+@given(
+    status_value=st.none()
+    | st.sampled_from(
+        list(gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.values())
+    )
+)
+def test_vehicle_current_status_tri_rule_oracle(
+    has_sequence: bool, has_stop_id: bool, status_value: int | None
+) -> None:
+    """The documented three branches of the current_status rule, over the
+    WHOLE presence lattice (status set or not x sequence set or not x
+    stop_id set or not): an explicitly set status surfaces verbatim even
+    when it equals the proto2 default; an unset status surfaces as the
+    IN_TRANSIT_TO default only behind a stop referent; with neither
+    referent an unset status is None.
+
+    The None branch is the misreport the rule exists to prevent: proto2
+    gives current_status the implicit default IN_TRANSIT_TO, so a vehicle
+    that named no stop at all would otherwise read as "in transit to"
+    some stop it never identified.
+    """
+    msg = _status_vehicle_message(
+        status_value=status_value,
+        has_sequence=has_sequence,
+        has_stop_id=has_stop_id,
+    )
+    [vehicle] = vehicles_from_message(msg, route_names={}, trip_routes={})
+    if status_value is not None:
+        expected: VehicleStopStatus | None = VehicleStopStatus(
+            gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.Name(status_value)
+        )
+    elif has_sequence or has_stop_id:
+        expected = VehicleStopStatus.IN_TRANSIT_TO
+    else:
+        expected = None
+    assert vehicle.current_status is expected
