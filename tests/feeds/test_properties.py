@@ -50,6 +50,8 @@ from aiomobilitydatabase.feeds.models import (
     WheelchairAccess,
 )
 from aiomobilitydatabase.feeds.rt import (
+    TripStopUpdate,
+    TripUpdateEntry,
     _epoch_to_utc,
     _first_translation,
     _trip_start_date,
@@ -4051,3 +4053,122 @@ def test_vehicle_current_status_tri_rule_oracle(
     else:
         expected = None
     assert vehicle.current_status is expected
+
+
+# --- unrecognized per-stop schedule_relationship -----------------------------
+
+# Relationship values that are NEITHER SKIPPED nor NO_DATA and are not
+# SCHEDULED either: UNSCHEDULED (a real member the propagation generators
+# never draw) plus out-of-vocabulary ints standing in for members the spec
+# may add later. TripStopUpdate's docstring commits to all of them
+# resolving exactly as SCHEDULED.
+_UNRECOGNIZED_RELATIONSHIPS = [
+    gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.UNSCHEDULED,
+    4,
+    7,
+    99,
+    2**31 - 1,
+]
+_RELATIONSHIP_POOL = [
+    gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SCHEDULED,
+    gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED,
+    gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA,
+    *_UNRECOGNIZED_RELATIONSHIPS,
+]
+
+
+def _draw_relationship_stu(
+    draw: st.DrawFn, position: int, relationship: int
+) -> TripStopUpdate:
+    """One stop_sequence-addressed STU at ``position`` with drawn content."""
+    delay = draw(st.none() | st.integers(-300, 900))
+    arrival = draw(
+        st.none() | st.just(_PROP_ANCHOR + timedelta(seconds=_prop_arr_secs(position)))
+    )
+    departure = draw(
+        st.none()
+        | st.just(
+            _PROP_ANCHOR + timedelta(seconds=_prop_arr_secs(position) + _PROP_DWELL)
+        )
+    )
+    return TripStopUpdate(
+        stop_id=f"S{position}",
+        stop_sequence=10 * (position + 1),
+        relationship=relationship,
+        arrival=arrival,
+        departure=departure,
+        delay_seconds=delay,
+    )
+
+
+@st.composite
+def _unrecognized_relationship_case(
+    draw: st.DrawFn,
+) -> tuple[TripUpdateEntry, list[tuple[int, str]]]:
+    """An entry whose STUs span the relationship pool, with at least one
+    STU forced to a non-SCHEDULED unrecognized value so no example is
+    vacuous.
+    """
+    n_calls = draw(st.integers(3, 8))
+    stop_calls = [(10 * (i + 1), f"S{i}") for i in range(n_calls)]
+    by_position: dict[int, TripStopUpdate] = {}
+    for position in range(n_calls):
+        if draw(st.booleans()):
+            by_position[position] = _draw_relationship_stu(
+                draw, position, draw(st.sampled_from(_RELATIONSHIP_POOL))
+            )
+    forced = draw(st.integers(0, n_calls - 1))
+    by_position[forced] = _draw_relationship_stu(
+        draw, forced, draw(st.sampled_from(_UNRECOGNIZED_RELATIONSHIPS))
+    )
+    entry = TripUpdateEntry(
+        stop_updates=tuple(by_position[pos] for pos in sorted(by_position)),
+        delay_seconds=draw(st.none() | st.integers(-300, 900)),
+        vehicle_id="V1",
+    )
+    return entry, stop_calls
+
+
+def _as_scheduled(entry: TripUpdateEntry) -> TripUpdateEntry:
+    """The same entry with every unrecognized relationship rewritten to
+    SCHEDULED (SKIPPED and NO_DATA, the only two the resolver recognizes,
+    are left alone)."""
+    recognized = (
+        gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED,
+        gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA,
+    )
+    return TripUpdateEntry(
+        stop_updates=tuple(
+            stu
+            if stu.relationship in recognized
+            else TripStopUpdate(
+                stop_id=stu.stop_id,
+                stop_sequence=stu.stop_sequence,
+                relationship=gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SCHEDULED,
+                arrival=stu.arrival,
+                departure=stu.departure,
+                delay_seconds=stu.delay_seconds,
+            )
+            for stu in entry.stop_updates
+        ),
+        delay_seconds=entry.delay_seconds,
+        vehicle_id=entry.vehicle_id,
+    )
+
+
+@settings(max_examples=300, deadline=None)
+@given(case=_unrecognized_relationship_case())
+def test_unrecognized_relationship_resolves_as_scheduled(
+    case: tuple[TripUpdateEntry, list[tuple[int, str]]],
+) -> None:
+    """Metamorphic law for TripStopUpdate's documented commitment: any
+    per-stop schedule_relationship outside {SKIPPED, NO_DATA} -- including
+    UNSCHEDULED and future/out-of-vocabulary values -- resolves EXACTLY as
+    SCHEDULED, delay propagation included. The generators behind the
+    propagation oracles only ever draw SCHEDULED/SKIPPED/NO_DATA, so this
+    documented branch had no coverage at all.
+    """
+    entry, stop_calls = case
+    assert resolve_trip_predictions(entry, stop_calls) == resolve_trip_predictions(
+        _as_scheduled(entry), stop_calls
+    )

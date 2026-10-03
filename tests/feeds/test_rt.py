@@ -676,3 +676,19 @@ def test_resolve_unplaceable_stus_are_ignored() -> None:
     resolved = resolve_trip_predictions(entry, _CALLS)
     assert resolved.predictions == {}
     assert resolved.skipped == frozenset()
+
+
+def test_resolve_unrecognized_relationship_behaves_as_scheduled() -> None:
+    """UNSCHEDULED and out-of-vocabulary relationship values resolve as
+    SCHEDULED (TripStopUpdate's documented contract): the delay predicts
+    its own stop and propagates onward exactly as a SCHEDULED STU would.
+    """
+    for relationship in (gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.UNSCHEDULED, 99):
+        entry = _entry(_stu(stop_id="A", relationship=relationship, delay=120))
+        resolved = resolve_trip_predictions(entry, _CALLS)
+        assert resolved.skipped == frozenset()
+        assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+            1: 120,
+            2: 120,
+            3: 120,
+        }
