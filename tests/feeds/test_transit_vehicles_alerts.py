@@ -506,3 +506,74 @@ async def test_cancelled_swap_wait_releases_the_guard(
         handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW), timeout=2
     )
     assert [a.trip_id for a in later] == ["T1", "T2"]
+
+
+async def test_cancelled_query_holds_the_guard_until_its_thread_finishes(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a query abandons its await but cannot stop the worker
+    thread, so the swap must still wait for that thread to leave the index."""
+    _mock_catalog(mock_api)
+    mock_api.get("/rt/all", body=_empty_trip_updates(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    old_index = handle._index
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original = StaticIndex.upcoming_departures
+
+    def parked(*args: object, **kwargs: object) -> object:
+        entered.set()
+        assert release.wait(timeout=5)
+        rows = original(old_index, *args, **kwargs)  # type: ignore[arg-type]
+        finished.set()
+        return rows
+
+    monkeypatch.setattr(old_index, "upcoming_departures", parked)
+    query = asyncio.create_task(
+        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+    )
+    await asyncio.to_thread(entered.wait, 5)
+    query.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await query
+    # The reader coroutine is gone, yet its thread is still inside the index.
+    assert handle._guard._readers == 0
+    _mock_newer_dataset(mock_api)
+    refresh = asyncio.create_task(handle.refresh_static())
+    await asyncio.sleep(0.3)  # ample for the catalog fetch and index rebuild
+    assert not refresh.done()
+    assert handle._index is old_index
+    assert handle._guard._workers  # the abandoned thread is what holds the gate
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 5)
+    assert await refresh is True
+    assert handle._index.dataset_id == NEW_DATASET
+
+
+async def test_static_dataset_tracks_the_published_index(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after the swap publishes must not leave static_dataset
+    describing a dataset the handle no longer serves."""
+    _mock_catalog(mock_api)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    old_index = handle._index
+    old_dataset = old_index.dataset_id
+    original_close = old_index.close
+
+    def failing_close() -> None:
+        original_close()
+        raise sqlite3.OperationalError("close failed")
+
+    monkeypatch.setattr(old_index, "close", failing_close)
+    _mock_newer_dataset(mock_api)
+    with pytest.raises(sqlite3.OperationalError):
+        await handle.refresh_static()
+    assert handle._index.dataset_id == NEW_DATASET != old_dataset
+    assert handle.static_dataset is not None
+    assert handle.static_dataset.id == NEW_DATASET

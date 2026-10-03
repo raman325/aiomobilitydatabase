@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from google.transit import gtfs_realtime_pb2
@@ -304,10 +304,15 @@ class _IndexGuard:
 
     def __init__(self) -> None:
         self._readers = 0
+        self._workers: set[asyncio.Future[Any]] = set()
         self._open = asyncio.Event()
         self._open.set()
         self._drained = asyncio.Event()
         self._drained.set()
+
+    def _release_if_idle(self) -> None:
+        if not self._readers and not self._workers:
+            self._drained.set()
 
     @asynccontextmanager
     async def reader(self) -> AsyncIterator[None]:
@@ -319,8 +324,25 @@ class _IndexGuard:
             yield
         finally:
             self._readers -= 1
-            if not self._readers:
-                self._drained.set()
+            self._release_if_idle()
+
+    def track(self, worker: asyncio.Future[Any]) -> None:
+        """Hold the gate until an offloaded index read's thread finishes.
+
+        Cancelling an ``asyncio.to_thread`` await abandons the future but
+        cannot stop the worker, so the reader count alone would let a swap
+        close the connection out from under a thread still reading it.
+        """
+        self._workers.add(worker)
+        self._drained.clear()
+        worker.add_done_callback(self._untrack)
+
+    def _untrack(self, worker: asyncio.Future[Any]) -> None:
+        self._workers.discard(worker)
+        # An abandoned read's exception has no awaiter left to receive it.
+        if not worker.cancelled():
+            worker.exception()
+        self._release_if_idle()
 
     @asynccontextmanager
     async def writer(self) -> AsyncIterator[None]:
@@ -374,6 +396,18 @@ class TransitFeedHandle:
         self.agencies: list[Agency] = index.agencies()
         # None when the dataset ships no feed_info.txt (an optional file).
         self.feed_info: FeedInfo | None = index.feed_info()
+
+    async def _index_read[T](
+        self, fn: Callable[..., T], *args: object, **kwargs: object
+    ) -> T:
+        """Run one index read on a worker thread, tracked by the guard.
+
+        Shielded so a cancelled caller returns at once while the guard keeps
+        waiting for the thread; see :meth:`_IndexGuard.track`.
+        """
+        worker = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+        self._guard.track(worker)
+        return await asyncio.shield(worker)
 
     @property
     def static_feed_id(self) -> str:
@@ -758,7 +792,7 @@ class TransitFeedHandle:
         """
         if not rt_keys:
             return {}
-        calls = await asyncio.to_thread(
+        calls = await self._index_read(
             self._index.trip_stop_calls, sorted({trip_id for trip_id, _ in rt_keys})
         )
         return {
@@ -845,7 +879,7 @@ class TransitFeedHandle:
         canceled = updates.canceled_trips
         added_rows = updates.added
         async with self._guard.reader():
-            scheduled = await asyncio.to_thread(
+            scheduled = await self._index_read(
                 self._index.upcoming_departures,
                 all_stop_ids,
                 None,
@@ -854,8 +888,8 @@ class TransitFeedHandle:
                 None,
                 grace=grace,
             )
-            stop_names = await asyncio.to_thread(self._index.stop_names)
-            route_names = await asyncio.to_thread(self._index.route_display_names)
+            stop_names = await self._index_read(self._index.stop_names)
+            route_names = await self._index_read(self._index.route_display_names)
             # Per-row RT matching: each scheduled row's (identity, service day)
             # resolves to at most one TripUpdates key via _rt_key_for_row —
             # dated keys hit exactly their service day's instance, date-less
@@ -1046,7 +1080,7 @@ class TransitFeedHandle:
         now = now_utc or datetime.now(UTC)
         updates = await self._aggregated_trip_updates()
         async with self._guard.reader():
-            scheduled = await asyncio.to_thread(
+            scheduled = await self._index_read(
                 self._index.upcoming_trips,
                 origin_stop_id,
                 destination_stop_id,
@@ -1055,7 +1089,7 @@ class TransitFeedHandle:
                 None,
                 grace=grace,
             )
-            route_names = await asyncio.to_thread(self._index.route_display_names)
+            route_names = await self._index_read(self._index.route_display_names)
             # Same per-instance RT matching as get_arrivals (_rt_key_for_row):
             # dated keys hit their service day's row, date-less keys only the
             # earliest in-window instance of the identity.
@@ -1179,10 +1213,8 @@ class TransitFeedHandle:
             }
         )
         async with self._guard.reader():
-            trip_routes = await asyncio.to_thread(
-                self._index.routes_for_trips, trip_ids
-            )
-            route_names = await asyncio.to_thread(self._index.route_display_names)
+            trip_routes = await self._index_read(self._index.routes_for_trips, trip_ids)
+            route_names = await self._index_read(self._index.route_display_names)
             vehicles: list[VehiclePosition] = []
             for message in messages:
                 vehicles.extend(
@@ -1238,8 +1270,7 @@ class TransitFeedHandle:
         if dataset is None or not dataset.id or dataset.id == self._index.dataset_id:
             return False
         new_index = await self._ensure_index(self._client, fresh)
-        await self._swap_index(new_index)
-        self._static_feed = fresh
+        await self._swap_index(new_index, fresh)
         return True
 
     async def _refresh_static_direct(self, direct: _DirectUrls) -> bool:
@@ -1269,12 +1300,17 @@ class TransitFeedHandle:
         await self._swap_index(new_index)
         return True
 
-    async def _swap_index(self, new_index: StaticIndex) -> None:
+    async def _swap_index(
+        self, new_index: StaticIndex, static_feed: GtfsFeed | None = None
+    ) -> None:
         """Publish the new index atomically, then close the old one.
 
         The new index's own reads need no exclusion, and the publish is a
         single assignment so no caller can observe mixed-dataset
-        attributes; the old index closes with no reader inside.
+        attributes; the old index closes with no reader inside. The catalog
+        record travels with the index so a failure after this point can
+        never leave ``static_dataset`` describing a dataset that is no
+        longer the one being served.
         """
         stops = await asyncio.to_thread(new_index.stops)
         routes = await asyncio.to_thread(new_index.routes)
@@ -1282,6 +1318,8 @@ class TransitFeedHandle:
         feed_info = await asyncio.to_thread(new_index.feed_info)
         async with self._guard.writer():
             old_index = self._index
+            if static_feed is not None:
+                self._static_feed = static_feed
             self._index, self.stops, self.routes, self.agencies, self.feed_info = (
                 new_index,
                 stops,
@@ -1313,14 +1351,14 @@ class TransitFeedHandle:
     async def routes_serving(self, stop_id: str) -> list[Route]:
         """Routes with scheduled service at the stop (route-filter picker)."""
         async with self._guard.reader():
-            return await asyncio.to_thread(self._index.routes_serving, stop_id)
+            return await self._index_read(self._index.routes_serving, stop_id)
 
     async def headsigns_serving(
         self, stop_id: str, route_id: str | None = None
     ) -> list[str]:
         """Distinct headsigns at the stop (direction-filter picker options)."""
         async with self._guard.reader():
-            return await asyncio.to_thread(
+            return await self._index_read(
                 self._index.headsigns_serving, stop_id, route_id
             )
 

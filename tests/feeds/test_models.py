@@ -244,3 +244,13 @@ def test_arrivals_query_rejects_a_bare_string(field: str) -> None:
     kwargs: dict[str, object] = {"stop_ids": ["S1"], field: "S1"}
     with pytest.raises(TypeError, match=field):
         ArrivalsQuery(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("limit", [-1, -10])
+def test_arrivals_query_rejects_a_negative_limit(limit: int) -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        ArrivalsQuery(["S1"], limit=limit)
+
+
+def test_arrivals_query_allows_a_zero_limit() -> None:
+    assert ArrivalsQuery(["S1"], limit=0).limit == 0

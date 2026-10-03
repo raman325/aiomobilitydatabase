@@ -255,7 +255,7 @@ class ArrivalsQuery:
     :meth:`TransitFeedHandle.headsigns_serving` offers), so RT-added trips,
     which announce no headsign, never pass a headsign filter. ``limit``
     caps the merged, filtered result for this query as a whole,
-    nearest effective departure first.
+    nearest effective departure first; zero asks for an empty board.
     """
 
     stop_ids: Sequence[str]
@@ -264,10 +264,13 @@ class ArrivalsQuery:
     limit: int = 10
 
     def __post_init__(self) -> None:
-        """Reject a bare str, which is a Sequence[str] of single characters."""
+        """Reject inputs a slice or an id-iteration would silently misread."""
         for name in ("stop_ids", "route_ids", "headsigns"):
             if isinstance(getattr(self, name), str):
                 raise TypeError(f"{name} must be a sequence of ids, not a str")
+        # A negative limit would slice rows off the END of the board.
+        if self.limit < 0:
+            raise ValueError(f"limit must be non-negative, got {self.limit}")
 
 
 @dataclass(frozen=True)
