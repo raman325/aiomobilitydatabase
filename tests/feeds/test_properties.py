@@ -4172,3 +4172,81 @@ def test_unrecognized_relationship_resolves_as_scheduled(
     assert resolve_trip_predictions(entry, stop_calls) == resolve_trip_predictions(
         _as_scheduled(entry), stop_calls
     )
+
+
+# --- alert scoping ------------------------------------------------------------
+
+# Drawn from a small pool so duplicates across informed entities actually
+# occur and the dedup/sort claim is exercised; "" is the producer's "field
+# absent" form and must never reach a scope list.
+_SCOPE_IDS = ["", "R1", "R2", "S1", "S2", "T1", "T2"]
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    informed=st.lists(
+        st.tuples(
+            st.sampled_from(_SCOPE_IDS),
+            st.sampled_from(_SCOPE_IDS),
+            st.sampled_from(_SCOPE_IDS),
+        ),
+        max_size=5,
+    )
+)
+def test_alert_scope_lists_are_exact_and_unscoped_iff_all_empty(
+    informed: list[tuple[str, str, str]],
+) -> None:
+    """Scoping law for alerts_from_message: each of route_ids, stop_ids and
+    trip_ids is exactly the sorted, distinct, empty-free set of ids the
+    informed entities named, and the alert is unscoped (feed-wide) if and
+    only if all three are empty.
+
+    The failure direction that matters is a scoped alert reading as
+    feed-wide -- a trip- or stop-scoped alert losing its ids shows up on
+    every entity in the feed.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "a1"
+    entity.alert.SetInParent()
+    for route_id, stop_id, trip_id in informed:
+        target = entity.alert.informed_entity.add()
+        target.route_id = route_id
+        target.stop_id = stop_id
+        target.trip.trip_id = trip_id
+    [alert] = alerts_from_message(msg)
+    expected_routes = sorted({r for r, _, _ in informed if r})
+    expected_stops = sorted({s for _, s, _ in informed if s})
+    expected_trips = sorted({t for _, _, t in informed if t})
+    assert alert.route_ids == expected_routes
+    assert alert.stop_ids == expected_stops
+    assert alert.trip_ids == expected_trips
+    for scope in (alert.route_ids, alert.stop_ids, alert.trip_ids):
+        assert scope == sorted(set(scope))
+        assert "" not in scope
+    unscoped = not (alert.route_ids or alert.stop_ids or alert.trip_ids)
+    assert unscoped is not any(value for triple in informed for value in triple)
+
+
+@given(
+    languages=st.lists(st.sampled_from(["de", "en", "fr"]), max_size=3),
+)
+def test_first_translation_without_text_entries_is_none(
+    languages: list[str],
+) -> None:
+    """An empty ``translation`` list (and a message with no such field at
+    all) reads as "no text" rather than raising or inventing an empty
+    string -- the branch the en-else-first property never reaches because
+    it always adds at least one entry.
+    """
+    translated = gtfs_realtime_pb2.TranslatedString()
+    assert _first_translation(translated) is None
+    assert _first_translation(gtfs_realtime_pb2.FeedHeader()) is None
+    for language in languages:
+        entry = translated.translation.add()
+        entry.text = ""
+        entry.language = language
+    # Entries with empty text still COUNT as text (the producer sent a
+    # translation); only an absent list is "no text".
+    assert _first_translation(translated) == ("" if languages else None)
