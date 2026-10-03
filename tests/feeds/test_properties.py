@@ -479,25 +479,6 @@ def test_active_service_ids_matches_naive_oracle(
 
 # --- messy-format properties (Task 13b) ---
 
-_JSONISH = st.recursive(
-    st.none()
-    | st.booleans()
-    | st.integers()
-    | st.floats(allow_nan=False)
-    | st.text(max_size=20),
-    lambda children: (
-        st.lists(children, max_size=4)
-        | st.dictionaries(st.text(max_size=8), children, max_size=4)
-    ),
-    max_leaves=10,
-)
-
-
-@given(value=_JSONISH)
-def test_localized_is_total(value: object) -> None:
-    result = _localized(value)
-    assert result is None or isinstance(result, str)
-
 
 # Localized entries with an OPTIONAL "text" key: real GBFS documents ship
 # entries missing text, and the selected entry must then yield None -- never
@@ -507,6 +488,51 @@ def _localized_entry(language: st.SearchStrategy[str]) -> st.SearchStrategy[dict
         {"language": language},
         optional={"text": st.text(min_size=1, max_size=20)},
     )
+
+
+# Keys, string leaves, and one whole list arm are biased toward the GBFS
+# localized-entry schema:
+# with free-form text keys only, 0 of 500 draws carried a "language" key at
+# all, so _localized's preferred-language branch was unreachable from here.
+_JSONISH = st.recursive(
+    st.none()
+    | st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=False)
+    | st.sampled_from(["en", "fr", "de", "Dock A", ""])
+    | st.text(max_size=20),
+    lambda children: (
+        st.lists(children, max_size=4)
+        | st.lists(_localized_entry(st.sampled_from(["en", "fr", "de"])), max_size=3)
+        | st.dictionaries(
+            st.sampled_from(["language", "text", "name"]) | st.text(max_size=8),
+            children,
+            max_size=4,
+        )
+    ),
+    max_leaves=10,
+)
+
+
+@given(value=_JSONISH)
+def test_localized_is_total(value: object) -> None:
+    """Any JSON value yields a string or None, never a raise. The event
+    tags record how often a draw actually reaches the preferred-language
+    branch (it was 0% before the schema bias above).
+    """
+    entries = (
+        [entry for entry in value if isinstance(entry, dict)]
+        if isinstance(value, list)
+        else []
+    )
+    event(
+        f"localized: entry with a language key: {any('language' in e for e in entries)}"
+    )
+    # "en" is the library's GBFS_LANGUAGE_PREFERENCE.
+    preferred = any(entry.get("language") == "en" for entry in entries)
+    event(f"localized: preferred-language branch: {preferred}")
+    result = _localized(value)
+    assert result is None or isinstance(result, str)
 
 
 @given(
@@ -540,15 +566,108 @@ def test_localized_entry_without_text_is_none() -> None:
     assert _localized([{"language": "de"}, {"language": "en", "text": "x"}]) == "x"
 
 
-@given(version=st.text(max_size=12))
-def test_version_key_is_total(version: str) -> None:
-    key = _version_key(version)
-    assert isinstance(key, tuple)
+@given(
+    left=st.lists(st.integers(0, 20), min_size=1, max_size=4),
+    right=st.lists(st.integers(0, 20), min_size=1, max_size=4),
+)
+def test_version_key_orders_like_its_components(
+    left: list[int], right: list[int]
+) -> None:
+    """The ordering law GbfsFeedHandle.create relies on to pick the newest
+    version: comparing two dotted version strings through _version_key
+    agrees with comparing their component tuples (so "2.3" < "2.3.1" and
+    "9.5" < "10.0", lexicographic string order notwithstanding).
+    """
+    key_left = _version_key(".".join(str(part) for part in left))
+    key_right = _version_key(".".join(str(part) for part in right))
+    assert key_left == tuple(left)
+    assert (key_left < key_right) is (tuple(left) < tuple(right))
+
+
+@given(version=st.text(max_size=12), other=st.text(max_size=12))
+def test_version_key_is_total(version: str, other: str) -> None:
+    """Catalog junk never raises, and ANY two keys stay mutually
+    comparable -- create() sorts a whole version list by this key, so one
+    unparseable entry must not break the sort with a TypeError.
+    """
+    key, other_key = _version_key(version), _version_key(other)
+    assert all(isinstance(part, int) for part in key)
+    assert key < other_key or other_key <= key
 
 
 def test_version_key_orders_numerically() -> None:
     assert _version_key("10.0") > _version_key("9.5")
     assert _version_key("3.0") > _version_key("2.3")
+
+
+# Duck-typed catalog stand-ins: create() only reads these attributes, and
+# defining them here keeps this property independent of catalog parsing.
+class _StubEndpoint:
+    def __init__(self, name: str | None, url: str | None) -> None:
+        self.name = name
+        self.url = url
+
+
+class _StubVersion:
+    def __init__(self, version: str, endpoints: list[_StubEndpoint]) -> None:
+        self.version = version
+        self.endpoints = endpoints
+
+
+class _StubCatalog:
+    def __init__(self, feed: object) -> None:
+        self._feed = feed
+
+    async def get_gbfs_feed(self, feed_id: str) -> object:
+        return self._feed
+
+
+class _StubClient:
+    def __init__(self, feed: object) -> None:
+        self.catalog = _StubCatalog(feed)
+
+
+@given(
+    versions=st.lists(
+        st.tuples(
+            st.lists(st.integers(0, 9), min_size=1, max_size=3),
+            st.booleans(),
+        ),
+        min_size=1,
+        max_size=5,
+        unique_by=lambda item: tuple(item[0]),
+    )
+)
+def test_create_picks_newest_version_that_has_endpoints(
+    versions: list[tuple[list[int], bool]],
+) -> None:
+    """create() resolves the _version_key-MAXIMAL version that actually
+    carries endpoints -- a newer version listing none must not shadow an
+    older one that does, and a feed with no endpoints anywhere resolves to
+    an empty table rather than raising.
+    """
+    stub_versions = [
+        _StubVersion(
+            ".".join(str(part) for part in parts),
+            [_StubEndpoint("station_information", f"https://e.com/{index}")]
+            if has_endpoints
+            else [],
+        )
+        for index, (parts, has_endpoints) in enumerate(versions)
+    ]
+    feed = _StubVersion("feed", [])  # any object carrying .versions below
+    feed.versions = stub_versions  # type: ignore[attr-defined]
+    client = _StubClient(feed)
+    handle = asyncio.run(GbfsFeedHandle.create(client, "f"))  # type: ignore[arg-type]
+    usable = [
+        (tuple(parts), index)
+        for index, (parts, has_endpoints) in enumerate(versions)
+        if has_endpoints
+    ]
+    expected = (
+        {"station_information": f"https://e.com/{max(usable)[1]}"} if usable else {}
+    )
+    assert handle._endpoints == expected
 
 
 @given(
