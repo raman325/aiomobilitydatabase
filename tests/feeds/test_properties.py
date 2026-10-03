@@ -6,6 +6,7 @@ import io
 import math
 import tempfile
 import zipfile
+from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
@@ -1168,8 +1169,39 @@ def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
 # empty results. The biased strategies below must keep the non-empty rate
 # healthy, and the *_nonvacuity_rate guard tests (which pytest runs AFTER
 # their property, in definition order) fail the suite if it collapses.
+# Non-vacuity tallies for the two generated-feed query properties below.
+#
+# These stay module-level because the properties that write to them are
+# plain @given functions, and the fragility worth fixing is not WHERE the
+# counts live -- a pytest stash is global mutable state too, keyed on the
+# config instead of the module, with identical ordering semantics -- but
+# that the guard assertions used to depend on running AFTER the property.
+# Each guard now seeds its own measurement when it finds an empty tally
+# (see _seeded_tally), which makes it correct when selected alone with -k,
+# under a random-order plugin, and on an xdist worker that received the
+# guard but not the property.
+#
+# Honest-measurement caveat: a count is bumped once per example that
+# reached the assertions, including Hypothesis's reuse-phase replays of
+# database entries, so "examples" can exceed max_examples. Both counters
+# are bumped together, so the RATE the guards assert is unaffected; only
+# the absolute floor is (upward, i.e. conservatively).
 _DEPARTURES_VACUITY = {"examples": 0, "nonempty": 0}
 _TRIPS_VACUITY = {"examples": 0, "nonempty": 0}
+
+
+def _seeded_tally(
+    tally: dict[str, int], property_test: Callable[[], None]
+) -> dict[str, int]:
+    """Return ``tally``, first running ``property_test`` if it is empty.
+
+    An empty tally means the property has not run in this process yet, so
+    the guard would otherwise assert on nothing.
+    """
+    if not tally["examples"]:
+        property_test()
+    return tally
+
 
 # The generator's calendar rows start service in 2026 OR 2027; probing one
 # Thursday in each year finds in-window schedule data for most feeds that
@@ -1252,9 +1284,10 @@ def test_upcoming_departures_deterministic(
 
 def test_upcoming_departures_nonvacuity_rate() -> None:
     """Guard for the property above: fail if its non-empty rate collapses."""
-    examples = _DEPARTURES_VACUITY["examples"]
-    assert examples > 0
-    assert _DEPARTURES_VACUITY["nonempty"] >= max(3, examples // 5)
+    tally = _seeded_tally(_DEPARTURES_VACUITY, test_upcoming_departures_deterministic)
+    examples = tally["examples"]
+    assert examples > 0, "no example reached the assertions even after seeding"
+    assert tally["nonempty"] >= max(3, examples // 5)
 
 
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
@@ -1337,9 +1370,10 @@ def test_upcoming_trips_invariants(zip_bytes: bytes, data: st.DataObject) -> Non
 
 def test_upcoming_trips_nonvacuity_rate() -> None:
     """Guard for the property above: fail if its non-empty rate collapses."""
-    examples = _TRIPS_VACUITY["examples"]
-    assert examples > 0
-    assert _TRIPS_VACUITY["nonempty"] >= max(3, examples // 5)
+    tally = _seeded_tally(_TRIPS_VACUITY, test_upcoming_trips_invariants)
+    examples = tally["examples"]
+    assert examples > 0, "no example reached the assertions even after seeding"
+    assert tally["nonempty"] >= max(3, examples // 5)
 
 
 # --- descriptive attribute-surface properties --------------------------------
