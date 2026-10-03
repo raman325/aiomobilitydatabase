@@ -1434,6 +1434,10 @@ def test_upcoming_trips_nonvacuity_rate() -> None:
 _INT_CELL = st.one_of(
     st.integers(min_value=-5, max_value=12).map(str),
     st.sampled_from(["", " ", "x", "1.5", "abc", "999999999999", "--"]),
+    # Spellings a bare int() used to accept, turning a corrupt cell into a
+    # plausible vocabulary value: unicode decimals, sign prefixes and
+    # PEP 515 underscore grouping are all garbage (-> None).
+    st.sampled_from(["\u0665", "\uff11\uff12", "+1", "1_0"]),
 )
 # Text-column cells: empty (-> None) or CSV-safe text kept verbatim
 # (including whitespace-only and digit-only values).
@@ -1445,6 +1449,23 @@ _TEXT_CELL = st.one_of(
         max_size=8,
     ),
 )
+# Text values whose CSV encoding needs quoting or quote-doubling. Written
+# through a real csv.writer below, so the loader's reader has to unquote
+# them to recover the value verbatim.
+_FRAMED_TEXT_CELL = st.one_of(
+    _TEXT_CELL,
+    # No bare \r: the loader's TextIOWrapper applies universal-newline
+    # translation inside quoted fields too, which is a reader artifact
+    # rather than a parsing rule worth pinning.
+    st.sampled_from(["a,b", ",", 'x"y', '"q"', "a\nb", "a\tb"]),
+)
+
+
+def _csv_row(*values: str) -> str:
+    """Encode one CSV data row, quoting exactly as a producer's writer would."""
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerow(values)
+    return buf.getvalue()
 
 
 def _expected_lenient_int(cell: str) -> int | None:
@@ -1497,21 +1518,21 @@ _DESCRIPTIVE_ROW_CELLS = st.fixed_dictionaries(
         "pickup_type": _INT_CELL,
         "drop_off_type": _INT_CELL,
         "timepoint": _INT_CELL,
-        "stop_code": _TEXT_CELL,
-        "platform_code": _TEXT_CELL,
-        "stop_headsign": _TEXT_CELL,
-        "agency_id": _TEXT_CELL,
-        "route_color": _TEXT_CELL,
-        "route_text_color": _TEXT_CELL,
-        "route_url": _TEXT_CELL,
-        "stop_desc": _TEXT_CELL,
-        "stop_url": _TEXT_CELL,
-        "zone_id": _TEXT_CELL,
-        "stop_timezone": _TEXT_CELL,
-        "route_desc": _TEXT_CELL,
+        "stop_code": _FRAMED_TEXT_CELL,
+        "platform_code": _FRAMED_TEXT_CELL,
+        "stop_headsign": _FRAMED_TEXT_CELL,
+        "agency_id": _FRAMED_TEXT_CELL,
+        "route_color": _FRAMED_TEXT_CELL,
+        "route_text_color": _FRAMED_TEXT_CELL,
+        "route_url": _FRAMED_TEXT_CELL,
+        "stop_desc": _FRAMED_TEXT_CELL,
+        "stop_url": _FRAMED_TEXT_CELL,
+        "zone_id": _FRAMED_TEXT_CELL,
+        "stop_timezone": _FRAMED_TEXT_CELL,
+        "route_desc": _FRAMED_TEXT_CELL,
         "route_sort_order": _INT_CELL,
-        "trip_short_name": _TEXT_CELL,
-        "block_id": _TEXT_CELL,
+        "trip_short_name": _FRAMED_TEXT_CELL,
+        "block_id": _FRAMED_TEXT_CELL,
     }
 )
 
@@ -1531,33 +1552,68 @@ def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) 
         "stops.txt": (
             "stop_id,stop_name,stop_lat,stop_lon,stop_code,platform_code,"
             "wheelchair_boarding,stop_desc,stop_url,zone_id,stop_timezone\n"
-            f"S1,A,0,0,{cells['stop_code']},{cells['platform_code']},"
-            f"{cells['wheelchair_boarding']},{cells['stop_desc']},"
-            f"{cells['stop_url']},{cells['zone_id']},{cells['stop_timezone']}\n"
-            "S2,B,0,0,,,,,,,\n"
+            + _csv_row(
+                "S1",
+                "A",
+                "0",
+                "0",
+                cells["stop_code"],
+                cells["platform_code"],
+                cells["wheelchair_boarding"],
+                cells["stop_desc"],
+                cells["stop_url"],
+                cells["zone_id"],
+                cells["stop_timezone"],
+            )
+            + "S2,B,0,0,,,,,,,\n"
         ),
         "routes.txt": (
             "route_id,route_short_name,route_long_name,route_type,agency_id,"
             "route_color,route_text_color,route_url,route_desc,"
             "route_sort_order\n"
-            f"R1,1,Line,3,{cells['agency_id']},{cells['route_color']},"
-            f"{cells['route_text_color']},{cells['route_url']},"
-            f"{cells['route_desc']},{cells['route_sort_order']}\n"
+            + _csv_row(
+                "R1",
+                "1",
+                "Line",
+                "3",
+                cells["agency_id"],
+                cells["route_color"],
+                cells["route_text_color"],
+                cells["route_url"],
+                cells["route_desc"],
+                cells["route_sort_order"],
+            )
         ),
         "trips.txt": (
             "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible,"
             "bikes_allowed,direction_id,trip_short_name,block_id\n"
-            f"R1,ONE,T1,H,{cells['wheelchair_accessible']},"
-            f"{cells['bikes_allowed']},{cells['direction_id']},"
-            f"{cells['trip_short_name']},{cells['block_id']}\n"
+            + _csv_row(
+                "R1",
+                "ONE",
+                "T1",
+                "H",
+                cells["wheelchair_accessible"],
+                cells["bikes_allowed"],
+                cells["direction_id"],
+                cells["trip_short_name"],
+                cells["block_id"],
+            )
         ),
         "stop_times.txt": (
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
             "pickup_type,drop_off_type,timepoint,stop_headsign\n"
-            f"T1,08:00:00,08:00:00,S1,1,{cells['pickup_type']},"
-            f"{cells['drop_off_type']},{cells['timepoint']},"
-            f"{cells['stop_headsign']}\n"
-            "T1,08:10:00,08:10:00,S2,2,,,,\n"
+            + _csv_row(
+                "T1",
+                "08:00:00",
+                "08:00:00",
+                "S1",
+                "1",
+                cells["pickup_type"],
+                cells["drop_off_type"],
+                cells["timepoint"],
+                cells["stop_headsign"],
+            )
+            + "T1,08:10:00,08:10:00,S2,2,,,,\n"
         ),
         "calendar.txt": _ONE_DAY_CALENDAR,
     }
@@ -1676,6 +1732,11 @@ _DATE_CELL = st.one_of(
             "20261332",
             "00000000",
             "20260230",
+            # Eight characters that str.isdigit() accepts but a GTFS date
+            # can never contain -- the only cells the isascii() guard
+            # exists for, and the shape int() would have happily parsed.
+            "\uff12\uff10\uff12\uff16\uff10\uff17\uff13\uff10",
+            "2026\u0660\u0667\u0663\u0660",
         ]
     ),
 )
@@ -1695,10 +1756,10 @@ def _expected_lenient_date(cell: str) -> date | None:
 
 _FEED_INFO_CELLS = st.fixed_dictionaries(
     {
-        "publisher_name": _TEXT_CELL,
-        "publisher_url": _TEXT_CELL,
-        "lang": _TEXT_CELL,
-        "version": _TEXT_CELL,
+        "publisher_name": _FRAMED_TEXT_CELL,
+        "publisher_url": _FRAMED_TEXT_CELL,
+        "lang": _FRAMED_TEXT_CELL,
+        "version": _FRAMED_TEXT_CELL,
         "start": _DATE_CELL,
         "end": _DATE_CELL,
     }
@@ -1728,8 +1789,14 @@ def test_feed_info_cells_parse_total_and_map_per_rules(cells: dict[str, str]) ->
         "feed_info.txt": (
             "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
             "feed_start_date,feed_end_date\n"
-            f"{cells['publisher_name']},{cells['publisher_url']},"
-            f"{cells['lang']},{cells['version']},{cells['start']},{cells['end']}\n"
+            + _csv_row(
+                cells["publisher_name"],
+                cells["publisher_url"],
+                cells["lang"],
+                cells["version"],
+                cells["start"],
+                cells["end"],
+            )
         ),
     }
     index = _build_index_from_files(files)  # totality: must never raise
@@ -1742,6 +1809,47 @@ def test_feed_info_cells_parse_total_and_map_per_rules(cells: dict[str, str]) ->
             start_date=_expected_lenient_date(cells["start"]),
             end_date=_expected_lenient_date(cells["end"]),
         )
+    finally:
+        index.close()
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        "\uff12\uff10\uff12\uff16\uff10\uff17\uff13\uff10",
+        "2026\u0660\u0667\u0663\u0660",
+    ],
+)
+def test_unicode_digit_feed_info_dates_are_none(cell: str) -> None:
+    """Asserted against the INTENDED rule, not the oracle restatement: these
+    cells are eight characters that str.isdigit() accepts, so only the
+    ASCII guard rejects them. A GTFS date is ASCII, so the answer is None.
+    """
+    assert len(cell) == 8 and cell.isdigit() and not cell.isascii()
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,A,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\nR1,ONE,T1,H\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T1,08:00:00,08:00:00,S1,1\n"
+        ),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+        "feed_info.txt": (
+            "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
+            "feed_start_date,feed_end_date\n"
+            + _csv_row("P", "https://e.com", "en", "1", cell, cell)
+        ),
+    }
+    index = _build_index_from_files(files)
+    try:
+        info = index.feed_info()
+        assert info is not None
+        assert info.start_date is None
+        assert info.end_date is None
     finally:
         index.close()
 
