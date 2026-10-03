@@ -3575,12 +3575,60 @@ def test_short_window_start_date_invariance(
     assert all(t.realtime is False for t in wrong_day_trips[("S0", "S2")])
 
 
-@given(done=st.integers(0, 2**40), total=st.integers(0, 2**40) | st.none())
-def test_build_progress_fraction_bounds(done: int, total: int | None) -> None:
+# done_bytes is drawn non-negative deliberately. Both producers in
+# transit.py accumulate len(chunk) / a row counter from 0, so a negative
+# value is unreachable; the dataclass accepts one and `fraction` would
+# return a negative float, but asserting a clamp the code does not perform
+# would be asserting a wish. The ceiling is well past 2**53: this code path
+# divides two ints into a float, the documented precision-loss hot spot.
+_PROGRESS_BYTES = st.integers(0, 2**70)
+
+
+@given(done=_PROGRESS_BYTES, total=_PROGRESS_BYTES | st.none())
+def test_build_progress_fraction_laws(done: int, total: int | None) -> None:
+    """``fraction`` is None if and only if ``total_bytes`` is falsy, and
+    otherwise lands in [0, 1].
+
+    The iff is the real claim: total_bytes == 0 yields None rather than
+    0.0, a deliberate-looking choice ("unknown total", same as missing
+    Content-Length) that nothing asserted before. The lower bound alone is
+    vacuous by construction over this domain.
+    """
     fraction = StaticBuildProgress(
         phase="index", done_bytes=done, total_bytes=total
     ).fraction
+    assert (fraction is None) is (not total)
     assert fraction is None or 0.0 <= fraction <= 1.0
+
+
+@given(total=st.integers(1, 2**70), dones=st.lists(_PROGRESS_BYTES, min_size=2))
+def test_build_progress_fraction_is_monotonic_in_done_bytes(
+    total: int, dones: list[int]
+) -> None:
+    """More bytes done never means less progress reported, including past
+    the clamp where done_bytes exceeds total_bytes."""
+    fractions = [
+        StaticBuildProgress(
+            phase="download", done_bytes=done, total_bytes=total
+        ).fraction
+        for done in sorted(dones)
+    ]
+    assert fractions == sorted(fractions)
+
+
+def test_build_progress_fraction_saturates_beyond_float_precision() -> None:
+    """Pinned, not a bug to fix: int/int -> float, so a total above 2**53
+    reports 1.0 while bytes remain. Unreachable at real dataset sizes
+    (2**53 bytes is 9 PB), which is why this is documented rather than
+    fixed with integer arithmetic.
+    """
+    total = 2**60
+    assert (
+        StaticBuildProgress(
+            phase="download", done_bytes=total - 1, total_bytes=total
+        ).fraction
+        == 1.0
+    )
 
 
 # --- station grouping properties (transit.group_stations) --------------------
