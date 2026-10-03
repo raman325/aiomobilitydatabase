@@ -2444,6 +2444,159 @@ def test_arrivals_batch_equals_per_query_calls(
     ]
 
 
+# 2026-07-31 is a Friday with the SPECIAL calendar_dates exception, so WKDY
+# (T1/T2, headsign Downtown) and SPECIAL (T4, headsign Holiday) both run: a
+# two-hour window holds four scheduled rows under two distinct headsigns.
+_HEADSIGN_NOW = datetime(2026, 7, 31, 14, 45, tzinfo=UTC)
+_HEADSIGN_LOOKAHEAD = timedelta(hours=2)
+_HEADSIGN_ADDED_AT = datetime(2026, 7, 31, 15, 20, tzinfo=UTC)
+
+
+@st.composite
+def _headsign_scenarios(
+    draw: st.DrawFn,
+) -> tuple[gtfs_realtime_pb2.FeedMessage, set[str], list[str], int]:
+    """A headsign subset (possibly empty), a limit, and 0-2 ADDED calls."""
+    headsigns = draw(
+        st.lists(
+            st.sampled_from(["Downtown", "Holiday", "Nope"]), max_size=3, unique=True
+        )
+    )
+    added_ids = [f"GEN-ADDED-{index}" for index in range(draw(st.integers(0, 2)))]
+    msg = _arrivals_rt_message(
+        [],
+        [],
+        [
+            (
+                trip_id,
+                "R1",
+                "S1",
+                None,
+                _HEADSIGN_ADDED_AT + timedelta(seconds=60 * (index + 1)),
+            )
+            for index, trip_id in enumerate(added_ids)
+        ],
+    )
+    return msg, set(added_ids), headsigns, draw(st.integers(0, 4))
+
+
+@given(scenario=_headsign_scenarios())
+@settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_arrivals_headsign_filter_matches_oracle(
+    scenario: tuple[gtfs_realtime_pb2.FeedMessage, set[str], list[str], int],
+) -> None:
+    """A query's ``headsigns`` returns exactly the TRIP-level-headsign subset
+    of the merged board, truncated to ``limit`` AFTER filtering -- with the
+    oracle reading each row's expected headsign off the FIXTURE rather than
+    off the row, so a filter matching the per-stop ``stop_headsign`` (or
+    letting a None headsign through) cannot agree with it.
+
+    RT-added rows announce no headsign, so a non-empty filter never returns
+    one; an EMPTY list narrows nothing, for ``headsigns`` and ``route_ids``
+    alike, which nothing else asserts.
+    """
+    msg, added_ids, headsigns, limit = scenario
+    allowed = set(headsigns)
+    boards, _ = _run_arrivals_merge_scenario(
+        msg,
+        [
+            [
+                ArrivalsQuery(_MERGE_STOPS, limit=_UNLIMITED),
+                ArrivalsQuery(_MERGE_STOPS, headsigns=headsigns, limit=limit),
+                ArrivalsQuery(_MERGE_STOPS, [], [], limit=_UNLIMITED),
+            ]
+        ],
+        _HEADSIGN_NOW,
+        _HEADSIGN_LOOKAHEAD,
+    )
+    [[board, filtered, unnarrowed]] = boards
+    # Non-vacuity: both fixture headsigns must actually be on the board.
+    assert {_expected_headsign(row.trip_id, added_ids) for row in board} >= {
+        "Downtown",
+        "Holiday",
+    }
+    for row in board:
+        assert row.headsign == _expected_headsign(row.trip_id, added_ids)
+    event(f"limit binds: {limit < len(board)}")
+
+    keep = [
+        row
+        for row in board
+        if not allowed or _expected_headsign(row.trip_id, added_ids) in allowed
+    ]
+    assert filtered == keep[:limit]
+    if allowed:
+        assert all(row.trip_id not in added_ids for row in filtered)
+    assert unnarrowed == board  # empty filter lists narrow nothing
+
+
+_SORT_ADDED_POOL = ["GEN-A", "GEN-B"]
+_SORT_CALL_KINDS = ["departure", "arrival_only", "both", "none"]
+
+
+@st.composite
+def _sort_scenarios(
+    draw: st.DrawFn,
+) -> tuple[gtfs_realtime_pb2.FeedMessage, list[tuple[str, str, datetime | None]]]:
+    """ADDED calls spanning every time shape: departure-only, arrival-only,
+    both, and NEITHER (the row that sorts at ``now``), at offsets that
+    include times before ``now``. Repeating a trip id across stops at the
+    same instant is deliberate: that is the only way the stop_id tie-break
+    can bite.
+    """
+    calls: list[_AddedCall] = []
+    expected: list[tuple[str, str, datetime | None]] = []
+    for _ in range(draw(st.integers(0, 4))):
+        trip_id = draw(st.sampled_from(_SORT_ADDED_POOL))
+        stop_id = draw(st.sampled_from(_MERGE_STOPS))
+        kind = draw(st.sampled_from(_SORT_CALL_KINDS))
+        when = _MERGE_BASE + timedelta(minutes=draw(st.integers(-30, 40)))
+        arrival = when if kind in ("arrival_only", "both") else None
+        departure = when if kind in ("departure", "both") else None
+        calls.append((trip_id, "R1", stop_id, arrival, departure))
+        expected.append((trip_id, stop_id, departure or arrival))
+    return _arrivals_rt_message([], [], calls), expected
+
+
+@given(scenario=_sort_scenarios())
+@settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_arrivals_sort_order_is_total(
+    scenario: tuple[
+        gtfs_realtime_pb2.FeedMessage, list[tuple[str, str, datetime | None]]
+    ],
+) -> None:
+    """Every returned board is in ``(effective departure, trip_id or "",
+    stop_id)`` order under the FULL fallback chain -- including arrival-only
+    RT-added rows and rows with no time at all, which sort at ``now`` and so
+    survive the past-row drop.
+
+    The expected board is modelled end to end, so a timeless row silently
+    falling back to something other than ``now`` (dropping it, or parking it
+    at the end) fails here rather than passing an order-only check.
+    """
+    msg, added = scenario
+    now = _MERGE_NOW
+    boards, _ = _run_arrivals_merge_scenario(
+        msg, [[ArrivalsQuery(_MERGE_STOPS, limit=_UNLIMITED)]], now
+    )
+    [[board]] = boards
+    candidates = [
+        *_MERGE_SCHEDULE,
+        *((trip_id, stop_id, when or now) for trip_id, stop_id, when in added),
+    ]
+    expected = sorted(
+        (row for row in candidates if row[2] >= now),
+        key=lambda row: (row[2], row[0], row[1]),
+    )
+    event(f"timeless rows: {sum(1 for _, _, when in added if when is None)}")
+    assert [
+        (row.trip_id, row.stop_id, _model_effective_departure(row, now))
+        for row in board
+    ] == expected
+    keys = [_model_sort_key(row, now) for row in board]
+    assert keys == sorted(keys)
+
+
 _GBFS_ZONE = Circle(latitude=34.05, longitude=-118.25, radius_m=2_000.0)
 _NEARBY_LAT = st.floats(33.95, 34.15)
 _NEARBY_LON = st.floats(-118.35, -118.15)
