@@ -1132,15 +1132,51 @@ def _run_gbfs_probe(status: int, body: bytes, content_type: str) -> str:
     return asyncio.run(scenario())
 
 
+# JSON-shaped bodies are assembled from spec-ish fragments because 0 of 1000
+# st.binary() draws parse as a JSON OBJECT (4 parse as scalars): with binary
+# alone the probe never got past "malformed JSON", leaving the data-envelope
+# and ttl branches of _document unreached.
+_GBFS_DATA_FRAGMENTS = [
+    b"{}",
+    b"[]",
+    b"null",
+    b'"data"',
+    b'{"stations":[]}',
+    b'{"stations":"nope"}',
+    b'{"stations":[1,null,{"station_id":null}]}',
+    b'{"stations":[{"station_id":"s1","lat":34.05,"lon":-118.25}]}',
+    b'{"vehicles":[{"vehicle_id":"v1","lat":"34.05","lon":-118.25}]}',
+    b'{"bikes":{}}',
+    b'{"feeds":"nope"}',
+    b'{"en":{"feeds":[{"name":"system_information","url":"https://e.com/s"}]}}',
+    b'{"system_id":null}',
+]
+_GBFS_TTL_FRAGMENTS = [b"0", b"60", b'"60"', b'"60s"', b"{}", b"[60]", b"null", b"-1"]
+
+
+@st.composite
+def _gbfs_document_body(draw: st.DrawFn) -> bytes:
+    """One JSON-shaped GBFS response body: an envelope plus a ttl."""
+    data = draw(st.sampled_from(_GBFS_DATA_FRAGMENTS))
+    ttl = draw(st.sampled_from(_GBFS_TTL_FRAGMENTS))
+    missing_envelope = draw(st.booleans())
+    return b'{"ttl":' + ttl + (b"}" if missing_envelope else b',"data":' + data + b"}")
+
+
 @given(
     status=st.integers(min_value=200, max_value=599),
-    body=st.binary(max_size=64),
+    body=st.binary(max_size=64) | _gbfs_document_body(),
     content_type=st.sampled_from(["application/json", "text/html"]),
 )
-@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_gbfs_document_total_over_status_and_body(
     status: int, body: bytes, content_type: str
 ) -> None:
+    """_document() either returns a document or raises one of the library's
+    own exceptions, for any status and any body -- including the JSON-shaped
+    bodies that actually reach its envelope and ttl handling.
+    """
+    event(f"gbfs probe: json-shaped body: {body.startswith(b'{')}")
     outcome = _run_gbfs_probe(status, body, content_type)
     assert outcome in ("success", "ours")
 
@@ -4164,3 +4200,136 @@ def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
     )
     assert via_both == via_30
     assert all(vehicle.id != "DECOY" for vehicle in via_both)
+
+
+# Dictionary keys are drawn from the GBFS vocabulary, since free-form keys
+# would never spell "stations"/"lat"/"ttl" and the documents would all be
+# uniformly empty rather than adversarially mis-shaped.
+_GBFS_KEY = st.sampled_from(
+    [
+        "data",
+        "ttl",
+        "feeds",
+        "name",
+        "url",
+        "en",
+        "stations",
+        "vehicles",
+        "bikes",
+        "station_id",
+        "vehicle_id",
+        "bike_id",
+        "system_id",
+        "lat",
+        "lon",
+        "count",
+        "vehicle_type_id",
+        "vehicle_types_available",
+        "num_bikes_available",
+        "num_vehicles_available",
+        "is_renting",
+        "rental_uris",
+    ]
+) | st.text(max_size=6)
+_GBFS_JSON = st.recursive(
+    st.none()
+    | st.booleans()
+    | st.integers(-200, 200)
+    | st.floats(allow_nan=True)
+    | st.sampled_from(["", "34.05", "nope", "s1", "en"])
+    | st.text(max_size=6),
+    lambda children: (
+        st.lists(children, max_size=3)
+        | st.dictionaries(_GBFS_KEY, children, max_size=4)
+    ),
+    max_leaves=12,
+)
+
+
+# Half-valid envelopes: real rows (near the zone, so the filter has work to
+# do) mixed with junk rows. Pure _GBFS_JSON almost never spells a usable
+# document, so on its own it proves totality without proving non-vacuity.
+_MESSY_STATION_DOC = st.builds(
+    lambda rows: {"stations": rows},
+    st.lists(_zone_row("station_id") | _GBFS_JSON, max_size=3),
+)
+_MESSY_VEHICLE_DOC = st.builds(
+    # Both id keys on every row: one document serves either endpoint.
+    lambda rows: {"vehicles": rows, "bikes": rows},
+    st.lists(
+        _zone_row("vehicle_id").map(lambda row: {**row, "bike_id": row["vehicle_id"]})
+        | _GBFS_JSON,
+        max_size=3,
+    ),
+)
+
+
+@given(
+    info=_GBFS_JSON | _MESSY_STATION_DOC,
+    status=_GBFS_JSON | _MESSY_STATION_DOC,
+    zone=st.none() | st.just(_GBFS_ZONE),
+)
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_get_stations_total_over_json_documents(
+    info: object, status: object, zone: Circle | None
+) -> None:
+    """get_stations is TOTAL over arbitrary JSON ``data`` envelopes: a list
+    of stations, never a KeyError/TypeError/AttributeError leaking producer
+    data shapes. Every returned station carries a real id: never empty and
+    never the synthesized literal "None" (duplicates are NOT asserted
+    against -- a document with two rows sharing an id really does describe
+    two stations with that id, and the library does not dedupe).
+    """
+    stations = asyncio.run(
+        _gbfs_handle(
+            {"station_information": info, "station_status": status}
+        ).get_stations(zone)
+    )
+    event(f"stations parsed from arbitrary json: {bool(stations)}")
+    ids = [station.id for station in stations]
+    assert all(ids)
+    assert "None" not in ids
+
+
+@given(
+    document=_GBFS_JSON | _MESSY_VEHICLE_DOC,
+    endpoint=st.sampled_from(["vehicle_status", "free_bike_status"]),
+    zone=st.none() | st.just(_GBFS_ZONE),
+)
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_get_vehicles_total_over_json_documents(
+    document: object, endpoint: str, zone: Circle | None
+) -> None:
+    """get_vehicles is TOTAL over arbitrary JSON ``data`` envelopes on both
+    the 3.x and 2.x endpoint, and every surfaced vehicle has a real id (never
+    the synthesized literal "None") and real float coordinates.
+    """
+    vehicles = asyncio.run(_gbfs_handle({endpoint: document}).get_vehicles(zone))
+    event(f"vehicles parsed from arbitrary json: {bool(vehicles)}")
+    ids = [vehicle.id for vehicle in vehicles]
+    assert all(ids)
+    assert "None" not in ids
+    assert all(isinstance(vehicle.latitude, float) for vehicle in vehicles)
+    assert all(isinstance(vehicle.longitude, float) for vehicle in vehicles)
+
+
+@given(document=_GBFS_JSON)
+@settings(max_examples=200, deadline=None)
+def test_endpoints_from_discovery_total_over_json_documents(document: object) -> None:
+    """_endpoints_from_discovery is TOTAL over arbitrary JSON: either a
+    NON-EMPTY name->url table of strings, or FeedParseError. A missing
+    ``data`` key used to escape as KeyError.
+    """
+    endpoints: dict[str, str] | None
+    try:
+        endpoints = _endpoints_from_discovery(document)
+    except FeedParseError:
+        endpoints = None
+    event(f"discovery resolved endpoints: {endpoints is not None}")
+    assert endpoints is None or (
+        endpoints
+        and all(
+            isinstance(name, str) and isinstance(url, str)
+            for name, url in endpoints.items()
+        )
+    )
