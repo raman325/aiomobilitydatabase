@@ -398,13 +398,24 @@ class StaticIndex:
 
     @classmethod
     def open_cached(cls, db_path: Path, dataset_id: str) -> StaticIndex | None:
-        """Open an existing DB if it matches dataset ID and schema version."""
-        if not Path(db_path).exists():
+        """Open an existing DB if it matches dataset ID and schema version.
+
+        Total over whatever sits at ``db_path``: anything that is not a
+        usable cached database is a cache miss (None). The caller rebuilds
+        on None but lets exceptions propagate, so raising here would brick
+        a feed instead of letting a corrupt entry self-heal. Non-regular
+        files (a directory, a FIFO) are rejected before connecting --
+        sqlite3.connect itself raises on those, outside any query guard.
+        """
+        if not Path(db_path).is_file():
             return None
-        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        try:
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        except (sqlite3.Error, OSError):
+            return None
         try:
             meta = dict(conn.execute("SELECT key, value FROM meta"))
-        except sqlite3.DatabaseError:
+        except (sqlite3.Error, OSError):
             conn.close()
             return None
         if (
