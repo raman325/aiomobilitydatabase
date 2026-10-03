@@ -1031,10 +1031,37 @@ def test_gbfs_document_total_over_status_and_body(
 # --- generative feed-data properties (Task 13d) ---
 
 
-@given(epoch=st.integers(min_value=0, max_value=2**63 - 1))
+# Uniform draws over 64 bits land in the representable range (below about
+# 2**31) in well under 1% of examples, so the success path needs its own
+# arm. The boundary samples straddle the 32-bit wall where
+# fromtimestamp starts raising.
+_EPOCHS = st.one_of(
+    st.integers(min_value=0, max_value=2**63 - 1),
+    st.integers(min_value=0, max_value=2**31),
+    st.sampled_from([0, 1, 2**31 - 1, 2**31, 2**32, 2**53, 2**63 - 1]),
+)
+
+
+@settings(max_examples=300, deadline=None)
+@given(epoch=_EPOCHS)
 def test_epoch_to_utc_is_total(epoch: int) -> None:
+    """Any uint64 producer timestamp converts to a UTC datetime of exactly
+    that epoch, or to None when it is unrepresentable -- never a wrong
+    instant, and never a crash. ``tzinfo is not None`` alone was
+    guaranteed by the literal ``tz=UTC`` argument.
+    """
     result = _epoch_to_utc(epoch)
-    assert result is None or result.tzinfo is not None
+    event(f"representable: {result is not None}")
+    assert result is None or (result.tzinfo is not None and result.timestamp() == epoch)
+
+
+def test_epoch_to_utc_zero_is_absent() -> None:
+    """Epoch 0 is the proto2 default for an unset timestamp, so it means
+    "no timestamp" rather than 1970-01-01 -- the falsy guard the value
+    property cannot state (0 IS representable).
+    """
+    assert _epoch_to_utc(0) is None
+    assert _epoch_to_utc(1) == datetime(1970, 1, 1, 0, 0, 1, tzinfo=UTC)
 
 
 @given(
