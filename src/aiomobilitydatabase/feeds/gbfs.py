@@ -81,7 +81,7 @@ def _as_bool(value: Any) -> bool | None:
     return None
 
 
-def _endpoints_from_discovery(document: dict[str, Any]) -> dict[str, str]:
+def _endpoints_from_discovery(document: Any) -> dict[str, str]:
     """Resolve the name->url endpoint table from a GBFS discovery document.
 
     GBFS 3.x publishes ``data.feeds`` directly; 2.x nests the feed list
@@ -90,26 +90,33 @@ def _endpoints_from_discovery(document: dict[str, Any]) -> dict[str, str]:
     carries feeds, mirroring the fallback order of :func:`_localized`.
     The result feeds the same endpoint table the catalog path builds from
     version metadata, so every handle method works identically after this.
+
+    Total over arbitrary JSON: any document that yields no usable
+    name/url pair raises :class:`FeedParseError` — including an absent or
+    wrongly typed ``data``, so a malformed discovery document can never
+    surface as a KeyError/TypeError to a caller.
     """
-    data = document["data"]
+    data = document.get("data") if isinstance(document, Mapping) else None
     feeds: Any = None
-    if isinstance(data, dict):
+    if isinstance(data, Mapping):
         feeds = data.get("feeds")
-        if feeds is None:  # 2.x language-keyed layout
+        if not isinstance(feeds, list):  # 2.x language-keyed layout
             candidates = [
                 block
                 for block in data.values()
-                if isinstance(block, dict) and isinstance(block.get("feeds"), list)
+                if isinstance(block, Mapping) and isinstance(block.get("feeds"), list)
             ]
             preferred = data.get(GBFS_LANGUAGE_PREFERENCE)
-            if isinstance(preferred, dict) and isinstance(preferred.get("feeds"), list):
+            if isinstance(preferred, Mapping) and isinstance(
+                preferred.get("feeds"), list
+            ):
                 candidates.insert(0, preferred)
             if candidates:
                 feeds = candidates[0]["feeds"]
     endpoints = {
         str(feed["name"]): str(feed["url"])
         for feed in (feeds if isinstance(feeds, list) else [])
-        if isinstance(feed, dict) and feed.get("name") and feed.get("url")
+        if isinstance(feed, Mapping) and feed.get("name") and feed.get("url")
     }
     if not endpoints:
         raise FeedParseError("GBFS discovery document lists no usable feeds")

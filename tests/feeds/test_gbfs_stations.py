@@ -3,7 +3,8 @@
 import pytest
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
-from aiomobilitydatabase.feeds.exceptions import SourceConnectionError
+from aiomobilitydatabase.feeds.exceptions import FeedParseError, SourceConnectionError
+from aiomobilitydatabase.feeds.gbfs import _endpoints_from_discovery
 from aiomobilitydatabase.feeds.geo import Circle
 
 from tests.feeds.fixtures import (
@@ -203,3 +204,40 @@ async def test_gbfs_30_localized_name(
     info = await handle.get_system_info()
     assert info.system_id == "test-bikes-3"
     assert info.name == "Test Bikes 3"
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param({}, id="no-data-key"),
+        pytest.param({"data": None}, id="data-null"),
+        pytest.param({"data": []}, id="data-list"),
+        pytest.param({"data": "nope"}, id="data-string"),
+        pytest.param({"data": {"feeds": "nope"}}, id="feeds-truthy-non-list"),
+        pytest.param({"data": {"feeds": {}}}, id="feeds-empty-dict"),
+        pytest.param(None, id="document-not-a-mapping"),
+    ],
+)
+def test_endpoints_from_discovery_malformed_raises_feed_parse_error(
+    document: object,
+) -> None:
+    """A discovery document the spec can't be read out of raises the
+    documented FeedParseError -- never KeyError/TypeError/AttributeError.
+    """
+    with pytest.raises(FeedParseError):
+        _endpoints_from_discovery(document)
+
+
+def test_endpoints_from_discovery_bad_feeds_still_tries_language_blocks() -> None:
+    """A junk ``data.feeds`` must not short-circuit the 2.x language-keyed
+    fallback: the usable ``data.en.feeds`` block still resolves.
+    """
+    document = {
+        "data": {
+            "feeds": "nope",
+            "en": {"feeds": [{"name": "system_information", "url": "https://e.com/s"}]},
+        }
+    }
+    assert _endpoints_from_discovery(document) == {
+        "system_information": "https://e.com/s"
+    }
