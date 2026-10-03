@@ -2068,6 +2068,41 @@ def test_purge_cache_removes_only_the_named_feed(
     assert survivors >= {name for name in siblings if name != Path(drawn).name}
 
 
+@given(
+    payload=st.binary(max_size=64),
+    kind=st.sampled_from(["bytes", "valid", "directory", "missing_parent"]),
+)
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_open_cached_is_total_over_cache_path_contents(
+    payload: bytes, kind: str
+) -> None:
+    """open_cached returns an index or None for anything at db_path, never
+    raises, and the index it returns carries the requested dataset id.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "static.db"
+        if kind == "bytes":
+            db_path.write_bytes(payload)
+        elif kind == "valid":
+            zip_path = Path(tmp_dir) / "feed.zip"
+            zip_path.write_bytes(build_gtfs_zip_bytes())
+            StaticIndex.build(zip_path, str(db_path), "ds-cache", None).close()
+        elif kind == "directory":
+            db_path.mkdir()
+        else:
+            db_path = Path(tmp_dir) / "gone" / "static.db"
+        index = StaticIndex.open_cached(db_path, "ds-cache")
+        event(f"open_cached({kind}) -> {'index' if index is not None else 'None'}")
+        if index is None:
+            return
+        try:
+            assert kind == "valid"  # only a real cached DB may open
+            assert index.dataset_id == "ds-cache"
+            assert index.stops()
+        finally:
+            index.close()
+
+
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
 @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_generated_feeds_end_to_end_totality(
