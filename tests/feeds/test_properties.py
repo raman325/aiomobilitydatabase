@@ -2184,6 +2184,15 @@ def _rt_fetch_count(api: MockApi) -> int:
     return sum(1 for request in api.requests if request.path == "/rt/all")
 
 
+def _expected_rt_fetches(queries: list[ArrivalsQuery]) -> int:
+    """Realtime fetches one get_arrivals call over ``queries`` must issue.
+
+    One per CALL, never per query -- except that a batch naming no stops at
+    all short-circuits to empty boards before any fetch.
+    """
+    return 1 if any(query.stop_ids for query in queries) else 0
+
+
 @dataclass(frozen=True)
 class _MergeScenario:
     """One drawn merge example: the RT message plus what it must imply."""
@@ -2336,6 +2345,103 @@ def test_arrivals_merge_invariants(scenario: _MergeScenario) -> None:
     for board in (unlimited, limited, route_limited):
         keys = [_model_sort_key(row, now) for row in board]
         assert keys == sorted(keys)
+
+
+_BATCH_STOPS = ["S1", "S2", "S3"]
+_BATCH_ROUTE_FILTERS: list[list[str] | None] = [
+    None,
+    [],
+    ["R1"],
+    ["R2"],
+    ["R1", "R2"],
+    ["NOPE"],
+]
+_BATCH_HEADSIGN_FILTERS: list[list[str] | None] = [
+    None,
+    [],
+    ["Downtown"],
+    ["Holiday"],
+    ["Downtown", "Nope"],
+]
+
+
+@st.composite
+def _arrivals_batches(
+    draw: st.DrawFn,
+) -> tuple[gtfs_realtime_pb2.FeedMessage, list[ArrivalsQuery]]:
+    """An RT message plus 1-4 queries whose stop lists overlap each other,
+    repeat ids within one query, and (on a fraction of draws) include an
+    EMPTY stop list alongside non-empty ones, with per-query filters and
+    limits drawn independently.
+    """
+    count = draw(st.integers(1, 4))
+    # == count leaves every query non-empty; otherwise that query is empty.
+    empty_at = draw(st.integers(0, count))
+    queries = []
+    for index in range(count):
+        size = 0 if index == empty_at else draw(st.integers(1, 3))
+        queries.append(
+            ArrivalsQuery(
+                draw(
+                    st.lists(
+                        st.sampled_from(_BATCH_STOPS), min_size=size, max_size=size
+                    )
+                ),
+                draw(st.sampled_from(_BATCH_ROUTE_FILTERS)),
+                draw(st.sampled_from(_BATCH_HEADSIGN_FILTERS)),
+                limit=draw(st.integers(0, 4)),
+            )
+        )
+    added_count = draw(st.integers(0, 2))
+    added_ids = [f"GEN-ADDED-{index}" for index in range(added_count)]
+    canceled = draw(
+        st.lists(
+            st.sampled_from([*_FIXTURE_TRIPS, *added_ids]), max_size=2, unique=True
+        )
+    )
+    predicted = draw(st.lists(st.sampled_from(_FIXTURE_TRIPS), max_size=2, unique=True))
+    msg = _arrivals_rt_message(
+        canceled,
+        [(trip_id, _MERGE_PREDICTED_AT) for trip_id in predicted],
+        [
+            (
+                trip_id,
+                draw(st.sampled_from(_ADDED_ROUTES)),
+                draw(st.sampled_from(_BATCH_STOPS)),
+                None,
+                _MERGE_BASE + timedelta(seconds=60 * (index + 1)),
+            )
+            for index, trip_id in enumerate(added_ids)
+        ],
+    )
+    return msg, queries
+
+
+@given(scenario=_arrivals_batches())
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_arrivals_batch_equals_per_query_calls(
+    scenario: tuple[gtfs_realtime_pb2.FeedMessage, list[ArrivalsQuery]],
+) -> None:
+    """Batching is pure factorization: one call over n queries returns exactly
+    what n single-query calls return, element for element -- so the shared
+    scheduled query over the UNION of stops, the single merge, and the
+    per-query filter/limit pass cannot leak across queries (a query seeing
+    another query's stops, or losing its own, breaks this).
+
+    Separately: the batch issues exactly ONE realtime fetch no matter how
+    many queries it carries, which is the whole point of the batched shape.
+    """
+    msg, queries = scenario
+    boards, fetches = _run_arrivals_merge_scenario(
+        msg, [queries, *([query] for query in queries)], _MERGE_NOW
+    )
+    batched, *singletons = boards
+    event(f"queries: {len(queries)}")
+    event(f"non-empty boards: {sum(1 for board in batched if board)}")
+    assert batched == [board for [board] in singletons]
+    assert fetches == [
+        _expected_rt_fetches(batch) for batch in [queries, *([q] for q in queries)]
+    ]
 
 
 _GBFS_ZONE = Circle(latitude=34.05, longitude=-118.25, radius_m=2_000.0)
