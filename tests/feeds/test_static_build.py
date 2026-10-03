@@ -8,7 +8,12 @@ import pytest
 
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import StopLocationType
-from aiomobilitydatabase.feeds.static_index import SCHEMA_VERSION, StaticIndex
+from aiomobilitydatabase.feeds.static_index import (
+    SCHEMA_VERSION,
+    StaticIndex,
+    _lenient_int,
+    parse_gtfs_time,
+)
 
 from tests.feeds.fixtures import _FILES, build_gtfs_zip_bytes
 
@@ -233,3 +238,113 @@ def test_loaders_flush_mid_loop_past_batch_size(tmp_path: Path) -> None:
         assert progress_calls  # report() ran at least once per flushed loader
     finally:
         index.close()
+
+
+def test_unicode_digit_stop_time_fails_the_build(tmp_path: Path) -> None:
+    """A whole-build check on the ASCII-digit rule: a stop_times cell spelled
+    in unicode digits used to parse as a real departure (08:00:00), so the
+    corrupt row entered the index unnoticed. It now fails the build.
+    """
+    corrupted = dict(_FILES)
+    corrupted["stop_times.txt"] = _FILES["stop_times.txt"].replace(
+        "08:00:00", "\u0660\u0668:00:00", 1
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in corrupted.items():
+            zf.writestr(name, content)
+    zip_path = tmp_path / "unicode_time.zip"
+    zip_path.write_bytes(buf.getvalue())
+    with pytest.raises(FeedParseError, match="Invalid GTFS time"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("08:00:00", 28800),
+        ("8:00:00", 28800),
+        ("8:0:0", 28800),
+        ("0008:00:00", 28800),
+        # Service days run past midnight, so hours are unbounded above.
+        ("27:30:00", 99000),
+        ("300:00:00", 1080000),
+        # A blank cell means "no time at this stop", not a parse failure.
+        ("", None),
+        ("   ", None),
+        # Surrounding whitespace is a formatting artifact of real exporters.
+        (" 08:00:00 ", 28800),
+        ("\t08:00:00\n", 28800),
+    ],
+)
+def test_parse_gtfs_time_accepts(value: str, expected: int | None) -> None:
+    assert parse_gtfs_time(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # ASCII digits only: unicode decimals would silently turn a corrupt
+        # cell into a plausible-looking time.
+        "\u0660\u0668:00:00",
+        "08:\u0660\u0660:00",
+        "08:00:\u0660\u0660",
+        "\uff10\uff18:00:00",
+        # int() accepts sign prefixes and underscore grouping; GTFS does not.
+        "+8:00:00",
+        "-1:00:00",
+        "-0:00:00",
+        "08:+0:00",
+        "1_0:00:00",
+        # Exactly three colon-separated components.
+        "08:00",
+        "08",
+        "1:2:3:4",
+        "08:00:00:",
+        ":00:00",
+        # No fractional seconds in GTFS.
+        "08:00:00.5",
+        "08.5:00:00",
+        # Intra-component whitespace is not a digit.
+        "08: 00:00",
+        "0 8:00:00",
+        # Out-of-range minutes/seconds.
+        "08:60:00",
+        "08:75:00",
+        "08:00:60",
+        "08:00:99",
+        "garbage",
+    ],
+)
+def test_parse_gtfs_time_rejects(value: str) -> None:
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("0", 0),
+        ("1", 1),
+        ("01", 1),
+        # Leniency is about not failing the build, not about the vocabulary:
+        # any non-negative ASCII int is stored verbatim.
+        ("12", 12),
+        ("999999999999", 999999999999),
+        (" 5 ", 5),
+        (None, None),
+        ("", None),
+        ("  ", None),
+        ("x", None),
+        ("1.5", None),
+        # Same ASCII-digit rule as parse_gtfs_time/_lenient_date, but
+        # lenient in kind: garbage is None rather than an exception.
+        ("\u0665", None),
+        ("\uff11\uff12", None),
+        ("+5", None),
+        ("-5", None),
+        ("5_0", None),
+    ],
+)
+def test_lenient_int_contract(value: str | None, expected: int | None) -> None:
+    assert _lenient_int(value) == expected

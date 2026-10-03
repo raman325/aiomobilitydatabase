@@ -114,22 +114,44 @@ _WEEKDAY_COLUMNS = (
 )
 
 
+def _ascii_digits(value: str) -> bool:
+    """Report whether a cell component is ASCII digits and nothing else.
+
+    ``int()`` also accepts any unicode decimal ("\u0660\u0668"), a sign prefix
+    ("+8") and PEP 515 underscore grouping ("1_0"), each of which turns a
+    corrupt GTFS cell into a plausible-looking number instead of a
+    detected problem. Every GTFS numeric field is spelled in ASCII digits.
+    """
+    return bool(value) and value.isascii() and value.isdigit()
+
+
+_GTFS_TIME_COMPONENTS = 3
+
+
 def parse_gtfs_time(value: str) -> int | None:
-    """Parse an ``HH:MM:SS`` GTFS time (hours may exceed 23) to seconds."""
+    """Parse an ``HH:MM:SS`` GTFS time (hours may exceed 23) to seconds.
+
+    STRUCTURAL field: a blank cell means "no time here" (None), but
+    anything else unparseable raises ``FeedParseError`` rather than
+    degrading -- a wrong departure time is worse than a failed build.
+
+    Accepted: exactly three colon-separated ASCII-digit components, any
+    zero-padding or none ("8:0:0"), unbounded hours (service days run
+    past midnight), minutes and seconds in [0, 60), and whitespace around
+    the whole cell (real exporters emit it). Everything else -- unicode
+    digits, sign prefixes, underscore grouping, fractional seconds, wrong
+    arity, intra-component whitespace -- is rejected.
+    """
     value = value.strip()
     if not value:
         return None
-    try:
-        hours, minutes, seconds = (int(part) for part in value.split(":"))
-    except ValueError as err:
-        raise FeedParseError(f"Invalid GTFS time: {value!r}") from err
-    # int() also accepts signed and out-of-range components (e.g. "-1",
-    # "08:75:00"); GTFS times are never negative and minutes/seconds are
-    # bounded to [0, 60).
+    parts = value.split(":")
+    if len(parts) != _GTFS_TIME_COMPONENTS or not all(map(_ascii_digits, parts)):
+        raise FeedParseError(f"Invalid GTFS time: {value!r}")
+    hours, minutes, seconds = (int(part) for part in parts)
     if (
-        hours < 0
-        or not (0 <= minutes < _SECONDS_OR_MINUTES_PER_UNIT)
-        or not (0 <= seconds < _SECONDS_OR_MINUTES_PER_UNIT)
+        minutes >= _SECONDS_OR_MINUTES_PER_UNIT
+        or seconds >= _SECONDS_OR_MINUTES_PER_UNIT
     ):
         raise FeedParseError(f"Invalid GTFS time: {value!r}")
     return hours * 3600 + minutes * 60 + seconds
@@ -141,18 +163,20 @@ def _lenient_int(value: str | None) -> int | None:
     Descriptive metadata (wheelchair flags, pickup types, direction ids)
     must never fail a build the way structural fields (stop_sequence,
     times) do -- a producer's typo in an accessibility column should not
-    take the whole schedule down. Parseable ints are stored as-is, even
+    take the whole schedule down. In-range values are stored as-is, even
     outside the closed vocabulary; the model boundary maps those to None.
+
+    Same ASCII-digit rule as ``parse_gtfs_time`` and ``_lenient_date``
+    (every column read through here is a GTFS non-negative integer, so a
+    sign prefix is garbage too), but lenient in KIND: garbage yields None
+    instead of raising. Whitespace around the cell is tolerated.
     """
     if value is None:
         return None
     value = value.strip()
-    if not value:
+    if not _ascii_digits(value):
         return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
+    return int(value)
 
 
 _GTFS_DATE_LENGTH = 8  # YYYYMMDD
@@ -163,13 +187,13 @@ def _lenient_date(value: str | None) -> date | None:
 
     Same contract as ``_lenient_int``: absent, blank, wrong-length,
     non-digit, or calendar-invalid (month 13, day 32) cells become None
-    rather than failing the build. ASCII digits only -- ``int()`` would
-    happily accept unicode digits a GTFS date can never contain.
+    rather than failing the build. ASCII digits only, like every other
+    scalar helper here.
     """
     if value is None:
         return None
     value = value.strip()
-    if len(value) != _GTFS_DATE_LENGTH or not (value.isascii() and value.isdigit()):
+    if len(value) != _GTFS_DATE_LENGTH or not _ascii_digits(value):
         return None
     try:
         return date(int(value[:4]), int(value[4:6]), int(value[6:8]))

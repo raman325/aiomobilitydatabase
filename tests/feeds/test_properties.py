@@ -1364,15 +1364,13 @@ _TEXT_CELL = st.one_of(
 
 
 def _expected_lenient_int(cell: str) -> int | None:
-    """Oracle for descriptive int cells: blank/garbage -> None, parseable
-    ints kept as-is (even outside every vocabulary)."""
+    """Oracle for descriptive int cells: a cell of nothing but ASCII digits
+    is that int (even outside every vocabulary); anything else -- blank,
+    signed, unicode-digit, underscore-grouped, garbage -- is None."""
     cell = cell.strip()
-    if not cell:
+    if not cell or not (cell.isascii() and cell.isdigit()):
         return None
-    try:
-        return int(cell)
-    except ValueError:
-        return None
+    return int(cell)
 
 
 def _expected_enum(enum_cls: type[IntEnum], cell: str) -> IntEnum | None:
