@@ -2282,34 +2282,44 @@ def test_haversine_along_a_meridian_equals_arc_length(
 
 
 @given(
+    # Languages INCLUDING "en", with the oracle computed from the drawn list
+    # rather than from a separately injected entry. That lets one strategy
+    # cover every branch at once: the empty list (-> None, the branch the
+    # previous version could not reach because min_size was 1), the
+    # first-entry fallback, "en" anywhere, and -- undrawn before -- a list
+    # with MORE THAN ONE "en" entry, where the first one must win.
     entries=st.lists(
         st.tuples(
-            st.text(min_size=1, max_size=10), st.sampled_from(["de", "fr", "es"])
+            st.text(max_size=10), st.sampled_from(["de", "fr", "es", "en", "en"])
         ),
-        min_size=1,
-        max_size=4,
-    ),
-    en_text=st.text(min_size=1, max_size=10),
-    include_en=st.booleans(),
+        max_size=5,
+    )
 )
-def test_first_translation_prefers_en_else_first(
-    entries: list[tuple[str, str]], en_text: str, include_en: bool
+def test_first_translation_prefers_en_else_first_else_none(
+    entries: list[tuple[str, str]],
 ) -> None:
     """Mirrors test_localized_prefers_en_else_first for the protobuf-side
-    translation picker: 'en' wins wherever it sits; otherwise first wins.
-    Non-'en' languages are drawn from a fixed pool so a coincidental 'en'
-    never sneaks in and makes the oracle wrong.
+    translation picker: the first 'en' wins wherever it sits; otherwise the
+    first entry wins; and an empty translation list yields None.
     """
     translated = gtfs_realtime_pb2.TranslatedString()
-    all_entries = list(entries)
-    if include_en:
-        all_entries.insert(len(all_entries) // 2, (en_text, "en"))
-    for text, language in all_entries:
+    for text, language in entries:
         entry = translated.translation.add()
         entry.text = text
         entry.language = language
-    result = _first_translation(translated)
-    assert result == (en_text if include_en else entries[0][0])
+    expected = next(
+        (text for text, language in entries if language == "en"),
+        entries[0][0] if entries else None,
+    )
+    assert _first_translation(translated) == expected
+
+
+def test_first_translation_of_empty_is_none() -> None:
+    """Deterministic companion: the property above draws the empty list on
+    only about 1 example in 200 (measured), too rare to rely on for the
+    branch that distinguishes None from "".
+    """
+    assert _first_translation(gtfs_realtime_pb2.TranslatedString()) is None
 
 
 # --- frequencies.txt materialization properties -----------------------------
