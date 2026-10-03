@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import copy
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 from urllib.parse import quote
 
@@ -181,21 +182,61 @@ def test_unknown_enum_value_is_rejected(
 
 _ENUM_VALUES = [*DataType, *FeedStatus, *SortOrder, *BoundingFilterMethod]
 
+# Values whose own text contains the separator encode_params joins on, so the
+# join is exercised at its ambiguous edge rather than only on comma-free text.
+_COMMA_TEXT = st.sampled_from(["a,b", ",", "a,,b", "trailing,"])
+
 _scalars = (
     st.booleans()
     | st.integers(min_value=-1_000_000, max_value=1_000_000)
     | st.text(max_size=12)
+    # "" is reachable (e.g. provider="") and, unlike an empty list, is KEPT.
+    | st.just("")
+    | _COMMA_TEXT
     | st.sampled_from(_ENUM_VALUES)
     | st.datetimes(min_value=datetime(2000, 1, 1), max_value=datetime(2035, 1, 1))
 )
 _containers = st.lists(_scalars, max_size=4).flatmap(
     lambda items: st.sampled_from([items, tuple(items)])
 )
-_values = st.none() | _scalars | _containers
+# Nested containers are not reachable through any public client signature, but
+# _encode_value recurses, so pin the flattening it produces today.
+_nested_containers = st.lists(_containers, max_size=3)
+_values = st.none() | _scalars | _containers | _nested_containers
 _param_keys = st.text(
     alphabet=st.characters(whitelist_categories=("Ll", "Lu")), min_size=1, max_size=10
 )
 _param_dicts = st.dictionaries(_param_keys, _values, max_size=8)
+
+
+def _expected_scalar(value: Any) -> str:
+    """Expected encoding of one non-container value, spelled out per type
+    rather than deferring to the implementation's helper."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, datetime):
+        # ISO 8601, i.e. "T"-separated -- not str(datetime)'s space.
+        return value.isoformat()
+    if isinstance(value, int):
+        return repr(value)
+    assert isinstance(value, str)
+    return value
+
+
+def _expected_encoded(value: Any) -> str:
+    """Expected encoding of a (possibly nested) value: containers comma-join
+    their items' encodings, recursively.
+
+    Note this is NOT a flatten: an empty inner container encodes to "", so
+    [[], []] encodes to "," rather than "". Only a TOP-level empty container
+    is dropped. Nested containers are unreachable through the public client
+    signatures; this pins the behavior rather than endorsing it.
+    """
+    if isinstance(value, list | tuple):
+        return ",".join(_expected_encoded(item) for item in value)
+    return _expected_scalar(value)
 
 
 @given(params=_param_dicts)
@@ -213,11 +254,36 @@ def test_encode_params_output_laws(params: dict[str, Any]) -> None:
         elif isinstance(value, list | tuple) and not value:
             # Empty containers are dropped, just like None.
             assert key not in encoded
-        elif isinstance(value, bool):
-            # Bools map exactly to "true"/"false".
-            assert encoded[key] == ("true" if value else "false")
+        elif isinstance(value, list | tuple):
+            # Comma-joined, so a ";"-join or a repr()-of-list would fail.
+            assert encoded[key] == _expected_encoded(value)
         else:
-            assert key in encoded
+            assert encoded[key] == _expected_scalar(value)
+            if isinstance(value, datetime):
+                # Independent of the oracle above: ISO round-trips, and the
+                # date/time separator is "T".
+                assert datetime.fromisoformat(encoded[key]) == value
+                assert "T" in encoded[key]
+
+
+def test_encode_params_keeps_empty_string_but_drops_empty_container() -> None:
+    """The deliberate asymmetry in encode_params' docstring: an empty list
+    means "no filter" and vanishes, while "" is a real (if odd) filter value
+    and survives as an empty-string param.
+    """
+    assert encode_params({"provider": "", "features": []}) == {"provider": ""}
+
+
+def test_encode_params_comma_join_is_ambiguous_for_commas_in_values() -> None:
+    """KNOWN GAP, pinned rather than fixed: the API's multi-value convention
+    is a comma-joined string with no escape, so a single value containing a
+    comma is indistinguishable on the wire from two values. Reachable today
+    via the list[str] filters (license_tags, features, license_ids). Fixing
+    it needs an escaping convention the API does not document.
+    """
+    assert encode_params({"license_tags": ["a,b"]}) == encode_params(
+        {"license_tags": ["a", "b"]}
+    )
 
 
 # --- Task 15R-b item 2: path-interpolated ids must be quoted ---------------
