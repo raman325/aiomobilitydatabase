@@ -1155,13 +1155,30 @@ def test_epoch_to_utc_is_total(epoch: int) -> None:
 
 
 @given(
-    raw=st.sampled_from([True, False, 0, 1, 2, "true", "false", "yes", "", None, 1.0])
+    raw=st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=True)
+    | st.text()
+    | st.none()
+    | st.lists(st.integers())
+    | st.dictionaries(st.text(), st.text())
 )
 def test_station_bool_coercion_never_lies(raw: object) -> None:
+    """Over any JSON value, _as_bool answers only True/False/None, and it
+    answers None for exactly the values that aren't already numeric
+    booleans -- so no truthy container or string is ever coerced.
+    """
     result = _as_bool(raw)
     assert result in (True, False, None)
-    if isinstance(raw, str):
-        assert result is None  # bool("false") is True — strings are UNKNOWN, not truthy
+    assert (result is None) is not isinstance(raw, bool | int | float)
+
+
+@given(raw=st.text())
+def test_station_bool_coercion_rejects_every_string(raw: str) -> None:
+    """bool("false") is True in Python, so NO string is a GBFS boolean --
+    not "true" either: a producer shipping strings is shipping unknowns.
+    """
+    assert _as_bool(raw) is None
 
 
 _IDS = st.text(
@@ -2264,76 +2281,128 @@ def test_arrivals_merge_invariants(data: st.DataObject) -> None:
 
 
 _GBFS_ZONE = Circle(latitude=34.05, longitude=-118.25, radius_m=2_000.0)
-_NEARBY_LAT = st.floats(33.95, 34.15)
-_NEARBY_LON = st.floats(-118.35, -118.15)
+# Points are drawn CONSTRUCTIVELY, as a metre offset from the zone centre: a
+# wide lat/lon box (the previous ~22km x 18km one, against a 2km radius) put
+# only 1 of 1015 generated rows inside the zone, so the filter's "keep" path
+# was effectively never exercised. A +-2.5km square puts ~50% inside.
+_ZONE_OFFSET_M = st.floats(-2_500.0, 2_500.0)
+_M_PER_DEG = 111_320.0
 
 
-@given(
-    rows=st.lists(
-        st.fixed_dictionaries(
-            {
-                "bike_id": st.text(min_size=1, max_size=6),
-                "lat": _NEARBY_LAT | st.none(),
-                "lon": _NEARBY_LON | st.none(),
-            }
-        ),
-        max_size=8,
+@st.composite
+def _zone_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
+    """One GBFS row offset from the zone centre, sometimes coordinate-less.
+
+    Real documents ship rows without coordinates, and both filters must
+    drop those rather than place them at (0, 0).
+    """
+    north = draw(_ZONE_OFFSET_M)
+    east = draw(_ZONE_OFFSET_M)
+    latitude = _GBFS_ZONE.latitude + north / _M_PER_DEG
+    longitude = _GBFS_ZONE.longitude + east / (
+        _M_PER_DEG * math.cos(math.radians(_GBFS_ZONE.latitude))
     )
-)
+    return {
+        id_key: draw(st.text(min_size=1, max_size=6)),
+        "lat": draw(st.just(latitude) | st.none()),
+        "lon": draw(st.just(longitude) | st.none()),
+    }
+
+
+def _gbfs_handle(documents: dict[str, object]) -> GbfsFeedHandle:
+    """A detached handle whose named endpoints serve pre-cached documents.
+
+    The cache entries are built with an infinite ttl so no method of the
+    handle ever reaches the network; ``documents`` maps an endpoint name
+    to that document's ``data`` envelope.
+    """
+    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
+    handle._doc_cache = {
+        name: (float("inf"), float("inf"), {"data": data})
+        for name, data in documents.items()
+    }
+    handle._endpoints = dict.fromkeys(documents, "x")
+    return handle
+
+
+@given(rows=st.lists(_zone_row("bike_id"), max_size=8))
 @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_gbfs_vehicles_zone_filter_law(rows: list[dict[str, object]]) -> None:
     """get_vehicles(zone) keeps exactly the coord-having rows inside the
     zone; nothing else.
     """
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        "free_bike_status": (float("inf"), float("inf"), {"data": {"bikes": rows}}),
-    }
-    handle._endpoints = {"free_bike_status": "x"}
+    handle = _gbfs_handle({"free_bike_status": {"bikes": rows}})
     unfiltered = asyncio.run(handle.get_vehicles(None))
     filtered = asyncio.run(handle.get_vehicles(_GBFS_ZONE))
+    event(f"vehicles: any row inside the zone: {bool(filtered)}")
     assert filtered == [
         v for v in unfiltered if in_circle(_GBFS_ZONE, v.latitude, v.longitude)
     ]
 
 
-@given(
-    rows=st.lists(
-        st.fixed_dictionaries(
-            {
-                "station_id": st.text(min_size=1, max_size=6),
-                "lat": _NEARBY_LAT | st.none(),
-                "lon": _NEARBY_LON | st.none(),
-            }
-        ),
-        max_size=8,
-        unique_by=lambda row: row["station_id"],
-    )
-)
+@given(data=st.data())
 @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_gbfs_stations_zone_filter_law(rows: list[dict[str, object]]) -> None:
-    """get_stations(zone) keeps exactly the coord-having rows inside the
-    zone; nothing else.
+def test_gbfs_stations_zone_filter_and_merge_law(data: st.DataObject) -> None:
+    """get_stations: the zone keeps exactly the coord-having rows inside the
+    circle, and the status merge is keyed by station_id -- each station gets
+    ITS OWN status row's values, a station with no status row reads
+    all-unknown, status rows for unknown ids are ignored, and the result
+    does not depend on the order the status rows arrive in.
     """
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        "station_information": (
-            float("inf"),
-            float("inf"),
-            {"data": {"stations": rows}},
-        ),
-        "station_status": (float("inf"), float("inf"), {"data": {"stations": []}}),
+    info_rows = data.draw(
+        st.lists(
+            _zone_row("station_id"), max_size=6, unique_by=lambda row: row["station_id"]
+        )
+    )
+    station_ids = [str(row["station_id"]) for row in info_rows]
+    covered = data.draw(
+        st.lists(st.booleans(), min_size=len(station_ids), max_size=len(station_ids))
+    )
+    # Distinct per-station counts: a merge keyed on anything but station_id
+    # would hand a station the wrong one.
+    expected_bikes = {
+        station_id: index
+        for index, (station_id, include) in enumerate(
+            zip(station_ids, covered, strict=True)
+        )
+        if include
     }
-    handle._endpoints = {"station_information": "x", "station_status": "x"}
-    unfiltered = asyncio.run(handle.get_stations(None))
-    filtered = asyncio.run(handle.get_stations(_GBFS_ZONE))
-    assert filtered == [
-        s
-        for s in unfiltered
-        if s.latitude is not None
-        and s.longitude is not None
-        and in_circle(_GBFS_ZONE, s.latitude, s.longitude)
+    status_rows: list[dict[str, object]] = [
+        {"station_id": station_id, "num_bikes_available": bikes, "is_renting": True}
+        for station_id, bikes in expected_bikes.items()
     ]
+    # Orphan ids are 8+ chars, so they cannot collide with a drawn id.
+    status_rows += [
+        {"station_id": f"orphan-{index}", "num_bikes_available": 99, "docks": 1}
+        for index in range(data.draw(st.integers(0, 3)))
+    ]
+
+    def run(status: list[dict[str, object]], zone: Circle | None):
+        return asyncio.run(
+            _gbfs_handle(
+                {
+                    "station_information": {"stations": info_rows},
+                    "station_status": {"stations": status},
+                }
+            ).get_stations(zone)
+        )
+
+    unfiltered = run(status_rows, None)
+    filtered = run(status_rows, _GBFS_ZONE)
+    event(f"stations: any row inside the zone: {bool(filtered)}")
+    assert [station.id for station in unfiltered] == station_ids
+    assert filtered == [
+        station
+        for station in unfiltered
+        if station.latitude is not None
+        and station.longitude is not None
+        and in_circle(_GBFS_ZONE, station.latitude, station.longitude)
+    ]
+    for station in unfiltered:
+        assert station.bikes_available == expected_bikes.get(station.id)
+        assert station.is_renting is (True if station.id in expected_bikes else None)
+    assert run(list(reversed(status_rows)), None) == unfiltered
+    assert run(data.draw(st.permutations(status_rows)), None) == unfiltered
 
 
 @given(
@@ -4041,33 +4110,24 @@ def test_endpoints_from_discovery_layouts_oracle(data: st.DataObject) -> None:
             _endpoints_from_discovery(document)
 
 
-def _vehicle_handle(endpoints: dict[str, dict[str, object]]) -> GbfsFeedHandle:
-    """A detached handle whose named endpoints serve pre-cached documents."""
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        name: (float("inf"), float("inf"), {"data": payload})
-        for name, payload in endpoints.items()
+@st.composite
+def _equivalence_row(draw: st.DrawFn) -> dict[str, object]:
+    """One descriptive vehicle row, keyed on a neutral ``id``.
+
+    The id is rewritten to each spec version's own key by the test; the
+    rest of the descriptive surface is drawn so the two paths have
+    something to disagree about.
+    """
+    return {
+        **draw(_zone_row("id")),
+        "is_reserved": draw(st.booleans() | st.none()),
+        "is_disabled": draw(st.booleans() | st.none()),
+        "vehicle_type_id": draw(st.text(min_size=1, max_size=4) | st.none()),
+        "current_range_meters": draw(st.floats(0, 50_000) | st.none()),
     }
-    handle._endpoints = dict.fromkeys(endpoints, "x")
-    return handle
 
 
-@given(
-    rows=st.lists(
-        st.fixed_dictionaries(
-            {
-                "id": st.text(min_size=1, max_size=6),
-                "lat": _NEARBY_LAT | st.none(),
-                "lon": _NEARBY_LON | st.none(),
-                "is_reserved": st.booleans() | st.none(),
-                "is_disabled": st.booleans() | st.none(),
-                "vehicle_type_id": st.text(min_size=1, max_size=4) | st.none(),
-                "current_range_meters": st.floats(0, 50_000) | st.none(),
-            }
-        ),
-        max_size=6,
-    )
-)
+@given(rows=st.lists(_equivalence_row(), max_size=6))
 @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
     rows: list[dict[str, object]],
@@ -4087,15 +4147,15 @@ def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
         for row in rows
     ]
     via_30 = asyncio.run(
-        _vehicle_handle({"vehicle_status": {"vehicles": v_rows}}).get_vehicles()
+        _gbfs_handle({"vehicle_status": {"vehicles": v_rows}}).get_vehicles()
     )
     via_23 = asyncio.run(
-        _vehicle_handle({"free_bike_status": {"bikes": b_rows}}).get_vehicles()
+        _gbfs_handle({"free_bike_status": {"bikes": b_rows}}).get_vehicles()
     )
     assert via_30 == via_23
     decoy = [{"bike_id": "DECOY", "lat": 34.05, "lon": -118.25}]
     via_both = asyncio.run(
-        _vehicle_handle(
+        _gbfs_handle(
             {
                 "vehicle_status": {"vehicles": v_rows},
                 "free_bike_status": {"bikes": decoy},
