@@ -353,11 +353,12 @@ class GbfsFeedHandle:
         for info in info_rows:
             latitude = _coordinate(info.get("lat"))
             longitude = _coordinate(info.get("lon"))
-            if zone is not None:
-                if latitude is None or longitude is None:
-                    continue
-                if not in_circle(zone, latitude, longitude):
-                    continue
+            if zone is not None and (
+                latitude is None
+                or longitude is None
+                or not in_circle(zone, latitude, longitude)
+            ):
+                continue
             station_id = _record_id(info.get("station_id"))
             if station_id is None:
                 continue

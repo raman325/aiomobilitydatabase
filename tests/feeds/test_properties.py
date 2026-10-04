@@ -2413,18 +2413,15 @@ def test_gbfs_stations_zone_filter_and_merge_law(data: st.DataObject) -> None:
         for index in range(data.draw(st.integers(0, 3)))
     ]
 
-    def run(status: list[dict[str, object]], zone: Circle | None):
-        return asyncio.run(
-            _gbfs_handle(
-                {
-                    "station_information": {"stations": info_rows},
-                    "station_status": {"stations": status},
-                }
-            ).get_stations(zone)
-        )
+    def documents(status: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "station_information": {"stations": info_rows},
+            "station_status": {"stations": status},
+        }
 
-    unfiltered = run(status_rows, None)
-    filtered = run(status_rows, _GBFS_ZONE)
+    handle = _gbfs_handle(documents(status_rows))
+    unfiltered = asyncio.run(handle.get_stations(None))
+    filtered = asyncio.run(handle.get_stations(_GBFS_ZONE))
     event(f"stations: any row inside the zone: {bool(filtered)}")
     assert [station.id for station in unfiltered] == station_ids
     assert filtered == [
@@ -2437,8 +2434,10 @@ def test_gbfs_stations_zone_filter_and_merge_law(data: st.DataObject) -> None:
     for station in unfiltered:
         assert station.bikes_available == expected_bikes.get(station.id)
         assert station.is_renting is (True if station.id in expected_bikes else None)
-    assert run(list(reversed(status_rows)), None) == unfiltered
-    assert run(data.draw(st.permutations(status_rows)), None) == unfiltered
+    reversed_handle = _gbfs_handle(documents(list(reversed(status_rows))))
+    shuffled_handle = _gbfs_handle(documents(data.draw(st.permutations(status_rows))))
+    assert asyncio.run(reversed_handle.get_stations(None)) == unfiltered
+    assert asyncio.run(shuffled_handle.get_stations(None)) == unfiltered
 
 
 @given(
