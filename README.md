@@ -208,6 +208,15 @@ Notes on direct mode:
   work with or without realtime coverage; GTFS-RT TripUpdates overlay delays,
   cancellations, and added trips when present, with cancellation always
   winning over stale predictions.
+- **Arrivals are batched and delay-aware**: `get_arrivals()` takes a sequence
+  of `ArrivalsQuery` and returns one board per query from a single schedule
+  read and a single realtime fetch, so several stops with different
+  route/headsign filters cost one round trip instead of one each. Each query's
+  filters apply *before* its `limit`, and `limit` caps that board as a whole
+  rather than per GTFS stop — so a narrow filter can never come back empty
+  because busier routes used up the limit. A `grace` window (default one hour)
+  keeps a delayed trip listed past its scheduled time until its prediction
+  passes, while a schedule-only departure still drops at its scheduled time.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic
   `{trip_id}#{start_secs}` ids, so every schedule query — arrivals,
@@ -227,6 +236,14 @@ Notes on direct mode:
   absent-means-exact default, and open vocabularies (`route_type`,
   `direction_id`) stay raw ints. Out-of-vocabulary values degrade to `None` —
   descriptive metadata never fails a build. Consumers decide what to keep.
+- **Numbers are ASCII-strict, and strictness follows the field's role**: a
+  GTFS number must be plain ASCII digits, so a Unicode decimal (`٨`), a sign
+  prefix, or Python's `1_0` underscore grouping is never quietly reinterpreted
+  as a plausible value. A malformed **structural** cell — `stop_times` times,
+  `stop_sequence`, `headway_secs`, `exception_type`, calendar weekday flags —
+  fails the build, because a wrong departure time or a wrong call order is
+  worse than no feed at all. A malformed **descriptive** cell still degrades
+  to `None`.
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
   `headsigns_serving()` alongside the stop/route helpers.
@@ -239,13 +256,22 @@ Notes on direct mode:
   keyed by feed, validated against the dataset ID, so restarts are instant and
   rebuilds only happen when the agency publishes a new dataset
   (`await transit.refresh_static()` — call it daily; it swaps in the new index
-  only after it's built, so lookups never see a half-built database). Without
-  a `cache_dir` the index is built in memory on every startup.
+  only after it's built, so lookups never see a half-built database, and it is
+  safe to call while queries are in flight: the swap waits for in-flight reads
+  to finish, and two overlapping refreshes run back to back rather than
+  double-building). A corrupt or unreadable cache is treated as a cache miss
+  and rebuilt rather than raising. Without a `cache_dir` the index is built in
+  memory on every startup.
 - **Pull, not push**: `TransitFeedHandle`/`GbfsFeedHandle` return snapshots on
   demand — there's no built-in polling loop or scheduler. Bring your own (e.g.
   Home Assistant's `DataUpdateCoordinator`).
 - **`purge_cache()`** deletes a feed's cached static data (or all feeds' when
   called with no argument) — call it on cleanup/removal of a configured feed.
+  A `feed_id` that is not a bare child name of the cache directory raises
+  `ValueError` instead of deleting anything, so an absolute path, a `..`
+  component, a symlinked entry, or a degenerate `""`/`"."` cannot take out
+  every feed's cache. Purging a feed with no cache directory is a no-op, so
+  repeated calls are idempotent.
   `transit.close()` releases a handle's SQLite connection — call it when you
   are done with a handle; the client's `close()` does not do it for you.
 - **Producer authentication**: pass `api_key=` to `get_transit_feed()`; it is
@@ -272,8 +298,16 @@ each define their own subtree beneath it, so you can catch broadly
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
 | `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
-| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON, or unreadable GTFS zip |
+| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, or a malformed scalar in a structural GTFS column |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset |
+
+The GBFS and GTFS-RT parse paths are **total** with respect to this table:
+any producer document, however malformed, either returns a typed result or
+raises one of the exceptions above — never a bare `KeyError`, `TypeError`,
+`ValueError` or `OverflowError` from inside the library. The one deliberate
+exception is `purge_cache()`, which raises the builtin `ValueError` for a
+`feed_id` it will not accept (see above), because that is a caller mistake
+rather than a feed problem.
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`
@@ -338,6 +372,22 @@ The suite combines example-based, property-based, and conformance testing:
     and GTFS-RT protobuf parsing, both checked for **totality** — every
     generated input must produce a typed result or a documented
     `MobilityFeedsError` subclass, never an unhandled exception;
+  - the batched arrivals contract: that batching is pure query factorization
+    (`get_arrivals([q1, q2])` equals the two single-query calls), that a batch
+    costs exactly one realtime fetch however many queries it carries, that
+    route and headsign filters apply before the limit, and that every returned
+    row's effective departure is still ahead of `now`;
+  - the origin→destination query against an oracle built from the stored
+    stop-call table: the self-join's direction rule (no return-trip rows) and
+    the earliest-destination-call rule for loop trips, neither of which any
+    test asserted before;
+  - window monotonicity — widening `lookahead` yields a prefix and widening
+    `grace` yields a superset — which guards the scan-window regression class
+    directly, without a hand-built oracle;
+  - the cache as a round trip: a built index and the same index reopened from
+    disk answer every query identically, including the stored timezone, and
+    `purge_cache` removes exactly the named feed and nothing else for any
+    generated `feed_id`;
   - error-contract fuzzing for malformed GTFS zips, RT payloads, and GBFS
     documents (garbage bytes, wrong types, out-of-range values) — the
     contract under test is "raises `FeedParseError`/`SourceConnectionError`",
