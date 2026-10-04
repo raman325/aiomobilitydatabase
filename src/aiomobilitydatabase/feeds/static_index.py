@@ -125,6 +125,23 @@ def _ascii_digits(value: str) -> bool:
     return bool(value) and value.isascii() and value.isdigit()
 
 
+def _ascii_int(value: str) -> int | None:
+    """Convert an ASCII-digit cell to an int, or None if it is not one.
+
+    Folds the predicate and the conversion together because an
+    all-ASCII-digit cell can still fail to convert: CPython caps
+    int-string conversion at 4300 digits, and a cell that long is the
+    same "not a usable number" answer as a non-digit cell. Every caller
+    then decides whether that answer raises or degrades.
+    """
+    if not _ascii_digits(value):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 def _strict_int(value: str, field: str) -> int:
     """Parse a STRUCTURAL integer cell: anything unparseable raises.
 
@@ -136,10 +153,9 @@ def _strict_int(value: str, field: str) -> int:
     ``parse_gtfs_time``, and the same reasoning: a corrupt structural
     value that silently parses is worse than a failed build.
     """
-    value = value.strip()
-    if not _ascii_digits(value):
+    if (parsed := _ascii_int(value.strip())) is None:
         raise FeedParseError(f"Invalid GTFS {field}: {value!r}")
-    return int(value)
+    return parsed
 
 
 _GTFS_TIME_COMPONENTS = 3
@@ -163,9 +179,14 @@ def parse_gtfs_time(value: str) -> int | None:
     if not value:
         return None
     parts = value.split(":")
-    if len(parts) != _GTFS_TIME_COMPONENTS or not all(map(_ascii_digits, parts)):
+    if len(parts) != _GTFS_TIME_COMPONENTS:
         raise FeedParseError(f"Invalid GTFS time: {value!r}")
-    hours, minutes, seconds = (int(part) for part in parts)
+    components: list[int] = []
+    for part in parts:
+        if (parsed := _ascii_int(part)) is None:
+            raise FeedParseError(f"Invalid GTFS time: {value!r}")
+        components.append(parsed)
+    hours, minutes, seconds = components
     if (
         minutes >= _SECONDS_OR_MINUTES_PER_UNIT
         or seconds >= _SECONDS_OR_MINUTES_PER_UNIT

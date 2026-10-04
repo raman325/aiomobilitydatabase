@@ -12,6 +12,7 @@ from aiomobilitydatabase.feeds.static_index import (
     SCHEMA_VERSION,
     StaticIndex,
     _lenient_int,
+    _strict_int,
     parse_gtfs_time,
 )
 
@@ -450,3 +451,29 @@ def test_non_ascii_route_type_is_not_a_build_failure(tmp_path: Path, cell: str) 
         assert {route.id for route in index.routes()} == {"R1", "R2"}
     finally:
         index.close()
+
+
+# Past CPython's default 4300-digit cap on int-string conversion, so int()
+# raises ValueError even though every character is an ASCII digit.
+_OVERSIZED_DIGITS = "1" * 5000
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_parse_gtfs_time_rejects_oversized_components(position: int) -> None:
+    """A component can be all ASCII digits and still refuse to convert:
+    CPython caps int-string conversion at 4300 digits. That must surface as
+    the documented FeedParseError, not the raw ValueError -- callers that
+    catch FeedParseError (rt.py's _trip_start_secs) would miss it.
+    """
+    cells = ["00", "00", "00"]
+    cells[position] = _OVERSIZED_DIGITS
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(":".join(cells))
+
+
+def test_strict_int_rejects_oversized_digits() -> None:
+    """The same digit cap on a structural integer column: FeedParseError
+    rather than the raw ValueError from int().
+    """
+    with pytest.raises(FeedParseError):
+        _strict_int(_OVERSIZED_DIGITS, "stop_sequence")
