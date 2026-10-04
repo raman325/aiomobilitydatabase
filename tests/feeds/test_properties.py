@@ -4,8 +4,11 @@ import asyncio
 import csv
 import io
 import math
+import sqlite3
+import sys
 import tempfile
 import zipfile
+from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
@@ -26,8 +29,11 @@ from aiomobilitydatabase.feeds.exceptions import (
 from aiomobilitydatabase.feeds.gbfs import (
     GbfsFeedHandle,
     _as_bool,
+    _coordinate,
     _endpoints_from_discovery,
     _localized,
+    _ttl_seconds,
+    _vehicle_types,
     _version_key,
 )
 from aiomobilitydatabase.feeds.geo import Circle, haversine_m, in_circle
@@ -62,6 +68,8 @@ from aiomobilitydatabase.feeds.rt import (
 from aiomobilitydatabase.feeds.static_index import (
     ScheduledTrip,
     StaticIndex,
+    _lenient_date,
+    _lenient_int,
     parse_gtfs_time,
 )
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle, group_stations
@@ -341,34 +349,179 @@ def test_departures_match_elapsed_seconds_oracle(
         index.close()
 
 
+# Garbage for ONE time component: letters, non-ASCII digits (the
+# ASCII-only hole), sign prefixes, a decimal point, and whitespace. ASCII
+# digits are excluded because any count of them in any component is VALID
+# GTFS ("8:0:0", "0008:00:00") -- generating them would be a broken oracle.
+_TIME_GARBAGE = st.one_of(
+    st.text(
+        alphabet=st.characters(
+            categories=["L", "N"],
+            exclude_characters="0123456789",
+            include_characters="+-. \t",
+        ),
+        min_size=1,
+        max_size=8,
+    ),
+    # Sampled explicitly as well: free text draws non-ASCII digits and sign
+    # prefixes only rarely, and those are the exact forms a bare int()
+    # silently accepted.
+    st.sampled_from(
+        ["\u0660\u0668", "\uff10\uff18", "+8", "-1", "-0", "1_0", "0 8", " 8 "]
+    ),
+)
+
+
 @given(
-    hours=st.integers(min_value=0, max_value=47),
+    hours=st.integers(min_value=0, max_value=500),
     minutes=st.integers(min_value=0, max_value=59),
     seconds=st.integers(min_value=0, max_value=59),
-    pad_hours=st.booleans(),
+    pad=st.tuples(st.booleans(), st.booleans(), st.booleans()),
 )
-def test_parse_gtfs_time_round_trip(
-    hours: int, minutes: int, seconds: int, pad_hours: bool
+def test_parse_gtfs_time_matches_component_oracle(
+    hours: int, minutes: int, seconds: int, pad: tuple[bool, bool, bool]
 ) -> None:
-    # Single-digit UNPADDED hours ("8:00:00") are valid GTFS the spec calls
-    # out explicitly; the suite previously only ever generated "08:00:00".
-    hour_cell = f"{hours:02d}" if pad_hours else str(hours)
-    value = f"{hour_cell}:{minutes:02d}:{seconds:02d}"
-    assert parse_gtfs_time(value) == hours * 3600 + minutes * 60 + seconds
+    """Oracle test (there is no formatter inverse to round-trip against):
+    any zero-padding combination of any in-range components parses to the
+    arithmetic the GTFS spec defines.
+    """
+    # Single-digit UNPADDED components ("8:0:0") are valid GTFS -- int()
+    # accepts them and real feeds ship them. Hours are deliberately drawn
+    # well past 47: a service day may run arbitrarily far past midnight,
+    # so the function has no hour ceiling to find.
+    cells = tuple(
+        f"{component:02d}" if padded else str(component)
+        for component, padded in zip((hours, minutes, seconds), pad, strict=True)
+    )
+    assert parse_gtfs_time(":".join(cells)) == hours * 3600 + minutes * 60 + seconds
 
 
-@given(text=st.text(alphabet=st.characters(categories=["L"]), min_size=1, max_size=8))
-def test_parse_gtfs_time_rejects_garbage(text: str) -> None:
-    # Letters-only: "0:00:00"-style single-digit hours are VALID GTFS, so the
-    # original numeric-string strategy was a broken oracle (found 2026-07-31).
+@given(garbage=_TIME_GARBAGE, position=st.integers(min_value=0, max_value=2))
+def test_parse_gtfs_time_rejects_garbage_in_any_component(
+    garbage: str, position: int
+) -> None:
+    """Garbage in ANY of the three components is rejected, not just the hour
+    -- a validation gap in minutes or seconds would otherwise be invisible.
+    """
+    cells = ["00", "00", "00"]
+    cells[position] = garbage
     with pytest.raises(FeedParseError):
-        parse_gtfs_time(f"{text}:00:00")
+        parse_gtfs_time(":".join(cells))
 
 
-def test_parse_gtfs_time_rejects_out_of_range_components() -> None:
-    for bad in ("08:75:00", "08:00:99", "-1:00:00", "08:-5:00"):
-        with pytest.raises(FeedParseError):
-            parse_gtfs_time(bad)
+@given(
+    value=st.integers(min_value=60, max_value=999),
+    in_seconds=st.booleans(),
+    pad=st.booleans(),
+)
+def test_parse_gtfs_time_rejects_out_of_range_minutes_and_seconds(
+    value: int, in_seconds: bool, pad: bool
+) -> None:
+    """Minutes and seconds are bounded to [0, 60) even though they are
+    spelled in valid ASCII digits (subsumes the hand-written "08:75:00"/
+    "08:00:99" cases). Hours have no such bound.
+    """
+    cell = f"{value:02d}" if pad else str(value)
+    bad = f"08:{cell}:00" if not in_seconds else f"08:00:{cell}"
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(bad)
+
+
+@given(
+    components=st.lists(
+        st.integers(min_value=0, max_value=59).map(lambda n: f"{n:02d}"),
+        min_size=0,
+        max_size=6,
+    ).filter(lambda parts: len(parts) != 3)
+)
+def test_parse_gtfs_time_rejects_wrong_arity(components: list[str]) -> None:
+    """Exactly three colon-separated components, by explicit check rather
+    than by an incidental generator-unpack ValueError: "08:00" and
+    "1:2:3:4" are rejected, and a blank cell stays None (not an arity
+    failure).
+    """
+    value = ":".join(components)
+    if not value:
+        assert parse_gtfs_time(value) is None
+        return
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(value)
+
+
+@given(
+    whole=st.integers(min_value=0, max_value=59),
+    frac=st.integers(min_value=1, max_value=999),
+    position=st.integers(min_value=0, max_value=2),
+)
+def test_parse_gtfs_time_rejects_fractional_components(
+    whole: int, frac: int, position: int
+) -> None:
+    """GTFS times have no sub-second resolution in any component."""
+    cells = ["00", "00", "00"]
+    cells[position] = f"{whole}.{frac}"
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(":".join(cells))
+
+
+# CPython caps int-string conversion at 4300 digits by default, so a cell
+# can be nothing but ASCII digits and still refuse to convert. No other
+# generator in this suite draws strings that long, so the boundary is drawn
+# explicitly: the last accepted lengths, the first rejected ones, and a few
+# thousand digits past the cap.
+_DIGIT_LIMIT = sys.get_int_max_str_digits()
+_CONVERTIBLE_LENGTHS = st.sampled_from([_DIGIT_LIMIT - 1, _DIGIT_LIMIT])
+_UNCONVERTIBLE_LENGTHS = st.sampled_from(
+    [_DIGIT_LIMIT + 1, _DIGIT_LIMIT + 2, _DIGIT_LIMIT + 3000]
+)
+
+
+@settings(max_examples=10, deadline=None)
+@given(
+    length=_CONVERTIBLE_LENGTHS,
+    minutes=st.integers(min_value=0, max_value=59),
+    seconds=st.integers(min_value=0, max_value=59),
+)
+def test_parse_gtfs_time_accepts_hours_up_to_the_digit_limit(
+    length: int, minutes: int, seconds: int
+) -> None:
+    """Hours are unbounded in GTFS, so an hour spelled right up to the
+    conversion cap is still a time: the cap is where "ASCII digits" stops
+    meaning "a number", not an hour ceiling moved into the parser.
+    """
+    hours = int("1" * length)
+    assert (
+        parse_gtfs_time(f"{hours}:{minutes:02d}:{seconds:02d}")
+        == hours * 3600 + minutes * 60 + seconds
+    )
+
+
+@settings(max_examples=10, deadline=None)
+@given(length=_UNCONVERTIBLE_LENGTHS, position=st.integers(min_value=0, max_value=2))
+def test_parse_gtfs_time_rejects_components_past_the_digit_limit(
+    length: int, position: int
+) -> None:
+    """Past the cap, any component is rejected the way every other
+    unparseable component is -- FeedParseError, never the raw ValueError
+    int() raises (which callers catching FeedParseError would miss).
+    """
+    cells = ["00", "00", "00"]
+    cells[position] = "1" * length
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(":".join(cells))
+
+
+@settings(max_examples=10, deadline=None)
+@given(length=st.one_of(_CONVERTIBLE_LENGTHS, _UNCONVERTIBLE_LENGTHS))
+def test_lenient_helpers_answer_none_across_the_digit_limit(length: int) -> None:
+    """The lenient helpers answer, never raise, on both sides of the cap:
+    _lenient_int keeps a convertible digit string and degrades the rest to
+    None, and _lenient_date rejects every one of them on length alone (which
+    is why it needs no conversion guard of its own).
+    """
+    cell = "1" * length
+    expected = int(cell) if length <= _DIGIT_LIMIT else None
+    assert _lenient_int(cell) == expected
+    assert _lenient_date(cell) is None
 
 
 @given(
@@ -584,25 +737,6 @@ def test_active_service_ids_matches_naive_oracle(
 
 # --- messy-format properties (Task 13b) ---
 
-_JSONISH = st.recursive(
-    st.none()
-    | st.booleans()
-    | st.integers()
-    | st.floats(allow_nan=False)
-    | st.text(max_size=20),
-    lambda children: (
-        st.lists(children, max_size=4)
-        | st.dictionaries(st.text(max_size=8), children, max_size=4)
-    ),
-    max_leaves=10,
-)
-
-
-@given(value=_JSONISH)
-def test_localized_is_total(value: object) -> None:
-    result = _localized(value)
-    assert result is None or isinstance(result, str)
-
 
 # Localized entries with an OPTIONAL "text" key: real GBFS documents ship
 # entries missing text, and the selected entry must then yield None -- never
@@ -612,6 +746,51 @@ def _localized_entry(language: st.SearchStrategy[str]) -> st.SearchStrategy[dict
         {"language": language},
         optional={"text": st.text(min_size=1, max_size=20)},
     )
+
+
+# Keys, string leaves, and one whole list arm are biased toward the GBFS
+# localized-entry schema:
+# with free-form text keys only, 0 of 500 draws carried a "language" key at
+# all, so _localized's preferred-language branch was unreachable from here.
+_JSONISH = st.recursive(
+    st.none()
+    | st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=False)
+    | st.sampled_from(["en", "fr", "de", "Dock A", ""])
+    | st.text(max_size=20),
+    lambda children: (
+        st.lists(children, max_size=4)
+        | st.lists(_localized_entry(st.sampled_from(["en", "fr", "de"])), max_size=3)
+        | st.dictionaries(
+            st.sampled_from(["language", "text", "name"]) | st.text(max_size=8),
+            children,
+            max_size=4,
+        )
+    ),
+    max_leaves=10,
+)
+
+
+@given(value=_JSONISH)
+def test_localized_is_total(value: object) -> None:
+    """Any JSON value yields a string or None, never a raise. The event
+    tags record how often a draw actually reaches the preferred-language
+    branch (it was 0% before the schema bias above).
+    """
+    entries = (
+        [entry for entry in value if isinstance(entry, dict)]
+        if isinstance(value, list)
+        else []
+    )
+    event(
+        f"localized: entry with a language key: {any('language' in e for e in entries)}"
+    )
+    # "en" is the library's GBFS_LANGUAGE_PREFERENCE.
+    preferred = any(entry.get("language") == "en" for entry in entries)
+    event(f"localized: preferred-language branch: {preferred}")
+    result = _localized(value)
+    assert result is None or isinstance(result, str)
 
 
 @given(
@@ -645,15 +824,108 @@ def test_localized_entry_without_text_is_none() -> None:
     assert _localized([{"language": "de"}, {"language": "en", "text": "x"}]) == "x"
 
 
-@given(version=st.text(max_size=12))
-def test_version_key_is_total(version: str) -> None:
-    key = _version_key(version)
-    assert isinstance(key, tuple)
+@given(
+    left=st.lists(st.integers(0, 20), min_size=1, max_size=4),
+    right=st.lists(st.integers(0, 20), min_size=1, max_size=4),
+)
+def test_version_key_orders_like_its_components(
+    left: list[int], right: list[int]
+) -> None:
+    """The ordering law GbfsFeedHandle.create relies on to pick the newest
+    version: comparing two dotted version strings through _version_key
+    agrees with comparing their component tuples (so "2.3" < "2.3.1" and
+    "9.5" < "10.0", lexicographic string order notwithstanding).
+    """
+    key_left = _version_key(".".join(str(part) for part in left))
+    key_right = _version_key(".".join(str(part) for part in right))
+    assert key_left == tuple(left)
+    assert (key_left < key_right) is (tuple(left) < tuple(right))
+
+
+@given(version=st.text(max_size=12), other=st.text(max_size=12))
+def test_version_key_is_total(version: str, other: str) -> None:
+    """Catalog junk never raises, and ANY two keys stay mutually
+    comparable -- create() sorts a whole version list by this key, so one
+    unparseable entry must not break the sort with a TypeError.
+    """
+    key, other_key = _version_key(version), _version_key(other)
+    assert all(isinstance(part, int) for part in key)
+    assert key < other_key or other_key <= key
 
 
 def test_version_key_orders_numerically() -> None:
     assert _version_key("10.0") > _version_key("9.5")
     assert _version_key("3.0") > _version_key("2.3")
+
+
+# Duck-typed catalog stand-ins: create() only reads these attributes, and
+# defining them here keeps this property independent of catalog parsing.
+class _StubEndpoint:
+    def __init__(self, name: str | None, url: str | None) -> None:
+        self.name = name
+        self.url = url
+
+
+class _StubVersion:
+    def __init__(self, version: str, endpoints: list[_StubEndpoint]) -> None:
+        self.version = version
+        self.endpoints = endpoints
+
+
+class _StubCatalog:
+    def __init__(self, feed: object) -> None:
+        self._feed = feed
+
+    async def get_gbfs_feed(self, feed_id: str) -> object:
+        return self._feed
+
+
+class _StubClient:
+    def __init__(self, feed: object) -> None:
+        self.catalog = _StubCatalog(feed)
+
+
+@given(
+    versions=st.lists(
+        st.tuples(
+            st.lists(st.integers(0, 9), min_size=1, max_size=3),
+            st.booleans(),
+        ),
+        min_size=1,
+        max_size=5,
+        unique_by=lambda item: tuple(item[0]),
+    )
+)
+def test_create_picks_newest_version_that_has_endpoints(
+    versions: list[tuple[list[int], bool]],
+) -> None:
+    """create() resolves the _version_key-MAXIMAL version that actually
+    carries endpoints -- a newer version listing none must not shadow an
+    older one that does, and a feed with no endpoints anywhere resolves to
+    an empty table rather than raising.
+    """
+    stub_versions = [
+        _StubVersion(
+            ".".join(str(part) for part in parts),
+            [_StubEndpoint("station_information", f"https://e.com/{index}")]
+            if has_endpoints
+            else [],
+        )
+        for index, (parts, has_endpoints) in enumerate(versions)
+    ]
+    feed = _StubVersion("feed", [])  # any object carrying .versions below
+    feed.versions = stub_versions  # type: ignore[attr-defined]
+    client = _StubClient(feed)
+    handle = asyncio.run(GbfsFeedHandle.create(client, "f"))  # type: ignore[arg-type]
+    usable = [
+        (tuple(parts), index)
+        for index, (parts, has_endpoints) in enumerate(versions)
+        if has_endpoints
+    ]
+    expected = (
+        {"station_information": f"https://e.com/{max(usable)[1]}"} if usable else {}
+    )
+    assert handle._endpoints == expected
 
 
 @given(
@@ -1118,15 +1390,64 @@ def _run_gbfs_probe(status: int, body: bytes, content_type: str) -> str:
     return asyncio.run(scenario())
 
 
+# JSON-shaped bodies are assembled from spec-ish fragments because 0 of 1000
+# st.binary() draws parse as a JSON OBJECT (4 parse as scalars): with binary
+# alone the probe never got past "malformed JSON", leaving the data-envelope
+# and ttl branches of _document unreached.
+_GBFS_DATA_FRAGMENTS = [
+    b"{}",
+    b"[]",
+    b"null",
+    b'"data"',
+    b'{"stations":[]}',
+    b'{"stations":"nope"}',
+    b'{"stations":[1,null,{"station_id":null}]}',
+    b'{"stations":[{"station_id":"s1","lat":34.05,"lon":-118.25}]}',
+    b'{"stations":[{"station_id":"s1","lat":1' + b"0" * 400 + b',"lon":1e999}]}',
+    b'{"vehicles":[{"vehicle_id":"v1","lat":"34.05","lon":-118.25}]}',
+    b'{"bikes":{}}',
+    b'{"feeds":"nope"}',
+    b'{"en":{"feeds":[{"name":"system_information","url":"https://e.com/s"}]}}',
+    b'{"system_id":null}',
+]
+_GBFS_TTL_FRAGMENTS = [
+    b"0",
+    b"60",
+    b'"60"',
+    b'"60s"',
+    b"{}",
+    b"[60]",
+    b"null",
+    b"-1",
+    b"1e308",
+    b"1e999",
+    b"1" + b"0" * 400,
+]
+
+
+@st.composite
+def _gbfs_document_body(draw: st.DrawFn) -> bytes:
+    """One JSON-shaped GBFS response body: an envelope plus a ttl."""
+    data = draw(st.sampled_from(_GBFS_DATA_FRAGMENTS))
+    ttl = draw(st.sampled_from(_GBFS_TTL_FRAGMENTS))
+    missing_envelope = draw(st.booleans())
+    return b'{"ttl":' + ttl + (b"}" if missing_envelope else b',"data":' + data + b"}")
+
+
 @given(
     status=st.integers(min_value=200, max_value=599),
-    body=st.binary(max_size=64),
+    body=st.binary(max_size=64) | _gbfs_document_body(),
     content_type=st.sampled_from(["application/json", "text/html"]),
 )
-@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_gbfs_document_total_over_status_and_body(
     status: int, body: bytes, content_type: str
 ) -> None:
+    """_document() either returns a document or raises one of the library's
+    own exceptions, for any status and any body -- including the JSON-shaped
+    bodies that actually reach its envelope and ttl handling.
+    """
+    event(f"gbfs probe: json-shaped body: {body.startswith(b'{')}")
     outcome = _run_gbfs_probe(status, body, content_type)
     assert outcome in ("success", "ours")
 
@@ -1141,13 +1462,30 @@ def test_epoch_to_utc_is_total(epoch: int) -> None:
 
 
 @given(
-    raw=st.sampled_from([True, False, 0, 1, 2, "true", "false", "yes", "", None, 1.0])
+    raw=st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=True)
+    | st.text()
+    | st.none()
+    | st.lists(st.integers())
+    | st.dictionaries(st.text(), st.text())
 )
 def test_station_bool_coercion_never_lies(raw: object) -> None:
+    """Over any JSON value, _as_bool answers only True/False/None, and it
+    answers None for exactly the values that aren't already numeric
+    booleans -- so no truthy container or string is ever coerced.
+    """
     result = _as_bool(raw)
     assert result in (True, False, None)
-    if isinstance(raw, str):
-        assert result is None  # bool("false") is True — strings are UNKNOWN, not truthy
+    assert (result is None) is not isinstance(raw, bool | int | float)
+
+
+@given(raw=st.text())
+def test_station_bool_coercion_rejects_every_string(raw: str) -> None:
+    """bool("false") is True in Python, so NO string is a GBFS boolean --
+    not "true" either: a producer shipping strings is shipping unknowns.
+    """
+    assert _as_bool(raw) is None
 
 
 _IDS = st.text(
@@ -1273,8 +1611,39 @@ def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
 # empty results. The biased strategies below must keep the non-empty rate
 # healthy, and the *_nonvacuity_rate guard tests (which pytest runs AFTER
 # their property, in definition order) fail the suite if it collapses.
+# Non-vacuity tallies for the two generated-feed query properties below.
+#
+# These stay module-level because the properties that write to them are
+# plain @given functions, and the fragility worth fixing is not WHERE the
+# counts live -- a pytest stash is global mutable state too, keyed on the
+# config instead of the module, with identical ordering semantics -- but
+# that the guard assertions used to depend on running AFTER the property.
+# Each guard now seeds its own measurement when it finds an empty tally
+# (see _seeded_tally), which makes it correct when selected alone with -k,
+# under a random-order plugin, and on an xdist worker that received the
+# guard but not the property.
+#
+# Honest-measurement caveat: a count is bumped once per example that
+# reached the assertions, including Hypothesis's reuse-phase replays of
+# database entries, so "examples" can exceed max_examples. Both counters
+# are bumped together, so the RATE the guards assert is unaffected; only
+# the absolute floor is (upward, i.e. conservatively).
 _DEPARTURES_VACUITY = {"examples": 0, "nonempty": 0}
 _TRIPS_VACUITY = {"examples": 0, "nonempty": 0}
+
+
+def _seeded_tally(
+    tally: dict[str, int], property_test: Callable[[], None]
+) -> dict[str, int]:
+    """Return ``tally``, first running ``property_test`` if it is empty.
+
+    An empty tally means the property has not run in this process yet, so
+    the guard would otherwise assert on nothing.
+    """
+    if not tally["examples"]:
+        property_test()
+    return tally
+
 
 # The generator's calendar rows start service in 2026 OR 2027; probing one
 # Thursday in each year finds in-window schedule data for most feeds that
@@ -1370,9 +1739,10 @@ def test_upcoming_departures_deterministic(
 
 def test_upcoming_departures_nonvacuity_rate() -> None:
     """Guard for the property above: fail if its non-empty rate collapses."""
-    examples = _DEPARTURES_VACUITY["examples"]
-    assert examples > 0
-    assert _DEPARTURES_VACUITY["nonempty"] >= max(3, examples // 5)
+    tally = _seeded_tally(_DEPARTURES_VACUITY, test_upcoming_departures_deterministic)
+    examples = tally["examples"]
+    assert examples > 0, "no example reached the assertions even after seeding"
+    assert tally["nonempty"] >= max(3, examples // 5)
 
 
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
@@ -1455,9 +1825,10 @@ def test_upcoming_trips_invariants(zip_bytes: bytes, data: st.DataObject) -> Non
 
 def test_upcoming_trips_nonvacuity_rate() -> None:
     """Guard for the property above: fail if its non-empty rate collapses."""
-    examples = _TRIPS_VACUITY["examples"]
-    assert examples > 0
-    assert _TRIPS_VACUITY["nonempty"] >= max(3, examples // 5)
+    tally = _seeded_tally(_TRIPS_VACUITY, test_upcoming_trips_invariants)
+    examples = tally["examples"]
+    assert examples > 0, "no example reached the assertions even after seeding"
+    assert tally["nonempty"] >= max(3, examples // 5)
 
 
 # --- descriptive attribute-surface properties --------------------------------
@@ -1468,6 +1839,15 @@ def test_upcoming_trips_nonvacuity_rate() -> None:
 _INT_CELL = st.one_of(
     st.integers(min_value=-5, max_value=12).map(str),
     st.sampled_from(["", " ", "x", "1.5", "abc", "999999999999", "--"]),
+    # Spellings a bare int() used to accept, turning a corrupt cell into a
+    # plausible vocabulary value: unicode decimals, sign prefixes and
+    # PEP 515 underscore grouping are all garbage (-> None).
+    st.sampled_from(["\u0665", "\uff11\uff12", "+1", "1_0"]),
+    # Past CPython's int-string conversion cap: all ASCII digits, and still
+    # not a number. Only lengths past the cap are drawn here -- a
+    # convertible 4300-digit int is outside SQLite's INTEGER range, which is
+    # a storage limit rather than a parsing rule.
+    _UNCONVERTIBLE_LENGTHS.map(lambda length: "1" * length),
 )
 # Text-column cells: empty (-> None) or CSV-safe text kept verbatim
 # (including whitespace-only and digit-only values).
@@ -1479,18 +1859,36 @@ _TEXT_CELL = st.one_of(
         max_size=8,
     ),
 )
+# Text values whose CSV encoding needs quoting or quote-doubling. Written
+# through a real csv.writer below, so the loader's reader has to unquote
+# them to recover the value verbatim.
+_FRAMED_TEXT_CELL = st.one_of(
+    _TEXT_CELL,
+    # No bare \r: the loader's TextIOWrapper applies universal-newline
+    # translation inside quoted fields too, which is a reader artifact
+    # rather than a parsing rule worth pinning.
+    st.sampled_from(["a,b", ",", 'x"y', '"q"', "a\nb", "a\tb"]),
+)
+
+
+def _csv_row(*values: str) -> str:
+    """Encode one CSV data row, quoting exactly as a producer's writer would."""
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerow(values)
+    return buf.getvalue()
 
 
 def _expected_lenient_int(cell: str) -> int | None:
-    """Oracle for descriptive int cells: blank/garbage -> None, parseable
-    ints kept as-is (even outside every vocabulary)."""
+    """Oracle for descriptive int cells: a cell of nothing but ASCII digits
+    is that int (even outside every vocabulary); anything else -- blank,
+    signed, unicode-digit, underscore-grouped, past the int-string
+    conversion cap, garbage -- is None."""
     cell = cell.strip()
-    if not cell:
+    if not cell or not (cell.isascii() and cell.isdigit()):
         return None
-    try:
-        return int(cell)
-    except ValueError:
+    if len(cell) > _DIGIT_LIMIT:
         return None
+    return int(cell)
 
 
 def _expected_enum(enum_cls: type[IntEnum], cell: str) -> IntEnum | None:
@@ -1533,21 +1931,21 @@ _DESCRIPTIVE_ROW_CELLS = st.fixed_dictionaries(
         "pickup_type": _INT_CELL,
         "drop_off_type": _INT_CELL,
         "timepoint": _INT_CELL,
-        "stop_code": _TEXT_CELL,
-        "platform_code": _TEXT_CELL,
-        "stop_headsign": _TEXT_CELL,
-        "agency_id": _TEXT_CELL,
-        "route_color": _TEXT_CELL,
-        "route_text_color": _TEXT_CELL,
-        "route_url": _TEXT_CELL,
-        "stop_desc": _TEXT_CELL,
-        "stop_url": _TEXT_CELL,
-        "zone_id": _TEXT_CELL,
-        "stop_timezone": _TEXT_CELL,
-        "route_desc": _TEXT_CELL,
+        "stop_code": _FRAMED_TEXT_CELL,
+        "platform_code": _FRAMED_TEXT_CELL,
+        "stop_headsign": _FRAMED_TEXT_CELL,
+        "agency_id": _FRAMED_TEXT_CELL,
+        "route_color": _FRAMED_TEXT_CELL,
+        "route_text_color": _FRAMED_TEXT_CELL,
+        "route_url": _FRAMED_TEXT_CELL,
+        "stop_desc": _FRAMED_TEXT_CELL,
+        "stop_url": _FRAMED_TEXT_CELL,
+        "zone_id": _FRAMED_TEXT_CELL,
+        "stop_timezone": _FRAMED_TEXT_CELL,
+        "route_desc": _FRAMED_TEXT_CELL,
         "route_sort_order": _INT_CELL,
-        "trip_short_name": _TEXT_CELL,
-        "block_id": _TEXT_CELL,
+        "trip_short_name": _FRAMED_TEXT_CELL,
+        "block_id": _FRAMED_TEXT_CELL,
     }
 )
 
@@ -1567,33 +1965,68 @@ def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) 
         "stops.txt": (
             "stop_id,stop_name,stop_lat,stop_lon,stop_code,platform_code,"
             "wheelchair_boarding,stop_desc,stop_url,zone_id,stop_timezone\n"
-            f"S1,A,0,0,{cells['stop_code']},{cells['platform_code']},"
-            f"{cells['wheelchair_boarding']},{cells['stop_desc']},"
-            f"{cells['stop_url']},{cells['zone_id']},{cells['stop_timezone']}\n"
-            "S2,B,0,0,,,,,,,\n"
+            + _csv_row(
+                "S1",
+                "A",
+                "0",
+                "0",
+                cells["stop_code"],
+                cells["platform_code"],
+                cells["wheelchair_boarding"],
+                cells["stop_desc"],
+                cells["stop_url"],
+                cells["zone_id"],
+                cells["stop_timezone"],
+            )
+            + "S2,B,0,0,,,,,,,\n"
         ),
         "routes.txt": (
             "route_id,route_short_name,route_long_name,route_type,agency_id,"
             "route_color,route_text_color,route_url,route_desc,"
             "route_sort_order\n"
-            f"R1,1,Line,3,{cells['agency_id']},{cells['route_color']},"
-            f"{cells['route_text_color']},{cells['route_url']},"
-            f"{cells['route_desc']},{cells['route_sort_order']}\n"
+            + _csv_row(
+                "R1",
+                "1",
+                "Line",
+                "3",
+                cells["agency_id"],
+                cells["route_color"],
+                cells["route_text_color"],
+                cells["route_url"],
+                cells["route_desc"],
+                cells["route_sort_order"],
+            )
         ),
         "trips.txt": (
             "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible,"
             "bikes_allowed,direction_id,trip_short_name,block_id\n"
-            f"R1,ONE,T1,H,{cells['wheelchair_accessible']},"
-            f"{cells['bikes_allowed']},{cells['direction_id']},"
-            f"{cells['trip_short_name']},{cells['block_id']}\n"
+            + _csv_row(
+                "R1",
+                "ONE",
+                "T1",
+                "H",
+                cells["wheelchair_accessible"],
+                cells["bikes_allowed"],
+                cells["direction_id"],
+                cells["trip_short_name"],
+                cells["block_id"],
+            )
         ),
         "stop_times.txt": (
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
             "pickup_type,drop_off_type,timepoint,stop_headsign\n"
-            f"T1,08:00:00,08:00:00,S1,1,{cells['pickup_type']},"
-            f"{cells['drop_off_type']},{cells['timepoint']},"
-            f"{cells['stop_headsign']}\n"
-            "T1,08:10:00,08:10:00,S2,2,,,,\n"
+            + _csv_row(
+                "T1",
+                "08:00:00",
+                "08:00:00",
+                "S1",
+                "1",
+                cells["pickup_type"],
+                cells["drop_off_type"],
+                cells["timepoint"],
+                cells["stop_headsign"],
+            )
+            + "T1,08:10:00,08:10:00,S2,2,,,,\n"
         ),
         "calendar.txt": _ONE_DAY_CALENDAR,
     }
@@ -1712,8 +2145,16 @@ _DATE_CELL = st.one_of(
             "20261332",
             "00000000",
             "20260230",
+            # Eight characters that str.isdigit() accepts but a GTFS date
+            # can never contain -- the only cells the isascii() guard
+            # exists for, and the shape int() would have happily parsed.
+            "\uff12\uff10\uff12\uff16\uff10\uff17\uff13\uff10",
+            "2026\u0660\u0667\u0663\u0660",
         ]
     ),
+    # Past the int-string conversion cap: _lenient_date's length check
+    # rejects it before any conversion is attempted.
+    _UNCONVERTIBLE_LENGTHS.map(lambda length: "1" * length),
 )
 
 
@@ -1731,10 +2172,10 @@ def _expected_lenient_date(cell: str) -> date | None:
 
 _FEED_INFO_CELLS = st.fixed_dictionaries(
     {
-        "publisher_name": _TEXT_CELL,
-        "publisher_url": _TEXT_CELL,
-        "lang": _TEXT_CELL,
-        "version": _TEXT_CELL,
+        "publisher_name": _FRAMED_TEXT_CELL,
+        "publisher_url": _FRAMED_TEXT_CELL,
+        "lang": _FRAMED_TEXT_CELL,
+        "version": _FRAMED_TEXT_CELL,
         "start": _DATE_CELL,
         "end": _DATE_CELL,
     }
@@ -1764,8 +2205,14 @@ def test_feed_info_cells_parse_total_and_map_per_rules(cells: dict[str, str]) ->
         "feed_info.txt": (
             "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
             "feed_start_date,feed_end_date\n"
-            f"{cells['publisher_name']},{cells['publisher_url']},"
-            f"{cells['lang']},{cells['version']},{cells['start']},{cells['end']}\n"
+            + _csv_row(
+                cells["publisher_name"],
+                cells["publisher_url"],
+                cells["lang"],
+                cells["version"],
+                cells["start"],
+                cells["end"],
+            )
         ),
     }
     index = _build_index_from_files(files)  # totality: must never raise
@@ -1778,6 +2225,47 @@ def test_feed_info_cells_parse_total_and_map_per_rules(cells: dict[str, str]) ->
             start_date=_expected_lenient_date(cells["start"]),
             end_date=_expected_lenient_date(cells["end"]),
         )
+    finally:
+        index.close()
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        "\uff12\uff10\uff12\uff16\uff10\uff17\uff13\uff10",
+        "2026\u0660\u0667\u0663\u0660",
+    ],
+)
+def test_unicode_digit_feed_info_dates_are_none(cell: str) -> None:
+    """Asserted against the INTENDED rule, not the oracle restatement: these
+    cells are eight characters that str.isdigit() accepts, so only the
+    ASCII guard rejects them. A GTFS date is ASCII, so the answer is None.
+    """
+    assert len(cell) == 8 and cell.isdigit() and not cell.isascii()
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,A,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\nR1,ONE,T1,H\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T1,08:00:00,08:00:00,S1,1\n"
+        ),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+        "feed_info.txt": (
+            "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
+            "feed_start_date,feed_end_date\n"
+            + _csv_row("P", "https://e.com", "en", "1", cell, cell)
+        ),
+    }
+    index = _build_index_from_files(files)
+    try:
+        info = index.feed_info()
+        assert info is not None
+        assert info.start_date is None
+        assert info.end_date is None
     finally:
         index.close()
 
@@ -2002,21 +2490,54 @@ def test_exactly_one_first_and_one_last_per_service_day_pair(
         index.close()
 
 
-@given(zip_bytes=_random_gtfs_zip(), data=st.data())
-@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_cache_roundtrip_equivalent(zip_bytes: bytes, data: st.DataObject) -> None:
-    """A reopened cached index answers every query identically to the builder."""
+def _with_agency_timezone(zip_bytes: bytes, tz_name: str) -> bytes:
+    """Re-emit a generated feed carrying ``tz_name`` in agency.txt.
+
+    ``_random_gtfs_zip`` hard-codes UTC and is shared with other
+    properties, so the cache roundtrip substitutes the timezone here
+    instead of widening the generator.
+    """
+    buf = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(zip_bytes)) as src,
+        zipfile.ZipFile(buf, "w") as dst,
+    ):
+        for name in src.namelist():
+            content = src.read(name)
+            if name == "agency.txt":
+                content = (
+                    "agency_id,agency_name,agency_url,agency_timezone\n"
+                    f"A1,T,https://e.com,{tz_name}\n"
+                ).encode()
+            dst.writestr(name, content)
+    return buf.getvalue()
+
+
+@given(zip_bytes=_random_gtfs_zip(), tz_name=st.sampled_from(TIMEZONES), data=st.data())
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_cache_roundtrip_equivalent(
+    zip_bytes: bytes, tz_name: str, data: st.DataObject
+) -> None:
+    """A reopened cached index answers every query identically to the builder.
+
+    The stored timezone is the DB's most important piece of non-table
+    state and is drawn rather than fixed: with a hard-coded UTC feed, an
+    index that failed to persist it and defaulted to UTC would still pass.
+    """
     with tempfile.TemporaryDirectory() as tmp_dir:
         zip_path = Path(tmp_dir) / "feed.zip"
-        zip_path.write_bytes(zip_bytes)
+        zip_path.write_bytes(_with_agency_timezone(zip_bytes, tz_name))
         db_path = Path(tmp_dir) / "static.db"
         try:
             built = StaticIndex.build(zip_path, str(db_path), "ds-rt", None)
         except FeedParseError:
             return
         try:
+            assert built.timezone_name == tz_name
             baseline_stops = built.stops()
             baseline_routes = built.routes()
+            baseline_agencies = built.agencies()
+            baseline_feed_info = built.feed_info()
             stops = [s.id for s in baseline_stops]
             queried = (
                 data.draw(
@@ -2027,23 +2548,242 @@ def test_cache_roundtrip_equivalent(zip_bytes: bytes, data: st.DataObject) -> No
                 if stops
                 else ["none"]
             )
+            origin, destination = queried[0], queried[-1]
             now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
             baseline_deps = built.upcoming_departures(
                 queried, None, now, timedelta(hours=30), 5
+            )
+            baseline_trips = built.upcoming_trips(
+                origin, destination, now, timedelta(hours=30), 5
             )
         finally:
             built.close()
         reopened = StaticIndex.open_cached(db_path, "ds-rt")
         assert reopened is not None
         try:
+            assert reopened.timezone_name == tz_name
             assert reopened.stops() == baseline_stops
             assert reopened.routes() == baseline_routes
+            assert reopened.agencies() == baseline_agencies
+            assert reopened.feed_info() == baseline_feed_info
             assert (
                 reopened.upcoming_departures(queried, None, now, timedelta(hours=30), 5)
                 == baseline_deps
             )
+            assert (
+                reopened.upcoming_trips(
+                    origin, destination, now, timedelta(hours=30), 5
+                )
+                == baseline_trips
+            )
         finally:
             reopened.close()
+
+
+# Degenerate, traversal, separator, unicode and percent-encoded feed ids.
+# Every arm stays inside the per-example sandbox and absolute ids are
+# filtered out of the free-text arms, so even a broken containment guard
+# could only damage the sandbox. Root-like ids ("/" and friends) are too
+# destructive to hand to a real rmtree and are covered instead by
+# test_purge_cache_rejects_root_like_feed_ids, which stubs rmtree out.
+_HOSTILE_FEED_IDS = [
+    "",
+    " ",
+    ".",
+    "./",
+    "..",
+    "../",
+    "../victim",
+    "..\\victim",
+    "mdb-100",
+    "mdb-100/",
+    "./mdb-100",
+    "mdb-100/..",
+    "mdb-100/nested",
+    "nested/mdb-100",
+    "a/../b",
+    "..//..",
+    "%2e%2e",
+    "%2e%2e%2f",
+    "..%2fvictim",
+    "\u002e\u002e",
+    "\uff0e\uff0e",  # fullwidth full stops
+    "mdb\u2011100",  # non-breaking hyphen
+    "\x00",
+]
+
+
+@given(
+    feed_id=st.one_of(
+        st.sampled_from(_HOSTILE_FEED_IDS),
+        st.text(max_size=12),
+        st.text(alphabet=st.characters(categories=["L", "N", "P", "Zs"]), max_size=12),
+    ).filter(lambda drawn: not drawn.startswith("/")),
+    # Each arm but "drawn" is built from the sandbox inside the test, so
+    # the generator cannot name a path outside it.
+    arm=st.sampled_from(
+        [
+            "drawn",
+            "absolute_outside",
+            "absolute_child",
+            "absolute_dot_child",
+            "traversal_to_child",
+            "separator_to_child",
+            "symlink_to_child",
+        ]
+    ),
+)
+@settings(
+    max_examples=200,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+def test_purge_cache_removes_only_the_named_feed(
+    tmp_path: Path, feed_id: str, arm: str
+) -> None:
+    """purge_cache either removes exactly ``cache_dir/<feed_id>`` or raises
+    ValueError, never touches another entry under cache_dir, and is
+    idempotent. This is the property that would have caught
+    ``purge_cache("")`` deleting the whole cache root.
+    """
+    sandbox = Path(tempfile.mkdtemp(dir=tmp_path))
+    root = sandbox / "cache"
+    root.mkdir()
+    siblings = ("mdb-100", "mdb-200", "url-abcdef0123456789")
+    for name in siblings:
+        (root / name).mkdir()
+        (root / name / "static.db").write_bytes(b"x")
+    (root / "sentinel").write_bytes(b"s")
+    victim = sandbox / "victim"
+    victim.mkdir()
+    (victim / "data").write_bytes(b"precious")
+    if arm == "symlink_to_child":
+        (root / "evil").symlink_to(root / "mdb-200", target_is_directory=True)
+    drawn = {
+        "drawn": feed_id,
+        "absolute_outside": str(victim / "data"),
+        "absolute_child": str(root / "mdb-200"),
+        "absolute_dot_child": str(root / "." / "mdb-200"),
+        "traversal_to_child": "mdb-100/../mdb-200",
+        "separator_to_child": "mdb-100/nested/../../mdb-200",
+        "symlink_to_child": "evil",
+    }[arm]
+    # Absolute ids are only ever built from the sandbox, keeping the
+    # generator incapable of naming anything outside tmp_path.
+    assert not Path(drawn.replace("\x00", "")).is_absolute() or drawn.startswith(
+        str(tmp_path)
+    )
+
+    async def scenario() -> bool:
+        async with MobilityFeedsClient(cache_dir=root) as client:
+            try:
+                await client.purge_cache(drawn)
+            except ValueError:
+                return True
+            await client.purge_cache(drawn)  # idempotent: same effect as once
+            return False
+
+    rejected = asyncio.run(scenario())
+    event(f"purge_cache rejected={rejected}")
+    # Only a bare child name is in contract; every constructed arm reaches
+    # a feed (or a path outside the cache) by a spelling purge_cache must
+    # refuse, so it has to raise rather than purge whatever it resolves to.
+    assert rejected or arm == "drawn"
+    assert (root / "sentinel").read_bytes() == b"s"
+    assert (victim / "data").read_bytes() == b"precious"
+    survivors = {name for name in siblings if (root / name / "static.db").is_file()}
+    if rejected:
+        assert survivors == set(siblings)
+        return
+    assert not (root / drawn).exists()
+    assert len(survivors) >= len(siblings) - 1
+    assert survivors >= {name for name in siblings if name != Path(drawn).name}
+
+
+# Values that are stored happily by the TEXT NOT NULL meta column but are
+# not usable ZoneInfo keys. The blob arm survives TEXT affinity as bytes,
+# so open_cached sees a non-string timezone.
+def _is_unusable_timezone(value: str | bytes) -> bool:
+    try:
+        ZoneInfo(value)  # type: ignore[arg-type]
+    except (KeyError, TypeError, ValueError):  # ZoneInfoNotFoundError is a KeyError
+        return True
+    return False
+
+
+_BAD_TIMEZONES = st.one_of(
+    st.sampled_from(
+        ["", " ", ".", "..", "/", "/UTC", "../escape", "Not/A/Zone", "123"]
+    ),
+    st.text(max_size=12),
+    st.binary(min_size=1, max_size=8),
+).filter(_is_unusable_timezone)
+
+
+def _open_fd_count(path: Path) -> int:
+    """Open descriptors in this process pointing at path (0 without /proc)."""
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        return 0
+    target = str(path)
+    count = 0
+    for entry in fd_dir.iterdir():
+        try:
+            link = str(entry.readlink())
+        except OSError:
+            continue  # fd closed while scanning
+        count += link == target
+    return count
+
+
+@given(
+    payload=st.binary(max_size=64),
+    kind=st.sampled_from(
+        ["bytes", "valid", "directory", "missing_parent", "bad_timezone"]
+    ),
+    bad_timezone=_BAD_TIMEZONES,
+)
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_open_cached_is_total_over_cache_path_contents(
+    payload: bytes, kind: str, bad_timezone: str | bytes
+) -> None:
+    """open_cached returns an index or None for anything at db_path, never
+    raises, and the index it returns carries the requested dataset id. A
+    cache whose only defect is unusable timezone metadata is structurally
+    valid down to StaticIndex.__init__, so it exercises the deepest layer
+    the rebuild-on-None contract has to cover; a rejected cache must not
+    leave the connection it opened behind.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "static.db"
+        if kind == "bytes":
+            db_path.write_bytes(payload)
+        elif kind in {"valid", "bad_timezone"}:
+            zip_path = Path(tmp_dir) / "feed.zip"
+            zip_path.write_bytes(build_gtfs_zip_bytes())
+            StaticIndex.build(zip_path, str(db_path), "ds-cache", None).close()
+        elif kind == "directory":
+            db_path.mkdir()
+        else:
+            db_path = Path(tmp_dir) / "gone" / "static.db"
+        if kind == "bad_timezone":
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'timezone'", (bad_timezone,)
+                )
+            conn.close()
+        fds_before = _open_fd_count(db_path)
+        index = StaticIndex.open_cached(db_path, "ds-cache")
+        event(f"open_cached({kind}) -> {'index' if index is not None else 'None'}")
+        if index is None:
+            assert _open_fd_count(db_path) == fds_before  # no leaked connection
+            return
+        try:
+            assert kind == "valid"  # only a real cached DB may open
+            assert index.dataset_id == "ds-cache"
+            assert index.stops()
+        finally:
+            index.close()
 
 
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
@@ -2263,126 +3003,232 @@ def test_arrivals_merge_invariants(data: st.DataObject) -> None:
 
 
 _GBFS_ZONE = Circle(latitude=34.05, longitude=-118.25, radius_m=2_000.0)
-_NEARBY_LAT = st.floats(33.95, 34.15)
-_NEARBY_LON = st.floats(-118.35, -118.15)
+# Points are drawn CONSTRUCTIVELY, as a metre offset from the zone centre: a
+# wide lat/lon box (the previous ~22km x 18km one, against a 2km radius) put
+# only 1 of 1015 generated rows inside the zone, so the filter's "keep" path
+# was effectively never exercised. A +-2.5km square puts ~50% inside.
+_ZONE_OFFSET_M = st.floats(-2_500.0, 2_500.0)
+_M_PER_DEG = 111_320.0
 
 
-@given(
-    rows=st.lists(
-        st.fixed_dictionaries(
-            {
-                "bike_id": st.text(min_size=1, max_size=6),
-                "lat": _NEARBY_LAT | st.none(),
-                "lon": _NEARBY_LON | st.none(),
-            }
-        ),
-        max_size=8,
+@st.composite
+def _zone_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
+    """One GBFS row offset from the zone centre, sometimes coordinate-less.
+
+    Real documents ship rows without coordinates, and both filters must
+    drop those rather than place them at (0, 0).
+    """
+    north = draw(_ZONE_OFFSET_M)
+    east = draw(_ZONE_OFFSET_M)
+    latitude = _GBFS_ZONE.latitude + north / _M_PER_DEG
+    longitude = _GBFS_ZONE.longitude + east / (
+        _M_PER_DEG * math.cos(math.radians(_GBFS_ZONE.latitude))
     )
-)
+    return {
+        id_key: draw(st.text(min_size=1, max_size=6)),
+        "lat": draw(st.just(latitude) | st.none()),
+        "lon": draw(st.just(longitude) | st.none()),
+    }
+
+
+def _gbfs_handle(documents: dict[str, object]) -> GbfsFeedHandle:
+    """A detached handle whose named endpoints serve pre-cached documents.
+
+    The cache entries are built with an infinite ttl so no method of the
+    handle ever reaches the network; ``documents`` maps an endpoint name
+    to that document's ``data`` envelope.
+    """
+    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
+    handle._doc_cache = {
+        name: (float("inf"), float("inf"), {"data": data})
+        for name, data in documents.items()
+    }
+    handle._endpoints = dict.fromkeys(documents, "x")
+    return handle
+
+
+@given(rows=st.lists(_zone_row("bike_id"), max_size=8))
 @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_gbfs_vehicles_zone_filter_law(rows: list[dict[str, object]]) -> None:
     """get_vehicles(zone) keeps exactly the coord-having rows inside the
     zone; nothing else.
     """
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        "free_bike_status": (float("inf"), float("inf"), {"data": {"bikes": rows}}),
-    }
-    handle._endpoints = {"free_bike_status": "x"}
+    handle = _gbfs_handle({"free_bike_status": {"bikes": rows}})
     unfiltered = asyncio.run(handle.get_vehicles(None))
     filtered = asyncio.run(handle.get_vehicles(_GBFS_ZONE))
+    event(f"vehicles: any row inside the zone: {bool(filtered)}")
     assert filtered == [
         v for v in unfiltered if in_circle(_GBFS_ZONE, v.latitude, v.longitude)
     ]
 
 
-@given(
-    rows=st.lists(
-        st.fixed_dictionaries(
-            {
-                "station_id": st.text(min_size=1, max_size=6),
-                "lat": _NEARBY_LAT | st.none(),
-                "lon": _NEARBY_LON | st.none(),
-            }
-        ),
-        max_size=8,
-        unique_by=lambda row: row["station_id"],
-    )
-)
+@given(data=st.data())
 @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_gbfs_stations_zone_filter_law(rows: list[dict[str, object]]) -> None:
-    """get_stations(zone) keeps exactly the coord-having rows inside the
-    zone; nothing else.
+def test_gbfs_stations_zone_filter_and_merge_law(data: st.DataObject) -> None:
+    """get_stations: the zone keeps exactly the coord-having rows inside the
+    circle, and the status merge is keyed by station_id -- each station gets
+    ITS OWN status row's values, a station with no status row reads
+    all-unknown, status rows for unknown ids are ignored, and the result
+    does not depend on the order the status rows arrive in.
     """
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        "station_information": (
-            float("inf"),
-            float("inf"),
-            {"data": {"stations": rows}},
-        ),
-        "station_status": (float("inf"), float("inf"), {"data": {"stations": []}}),
+    info_rows = data.draw(
+        st.lists(
+            _zone_row("station_id"), max_size=6, unique_by=lambda row: row["station_id"]
+        )
+    )
+    station_ids = [str(row["station_id"]) for row in info_rows]
+    covered = data.draw(
+        st.lists(st.booleans(), min_size=len(station_ids), max_size=len(station_ids))
+    )
+    # Distinct per-station counts: a merge keyed on anything but station_id
+    # would hand a station the wrong one.
+    expected_bikes = {
+        station_id: index
+        for index, (station_id, include) in enumerate(
+            zip(station_ids, covered, strict=True)
+        )
+        if include
     }
-    handle._endpoints = {"station_information": "x", "station_status": "x"}
-    unfiltered = asyncio.run(handle.get_stations(None))
-    filtered = asyncio.run(handle.get_stations(_GBFS_ZONE))
-    assert filtered == [
-        s
-        for s in unfiltered
-        if s.latitude is not None
-        and s.longitude is not None
-        and in_circle(_GBFS_ZONE, s.latitude, s.longitude)
+    status_rows: list[dict[str, object]] = [
+        {"station_id": station_id, "num_bikes_available": bikes, "is_renting": True}
+        for station_id, bikes in expected_bikes.items()
+    ]
+    # Orphan ids are 8+ chars, so they cannot collide with a drawn id.
+    status_rows += [
+        {"station_id": f"orphan-{index}", "num_bikes_available": 99, "docks": 1}
+        for index in range(data.draw(st.integers(0, 3)))
     ]
 
+    def documents(status: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "station_information": {"stations": info_rows},
+            "station_status": {"stations": status},
+        }
+
+    handle = _gbfs_handle(documents(status_rows))
+    unfiltered = asyncio.run(handle.get_stations(None))
+    filtered = asyncio.run(handle.get_stations(_GBFS_ZONE))
+    event(f"stations: any row inside the zone: {bool(filtered)}")
+    assert [station.id for station in unfiltered] == station_ids
+    assert filtered == [
+        station
+        for station in unfiltered
+        if station.latitude is not None
+        and station.longitude is not None
+        and in_circle(_GBFS_ZONE, station.latitude, station.longitude)
+    ]
+    for station in unfiltered:
+        assert station.bikes_available == expected_bikes.get(station.id)
+        assert station.is_renting is (True if station.id in expected_bikes else None)
+    reversed_handle = _gbfs_handle(documents(list(reversed(status_rows))))
+    shuffled_handle = _gbfs_handle(documents(data.draw(st.permutations(status_rows))))
+    assert asyncio.run(reversed_handle.get_stations(None)) == unfiltered
+    assert asyncio.run(shuffled_handle.get_stations(None)) == unfiltered
+
+
+_EARTH_HALF_CIRCUMFERENCE_M = math.pi * 6_371_000.0
+# Metres per degree of latitude along a meridian, for the calibration law
+# below. Written from first principles (R * pi / 180), NOT imported from
+# geo.py, so a wrong radius there cannot cancel out of the oracle.
+_M_PER_DEG_LAT = 6_371_000.0 * math.pi / 180.0
+
 
 @given(
-    lat1=st.floats(-85, 85),
-    lon1=st.floats(-179, 179),
-    lat2=st.floats(-85, 85),
-    lon2=st.floats(-179, 179),
+    # Full domain, including the poles, where cos(phi) -> 0. The previous
+    # +-85/+-179 clipping excluded them and nothing else covered them.
+    lat1=st.floats(-90, 90),
+    lon1=st.floats(-180, 180),
+    lat2=st.floats(-90, 90),
+    lon2=st.floats(-180, 180),
+    third=st.tuples(st.floats(-90, 90), st.floats(-180, 180)),
 )
 def test_haversine_metric_laws(
-    lat1: float, lon1: float, lat2: float, lon2: float
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+    third: tuple[float, float],
 ) -> None:
     """Non-negativity, symmetry, identity-of-indiscernibles (same point),
-    and the trivial upper bound (half the Earth's circumference).
+    the trivial upper bound (half the Earth's circumference), and the
+    triangle inequality via a third drawn point.
+
+    The triangle inequality does NOT catch a lat/lon argument swap:
+    measured over 2000 examples the swapped implementation produces zero
+    violations, because swapping the coordinates is a bijection of the
+    sphere and the composition is still a metric. The calibration law
+    below is what catches that.
     """
+    lat3, lon3 = third
     d_ab = haversine_m(lat1, lon1, lat2, lon2)
+    d_bc = haversine_m(lat2, lon2, lat3, lon3)
+    d_ac = haversine_m(lat1, lon1, lat3, lon3)
     assert d_ab >= 0
     assert abs(d_ab - haversine_m(lat2, lon2, lat1, lon1)) < 1e-6
     assert haversine_m(lat1, lon1, lat1, lon1) < 1e-6
-    assert d_ab <= math.pi * 6_371_000.0 + 1.0
+    assert d_ab <= _EARTH_HALF_CIRCUMFERENCE_M + 1.0
+    # Epsilon in metres: these distances reach ~2e7, so float rounding in
+    # sqrt/asin is worth more slack than the 1e-6 used for the exact laws.
+    assert d_ac <= d_ab + d_bc + 1e-3
+
+
+@given(lat1=st.floats(-90, 90), lat2=st.floats(-90, 90), lon=st.floats(-180, 180))
+def test_haversine_along_a_meridian_equals_arc_length(
+    lat1: float, lat2: float, lon: float
+) -> None:
+    """Calibration, not just structure: two points on the SAME meridian are
+    exactly |dlat| degrees of arc apart, so the distance must equal
+    |dlat| * R * pi / 180 whatever longitude they share.
+
+    This is the law the metric laws cannot express. All of them -- including
+    the triangle inequality -- survive a lat/lon argument swap and a wrong
+    Earth radius; this one fails on both (verified over a 150-point probe
+    grid: 58 violations under the swap, 145 under a halved radius).
+    """
+    distance = haversine_m(lat1, lon, lat2, lon)
+    expected = abs(lat2 - lat1) * _M_PER_DEG_LAT
+    assert math.isclose(distance, expected, rel_tol=1e-9, abs_tol=1e-6)
 
 
 @given(
+    # Languages INCLUDING "en", with the oracle computed from the drawn list
+    # rather than from a separately injected entry. That lets one strategy
+    # cover every branch at once: the empty list (-> None, the branch the
+    # previous version could not reach because min_size was 1), the
+    # first-entry fallback, "en" anywhere, and -- undrawn before -- a list
+    # with MORE THAN ONE "en" entry, where the first one must win.
     entries=st.lists(
         st.tuples(
-            st.text(min_size=1, max_size=10), st.sampled_from(["de", "fr", "es"])
+            st.text(max_size=10), st.sampled_from(["de", "fr", "es", "en", "en"])
         ),
-        min_size=1,
-        max_size=4,
-    ),
-    en_text=st.text(min_size=1, max_size=10),
-    include_en=st.booleans(),
+        max_size=5,
+    )
 )
-def test_first_translation_prefers_en_else_first(
-    entries: list[tuple[str, str]], en_text: str, include_en: bool
+def test_first_translation_prefers_en_else_first_else_none(
+    entries: list[tuple[str, str]],
 ) -> None:
     """Mirrors test_localized_prefers_en_else_first for the protobuf-side
-    translation picker: 'en' wins wherever it sits; otherwise first wins.
-    Non-'en' languages are drawn from a fixed pool so a coincidental 'en'
-    never sneaks in and makes the oracle wrong.
+    translation picker: the first 'en' wins wherever it sits; otherwise the
+    first entry wins; and an empty translation list yields None.
     """
     translated = gtfs_realtime_pb2.TranslatedString()
-    all_entries = list(entries)
-    if include_en:
-        all_entries.insert(len(all_entries) // 2, (en_text, "en"))
-    for text, language in all_entries:
+    for text, language in entries:
         entry = translated.translation.add()
         entry.text = text
         entry.language = language
-    result = _first_translation(translated)
-    assert result == (en_text if include_en else entries[0][0])
+    expected = next(
+        (text for text, language in entries if language == "en"),
+        entries[0][0] if entries else None,
+    )
+    assert _first_translation(translated) == expected
+
+
+def test_first_translation_of_empty_is_none() -> None:
+    """Deterministic companion: the property above draws the empty list on
+    only about 1 example in 200 (measured), too rare to rely on for the
+    branch that distinguishes None from "".
+    """
+    assert _first_translation(gtfs_realtime_pb2.TranslatedString()) is None
 
 
 # --- frequencies.txt materialization properties -----------------------------
@@ -2549,23 +3395,31 @@ def test_frequency_offsets_preserved_on_every_repetition(
         index.close()
 
 
-@settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-@given(
-    template=_frequency_template_strategy(),
-    rows=st.lists(
-        st.tuples(
-            st.integers(0, 24 * 3600), st.integers(1, 5400), st.integers(60, 1800)
-        ),
-        min_size=1,
-        max_size=2,
-    ),
+@pytest.mark.parametrize(
+    ("template", "rows"),
+    [
+        pytest.param(
+            [(0, 0), (300, 330), (900, 900)],
+            [(21_600, 3_600, 600), (43_200, 1_800, 900)],
+            id="two-spans-three-stops",
+        )
+    ],
 )
 def test_frequency_exact_times_values_materialize_identically(
     template: list[tuple[int, int]], rows: list[tuple[int, int, int]]
 ) -> None:
-    """Pin the documented equivalence: exact_times=0 (idealized headway
-    service) and exact_times=1 (exact schedule) materialize identical
-    repetitions -- the column changes nothing downstream.
+    """Regression guard for the documented equivalence: exact_times=0
+    (idealized headway service) and exact_times=1 (exact schedule)
+    materialize identical repetitions.
+
+    Deliberately ONE fixed example rather than a @given property. The
+    column is read by no production code path -- _parse_frequency_spans
+    destructures only trip_id/start_time/end_time/headway_secs, and
+    static_index's docstring says the column is ignored for both values --
+    so the assertion cannot fail for any drawn input, and drawn variety
+    bought nothing but two extra full index builds per example. It stays
+    as a guard that would fail if someone later started branching on the
+    column without saying so.
     """
     results = []
     for exact in ("0", "1"):
@@ -2582,6 +3436,8 @@ def test_frequency_exact_times_values_materialize_identically(
         finally:
             index.close()
     assert results[0] == results[1]
+    # Not vacuous: the fixed feed really materializes repetitions.
+    assert results[0]
 
 
 @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -3628,12 +4484,60 @@ def test_short_window_start_date_invariance(
     assert all(t.realtime is False for t in wrong_day_trips[("S0", "S2")])
 
 
-@given(done=st.integers(0, 2**40), total=st.integers(0, 2**40) | st.none())
-def test_build_progress_fraction_bounds(done: int, total: int | None) -> None:
+# done_bytes is drawn non-negative deliberately. Both producers in
+# transit.py accumulate len(chunk) / a row counter from 0, so a negative
+# value is unreachable; the dataclass accepts one and `fraction` would
+# return a negative float, but asserting a clamp the code does not perform
+# would be asserting a wish. The ceiling is well past 2**53: this code path
+# divides two ints into a float, the documented precision-loss hot spot.
+_PROGRESS_BYTES = st.integers(0, 2**70)
+
+
+@given(done=_PROGRESS_BYTES, total=_PROGRESS_BYTES | st.none())
+def test_build_progress_fraction_laws(done: int, total: int | None) -> None:
+    """``fraction`` is None if and only if ``total_bytes`` is falsy, and
+    otherwise lands in [0, 1].
+
+    The iff is the real claim: total_bytes == 0 yields None rather than
+    0.0, a deliberate-looking choice ("unknown total", same as missing
+    Content-Length) that nothing asserted before. The lower bound alone is
+    vacuous by construction over this domain.
+    """
     fraction = StaticBuildProgress(
         phase="index", done_bytes=done, total_bytes=total
     ).fraction
+    assert (fraction is None) is (not total)
     assert fraction is None or 0.0 <= fraction <= 1.0
+
+
+@given(total=st.integers(1, 2**70), dones=st.lists(_PROGRESS_BYTES, min_size=2))
+def test_build_progress_fraction_is_monotonic_in_done_bytes(
+    total: int, dones: list[int]
+) -> None:
+    """More bytes done never means less progress reported, including past
+    the clamp where done_bytes exceeds total_bytes."""
+    fractions = [
+        StaticBuildProgress(
+            phase="download", done_bytes=done, total_bytes=total
+        ).fraction
+        for done in sorted(dones)
+    ]
+    assert fractions == sorted(fractions)
+
+
+def test_build_progress_fraction_saturates_beyond_float_precision() -> None:
+    """Pinned, not a bug to fix: int/int -> float, so a total above 2**53
+    reports 1.0 while bytes remain. Unreachable at real dataset sizes
+    (2**53 bytes is 9 PB), which is why this is documented rather than
+    fixed with integer arithmetic.
+    """
+    total = 2**60
+    assert (
+        StaticBuildProgress(
+            phase="download", done_bytes=total - 1, total_bytes=total
+        ).fraction
+        == 1.0
+    )
 
 
 # --- station grouping properties (transit.group_stations) --------------------
@@ -4040,33 +4944,24 @@ def test_endpoints_from_discovery_layouts_oracle(data: st.DataObject) -> None:
             _endpoints_from_discovery(document)
 
 
-def _vehicle_handle(endpoints: dict[str, dict[str, object]]) -> GbfsFeedHandle:
-    """A detached handle whose named endpoints serve pre-cached documents."""
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        name: (float("inf"), float("inf"), {"data": payload})
-        for name, payload in endpoints.items()
+@st.composite
+def _equivalence_row(draw: st.DrawFn) -> dict[str, object]:
+    """One descriptive vehicle row, keyed on a neutral ``id``.
+
+    The id is rewritten to each spec version's own key by the test; the
+    rest of the descriptive surface is drawn so the two paths have
+    something to disagree about.
+    """
+    return {
+        **draw(_zone_row("id")),
+        "is_reserved": draw(st.booleans() | st.none()),
+        "is_disabled": draw(st.booleans() | st.none()),
+        "vehicle_type_id": draw(st.text(min_size=1, max_size=4) | st.none()),
+        "current_range_meters": draw(st.floats(0, 50_000) | st.none()),
     }
-    handle._endpoints = dict.fromkeys(endpoints, "x")
-    return handle
 
 
-@given(
-    rows=st.lists(
-        st.fixed_dictionaries(
-            {
-                "id": st.text(min_size=1, max_size=6),
-                "lat": _NEARBY_LAT | st.none(),
-                "lon": _NEARBY_LON | st.none(),
-                "is_reserved": st.booleans() | st.none(),
-                "is_disabled": st.booleans() | st.none(),
-                "vehicle_type_id": st.text(min_size=1, max_size=4) | st.none(),
-                "current_range_meters": st.floats(0, 50_000) | st.none(),
-            }
-        ),
-        max_size=6,
-    )
-)
+@given(rows=st.lists(_equivalence_row(), max_size=6))
 @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
     rows: list[dict[str, object]],
@@ -4086,15 +4981,15 @@ def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
         for row in rows
     ]
     via_30 = asyncio.run(
-        _vehicle_handle({"vehicle_status": {"vehicles": v_rows}}).get_vehicles()
+        _gbfs_handle({"vehicle_status": {"vehicles": v_rows}}).get_vehicles()
     )
     via_23 = asyncio.run(
-        _vehicle_handle({"free_bike_status": {"bikes": b_rows}}).get_vehicles()
+        _gbfs_handle({"free_bike_status": {"bikes": b_rows}}).get_vehicles()
     )
     assert via_30 == via_23
     decoy = [{"bike_id": "DECOY", "lat": 34.05, "lon": -118.25}]
     via_both = asyncio.run(
-        _vehicle_handle(
+        _gbfs_handle(
             {
                 "vehicle_status": {"vehicles": v_rows},
                 "free_bike_status": {"bikes": decoy},
@@ -4103,6 +4998,192 @@ def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
     )
     assert via_both == via_30
     assert all(vehicle.id != "DECOY" for vehicle in via_both)
+
+
+# JSON permits an arbitrarily large integer literal and Python's json parses
+# it into an unbounded int, so a producer document can carry a number that no
+# float can represent -- float(10**400) raises OverflowError -- and "1e999"
+# parses to inf, which int() refuses in turn. 1e308 is the largest power of
+# ten that IS representable and is kept, so the boundary stays pinned.
+# The exponents stop at 400 because json.loads itself rejects an integer
+# literal over 4300 digits (CPython's int/str limit), and that ValueError is
+# already mapped to FeedParseError at the fetch boundary.
+_TOO_LARGE_FOR_FLOAT = [10**400, -(10**400)]
+_TOO_LARGE_FOR_INT = [1e309, -1e309]
+
+
+# Dictionary keys are drawn from the GBFS vocabulary, since free-form keys
+# would never spell "stations"/"lat"/"ttl" and the documents would all be
+# uniformly empty rather than adversarially mis-shaped.
+_GBFS_KEY = st.sampled_from(
+    [
+        "data",
+        "ttl",
+        "feeds",
+        "name",
+        "url",
+        "en",
+        "stations",
+        "vehicles",
+        "bikes",
+        "station_id",
+        "vehicle_id",
+        "bike_id",
+        "system_id",
+        "lat",
+        "lon",
+        "count",
+        "vehicle_type_id",
+        "vehicle_types_available",
+        "num_bikes_available",
+        "num_vehicles_available",
+        "is_renting",
+        "rental_uris",
+    ]
+) | st.text(max_size=6)
+_GBFS_JSON = st.recursive(
+    st.none()
+    | st.booleans()
+    | st.integers(-200, 200)
+    | st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT)
+    | st.floats(allow_nan=True)
+    | st.sampled_from(["", "34.05", "nope", "s1", "en"])
+    | st.text(max_size=6),
+    lambda children: (
+        st.lists(children, max_size=3)
+        | st.dictionaries(_GBFS_KEY, children, max_size=4)
+    ),
+    max_leaves=12,
+)
+
+
+# A row whose numeric cells are unrepresentable: _GBFS_JSON on its own
+# almost never spells one of those numbers into a "lat"/"lon"/"count" key,
+# so the coordinate and vehicle-count coercions were never handed one.
+@st.composite
+def _unrepresentable_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
+    unrepresentable = st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT)
+    return {
+        id_key: draw(st.text(min_size=1, max_size=4)),
+        "lat": draw(unrepresentable),
+        "lon": draw(unrepresentable),
+        "vehicle_types_available": [
+            {"vehicle_type_id": "v1", "count": draw(unrepresentable)}
+        ],
+    }
+
+
+# Half-valid envelopes: real rows (near the zone, so the filter has work to
+# do) mixed with junk rows. Pure _GBFS_JSON almost never spells a usable
+# document, so on its own it proves totality without proving non-vacuity.
+_MESSY_STATION_DOC = st.builds(
+    lambda rows: {"stations": rows},
+    st.lists(
+        _zone_row("station_id") | _unrepresentable_row("station_id") | _GBFS_JSON,
+        max_size=3,
+    ),
+)
+_MESSY_VEHICLE_DOC = st.builds(
+    # Both id keys on every row: one document serves either endpoint.
+    lambda rows: {"vehicles": rows, "bikes": rows},
+    st.lists(
+        (_zone_row("vehicle_id") | _unrepresentable_row("vehicle_id")).map(
+            lambda row: {**row, "bike_id": row["vehicle_id"]}
+        )
+        | _GBFS_JSON,
+        max_size=3,
+    ),
+)
+
+
+@given(
+    info=_GBFS_JSON | _MESSY_STATION_DOC,
+    status=_GBFS_JSON | _MESSY_STATION_DOC,
+    zone=st.none() | st.just(_GBFS_ZONE),
+)
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_get_stations_total_over_json_documents(
+    info: object, status: object, zone: Circle | None
+) -> None:
+    """get_stations is TOTAL over arbitrary JSON ``data`` envelopes: a list
+    of stations, never a KeyError/TypeError/AttributeError leaking producer
+    data shapes. Every returned station carries a real id: never empty and
+    never the synthesized literal "None" (duplicates are NOT asserted
+    against -- a document with two rows sharing an id really does describe
+    two stations with that id, and the library does not dedupe).
+    """
+    stations = asyncio.run(
+        _gbfs_handle(
+            {"station_information": info, "station_status": status}
+        ).get_stations(zone)
+    )
+    event(f"stations parsed from arbitrary json: {bool(stations)}")
+    ids = [station.id for station in stations]
+    assert all(ids)
+    assert "None" not in ids
+
+
+@given(
+    document=_GBFS_JSON | _MESSY_VEHICLE_DOC,
+    endpoint=st.sampled_from(["vehicle_status", "free_bike_status"]),
+    zone=st.none() | st.just(_GBFS_ZONE),
+)
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_get_vehicles_total_over_json_documents(
+    document: object, endpoint: str, zone: Circle | None
+) -> None:
+    """get_vehicles is TOTAL over arbitrary JSON ``data`` envelopes on both
+    the 3.x and 2.x endpoint, and every surfaced vehicle has a real id (never
+    the synthesized literal "None") and real float coordinates.
+    """
+    vehicles = asyncio.run(_gbfs_handle({endpoint: document}).get_vehicles(zone))
+    event(f"vehicles parsed from arbitrary json: {bool(vehicles)}")
+    ids = [vehicle.id for vehicle in vehicles]
+    assert all(ids)
+    assert "None" not in ids
+    assert all(isinstance(vehicle.latitude, float) for vehicle in vehicles)
+    assert all(isinstance(vehicle.longitude, float) for vehicle in vehicles)
+
+
+@given(document=_GBFS_JSON)
+@settings(max_examples=200, deadline=None)
+def test_endpoints_from_discovery_total_over_json_documents(document: object) -> None:
+    """_endpoints_from_discovery is TOTAL over arbitrary JSON: either a
+    NON-EMPTY name->url table of strings, or FeedParseError. A missing
+    ``data`` key used to escape as KeyError.
+    """
+    endpoints: dict[str, str] | None
+    try:
+        endpoints = _endpoints_from_discovery(document)
+    except FeedParseError:
+        endpoints = None
+    event(f"discovery resolved endpoints: {endpoints is not None}")
+    assert endpoints is None or (
+        endpoints
+        and all(
+            isinstance(name, str) and isinstance(url, str)
+            for name, url in endpoints.items()
+        )
+    )
+
+
+@given(
+    number=st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT),
+    count=st.sampled_from(_TOO_LARGE_FOR_INT),
+)
+def test_numeric_helpers_treat_unrepresentable_numbers_as_unknown(
+    number: float, count: float
+) -> None:
+    """A number no float can hold is UNKNOWN, not an escaping OverflowError.
+
+    Each helper answers with what it already answers for other malformed
+    input: no coordinate, no caching, and a dropped vehicle-type count.
+    """
+    assert _coordinate(number) is None
+    assert _ttl_seconds(number) == 0.0
+    assert _vehicle_types([{"vehicle_type_id": "v1", "count": count}]) is None
+    assert _coordinate(1e308) == 1e308
+    assert _ttl_seconds(1e308) == 1e308
 
 
 # --- static-index query-method properties (Task 16: pair semantics, window
