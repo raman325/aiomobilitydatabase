@@ -140,6 +140,52 @@ async def test_purge_cache_rejects_symlink_escape(
     await client.close()
 
 
+@pytest.mark.parametrize(
+    "feed_id_template",
+    ["{root}/mdb-200", "{root}/./mdb-200", "mdb-100/../mdb-200"],
+)
+async def test_purge_cache_rejects_ids_that_resolve_to_a_child(
+    mock_api: MockApi, tmp_path: Path, feed_id_template: str
+) -> None:
+    """An id that reaches a feed by an absolute path or through ``..`` must
+    be rejected even though it resolves to a direct child: the documented
+    contract is a bare child name, and accepting these lets a caller purge
+    a feed it cannot name directly.
+    """
+    root = tmp_path / "cache"
+    for name in ("mdb-100", "mdb-200"):
+        (root / name).mkdir(parents=True)
+        (root / name / "static.db").write_bytes(b"x")
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(ValueError, match="escapes"):
+        await client.purge_cache(feed_id_template.format(root=root))
+    assert (root / "mdb-200" / "static.db").exists()
+    assert (root / "mdb-100" / "static.db").exists()
+    await client.close()
+
+
+async def test_purge_cache_rejects_symlink_to_sibling_feed(
+    mock_api: MockApi, tmp_path: Path
+) -> None:
+    """A symlinked cache entry pointing at a sibling feed must raise
+    ValueError, not let rmtree follow the link (or fail with OSError).
+    """
+    root = tmp_path / "cache"
+    (root / "mdb-200").mkdir(parents=True)
+    (root / "mdb-200" / "static.db").write_bytes(b"x")
+    (root / "evil").symlink_to(root / "mdb-200", target_is_directory=True)
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(ValueError, match="escapes"):
+        await client.purge_cache("evil")
+    assert (root / "mdb-200" / "static.db").exists()
+    assert (root / "evil").is_symlink()
+    await client.close()
+
+
 @pytest.mark.parametrize("feed_id", ["", ".", "./", "nested/inner"])
 async def test_purge_cache_rejects_non_child_feed_ids(
     mock_api: MockApi, tmp_path: Path, feed_id: str

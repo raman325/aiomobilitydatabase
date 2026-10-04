@@ -139,10 +139,23 @@ class MobilityFeedsClient:
         if self.cache_dir is None:
             return
         if feed_id is not None:
+            candidate = Path(feed_id)
             target = self.cache_dir / feed_id
             root = self.cache_dir.resolve()
-            resolved = target.resolve()
-            if resolved == root or resolved.parent != root:
+            # The input itself must be a bare child name. Resolving first
+            # and checking only the destination accepts ids that reach a
+            # feed the caller cannot name directly (an absolute path, or
+            # one routed through ``..``), and hands symlinked entries to
+            # rmtree, which rejects them with OSError.
+            invalid = (
+                candidate.is_absolute()
+                or candidate.name != feed_id
+                or target.is_symlink()
+            )
+            if not invalid:
+                resolved = target.resolve()
+                invalid = resolved == root or resolved.parent != root
+            if invalid:
                 raise ValueError(
                     f"feed_id {feed_id!r} escapes the cache directory: "
                     "it does not name a direct child"

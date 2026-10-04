@@ -2013,7 +2013,19 @@ _HOSTILE_FEED_IDS = [
         st.text(max_size=12),
         st.text(alphabet=st.characters(categories=["L", "N", "P", "Zs"]), max_size=12),
     ).filter(lambda drawn: not drawn.startswith("/")),
-    absolute=st.booleans(),
+    # Each arm but "drawn" is built from the sandbox inside the test, so
+    # the generator cannot name a path outside it.
+    arm=st.sampled_from(
+        [
+            "drawn",
+            "absolute_outside",
+            "absolute_child",
+            "absolute_dot_child",
+            "traversal_to_child",
+            "separator_to_child",
+            "symlink_to_child",
+        ]
+    ),
 )
 @settings(
     max_examples=200,
@@ -2021,7 +2033,7 @@ _HOSTILE_FEED_IDS = [
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 def test_purge_cache_removes_only_the_named_feed(
-    tmp_path: Path, feed_id: str, absolute: bool
+    tmp_path: Path, feed_id: str, arm: str
 ) -> None:
     """purge_cache either removes exactly ``cache_dir/<feed_id>`` or raises
     ValueError, never touches another entry under cache_dir, and is
@@ -2039,9 +2051,19 @@ def test_purge_cache_removes_only_the_named_feed(
     victim = sandbox / "victim"
     victim.mkdir()
     (victim / "data").write_bytes(b"precious")
-    # The absolute arm points inside the sandbox, keeping the generator
-    # incapable of naming anything outside tmp_path.
-    drawn = str(victim / "data") if absolute else feed_id
+    if arm == "symlink_to_child":
+        (root / "evil").symlink_to(root / "mdb-200", target_is_directory=True)
+    drawn = {
+        "drawn": feed_id,
+        "absolute_outside": str(victim / "data"),
+        "absolute_child": str(root / "mdb-200"),
+        "absolute_dot_child": str(root / "." / "mdb-200"),
+        "traversal_to_child": "mdb-100/../mdb-200",
+        "separator_to_child": "mdb-100/nested/../../mdb-200",
+        "symlink_to_child": "evil",
+    }[arm]
+    # Absolute ids are only ever built from the sandbox, keeping the
+    # generator incapable of naming anything outside tmp_path.
     assert not Path(drawn.replace("\x00", "")).is_absolute() or drawn.startswith(
         str(tmp_path)
     )
@@ -2057,6 +2079,10 @@ def test_purge_cache_removes_only_the_named_feed(
 
     rejected = asyncio.run(scenario())
     event(f"purge_cache rejected={rejected}")
+    # Only a bare child name is in contract; every constructed arm reaches
+    # a feed (or a path outside the cache) by a spelling purge_cache must
+    # refuse, so it has to raise rather than purge whatever it resolves to.
+    assert rejected or arm == "drawn"
     assert (root / "sentinel").read_bytes() == b"s"
     assert (victim / "data").read_bytes() == b"precious"
     survivors = {name for name in siblings if (root / name / "static.db").is_file()}
