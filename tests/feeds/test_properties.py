@@ -1034,8 +1034,12 @@ def _rt_response_body(draw: st.DrawFn) -> tuple[str, bytes]:
 # can actually send. content_type is NOT drawn: fetch_feed_message never
 # inspects it, so varying it only spent budget on an axis that provably
 # cannot change the outcome.
+# The classification claim hinges on 401/403, which a uniform draw over 400
+# values reaches ~0.5% of the time -- so the auth branch went unexercised in
+# about half of runs. Union the decision-boundary statuses in explicitly.
 @given(
-    status=st.integers(min_value=200, max_value=599),
+    status=st.sampled_from([200, 204, 304, 400, 401, 403, 404, 429, 500, 599])
+    | st.integers(min_value=200, max_value=599),
     body=_rt_response_body(),
 )
 @settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
