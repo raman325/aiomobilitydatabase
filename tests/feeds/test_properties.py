@@ -3789,8 +3789,21 @@ def test_group_stations_partition_oracle(data: st.DataObject) -> None:
 _MULTI_RT_NOW = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
 
 
-def _multi_rt_message(kind: str, delay: int) -> gtfs_realtime_pb2.FeedMessage:
-    """One TU source's message about TP: a delay, a cancellation, or nothing."""
+_MULTI_RT_STOPS = ["S0", "S1", "S2"]
+
+
+def _multi_rt_message(
+    kind: str, delay: int, stop_index: int
+) -> gtfs_realtime_pb2.FeedMessage:
+    """One TU source's message about TP: a delay AT A NAMED STOP, a
+    cancellation, or nothing.
+
+    Which stop the delay addresses is what makes "wins wholesale"
+    observable: aggregation replaces the whole TripUpdateEntry, so only
+    the winning source's stop (and the stops after it, by propagation)
+    may be realtime. A field-level merge would light up every source's
+    stop at once.
+    """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
     if kind == "absent":
@@ -3804,15 +3817,16 @@ def _multi_rt_message(kind: str, delay: int) -> gtfs_realtime_pb2.FeedMessage:
         )
     else:
         stu = entity.trip_update.stop_time_update.add()
-        stu.stop_id = "S0"
+        stu.stop_id = _MULTI_RT_STOPS[stop_index]
         stu.departure.delay = delay
     return msg
 
 
 def _run_multi_rt_scenario(
-    msg_one: gtfs_realtime_pb2.FeedMessage, msg_two: gtfs_realtime_pb2.FeedMessage
+    messages: list[gtfs_realtime_pb2.FeedMessage],
 ) -> list[StopArrival]:
-    """Two scripted TU sources behind one DIRECT-URL handle."""
+    """Several scripted TU sources behind one DIRECT-URL handle, in the
+    order they are passed (which IS the handle's catalog order)."""
 
     async def scenario() -> list[StopArrival]:
         api = MockApi()
@@ -3824,23 +3838,21 @@ def _run_multi_rt_scenario(
                 body=_propagation_zip(3, 1),
                 content_type="application/zip",
             )
-            api.get(
-                "/rt/one",
-                body=msg_one.SerializeToString(),
-                content_type="application/octet-stream",
-            )
-            api.get(
-                "/rt/two",
-                body=msg_two.SerializeToString(),
-                content_type="application/octet-stream",
-            )
+            for index, message in enumerate(messages):
+                api.get(
+                    f"/rt/{index}",
+                    body=message.SerializeToString(),
+                    content_type="application/octet-stream",
+                )
             async with MobilityFeedsClient() as client:
                 handle = await client.get_transit_feed_from_urls(
                     api.url("/static.zip"),
-                    trip_updates_urls=[api.url("/rt/one"), api.url("/rt/two")],
+                    trip_updates_urls=[
+                        api.url(f"/rt/{index}") for index in range(len(messages))
+                    ],
                 )
                 [arrivals] = await handle.get_arrivals(
-                    [ArrivalsQuery(["S0", "S1", "S2"], limit=150)],
+                    [ArrivalsQuery(_MULTI_RT_STOPS, limit=150)],
                     lookahead=timedelta(hours=6),
                     now_utc=_MULTI_RT_NOW,
                 )
@@ -3851,45 +3863,59 @@ def _run_multi_rt_scenario(
     return asyncio.run(scenario())
 
 
-@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
-    kind_one=st.sampled_from(["delay", "cancel", "absent"]),
-    kind_two=st.sampled_from(["delay", "cancel", "absent"]),
-    delay_one=st.integers(-300, 900),
+    kinds=st.lists(
+        st.sampled_from(["delay", "cancel", "absent"]), min_size=2, max_size=4
+    ),
+    stop_indices=st.lists(st.integers(0, 2), min_size=4, max_size=4),
+    base_delay=st.integers(-300, 900),
     delay_gap=st.integers(1, 500),
 )
 def test_multi_rt_aggregation_last_feed_wins_and_cancellation_suppresses(
-    kind_one: str, kind_two: str, delay_one: int, delay_gap: int
+    kinds: list[str],
+    stop_indices: list[int],
+    base_delay: int,
+    delay_gap: int,
 ) -> None:
-    """Two TU-capable sources sharing the TP identity: when both carry an
-    entry, the LAST feed's delay wins wholesale (values drawn distinct so a
-    flip is observable); a cancellation in EITHER source suppresses the
-    rows end-to-end -- including the delay+cancel mix where the identity
-    sits in both ``trips`` and ``canceled_trips`` after aggregation -- and
-    the RT-untouched sibling trip is never affected.
+    """Two to four TU-capable sources sharing the TP identity: the LAST
+    source in catalog order that sent an entry wins WHOLESALE, a
+    cancellation in ANY source suppresses the rows end-to-end -- including
+    the delay+cancel mix where the identity sits in both ``trips`` and
+    ``canceled_trips`` after aggregation -- and the RT-untouched sibling
+    trip is never affected.
+
+    "Wholesale" is observable because each source addresses a drawn stop:
+    replacement predicts a delay from the winning source's stop onward and
+    leaves the earlier stops schedule-only, whereas a field-level merge
+    would surface a losing source's stop as realtime too. Delays are
+    distinct per source so a tiebreak flip can never be masked.
     """
-    delay_two = delay_one + delay_gap  # distinct by construction
+    delays = [base_delay + index * delay_gap for index in range(len(kinds))]
     arrivals = _run_multi_rt_scenario(
-        _multi_rt_message(kind_one, delay_one),
-        _multi_rt_message(kind_two, delay_two),
+        [
+            _multi_rt_message(kind, delays[index], stop_indices[index])
+            for index, kind in enumerate(kinds)
+        ]
     )
     other_rows = [row for row in arrivals if row.trip_id == "OTHER"]
-    assert {row.stop_id for row in other_rows} == {"S0", "S1", "S2"}
+    assert {row.stop_id for row in other_rows} == set(_MULTI_RT_STOPS)
     assert all(row.realtime is False for row in other_rows)
     tp_rows = [row for row in arrivals if row.trip_id == "TP"]
-    if "cancel" in (kind_one, kind_two):
+    if "cancel" in kinds:
         assert tp_rows == []  # cancellation wins over any sibling entry
         return
-    assert {row.stop_id for row in tp_rows} == {"S0", "S1", "S2"}
-    if kind_one == kind_two == "absent":
+    assert {row.stop_id for row in tp_rows} == set(_MULTI_RT_STOPS)
+    winners = [index for index, kind in enumerate(kinds) if kind == "delay"]
+    if not winners:
         assert all(row.realtime is False for row in tp_rows)
         return
-    # Exactly one or both feeds sent a delay entry: the LAST feed that sent
-    # one wins wholesale (the S0 delay propagates over the whole trip).
-    expected_delay = delay_two if kind_two == "delay" else delay_one
+    winner = winners[-1]  # last source in catalog order
+    first_affected = stop_indices[winner]
     for row in tp_rows:
-        assert row.realtime is True
-        assert row.delay_seconds == expected_delay
+        affected = _MULTI_RT_STOPS.index(row.stop_id) >= first_affected
+        assert row.realtime is affected
+        assert row.delay_seconds == (delays[winner] if affected else None)
 
 
 # --- get_arrivals route_ids filter properties --------------------------------
