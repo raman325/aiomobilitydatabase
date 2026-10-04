@@ -211,10 +211,7 @@ def _lenient_int(value: str | None) -> int | None:
     """
     if value is None:
         return None
-    value = value.strip()
-    if not _ascii_digits(value):
-        return None
-    return int(value)
+    return _ascii_int(value.strip())
 
 
 _GTFS_DATE_LENGTH = 8  # YYYYMMDD

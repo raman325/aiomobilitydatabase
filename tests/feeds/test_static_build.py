@@ -11,6 +11,7 @@ from aiomobilitydatabase.feeds.models import StopLocationType
 from aiomobilitydatabase.feeds.static_index import (
     SCHEMA_VERSION,
     StaticIndex,
+    _lenient_date,
     _lenient_int,
     _strict_int,
     parse_gtfs_time,
@@ -477,3 +478,18 @@ def test_strict_int_rejects_oversized_digits() -> None:
     """
     with pytest.raises(FeedParseError):
         _strict_int(_OVERSIZED_DIGITS, "stop_sequence")
+
+
+def test_lenient_int_oversized_digits_is_none() -> None:
+    """_lenient_int is documented to answer None for anything unparseable so
+    that one bad descriptive cell cannot abort a build; a cell past the
+    4300-digit conversion cap is unparseable like any other.
+    """
+    assert _lenient_int(_OVERSIZED_DIGITS) is None
+
+
+def test_lenient_date_oversized_digits_is_none() -> None:
+    """_lenient_date needs no conversion guard of its own: its length check
+    rejects an oversized cell before any int() runs.
+    """
+    assert _lenient_date(_OVERSIZED_DIGITS) is None
