@@ -1117,9 +1117,13 @@ def test_gbfs_document_total_over_status_and_body(
 # arm. The boundary samples straddle the 32-bit wall where
 # fromtimestamp starts raising.
 _EPOCHS = st.one_of(
-    st.integers(min_value=0, max_value=2**63 - 1),
+    # The field is uint64, so the domain runs to 2**64 - 1; stopping the broad
+    # arm at 2**63 - 1 left the whole upper half of the stated domain untested.
+    st.integers(min_value=0, max_value=2**64 - 1),
     st.integers(min_value=0, max_value=2**31),
-    st.sampled_from([0, 1, 2**31 - 1, 2**31, 2**32, 2**53, 2**63 - 1]),
+    st.sampled_from(
+        [0, 1, 2**31 - 1, 2**31, 2**32, 2**53, 2**63 - 1, 2**63, 2**64 - 1]
+    ),
 )
 
 
