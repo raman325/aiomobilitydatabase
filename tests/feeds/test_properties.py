@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import zipfile
+from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
@@ -1317,8 +1318,39 @@ def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
 # empty results. The biased strategies below must keep the non-empty rate
 # healthy, and the *_nonvacuity_rate guard tests (which pytest runs AFTER
 # their property, in definition order) fail the suite if it collapses.
+# Non-vacuity tallies for the two generated-feed query properties below.
+#
+# These stay module-level because the properties that write to them are
+# plain @given functions, and the fragility worth fixing is not WHERE the
+# counts live -- a pytest stash is global mutable state too, keyed on the
+# config instead of the module, with identical ordering semantics -- but
+# that the guard assertions used to depend on running AFTER the property.
+# Each guard now seeds its own measurement when it finds an empty tally
+# (see _seeded_tally), which makes it correct when selected alone with -k,
+# under a random-order plugin, and on an xdist worker that received the
+# guard but not the property.
+#
+# Honest-measurement caveat: a count is bumped once per example that
+# reached the assertions, including Hypothesis's reuse-phase replays of
+# database entries, so "examples" can exceed max_examples. Both counters
+# are bumped together, so the RATE the guards assert is unaffected; only
+# the absolute floor is (upward, i.e. conservatively).
 _DEPARTURES_VACUITY = {"examples": 0, "nonempty": 0}
 _TRIPS_VACUITY = {"examples": 0, "nonempty": 0}
+
+
+def _seeded_tally(
+    tally: dict[str, int], property_test: Callable[[], None]
+) -> dict[str, int]:
+    """Return ``tally``, first running ``property_test`` if it is empty.
+
+    An empty tally means the property has not run in this process yet, so
+    the guard would otherwise assert on nothing.
+    """
+    if not tally["examples"]:
+        property_test()
+    return tally
+
 
 # The generator's calendar rows start service in 2026 OR 2027; probing one
 # Thursday in each year finds in-window schedule data for most feeds that
@@ -1401,9 +1433,10 @@ def test_upcoming_departures_deterministic(
 
 def test_upcoming_departures_nonvacuity_rate() -> None:
     """Guard for the property above: fail if its non-empty rate collapses."""
-    examples = _DEPARTURES_VACUITY["examples"]
-    assert examples > 0
-    assert _DEPARTURES_VACUITY["nonempty"] >= max(3, examples // 5)
+    tally = _seeded_tally(_DEPARTURES_VACUITY, test_upcoming_departures_deterministic)
+    examples = tally["examples"]
+    assert examples > 0, "no example reached the assertions even after seeding"
+    assert tally["nonempty"] >= max(3, examples // 5)
 
 
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())
@@ -1486,9 +1519,10 @@ def test_upcoming_trips_invariants(zip_bytes: bytes, data: st.DataObject) -> Non
 
 def test_upcoming_trips_nonvacuity_rate() -> None:
     """Guard for the property above: fail if its non-empty rate collapses."""
-    examples = _TRIPS_VACUITY["examples"]
-    assert examples > 0
-    assert _TRIPS_VACUITY["nonempty"] >= max(3, examples // 5)
+    tally = _seeded_tally(_TRIPS_VACUITY, test_upcoming_trips_invariants)
+    examples = tally["examples"]
+    assert examples > 0, "no example reached the assertions even after seeding"
+    assert tally["nonempty"] >= max(3, examples // 5)
 
 
 # --- descriptive attribute-surface properties --------------------------------
@@ -2735,54 +2769,109 @@ def test_gbfs_stations_zone_filter_law(rows: list[dict[str, object]]) -> None:
     ]
 
 
+_EARTH_HALF_CIRCUMFERENCE_M = math.pi * 6_371_000.0
+# Metres per degree of latitude along a meridian, for the calibration law
+# below. Written from first principles (R * pi / 180), NOT imported from
+# geo.py, so a wrong radius there cannot cancel out of the oracle.
+_M_PER_DEG_LAT = 6_371_000.0 * math.pi / 180.0
+
+
 @given(
-    lat1=st.floats(-85, 85),
-    lon1=st.floats(-179, 179),
-    lat2=st.floats(-85, 85),
-    lon2=st.floats(-179, 179),
+    # Full domain, including the poles, where cos(phi) -> 0. The previous
+    # +-85/+-179 clipping excluded them and nothing else covered them.
+    lat1=st.floats(-90, 90),
+    lon1=st.floats(-180, 180),
+    lat2=st.floats(-90, 90),
+    lon2=st.floats(-180, 180),
+    third=st.tuples(st.floats(-90, 90), st.floats(-180, 180)),
 )
 def test_haversine_metric_laws(
-    lat1: float, lon1: float, lat2: float, lon2: float
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+    third: tuple[float, float],
 ) -> None:
     """Non-negativity, symmetry, identity-of-indiscernibles (same point),
-    and the trivial upper bound (half the Earth's circumference).
+    the trivial upper bound (half the Earth's circumference), and the
+    triangle inequality via a third drawn point.
+
+    The triangle inequality does NOT catch a lat/lon argument swap:
+    measured over 2000 examples the swapped implementation produces zero
+    violations, because swapping the coordinates is a bijection of the
+    sphere and the composition is still a metric. The calibration law
+    below is what catches that.
     """
+    lat3, lon3 = third
     d_ab = haversine_m(lat1, lon1, lat2, lon2)
+    d_bc = haversine_m(lat2, lon2, lat3, lon3)
+    d_ac = haversine_m(lat1, lon1, lat3, lon3)
     assert d_ab >= 0
     assert abs(d_ab - haversine_m(lat2, lon2, lat1, lon1)) < 1e-6
     assert haversine_m(lat1, lon1, lat1, lon1) < 1e-6
-    assert d_ab <= math.pi * 6_371_000.0 + 1.0
+    assert d_ab <= _EARTH_HALF_CIRCUMFERENCE_M + 1.0
+    # Epsilon in metres: these distances reach ~2e7, so float rounding in
+    # sqrt/asin is worth more slack than the 1e-6 used for the exact laws.
+    assert d_ac <= d_ab + d_bc + 1e-3
+
+
+@given(lat1=st.floats(-90, 90), lat2=st.floats(-90, 90), lon=st.floats(-180, 180))
+def test_haversine_along_a_meridian_equals_arc_length(
+    lat1: float, lat2: float, lon: float
+) -> None:
+    """Calibration, not just structure: two points on the SAME meridian are
+    exactly |dlat| degrees of arc apart, so the distance must equal
+    |dlat| * R * pi / 180 whatever longitude they share.
+
+    This is the law the metric laws cannot express. All of them -- including
+    the triangle inequality -- survive a lat/lon argument swap and a wrong
+    Earth radius; this one fails on both (verified over a 150-point probe
+    grid: 58 violations under the swap, 145 under a halved radius).
+    """
+    distance = haversine_m(lat1, lon, lat2, lon)
+    expected = abs(lat2 - lat1) * _M_PER_DEG_LAT
+    assert math.isclose(distance, expected, rel_tol=1e-9, abs_tol=1e-6)
 
 
 @given(
+    # Languages INCLUDING "en", with the oracle computed from the drawn list
+    # rather than from a separately injected entry. That lets one strategy
+    # cover every branch at once: the empty list (-> None, the branch the
+    # previous version could not reach because min_size was 1), the
+    # first-entry fallback, "en" anywhere, and -- undrawn before -- a list
+    # with MORE THAN ONE "en" entry, where the first one must win.
     entries=st.lists(
         st.tuples(
-            st.text(min_size=1, max_size=10), st.sampled_from(["de", "fr", "es"])
+            st.text(max_size=10), st.sampled_from(["de", "fr", "es", "en", "en"])
         ),
-        min_size=1,
-        max_size=4,
-    ),
-    en_text=st.text(min_size=1, max_size=10),
-    include_en=st.booleans(),
+        max_size=5,
+    )
 )
-def test_first_translation_prefers_en_else_first(
-    entries: list[tuple[str, str]], en_text: str, include_en: bool
+def test_first_translation_prefers_en_else_first_else_none(
+    entries: list[tuple[str, str]],
 ) -> None:
     """Mirrors test_localized_prefers_en_else_first for the protobuf-side
-    translation picker: 'en' wins wherever it sits; otherwise first wins.
-    Non-'en' languages are drawn from a fixed pool so a coincidental 'en'
-    never sneaks in and makes the oracle wrong.
+    translation picker: the first 'en' wins wherever it sits; otherwise the
+    first entry wins; and an empty translation list yields None.
     """
     translated = gtfs_realtime_pb2.TranslatedString()
-    all_entries = list(entries)
-    if include_en:
-        all_entries.insert(len(all_entries) // 2, (en_text, "en"))
-    for text, language in all_entries:
+    for text, language in entries:
         entry = translated.translation.add()
         entry.text = text
         entry.language = language
-    result = _first_translation(translated)
-    assert result == (en_text if include_en else entries[0][0])
+    expected = next(
+        (text for text, language in entries if language == "en"),
+        entries[0][0] if entries else None,
+    )
+    assert _first_translation(translated) == expected
+
+
+def test_first_translation_of_empty_is_none() -> None:
+    """Deterministic companion: the property above draws the empty list on
+    only about 1 example in 200 (measured), too rare to rely on for the
+    branch that distinguishes None from "".
+    """
+    assert _first_translation(gtfs_realtime_pb2.TranslatedString()) is None
 
 
 # --- frequencies.txt materialization properties -----------------------------
@@ -2949,23 +3038,31 @@ def test_frequency_offsets_preserved_on_every_repetition(
         index.close()
 
 
-@settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-@given(
-    template=_frequency_template_strategy(),
-    rows=st.lists(
-        st.tuples(
-            st.integers(0, 24 * 3600), st.integers(1, 5400), st.integers(60, 1800)
-        ),
-        min_size=1,
-        max_size=2,
-    ),
+@pytest.mark.parametrize(
+    ("template", "rows"),
+    [
+        pytest.param(
+            [(0, 0), (300, 330), (900, 900)],
+            [(21_600, 3_600, 600), (43_200, 1_800, 900)],
+            id="two-spans-three-stops",
+        )
+    ],
 )
 def test_frequency_exact_times_values_materialize_identically(
     template: list[tuple[int, int]], rows: list[tuple[int, int, int]]
 ) -> None:
-    """Pin the documented equivalence: exact_times=0 (idealized headway
-    service) and exact_times=1 (exact schedule) materialize identical
-    repetitions -- the column changes nothing downstream.
+    """Regression guard for the documented equivalence: exact_times=0
+    (idealized headway service) and exact_times=1 (exact schedule)
+    materialize identical repetitions.
+
+    Deliberately ONE fixed example rather than a @given property. The
+    column is read by no production code path -- _parse_frequency_spans
+    destructures only trip_id/start_time/end_time/headway_secs, and
+    static_index's docstring says the column is ignored for both values --
+    so the assertion cannot fail for any drawn input, and drawn variety
+    bought nothing but two extra full index builds per example. It stays
+    as a guard that would fail if someone later started branching on the
+    column without saying so.
     """
     results = []
     for exact in ("0", "1"):
@@ -2982,6 +3079,8 @@ def test_frequency_exact_times_values_materialize_identically(
         finally:
             index.close()
     assert results[0] == results[1]
+    # Not vacuous: the fixed feed really materializes repetitions.
+    assert results[0]
 
 
 @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -4028,12 +4127,60 @@ def test_short_window_start_date_invariance(
     assert all(t.realtime is False for t in wrong_day_trips[("S0", "S2")])
 
 
-@given(done=st.integers(0, 2**40), total=st.integers(0, 2**40) | st.none())
-def test_build_progress_fraction_bounds(done: int, total: int | None) -> None:
+# done_bytes is drawn non-negative deliberately. Both producers in
+# transit.py accumulate len(chunk) / a row counter from 0, so a negative
+# value is unreachable; the dataclass accepts one and `fraction` would
+# return a negative float, but asserting a clamp the code does not perform
+# would be asserting a wish. The ceiling is well past 2**53: this code path
+# divides two ints into a float, the documented precision-loss hot spot.
+_PROGRESS_BYTES = st.integers(0, 2**70)
+
+
+@given(done=_PROGRESS_BYTES, total=_PROGRESS_BYTES | st.none())
+def test_build_progress_fraction_laws(done: int, total: int | None) -> None:
+    """``fraction`` is None if and only if ``total_bytes`` is falsy, and
+    otherwise lands in [0, 1].
+
+    The iff is the real claim: total_bytes == 0 yields None rather than
+    0.0, a deliberate-looking choice ("unknown total", same as missing
+    Content-Length) that nothing asserted before. The lower bound alone is
+    vacuous by construction over this domain.
+    """
     fraction = StaticBuildProgress(
         phase="index", done_bytes=done, total_bytes=total
     ).fraction
+    assert (fraction is None) is (not total)
     assert fraction is None or 0.0 <= fraction <= 1.0
+
+
+@given(total=st.integers(1, 2**70), dones=st.lists(_PROGRESS_BYTES, min_size=2))
+def test_build_progress_fraction_is_monotonic_in_done_bytes(
+    total: int, dones: list[int]
+) -> None:
+    """More bytes done never means less progress reported, including past
+    the clamp where done_bytes exceeds total_bytes."""
+    fractions = [
+        StaticBuildProgress(
+            phase="download", done_bytes=done, total_bytes=total
+        ).fraction
+        for done in sorted(dones)
+    ]
+    assert fractions == sorted(fractions)
+
+
+def test_build_progress_fraction_saturates_beyond_float_precision() -> None:
+    """Pinned, not a bug to fix: int/int -> float, so a total above 2**53
+    reports 1.0 while bytes remain. Unreachable at real dataset sizes
+    (2**53 bytes is 9 PB), which is why this is documented rather than
+    fixed with integer arithmetic.
+    """
+    total = 2**60
+    assert (
+        StaticBuildProgress(
+            phase="download", done_bytes=total - 1, total_bytes=total
+        ).fraction
+        == 1.0
+    )
 
 
 # --- station grouping properties (transit.group_stations) --------------------
