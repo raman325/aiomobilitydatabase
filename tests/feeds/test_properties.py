@@ -5,6 +5,7 @@ import csv
 import io
 import math
 import sqlite3
+import sys
 import tempfile
 import zipfile
 from datetime import UTC, date, datetime, time, timedelta
@@ -63,6 +64,8 @@ from aiomobilitydatabase.feeds.rt import (
 from aiomobilitydatabase.feeds.static_index import (
     ScheduledTrip,
     StaticIndex,
+    _lenient_date,
+    _lenient_int,
     parse_gtfs_time,
 )
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle, group_stations
@@ -259,34 +262,179 @@ def test_departures_match_elapsed_seconds_oracle(
         index.close()
 
 
+# Garbage for ONE time component: letters, non-ASCII digits (the
+# ASCII-only hole), sign prefixes, a decimal point, and whitespace. ASCII
+# digits are excluded because any count of them in any component is VALID
+# GTFS ("8:0:0", "0008:00:00") -- generating them would be a broken oracle.
+_TIME_GARBAGE = st.one_of(
+    st.text(
+        alphabet=st.characters(
+            categories=["L", "N"],
+            exclude_characters="0123456789",
+            include_characters="+-. \t",
+        ),
+        min_size=1,
+        max_size=8,
+    ),
+    # Sampled explicitly as well: free text draws non-ASCII digits and sign
+    # prefixes only rarely, and those are the exact forms a bare int()
+    # silently accepted.
+    st.sampled_from(
+        ["\u0660\u0668", "\uff10\uff18", "+8", "-1", "-0", "1_0", "0 8", " 8 "]
+    ),
+)
+
+
 @given(
-    hours=st.integers(min_value=0, max_value=47),
+    hours=st.integers(min_value=0, max_value=500),
     minutes=st.integers(min_value=0, max_value=59),
     seconds=st.integers(min_value=0, max_value=59),
-    pad_hours=st.booleans(),
+    pad=st.tuples(st.booleans(), st.booleans(), st.booleans()),
 )
-def test_parse_gtfs_time_round_trip(
-    hours: int, minutes: int, seconds: int, pad_hours: bool
+def test_parse_gtfs_time_matches_component_oracle(
+    hours: int, minutes: int, seconds: int, pad: tuple[bool, bool, bool]
 ) -> None:
-    # Single-digit UNPADDED hours ("8:00:00") are valid GTFS the spec calls
-    # out explicitly; the suite previously only ever generated "08:00:00".
-    hour_cell = f"{hours:02d}" if pad_hours else str(hours)
-    value = f"{hour_cell}:{minutes:02d}:{seconds:02d}"
-    assert parse_gtfs_time(value) == hours * 3600 + minutes * 60 + seconds
+    """Oracle test (there is no formatter inverse to round-trip against):
+    any zero-padding combination of any in-range components parses to the
+    arithmetic the GTFS spec defines.
+    """
+    # Single-digit UNPADDED components ("8:0:0") are valid GTFS -- int()
+    # accepts them and real feeds ship them. Hours are deliberately drawn
+    # well past 47: a service day may run arbitrarily far past midnight,
+    # so the function has no hour ceiling to find.
+    cells = tuple(
+        f"{component:02d}" if padded else str(component)
+        for component, padded in zip((hours, minutes, seconds), pad, strict=True)
+    )
+    assert parse_gtfs_time(":".join(cells)) == hours * 3600 + minutes * 60 + seconds
 
 
-@given(text=st.text(alphabet=st.characters(categories=["L"]), min_size=1, max_size=8))
-def test_parse_gtfs_time_rejects_garbage(text: str) -> None:
-    # Letters-only: "0:00:00"-style single-digit hours are VALID GTFS, so the
-    # original numeric-string strategy was a broken oracle (found 2026-07-31).
+@given(garbage=_TIME_GARBAGE, position=st.integers(min_value=0, max_value=2))
+def test_parse_gtfs_time_rejects_garbage_in_any_component(
+    garbage: str, position: int
+) -> None:
+    """Garbage in ANY of the three components is rejected, not just the hour
+    -- a validation gap in minutes or seconds would otherwise be invisible.
+    """
+    cells = ["00", "00", "00"]
+    cells[position] = garbage
     with pytest.raises(FeedParseError):
-        parse_gtfs_time(f"{text}:00:00")
+        parse_gtfs_time(":".join(cells))
 
 
-def test_parse_gtfs_time_rejects_out_of_range_components() -> None:
-    for bad in ("08:75:00", "08:00:99", "-1:00:00", "08:-5:00"):
-        with pytest.raises(FeedParseError):
-            parse_gtfs_time(bad)
+@given(
+    value=st.integers(min_value=60, max_value=999),
+    in_seconds=st.booleans(),
+    pad=st.booleans(),
+)
+def test_parse_gtfs_time_rejects_out_of_range_minutes_and_seconds(
+    value: int, in_seconds: bool, pad: bool
+) -> None:
+    """Minutes and seconds are bounded to [0, 60) even though they are
+    spelled in valid ASCII digits (subsumes the hand-written "08:75:00"/
+    "08:00:99" cases). Hours have no such bound.
+    """
+    cell = f"{value:02d}" if pad else str(value)
+    bad = f"08:{cell}:00" if not in_seconds else f"08:00:{cell}"
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(bad)
+
+
+@given(
+    components=st.lists(
+        st.integers(min_value=0, max_value=59).map(lambda n: f"{n:02d}"),
+        min_size=0,
+        max_size=6,
+    ).filter(lambda parts: len(parts) != 3)
+)
+def test_parse_gtfs_time_rejects_wrong_arity(components: list[str]) -> None:
+    """Exactly three colon-separated components, by explicit check rather
+    than by an incidental generator-unpack ValueError: "08:00" and
+    "1:2:3:4" are rejected, and a blank cell stays None (not an arity
+    failure).
+    """
+    value = ":".join(components)
+    if not value:
+        assert parse_gtfs_time(value) is None
+        return
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(value)
+
+
+@given(
+    whole=st.integers(min_value=0, max_value=59),
+    frac=st.integers(min_value=1, max_value=999),
+    position=st.integers(min_value=0, max_value=2),
+)
+def test_parse_gtfs_time_rejects_fractional_components(
+    whole: int, frac: int, position: int
+) -> None:
+    """GTFS times have no sub-second resolution in any component."""
+    cells = ["00", "00", "00"]
+    cells[position] = f"{whole}.{frac}"
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(":".join(cells))
+
+
+# CPython caps int-string conversion at 4300 digits by default, so a cell
+# can be nothing but ASCII digits and still refuse to convert. No other
+# generator in this suite draws strings that long, so the boundary is drawn
+# explicitly: the last accepted lengths, the first rejected ones, and a few
+# thousand digits past the cap.
+_DIGIT_LIMIT = sys.get_int_max_str_digits()
+_CONVERTIBLE_LENGTHS = st.sampled_from([_DIGIT_LIMIT - 1, _DIGIT_LIMIT])
+_UNCONVERTIBLE_LENGTHS = st.sampled_from(
+    [_DIGIT_LIMIT + 1, _DIGIT_LIMIT + 2, _DIGIT_LIMIT + 3000]
+)
+
+
+@settings(max_examples=10, deadline=None)
+@given(
+    length=_CONVERTIBLE_LENGTHS,
+    minutes=st.integers(min_value=0, max_value=59),
+    seconds=st.integers(min_value=0, max_value=59),
+)
+def test_parse_gtfs_time_accepts_hours_up_to_the_digit_limit(
+    length: int, minutes: int, seconds: int
+) -> None:
+    """Hours are unbounded in GTFS, so an hour spelled right up to the
+    conversion cap is still a time: the cap is where "ASCII digits" stops
+    meaning "a number", not an hour ceiling moved into the parser.
+    """
+    hours = int("1" * length)
+    assert (
+        parse_gtfs_time(f"{hours}:{minutes:02d}:{seconds:02d}")
+        == hours * 3600 + minutes * 60 + seconds
+    )
+
+
+@settings(max_examples=10, deadline=None)
+@given(length=_UNCONVERTIBLE_LENGTHS, position=st.integers(min_value=0, max_value=2))
+def test_parse_gtfs_time_rejects_components_past_the_digit_limit(
+    length: int, position: int
+) -> None:
+    """Past the cap, any component is rejected the way every other
+    unparseable component is -- FeedParseError, never the raw ValueError
+    int() raises (which callers catching FeedParseError would miss).
+    """
+    cells = ["00", "00", "00"]
+    cells[position] = "1" * length
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(":".join(cells))
+
+
+@settings(max_examples=10, deadline=None)
+@given(length=st.one_of(_CONVERTIBLE_LENGTHS, _UNCONVERTIBLE_LENGTHS))
+def test_lenient_helpers_answer_none_across_the_digit_limit(length: int) -> None:
+    """The lenient helpers answer, never raise, on both sides of the cap:
+    _lenient_int keeps a convertible digit string and degrades the rest to
+    None, and _lenient_date rejects every one of them on length alone (which
+    is why it needs no conversion guard of its own).
+    """
+    cell = "1" * length
+    expected = int(cell) if length <= _DIGIT_LIMIT else None
+    assert _lenient_int(cell) == expected
+    assert _lenient_date(cell) is None
 
 
 @given(
@@ -1351,6 +1499,15 @@ def test_upcoming_trips_nonvacuity_rate() -> None:
 _INT_CELL = st.one_of(
     st.integers(min_value=-5, max_value=12).map(str),
     st.sampled_from(["", " ", "x", "1.5", "abc", "999999999999", "--"]),
+    # Spellings a bare int() used to accept, turning a corrupt cell into a
+    # plausible vocabulary value: unicode decimals, sign prefixes and
+    # PEP 515 underscore grouping are all garbage (-> None).
+    st.sampled_from(["\u0665", "\uff11\uff12", "+1", "1_0"]),
+    # Past CPython's int-string conversion cap: all ASCII digits, and still
+    # not a number. Only lengths past the cap are drawn here -- a
+    # convertible 4300-digit int is outside SQLite's INTEGER range, which is
+    # a storage limit rather than a parsing rule.
+    _UNCONVERTIBLE_LENGTHS.map(lambda length: "1" * length),
 )
 # Text-column cells: empty (-> None) or CSV-safe text kept verbatim
 # (including whitespace-only and digit-only values).
@@ -1362,18 +1519,36 @@ _TEXT_CELL = st.one_of(
         max_size=8,
     ),
 )
+# Text values whose CSV encoding needs quoting or quote-doubling. Written
+# through a real csv.writer below, so the loader's reader has to unquote
+# them to recover the value verbatim.
+_FRAMED_TEXT_CELL = st.one_of(
+    _TEXT_CELL,
+    # No bare \r: the loader's TextIOWrapper applies universal-newline
+    # translation inside quoted fields too, which is a reader artifact
+    # rather than a parsing rule worth pinning.
+    st.sampled_from(["a,b", ",", 'x"y', '"q"', "a\nb", "a\tb"]),
+)
+
+
+def _csv_row(*values: str) -> str:
+    """Encode one CSV data row, quoting exactly as a producer's writer would."""
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerow(values)
+    return buf.getvalue()
 
 
 def _expected_lenient_int(cell: str) -> int | None:
-    """Oracle for descriptive int cells: blank/garbage -> None, parseable
-    ints kept as-is (even outside every vocabulary)."""
+    """Oracle for descriptive int cells: a cell of nothing but ASCII digits
+    is that int (even outside every vocabulary); anything else -- blank,
+    signed, unicode-digit, underscore-grouped, past the int-string
+    conversion cap, garbage -- is None."""
     cell = cell.strip()
-    if not cell:
+    if not cell or not (cell.isascii() and cell.isdigit()):
         return None
-    try:
-        return int(cell)
-    except ValueError:
+    if len(cell) > _DIGIT_LIMIT:
         return None
+    return int(cell)
 
 
 def _expected_enum(enum_cls: type[IntEnum], cell: str) -> IntEnum | None:
@@ -1416,21 +1591,21 @@ _DESCRIPTIVE_ROW_CELLS = st.fixed_dictionaries(
         "pickup_type": _INT_CELL,
         "drop_off_type": _INT_CELL,
         "timepoint": _INT_CELL,
-        "stop_code": _TEXT_CELL,
-        "platform_code": _TEXT_CELL,
-        "stop_headsign": _TEXT_CELL,
-        "agency_id": _TEXT_CELL,
-        "route_color": _TEXT_CELL,
-        "route_text_color": _TEXT_CELL,
-        "route_url": _TEXT_CELL,
-        "stop_desc": _TEXT_CELL,
-        "stop_url": _TEXT_CELL,
-        "zone_id": _TEXT_CELL,
-        "stop_timezone": _TEXT_CELL,
-        "route_desc": _TEXT_CELL,
+        "stop_code": _FRAMED_TEXT_CELL,
+        "platform_code": _FRAMED_TEXT_CELL,
+        "stop_headsign": _FRAMED_TEXT_CELL,
+        "agency_id": _FRAMED_TEXT_CELL,
+        "route_color": _FRAMED_TEXT_CELL,
+        "route_text_color": _FRAMED_TEXT_CELL,
+        "route_url": _FRAMED_TEXT_CELL,
+        "stop_desc": _FRAMED_TEXT_CELL,
+        "stop_url": _FRAMED_TEXT_CELL,
+        "zone_id": _FRAMED_TEXT_CELL,
+        "stop_timezone": _FRAMED_TEXT_CELL,
+        "route_desc": _FRAMED_TEXT_CELL,
         "route_sort_order": _INT_CELL,
-        "trip_short_name": _TEXT_CELL,
-        "block_id": _TEXT_CELL,
+        "trip_short_name": _FRAMED_TEXT_CELL,
+        "block_id": _FRAMED_TEXT_CELL,
     }
 )
 
@@ -1450,33 +1625,68 @@ def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) 
         "stops.txt": (
             "stop_id,stop_name,stop_lat,stop_lon,stop_code,platform_code,"
             "wheelchair_boarding,stop_desc,stop_url,zone_id,stop_timezone\n"
-            f"S1,A,0,0,{cells['stop_code']},{cells['platform_code']},"
-            f"{cells['wheelchair_boarding']},{cells['stop_desc']},"
-            f"{cells['stop_url']},{cells['zone_id']},{cells['stop_timezone']}\n"
-            "S2,B,0,0,,,,,,,\n"
+            + _csv_row(
+                "S1",
+                "A",
+                "0",
+                "0",
+                cells["stop_code"],
+                cells["platform_code"],
+                cells["wheelchair_boarding"],
+                cells["stop_desc"],
+                cells["stop_url"],
+                cells["zone_id"],
+                cells["stop_timezone"],
+            )
+            + "S2,B,0,0,,,,,,,\n"
         ),
         "routes.txt": (
             "route_id,route_short_name,route_long_name,route_type,agency_id,"
             "route_color,route_text_color,route_url,route_desc,"
             "route_sort_order\n"
-            f"R1,1,Line,3,{cells['agency_id']},{cells['route_color']},"
-            f"{cells['route_text_color']},{cells['route_url']},"
-            f"{cells['route_desc']},{cells['route_sort_order']}\n"
+            + _csv_row(
+                "R1",
+                "1",
+                "Line",
+                "3",
+                cells["agency_id"],
+                cells["route_color"],
+                cells["route_text_color"],
+                cells["route_url"],
+                cells["route_desc"],
+                cells["route_sort_order"],
+            )
         ),
         "trips.txt": (
             "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible,"
             "bikes_allowed,direction_id,trip_short_name,block_id\n"
-            f"R1,ONE,T1,H,{cells['wheelchair_accessible']},"
-            f"{cells['bikes_allowed']},{cells['direction_id']},"
-            f"{cells['trip_short_name']},{cells['block_id']}\n"
+            + _csv_row(
+                "R1",
+                "ONE",
+                "T1",
+                "H",
+                cells["wheelchair_accessible"],
+                cells["bikes_allowed"],
+                cells["direction_id"],
+                cells["trip_short_name"],
+                cells["block_id"],
+            )
         ),
         "stop_times.txt": (
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
             "pickup_type,drop_off_type,timepoint,stop_headsign\n"
-            f"T1,08:00:00,08:00:00,S1,1,{cells['pickup_type']},"
-            f"{cells['drop_off_type']},{cells['timepoint']},"
-            f"{cells['stop_headsign']}\n"
-            "T1,08:10:00,08:10:00,S2,2,,,,\n"
+            + _csv_row(
+                "T1",
+                "08:00:00",
+                "08:00:00",
+                "S1",
+                "1",
+                cells["pickup_type"],
+                cells["drop_off_type"],
+                cells["timepoint"],
+                cells["stop_headsign"],
+            )
+            + "T1,08:10:00,08:10:00,S2,2,,,,\n"
         ),
         "calendar.txt": _ONE_DAY_CALENDAR,
     }
@@ -1595,8 +1805,16 @@ _DATE_CELL = st.one_of(
             "20261332",
             "00000000",
             "20260230",
+            # Eight characters that str.isdigit() accepts but a GTFS date
+            # can never contain -- the only cells the isascii() guard
+            # exists for, and the shape int() would have happily parsed.
+            "\uff12\uff10\uff12\uff16\uff10\uff17\uff13\uff10",
+            "2026\u0660\u0667\u0663\u0660",
         ]
     ),
+    # Past the int-string conversion cap: _lenient_date's length check
+    # rejects it before any conversion is attempted.
+    _UNCONVERTIBLE_LENGTHS.map(lambda length: "1" * length),
 )
 
 
@@ -1614,10 +1832,10 @@ def _expected_lenient_date(cell: str) -> date | None:
 
 _FEED_INFO_CELLS = st.fixed_dictionaries(
     {
-        "publisher_name": _TEXT_CELL,
-        "publisher_url": _TEXT_CELL,
-        "lang": _TEXT_CELL,
-        "version": _TEXT_CELL,
+        "publisher_name": _FRAMED_TEXT_CELL,
+        "publisher_url": _FRAMED_TEXT_CELL,
+        "lang": _FRAMED_TEXT_CELL,
+        "version": _FRAMED_TEXT_CELL,
         "start": _DATE_CELL,
         "end": _DATE_CELL,
     }
@@ -1647,8 +1865,14 @@ def test_feed_info_cells_parse_total_and_map_per_rules(cells: dict[str, str]) ->
         "feed_info.txt": (
             "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
             "feed_start_date,feed_end_date\n"
-            f"{cells['publisher_name']},{cells['publisher_url']},"
-            f"{cells['lang']},{cells['version']},{cells['start']},{cells['end']}\n"
+            + _csv_row(
+                cells["publisher_name"],
+                cells["publisher_url"],
+                cells["lang"],
+                cells["version"],
+                cells["start"],
+                cells["end"],
+            )
         ),
     }
     index = _build_index_from_files(files)  # totality: must never raise
@@ -1661,6 +1885,47 @@ def test_feed_info_cells_parse_total_and_map_per_rules(cells: dict[str, str]) ->
             start_date=_expected_lenient_date(cells["start"]),
             end_date=_expected_lenient_date(cells["end"]),
         )
+    finally:
+        index.close()
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        "\uff12\uff10\uff12\uff16\uff10\uff17\uff13\uff10",
+        "2026\u0660\u0667\u0663\u0660",
+    ],
+)
+def test_unicode_digit_feed_info_dates_are_none(cell: str) -> None:
+    """Asserted against the INTENDED rule, not the oracle restatement: these
+    cells are eight characters that str.isdigit() accepts, so only the
+    ASCII guard rejects them. A GTFS date is ASCII, so the answer is None.
+    """
+    assert len(cell) == 8 and cell.isdigit() and not cell.isascii()
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,A,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\nR1,ONE,T1,H\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T1,08:00:00,08:00:00,S1,1\n"
+        ),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+        "feed_info.txt": (
+            "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
+            "feed_start_date,feed_end_date\n"
+            + _csv_row("P", "https://e.com", "en", "1", cell, cell)
+        ),
+    }
+    index = _build_index_from_files(files)
+    try:
+        info = index.feed_info()
+        assert info is not None
+        assert info.start_date is None
+        assert info.end_date is None
     finally:
         index.close()
 
