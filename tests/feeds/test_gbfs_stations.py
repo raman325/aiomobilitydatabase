@@ -386,6 +386,11 @@ async def test_get_stations_total_over_malformed_envelopes(
         pytest.param({"bike": 4}, None, id="object-not-a-list"),
         pytest.param("bike", None, id="string"),
         pytest.param([], None, id="empty"),
+        pytest.param(
+            [{"vehicle_type_id": "bike", "count": 2}, "not-a-dict", None, 7],
+            {"bike": 2},
+            id="list-with-non-mapping-entries",
+        ),
     ],
 )
 async def test_vehicle_types_available_shapes(
