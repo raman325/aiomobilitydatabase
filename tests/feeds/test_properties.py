@@ -4,6 +4,7 @@ import asyncio
 import csv
 import io
 import math
+import sqlite3
 import tempfile
 import zipfile
 from datetime import UTC, date, datetime, time, timedelta
@@ -2094,22 +2095,65 @@ def test_purge_cache_removes_only_the_named_feed(
     assert survivors >= {name for name in siblings if name != Path(drawn).name}
 
 
+# Values that are stored happily by the TEXT NOT NULL meta column but are
+# not usable ZoneInfo keys. The blob arm survives TEXT affinity as bytes,
+# so open_cached sees a non-string timezone.
+def _is_unusable_timezone(value: str | bytes) -> bool:
+    try:
+        ZoneInfo(value)  # type: ignore[arg-type]
+    except (KeyError, TypeError, ValueError):  # ZoneInfoNotFoundError is a KeyError
+        return True
+    return False
+
+
+_BAD_TIMEZONES = st.one_of(
+    st.sampled_from(
+        ["", " ", ".", "..", "/", "/UTC", "../escape", "Not/A/Zone", "123"]
+    ),
+    st.text(max_size=12),
+    st.binary(min_size=1, max_size=8),
+).filter(_is_unusable_timezone)
+
+
+def _open_fd_count(path: Path) -> int:
+    """Open descriptors in this process pointing at path (0 without /proc)."""
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        return 0
+    target = str(path)
+    count = 0
+    for entry in fd_dir.iterdir():
+        try:
+            link = str(entry.readlink())
+        except OSError:
+            continue  # fd closed while scanning
+        count += link == target
+    return count
+
+
 @given(
     payload=st.binary(max_size=64),
-    kind=st.sampled_from(["bytes", "valid", "directory", "missing_parent"]),
+    kind=st.sampled_from(
+        ["bytes", "valid", "directory", "missing_parent", "bad_timezone"]
+    ),
+    bad_timezone=_BAD_TIMEZONES,
 )
 @settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_open_cached_is_total_over_cache_path_contents(
-    payload: bytes, kind: str
+    payload: bytes, kind: str, bad_timezone: str | bytes
 ) -> None:
     """open_cached returns an index or None for anything at db_path, never
-    raises, and the index it returns carries the requested dataset id.
+    raises, and the index it returns carries the requested dataset id. A
+    cache whose only defect is unusable timezone metadata is structurally
+    valid down to StaticIndex.__init__, so it exercises the deepest layer
+    the rebuild-on-None contract has to cover; a rejected cache must not
+    leave the connection it opened behind.
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
         db_path = Path(tmp_dir) / "static.db"
         if kind == "bytes":
             db_path.write_bytes(payload)
-        elif kind == "valid":
+        elif kind in {"valid", "bad_timezone"}:
             zip_path = Path(tmp_dir) / "feed.zip"
             zip_path.write_bytes(build_gtfs_zip_bytes())
             StaticIndex.build(zip_path, str(db_path), "ds-cache", None).close()
@@ -2117,9 +2161,17 @@ def test_open_cached_is_total_over_cache_path_contents(
             db_path.mkdir()
         else:
             db_path = Path(tmp_dir) / "gone" / "static.db"
+        if kind == "bad_timezone":
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'timezone'", (bad_timezone,)
+                )
+            conn.close()
+        fds_before = _open_fd_count(db_path)
         index = StaticIndex.open_cached(db_path, "ds-cache")
         event(f"open_cached({kind}) -> {'index' if index is not None else 'None'}")
         if index is None:
+            assert _open_fd_count(db_path) == fds_before  # no leaked connection
             return
         try:
             assert kind == "valid"  # only a real cached DB may open

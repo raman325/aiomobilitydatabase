@@ -17,7 +17,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
 from typing import IO, Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .exceptions import FeedParseError
 from .models import (
@@ -406,6 +406,7 @@ class StaticIndex:
         a feed instead of letting a corrupt entry self-heal. Non-regular
         files (a directory, a FIFO) are rejected before connecting --
         sqlite3.connect itself raises on those, outside any query guard.
+        Every failure path closes the connection it opened.
         """
         if not Path(db_path).is_file():
             return None
@@ -425,7 +426,15 @@ class StaticIndex:
         ):
             conn.close()
             return None
-        return cls(conn, dataset_id, meta["timezone"])
+        try:
+            return cls(conn, dataset_id, meta["timezone"])
+        except (ZoneInfoNotFoundError, TypeError, ValueError):
+            # Unusable cached timezone metadata (unknown key, empty, or a
+            # non-string the column's TEXT affinity left as a blob) is a
+            # cache miss like any other corruption: ZoneInfo raises in
+            # __init__, one layer below the guards above.
+            conn.close()
+            return None
 
     @staticmethod
     def _timezone_from_agency(archive: zipfile.ZipFile, names: set[str]) -> str | None:
