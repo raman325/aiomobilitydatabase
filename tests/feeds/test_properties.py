@@ -4,6 +4,7 @@ import asyncio
 import csv
 import io
 import math
+import sqlite3
 import sys
 import tempfile
 import zipfile
@@ -2149,21 +2150,54 @@ def test_exactly_one_first_and_one_last_per_service_day_pair(
         index.close()
 
 
-@given(zip_bytes=_random_gtfs_zip(), data=st.data())
-@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_cache_roundtrip_equivalent(zip_bytes: bytes, data: st.DataObject) -> None:
-    """A reopened cached index answers every query identically to the builder."""
+def _with_agency_timezone(zip_bytes: bytes, tz_name: str) -> bytes:
+    """Re-emit a generated feed carrying ``tz_name`` in agency.txt.
+
+    ``_random_gtfs_zip`` hard-codes UTC and is shared with other
+    properties, so the cache roundtrip substitutes the timezone here
+    instead of widening the generator.
+    """
+    buf = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(zip_bytes)) as src,
+        zipfile.ZipFile(buf, "w") as dst,
+    ):
+        for name in src.namelist():
+            content = src.read(name)
+            if name == "agency.txt":
+                content = (
+                    "agency_id,agency_name,agency_url,agency_timezone\n"
+                    f"A1,T,https://e.com,{tz_name}\n"
+                ).encode()
+            dst.writestr(name, content)
+    return buf.getvalue()
+
+
+@given(zip_bytes=_random_gtfs_zip(), tz_name=st.sampled_from(TIMEZONES), data=st.data())
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_cache_roundtrip_equivalent(
+    zip_bytes: bytes, tz_name: str, data: st.DataObject
+) -> None:
+    """A reopened cached index answers every query identically to the builder.
+
+    The stored timezone is the DB's most important piece of non-table
+    state and is drawn rather than fixed: with a hard-coded UTC feed, an
+    index that failed to persist it and defaulted to UTC would still pass.
+    """
     with tempfile.TemporaryDirectory() as tmp_dir:
         zip_path = Path(tmp_dir) / "feed.zip"
-        zip_path.write_bytes(zip_bytes)
+        zip_path.write_bytes(_with_agency_timezone(zip_bytes, tz_name))
         db_path = Path(tmp_dir) / "static.db"
         try:
             built = StaticIndex.build(zip_path, str(db_path), "ds-rt", None)
         except FeedParseError:
             return
         try:
+            assert built.timezone_name == tz_name
             baseline_stops = built.stops()
             baseline_routes = built.routes()
+            baseline_agencies = built.agencies()
+            baseline_feed_info = built.feed_info()
             stops = [s.id for s in baseline_stops]
             queried = (
                 data.draw(
@@ -2174,23 +2208,242 @@ def test_cache_roundtrip_equivalent(zip_bytes: bytes, data: st.DataObject) -> No
                 if stops
                 else ["none"]
             )
+            origin, destination = queried[0], queried[-1]
             now = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
             baseline_deps = built.upcoming_departures(
                 queried, None, now, timedelta(hours=30), 5
+            )
+            baseline_trips = built.upcoming_trips(
+                origin, destination, now, timedelta(hours=30), 5
             )
         finally:
             built.close()
         reopened = StaticIndex.open_cached(db_path, "ds-rt")
         assert reopened is not None
         try:
+            assert reopened.timezone_name == tz_name
             assert reopened.stops() == baseline_stops
             assert reopened.routes() == baseline_routes
+            assert reopened.agencies() == baseline_agencies
+            assert reopened.feed_info() == baseline_feed_info
             assert (
                 reopened.upcoming_departures(queried, None, now, timedelta(hours=30), 5)
                 == baseline_deps
             )
+            assert (
+                reopened.upcoming_trips(
+                    origin, destination, now, timedelta(hours=30), 5
+                )
+                == baseline_trips
+            )
         finally:
             reopened.close()
+
+
+# Degenerate, traversal, separator, unicode and percent-encoded feed ids.
+# Every arm stays inside the per-example sandbox and absolute ids are
+# filtered out of the free-text arms, so even a broken containment guard
+# could only damage the sandbox. Root-like ids ("/" and friends) are too
+# destructive to hand to a real rmtree and are covered instead by
+# test_purge_cache_rejects_root_like_feed_ids, which stubs rmtree out.
+_HOSTILE_FEED_IDS = [
+    "",
+    " ",
+    ".",
+    "./",
+    "..",
+    "../",
+    "../victim",
+    "..\\victim",
+    "mdb-100",
+    "mdb-100/",
+    "./mdb-100",
+    "mdb-100/..",
+    "mdb-100/nested",
+    "nested/mdb-100",
+    "a/../b",
+    "..//..",
+    "%2e%2e",
+    "%2e%2e%2f",
+    "..%2fvictim",
+    "\u002e\u002e",
+    "\uff0e\uff0e",  # fullwidth full stops
+    "mdb\u2011100",  # non-breaking hyphen
+    "\x00",
+]
+
+
+@given(
+    feed_id=st.one_of(
+        st.sampled_from(_HOSTILE_FEED_IDS),
+        st.text(max_size=12),
+        st.text(alphabet=st.characters(categories=["L", "N", "P", "Zs"]), max_size=12),
+    ).filter(lambda drawn: not drawn.startswith("/")),
+    # Each arm but "drawn" is built from the sandbox inside the test, so
+    # the generator cannot name a path outside it.
+    arm=st.sampled_from(
+        [
+            "drawn",
+            "absolute_outside",
+            "absolute_child",
+            "absolute_dot_child",
+            "traversal_to_child",
+            "separator_to_child",
+            "symlink_to_child",
+        ]
+    ),
+)
+@settings(
+    max_examples=200,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+def test_purge_cache_removes_only_the_named_feed(
+    tmp_path: Path, feed_id: str, arm: str
+) -> None:
+    """purge_cache either removes exactly ``cache_dir/<feed_id>`` or raises
+    ValueError, never touches another entry under cache_dir, and is
+    idempotent. This is the property that would have caught
+    ``purge_cache("")`` deleting the whole cache root.
+    """
+    sandbox = Path(tempfile.mkdtemp(dir=tmp_path))
+    root = sandbox / "cache"
+    root.mkdir()
+    siblings = ("mdb-100", "mdb-200", "url-abcdef0123456789")
+    for name in siblings:
+        (root / name).mkdir()
+        (root / name / "static.db").write_bytes(b"x")
+    (root / "sentinel").write_bytes(b"s")
+    victim = sandbox / "victim"
+    victim.mkdir()
+    (victim / "data").write_bytes(b"precious")
+    if arm == "symlink_to_child":
+        (root / "evil").symlink_to(root / "mdb-200", target_is_directory=True)
+    drawn = {
+        "drawn": feed_id,
+        "absolute_outside": str(victim / "data"),
+        "absolute_child": str(root / "mdb-200"),
+        "absolute_dot_child": str(root / "." / "mdb-200"),
+        "traversal_to_child": "mdb-100/../mdb-200",
+        "separator_to_child": "mdb-100/nested/../../mdb-200",
+        "symlink_to_child": "evil",
+    }[arm]
+    # Absolute ids are only ever built from the sandbox, keeping the
+    # generator incapable of naming anything outside tmp_path.
+    assert not Path(drawn.replace("\x00", "")).is_absolute() or drawn.startswith(
+        str(tmp_path)
+    )
+
+    async def scenario() -> bool:
+        async with MobilityFeedsClient(cache_dir=root) as client:
+            try:
+                await client.purge_cache(drawn)
+            except ValueError:
+                return True
+            await client.purge_cache(drawn)  # idempotent: same effect as once
+            return False
+
+    rejected = asyncio.run(scenario())
+    event(f"purge_cache rejected={rejected}")
+    # Only a bare child name is in contract; every constructed arm reaches
+    # a feed (or a path outside the cache) by a spelling purge_cache must
+    # refuse, so it has to raise rather than purge whatever it resolves to.
+    assert rejected or arm == "drawn"
+    assert (root / "sentinel").read_bytes() == b"s"
+    assert (victim / "data").read_bytes() == b"precious"
+    survivors = {name for name in siblings if (root / name / "static.db").is_file()}
+    if rejected:
+        assert survivors == set(siblings)
+        return
+    assert not (root / drawn).exists()
+    assert len(survivors) >= len(siblings) - 1
+    assert survivors >= {name for name in siblings if name != Path(drawn).name}
+
+
+# Values that are stored happily by the TEXT NOT NULL meta column but are
+# not usable ZoneInfo keys. The blob arm survives TEXT affinity as bytes,
+# so open_cached sees a non-string timezone.
+def _is_unusable_timezone(value: str | bytes) -> bool:
+    try:
+        ZoneInfo(value)  # type: ignore[arg-type]
+    except (KeyError, TypeError, ValueError):  # ZoneInfoNotFoundError is a KeyError
+        return True
+    return False
+
+
+_BAD_TIMEZONES = st.one_of(
+    st.sampled_from(
+        ["", " ", ".", "..", "/", "/UTC", "../escape", "Not/A/Zone", "123"]
+    ),
+    st.text(max_size=12),
+    st.binary(min_size=1, max_size=8),
+).filter(_is_unusable_timezone)
+
+
+def _open_fd_count(path: Path) -> int:
+    """Open descriptors in this process pointing at path (0 without /proc)."""
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        return 0
+    target = str(path)
+    count = 0
+    for entry in fd_dir.iterdir():
+        try:
+            link = str(entry.readlink())
+        except OSError:
+            continue  # fd closed while scanning
+        count += link == target
+    return count
+
+
+@given(
+    payload=st.binary(max_size=64),
+    kind=st.sampled_from(
+        ["bytes", "valid", "directory", "missing_parent", "bad_timezone"]
+    ),
+    bad_timezone=_BAD_TIMEZONES,
+)
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_open_cached_is_total_over_cache_path_contents(
+    payload: bytes, kind: str, bad_timezone: str | bytes
+) -> None:
+    """open_cached returns an index or None for anything at db_path, never
+    raises, and the index it returns carries the requested dataset id. A
+    cache whose only defect is unusable timezone metadata is structurally
+    valid down to StaticIndex.__init__, so it exercises the deepest layer
+    the rebuild-on-None contract has to cover; a rejected cache must not
+    leave the connection it opened behind.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "static.db"
+        if kind == "bytes":
+            db_path.write_bytes(payload)
+        elif kind in {"valid", "bad_timezone"}:
+            zip_path = Path(tmp_dir) / "feed.zip"
+            zip_path.write_bytes(build_gtfs_zip_bytes())
+            StaticIndex.build(zip_path, str(db_path), "ds-cache", None).close()
+        elif kind == "directory":
+            db_path.mkdir()
+        else:
+            db_path = Path(tmp_dir) / "gone" / "static.db"
+        if kind == "bad_timezone":
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'timezone'", (bad_timezone,)
+                )
+            conn.close()
+        fds_before = _open_fd_count(db_path)
+        index = StaticIndex.open_cached(db_path, "ds-cache")
+        event(f"open_cached({kind}) -> {'index' if index is not None else 'None'}")
+        if index is None:
+            assert _open_fd_count(db_path) == fds_before  # no leaked connection
+            return
+        try:
+            assert kind == "valid"  # only a real cached DB may open
+            assert index.dataset_id == "ds-cache"
+            assert index.stops()
+        finally:
+            index.close()
 
 
 @given(zip_bytes=_random_gtfs_zip(), data=st.data())

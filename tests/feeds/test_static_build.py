@@ -1,6 +1,8 @@
 """Tests for SQLite index build and cache-open."""
 
 import io
+import os
+import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -493,3 +495,82 @@ def test_lenient_date_oversized_digits_is_none() -> None:
     rejects an oversized cell before any int() runs.
     """
     assert _lenient_date(_OVERSIZED_DIGITS) is None
+def test_open_cached_directory_at_db_path_returns_none(tmp_path: Path) -> None:
+    """A directory where the cached DB should be is a cache miss, not a
+    crash: the caller rebuilds on None but lets exceptions propagate, so a
+    raising open_cached would brick the feed permanently.
+    """
+    db_path = tmp_path / "static.db"
+    db_path.mkdir()
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_open_cached_non_regular_file_returns_none(tmp_path: Path) -> None:
+    db_path = tmp_path / "static.db"
+    os.mkfifo(db_path)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_open_cached_empty_file_returns_none(tmp_path: Path) -> None:
+    db_path = tmp_path / "static.db"
+    db_path.write_bytes(b"")
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_open_cached_missing_parent_returns_none(tmp_path: Path) -> None:
+    assert StaticIndex.open_cached(tmp_path / "gone" / "static.db", DATASET) is None
+
+
+def _open_db_fd_count(db_path: Path) -> int:
+    """Number of this process's open file descriptors pointing at db_path."""
+    target = str(db_path)
+    count = 0
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            link = os.readlink(f"/proc/self/fd/{name}")
+        except OSError:
+            continue  # fd closed while scanning (e.g. listdir's own handle)
+        count += link == target
+    return count
+
+
+@pytest.mark.parametrize(
+    "bad_timezone",
+    [
+        pytest.param("Not/A/Zone", id="unknown-key"),
+        pytest.param("", id="empty"),
+        pytest.param("123", id="numeric"),
+        pytest.param("/absolute", id="absolute"),
+        pytest.param("../escape", id="traversal"),
+        pytest.param(b"\x00\x01", id="blob"),
+    ],
+)
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="needs /proc to count open fds"
+)
+def test_open_cached_invalid_timezone_metadata_returns_none(
+    tmp_path: Path, bad_timezone: str | bytes
+) -> None:
+    """A structurally valid cache carrying an unusable timezone is a cache
+    miss, not a crash: ZoneInfo raises inside __init__, one layer below the
+    guards, and that would propagate out of the rebuild path. The
+    connection opened to read ``meta`` must not leak either.
+    """
+    db_path = tmp_path / "static.db"
+    StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ).close()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'timezone'", (bad_timezone,)
+        )
+    conn.close()
+    before = _open_db_fd_count(db_path)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+    assert _open_db_fd_count(db_path) == before
+
+
+def test_open_cached_truncated_database_returns_none(tmp_path: Path) -> None:
+    db_path = tmp_path / "static.db"
+    StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ).close()
+    intact = db_path.read_bytes()
+    db_path.write_bytes(intact[: len(intact) // 3])
+    assert StaticIndex.open_cached(db_path, DATASET) is None
