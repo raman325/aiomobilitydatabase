@@ -26,8 +26,11 @@ from aiomobilitydatabase.feeds.exceptions import (
 from aiomobilitydatabase.feeds.gbfs import (
     GbfsFeedHandle,
     _as_bool,
+    _coordinate,
     _endpoints_from_discovery,
     _localized,
+    _ttl_seconds,
+    _vehicle_types,
     _version_key,
 )
 from aiomobilitydatabase.feeds.geo import Circle, haversine_m, in_circle
@@ -1145,13 +1148,26 @@ _GBFS_DATA_FRAGMENTS = [
     b'{"stations":"nope"}',
     b'{"stations":[1,null,{"station_id":null}]}',
     b'{"stations":[{"station_id":"s1","lat":34.05,"lon":-118.25}]}',
+    b'{"stations":[{"station_id":"s1","lat":1' + b"0" * 400 + b',"lon":1e999}]}',
     b'{"vehicles":[{"vehicle_id":"v1","lat":"34.05","lon":-118.25}]}',
     b'{"bikes":{}}',
     b'{"feeds":"nope"}',
     b'{"en":{"feeds":[{"name":"system_information","url":"https://e.com/s"}]}}',
     b'{"system_id":null}',
 ]
-_GBFS_TTL_FRAGMENTS = [b"0", b"60", b'"60"', b'"60s"', b"{}", b"[60]", b"null", b"-1"]
+_GBFS_TTL_FRAGMENTS = [
+    b"0",
+    b"60",
+    b'"60"',
+    b'"60s"',
+    b"{}",
+    b"[60]",
+    b"null",
+    b"-1",
+    b"1e308",
+    b"1e999",
+    b"1" + b"0" * 400,
+]
 
 
 @st.composite
@@ -4201,6 +4217,18 @@ def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
     assert all(vehicle.id != "DECOY" for vehicle in via_both)
 
 
+# JSON permits an arbitrarily large integer literal and Python's json parses
+# it into an unbounded int, so a producer document can carry a number that no
+# float can represent -- float(10**400) raises OverflowError -- and "1e999"
+# parses to inf, which int() refuses in turn. 1e308 is the largest power of
+# ten that IS representable and is kept, so the boundary stays pinned.
+# The exponents stop at 400 because json.loads itself rejects an integer
+# literal over 4300 digits (CPython's int/str limit), and that ValueError is
+# already mapped to FeedParseError at the fetch boundary.
+_TOO_LARGE_FOR_FLOAT = [10**400, -(10**400)]
+_TOO_LARGE_FOR_INT = [1e309, -1e309]
+
+
 # Dictionary keys are drawn from the GBFS vocabulary, since free-form keys
 # would never spell "stations"/"lat"/"ttl" and the documents would all be
 # uniformly empty rather than adversarially mis-shaped.
@@ -4234,6 +4262,7 @@ _GBFS_JSON = st.recursive(
     st.none()
     | st.booleans()
     | st.integers(-200, 200)
+    | st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT)
     | st.floats(allow_nan=True)
     | st.sampled_from(["", "34.05", "nope", "s1", "en"])
     | st.text(max_size=6),
@@ -4245,18 +4274,39 @@ _GBFS_JSON = st.recursive(
 )
 
 
+# A row whose numeric cells are unrepresentable: _GBFS_JSON on its own
+# almost never spells one of those numbers into a "lat"/"lon"/"count" key,
+# so the coordinate and vehicle-count coercions were never handed one.
+@st.composite
+def _unrepresentable_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
+    unrepresentable = st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT)
+    return {
+        id_key: draw(st.text(min_size=1, max_size=4)),
+        "lat": draw(unrepresentable),
+        "lon": draw(unrepresentable),
+        "vehicle_types_available": [
+            {"vehicle_type_id": "v1", "count": draw(unrepresentable)}
+        ],
+    }
+
+
 # Half-valid envelopes: real rows (near the zone, so the filter has work to
 # do) mixed with junk rows. Pure _GBFS_JSON almost never spells a usable
 # document, so on its own it proves totality without proving non-vacuity.
 _MESSY_STATION_DOC = st.builds(
     lambda rows: {"stations": rows},
-    st.lists(_zone_row("station_id") | _GBFS_JSON, max_size=3),
+    st.lists(
+        _zone_row("station_id") | _unrepresentable_row("station_id") | _GBFS_JSON,
+        max_size=3,
+    ),
 )
 _MESSY_VEHICLE_DOC = st.builds(
     # Both id keys on every row: one document serves either endpoint.
     lambda rows: {"vehicles": rows, "bikes": rows},
     st.lists(
-        _zone_row("vehicle_id").map(lambda row: {**row, "bike_id": row["vehicle_id"]})
+        (_zone_row("vehicle_id") | _unrepresentable_row("vehicle_id")).map(
+            lambda row: {**row, "bike_id": row["vehicle_id"]}
+        )
         | _GBFS_JSON,
         max_size=3,
     ),
@@ -4332,3 +4382,22 @@ def test_endpoints_from_discovery_total_over_json_documents(document: object) ->
             for name, url in endpoints.items()
         )
     )
+
+
+@given(
+    number=st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT),
+    count=st.sampled_from(_TOO_LARGE_FOR_INT),
+)
+def test_numeric_helpers_treat_unrepresentable_numbers_as_unknown(
+    number: float, count: float
+) -> None:
+    """A number no float can hold is UNKNOWN, not an escaping OverflowError.
+
+    Each helper answers with what it already answers for other malformed
+    input: no coordinate, no caching, and a dropped vehicle-type count.
+    """
+    assert _coordinate(number) is None
+    assert _ttl_seconds(number) == 0.0
+    assert _vehicle_types([{"vehicle_type_id": "v1", "count": count}]) is None
+    assert _coordinate(1e308) == 1e308
+    assert _ttl_seconds(1e308) == 1e308

@@ -90,13 +90,14 @@ def _coordinate(value: Any) -> float | None:
     :func:`~.geo.in_circle` compares the value and takes its cosine, so a
     string coordinate would raise and a NaN would answer every comparison
     False; both are UNKNOWN instead. Numeric strings are accepted because
-    producers ship them.
+    producers ship them, and an integer literal too large for a float
+    (JSON allows one of any size) is UNKNOWN rather than an OverflowError.
     """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         return None
     try:
         coordinate = float(value)
-    except ValueError:
+    except (OverflowError, ValueError):
         return None
     return coordinate if math.isfinite(coordinate) else None
 
@@ -107,7 +108,8 @@ def _vehicle_types(value: Any) -> dict[str, int] | None:
     Entries without a usable type id, and counts that aren't parseable as
     an int (``int(None)`` used to raise), are dropped rather than
     coerced; an absent count is the spec's 0. Anything that isn't a list
-    with at least one usable entry is None, i.e. "not published".
+    with at least one usable entry is None, i.e. "not published". A count
+    of ``1e999`` parses as inf, which int() refuses, so it is dropped too.
     """
     if not isinstance(value, list):
         return None
@@ -118,7 +120,7 @@ def _vehicle_types(value: Any) -> dict[str, int] | None:
         type_id = _record_id(entry.get("vehicle_type_id"))
         try:
             count = int(entry.get("count", 0))
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             continue
         if type_id is not None:
             types[type_id] = count
@@ -157,13 +159,15 @@ def _ttl_seconds(value: Any) -> float:
     A ttl that isn't a usable, finite, non-negative number degrades to 0
     (no caching) like every other malformed scalar at this boundary: a
     bad cache HINT must not fail a document that otherwise parsed. Plain
-    numeric strings are accepted because producers do ship them.
+    numeric strings are accepted because producers do ship them, and an
+    integer literal too large for a float degrades like any other
+    unusable ttl.
     """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         return 0.0
     try:
         ttl = float(value)
-    except ValueError:
+    except (OverflowError, ValueError):
         return 0.0
     return ttl if math.isfinite(ttl) and ttl > 0 else 0.0
 
