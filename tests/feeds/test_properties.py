@@ -179,6 +179,85 @@ _QUERY_DATES = st.one_of(
     st.dates(min_value=date(2026, 2, 1), max_value=date(2027, 11, 30)),
     st.sampled_from(_DST_TRANSITION_DATES),
 )
+_NOW_MINUTES = st.sampled_from([0, 30, 59])
+
+
+def _utc_transitions(tz_name: str) -> tuple[datetime, ...]:
+    """Every UTC instant in the calendar range at which ``tz_name`` shifts.
+
+    Derived from zoneinfo, not tabulated, because the instant is per zone
+    and a table would silently rot: US Pacific springs forward at 10:00
+    UTC but US Eastern at 07:00, Europe/Berlin at 01:00 and
+    Australia/Sydney at 16:00, so one hardcoded instant straddles the
+    transition for at most one zone.
+    """
+    tz = ZoneInfo(tz_name)
+    minute = timedelta(minutes=1)
+    found: list[datetime] = []
+    probe = datetime.combine(CAL_START, time(0), tzinfo=UTC)
+    end = datetime.combine(CAL_END, time(0), tzinfo=UTC)
+    while probe < end:
+        following = min(probe + timedelta(days=1), end)
+        before = probe.astimezone(tz).utcoffset()
+        if before != following.astimezone(tz).utcoffset():
+            low, high = 0, int((following - probe) / minute)
+            while high - low > 1:
+                mid = (low + high) // 2
+                if (probe + mid * minute).astimezone(tz).utcoffset() == before:
+                    low = mid
+                else:
+                    high = mid
+            found.append(probe + high * minute)
+        probe = following
+    return tuple(found)
+
+
+_ZONE_TRANSITIONS = {tz_name: _utc_transitions(tz_name) for tz_name in TIMEZONES}
+_DST_ZONES = sorted(
+    tz_name for tz_name, transitions in _ZONE_TRANSITIONS.items() if transitions
+)
+# How far either side of a transition the coupled arm places ``now``.
+_STRADDLE_SPAN_S = 3 * 3600
+
+
+def _straddles_transition(tz_name: str, now: datetime) -> bool:
+    """Is ``now`` within an hour of one of ``tz_name``'s own transitions?"""
+    return any(
+        abs(now - transition) <= timedelta(hours=1)
+        for transition in _ZONE_TRANSITIONS[tz_name]
+    )
+
+
+@st.composite
+def _zone_and_now(draw: st.DrawFn) -> tuple[str, datetime]:
+    """A zone paired with a UTC ``now``, half of them near a transition.
+
+    The zone, the date and the time of day were drawn INDEPENDENTLY, so
+    ``now`` landed within an hour of that zone's own transition on only
+    0.36% of draws (146/40000) -- 0.14 expected hits across a 40-example
+    run. One arm now draws the zone, then one of THAT zone's transition
+    instants, then an offset either side of it, so ``now`` sits before, on
+    and after the transition; the other arm keeps the independent draws so
+    unremarkable instants stay covered. Measured after the change: 41%
+    of 1000 draws straddle, and 20-55% (8-22 of 40, never zero) across ten fresh
+    40-example runs, of which 12-45% also pin a window boundary ON the
+    straddling instant.
+    """
+    if draw(st.booleans()):
+        tz_name = draw(st.sampled_from(_DST_ZONES))
+        transition = draw(st.sampled_from(_ZONE_TRANSITIONS[tz_name]))
+        offset = draw(
+            st.sampled_from([-_STRADDLE_SPAN_S, -3600, -1, 0, 1, 3600])
+            | st.integers(min_value=-_STRADDLE_SPAN_S, max_value=_STRADDLE_SPAN_S)
+        )
+        return tz_name, transition + timedelta(seconds=offset)
+    tz_name = draw(st.sampled_from(TIMEZONES))
+    now = datetime.combine(
+        draw(_QUERY_DATES),
+        time(draw(st.integers(min_value=0, max_value=23)), draw(_NOW_MINUTES)),
+        tzinfo=UTC,
+    )
+    return tz_name, now
 
 
 def _boundary_dep_secs(target: datetime, tz: ZoneInfo, query_date: date) -> int:
@@ -201,8 +280,7 @@ def _boundary_dep_secs(target: datetime, tz: ZoneInfo, query_date: date) -> int:
     suppress_health_check=[HealthCheck.too_slow],
 )
 @given(
-    tz_name=st.sampled_from(TIMEZONES),
-    query_date=_QUERY_DATES,
+    zone_and_now=_zone_and_now(),
     dep_secs=st.integers(min_value=0, max_value=30 * 3600 - 1),
     lookahead_hours=st.integers(min_value=1, max_value=72),
     # Pin the departure to EXACTLY `now` or EXACTLY `now + lookahead` on a
@@ -211,25 +289,23 @@ def _boundary_dep_secs(target: datetime, tz: ZoneInfo, query_date: date) -> int:
     # tested strictly inside the window.
     pin=st.sampled_from(["none", "lower", "upper"]),
     limit=st.integers(min_value=1, max_value=3),
-    # A hardcoded 03:00 UTC `now` never lands on a US wall-clock DST
-    # transition (10:00 UTC), so the "now straddles the transition" case was
-    # unreachable despite query_date deliberately sampling transition days.
-    now_hour=st.integers(min_value=0, max_value=23),
-    now_minute=st.sampled_from([0, 30, 59]),
 )
 def test_departures_match_elapsed_seconds_oracle(
     *,
-    tz_name: str,
-    query_date: date,
+    zone_and_now: tuple[str, datetime],
     dep_secs: int,
     lookahead_hours: int,
     pin: str,
     limit: int,
-    now_hour: int,
-    now_minute: int,
 ) -> None:
+    tz_name, now = zone_and_now
+    query_date = now.date()
     tz = ZoneInfo(tz_name)
-    now = datetime.combine(query_date, time(now_hour, now_minute), tzinfo=UTC)
+    straddles = _straddles_transition(tz_name, now)
+    event(f"now straddles this zone's own transition: {straddles}")
+    event(
+        f"window boundary pinned at a straddling instant: {straddles and pin != 'none'}"
+    )
     lookahead = timedelta(hours=lookahead_hours)
     if pin == "lower":
         dep_secs = _boundary_dep_secs(now, tz, query_date)
@@ -4620,3 +4696,41 @@ def test_limits_keep_the_earliest_departures_not_the_scan_order(
         )
     finally:
         index.close()
+
+
+def test_zone_transitions_are_per_zone_and_non_empty() -> None:
+    """Guard the coupled strategy's transition table against silent rot.
+
+    _zone_and_now draws from it, so a tzdata change or a narrowed calendar
+    range that emptied it would quietly stop exercising the straddle case
+    rather than fail. The per-zone instants are the reason the table is
+    keyed by zone at all: US Pacific and US Eastern spring forward on the
+    same DATE three hours apart in UTC.
+    """
+    assert _DST_ZONES == [
+        "America/Los_Angeles",
+        "America/New_York",
+        "Australia/Sydney",
+        "Europe/Berlin",
+    ]
+    # Two transitions per year over CAL_START..CAL_END, and none where the
+    # zone does not observe DST.
+    assert [len(_ZONE_TRANSITIONS[tz_name]) for tz_name in _DST_ZONES] == [4, 4, 4, 4]
+    assert _ZONE_TRANSITIONS["UTC"] == ()
+    assert _ZONE_TRANSITIONS["Asia/Kolkata"] == ()
+    assert (
+        datetime(2026, 3, 8, 10, tzinfo=UTC) in _ZONE_TRANSITIONS["America/Los_Angeles"]
+    )
+    assert datetime(2026, 3, 8, 7, tzinfo=UTC) in _ZONE_TRANSITIONS["America/New_York"]
+    # Every derived instant is where zoneinfo's own offset changes.
+    offsets = {
+        (tz_name, transition): (
+            (transition - timedelta(minutes=1))
+            .astimezone(ZoneInfo(tz_name))
+            .utcoffset(),
+            transition.astimezone(ZoneInfo(tz_name)).utcoffset(),
+        )
+        for tz_name in _DST_ZONES
+        for transition in _ZONE_TRANSITIONS[tz_name]
+    }
+    assert all(before != after for before, after in offsets.values())
