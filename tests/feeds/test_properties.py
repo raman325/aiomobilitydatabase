@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
+from http import HTTPStatus
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -57,6 +58,8 @@ from aiomobilitydatabase.feeds.models import (
     WheelchairAccess,
 )
 from aiomobilitydatabase.feeds.rt import (
+    TripStopUpdate,
+    TripUpdateEntry,
     _epoch_to_utc,
     _first_translation,
     _trip_start_date,
@@ -1321,22 +1324,30 @@ def test_build_error_contract_on_garbage_values(
 # --- status-code totality (Task 13c): the input space is NOT finite, so prove
 # --- totality over it instead of enumerating the handled subset.
 
-_FEED_FETCH_ALLOWED = (SourceAuthenticationError, SourceConnectionError, FeedParseError)
 
+def _run_fetch_probe(status: int, body: bytes) -> str:
+    """Serve one scripted response and CLASSIFY the fetch outcome.
 
-def _run_fetch_probe(status: int, body: bytes, content_type: str) -> str:
-    """Serve one scripted response and classify the fetch outcome."""
+    A connection failure reports its status too, so the 4xx/5xx branch is
+    pinned to the response that produced it rather than just to "one of
+    our three exception types" -- which is what let the 401 and 500
+    branches be swapped without any test noticing.
+    """
 
     async def scenario() -> str:
         api = MockApi()
         await api.start()
         try:
-            api.get("/rt", status=status, body=body, content_type=content_type)
+            api.get("/rt", status=status, body=body, content_type="application/x-pb")
             async with aiohttp.ClientSession() as session:
                 try:
                     await fetch_feed_message(session, api.url("/rt"))
-                except _FEED_FETCH_ALLOWED:
-                    return "ours"
+                except SourceAuthenticationError:
+                    return "auth"
+                except SourceConnectionError as err:
+                    return f"connection:{err.status}"
+                except FeedParseError:
+                    return "parse"
                 return "success"
         finally:
             await api.stop()
@@ -1344,24 +1355,96 @@ def _run_fetch_probe(status: int, body: bytes, content_type: str) -> str:
     return asyncio.run(scenario())
 
 
+def _valid_rt_bytes() -> bytes:
+    """A serialized FeedMessage covering all three entity kinds."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = 1_784_000_000
+    vehicle = msg.entity.add()
+    vehicle.id = "v1"
+    vehicle.vehicle.trip.trip_id = "TP"
+    vehicle.vehicle.position.latitude = 34.05
+    vehicle.vehicle.position.longitude = -118.25
+    vehicle.vehicle.current_stop_sequence = 3
+    trip_update = msg.entity.add()
+    trip_update.id = "tu1"
+    trip_update.trip_update.trip.trip_id = "TP"
+    trip_update.trip_update.trip.start_date = "20260730"
+    stu = trip_update.trip_update.stop_time_update.add()
+    stu.stop_id = "S0"
+    stu.departure.delay = 120
+    alert = msg.entity.add()
+    alert.id = "a1"
+    alert.alert.informed_entity.add().route_id = "R1"
+    alert.alert.header_text.translation.add().text = "Delays"
+    return msg.SerializeToString()
+
+
+_VALID_RT_BYTES = _valid_rt_bytes()
+
+
+@st.composite
+def _rt_response_body(draw: st.DrawFn) -> tuple[str, bytes]:
+    """A response body plus its kind: arbitrary binary, a pristine
+    serialized FeedMessage, or that message with drawn bytes flipped.
+
+    Flipped-byte bodies probe the protobuf parser far harder than
+    st.binary, which is almost never even plausibly a wire message: they
+    keep the tag/length structure mostly intact, so they reach deeper
+    decode paths (truncated submessages, bogus wire types, lengths that
+    overrun) instead of failing on the first byte.
+    """
+    kind = draw(st.sampled_from(["binary", "valid", "flipped"]))
+    if kind == "binary":
+        return kind, draw(st.binary(max_size=64))
+    if kind == "valid":
+        return kind, _VALID_RT_BYTES
+    raw = bytearray(_VALID_RT_BYTES)
+    for _ in range(draw(st.integers(1, 6))):
+        raw[draw(st.integers(0, len(raw) - 1))] ^= draw(st.integers(1, 255))
+    return kind, bytes(raw)
+
+
 # 1xx statuses are excluded: aiohttp's web.Response (which the in-repo mock
 # server uses) does not support serving informational responses as a normal
 # handler return value, so status < 200 is untestable through a real HTTP
 # round-trip here. 200-599 is the servable range and is what a real producer
-# can actually send.
+# can actually send. content_type is NOT drawn: fetch_feed_message never
+# inspects it, so varying it only spent budget on an axis that provably
+# cannot change the outcome.
+# The classification claim hinges on 401/403, which a uniform draw over 400
+# values reaches ~0.5% of the time -- so the auth branch went unexercised in
+# about half of runs. Union the decision-boundary statuses in explicitly.
 @given(
-    status=st.integers(min_value=200, max_value=599),
-    body=st.binary(max_size=64),
-    content_type=st.sampled_from(
-        ["application/octet-stream", "application/json", "text/html", "text/plain"]
-    ),
+    status=st.sampled_from([200, 204, 304, 400, 401, 403, 404, 429, 500, 599])
+    | st.integers(min_value=200, max_value=599),
+    body=_rt_response_body(),
 )
-@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_rt_fetch_total_over_status_and_body(
-    status: int, body: bytes, content_type: str
+    status: int, body: tuple[str, bytes]
 ) -> None:
-    outcome = _run_fetch_probe(status, body, content_type)
-    assert outcome in ("success", "ours")  # anything else already raised out
+    """Every servable status maps to its DOCUMENTED classification: 401 and
+    403 are authentication failures, any other status at or above 400 is a
+    connection failure carrying that status, and a sub-400 response either
+    parses or raises FeedParseError -- never anything else, and never a
+    crash.
+    """
+    kind, raw = body
+    outcome = _run_fetch_probe(status, raw)
+    if status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+        assert outcome == "auth"
+    elif status >= HTTPStatus.BAD_REQUEST:
+        assert outcome == f"connection:{status}"
+    else:
+        # 204/304 carry no body on the wire, so the parser sees b"" and
+        # succeeds whatever was queued; a pristine message always parses.
+        allowed = (
+            {"success"}
+            if kind == "valid" or status in (HTTPStatus.NO_CONTENT, 304)
+            else {"success", "parse"}
+        )
+        assert outcome in allowed
 
 
 def _run_gbfs_probe(status: int, body: bytes, content_type: str) -> str:
@@ -1456,10 +1539,41 @@ def test_gbfs_document_total_over_status_and_body(
 # --- generative feed-data properties (Task 13d) ---
 
 
-@given(epoch=st.integers(min_value=0, max_value=2**63 - 1))
+# Uniform draws over 64 bits land in the representable range (below about
+# 2**31) in well under 1% of examples, so the success path needs its own
+# arm. The boundary samples straddle the 32-bit wall where
+# fromtimestamp starts raising.
+_EPOCHS = st.one_of(
+    # The field is uint64, so the domain runs to 2**64 - 1; stopping the broad
+    # arm at 2**63 - 1 left the whole upper half of the stated domain untested.
+    st.integers(min_value=0, max_value=2**64 - 1),
+    st.integers(min_value=0, max_value=2**31),
+    st.sampled_from(
+        [0, 1, 2**31 - 1, 2**31, 2**32, 2**53, 2**63 - 1, 2**63, 2**64 - 1]
+    ),
+)
+
+
+@settings(max_examples=300, deadline=None)
+@given(epoch=_EPOCHS)
 def test_epoch_to_utc_is_total(epoch: int) -> None:
+    """Any uint64 producer timestamp converts to a UTC datetime of exactly
+    that epoch, or to None when it is unrepresentable -- never a wrong
+    instant, and never a crash. ``tzinfo is not None`` alone was
+    guaranteed by the literal ``tz=UTC`` argument.
+    """
     result = _epoch_to_utc(epoch)
-    assert result is None or result.tzinfo is not None
+    event(f"representable: {result is not None}")
+    assert result is None or (result.tzinfo is not None and result.timestamp() == epoch)
+
+
+def test_epoch_to_utc_zero_is_absent() -> None:
+    """Epoch 0 is the proto2 default for an unset timestamp, so it means
+    "no timestamp" rather than 1970-01-01 -- the falsy guard the value
+    property cannot state (0 IS representable).
+    """
+    assert _epoch_to_utc(0) is None
+    assert _epoch_to_utc(1) == datetime(1970, 1, 1, 0, 0, 1, tzinfo=UTC)
 
 
 @given(
@@ -4294,7 +4408,10 @@ def _propagation_case(draw: st.DrawFn) -> dict[str, object]:
     unplaceable "ghost" STU, optional DUPLICATE trailing STU for one call
     (the last one in feed order must win), drawn feed order.
     """
-    n_stops = draw(st.integers(3, 8))
+    # Up to 14 calls: the deep-structure regime where a propagated delay
+    # has to survive many intervening stops, which an 8-stop cap never
+    # reached.
+    n_stops = draw(st.integers(3, 14))
     loop: tuple[int, int] | None = None
     if draw(st.booleans()):
         dup_at = draw(st.integers(2, n_stops - 1))
@@ -4500,7 +4617,7 @@ def _assert_prediction_matches_outcome(
         assert row.predicted_arrival is None
 
 
-@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(case=_propagation_case())
 def test_propagation_matches_piecewise_oracle(case: dict[str, object]) -> None:
     """THE load-bearing propagation property: for EVERY stop of a generated
@@ -4552,7 +4669,9 @@ def test_propagation_matches_piecewise_oracle(case: dict[str, object]) -> None:
 # straight through trip_updates_from_message + resolve_trip_predictions with
 # no server, zip build, or SQLite in the loop -- so the example budget can
 # be two orders of magnitude higher than the merged end-to-end property's.
-@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=1000, deadline=None, suppress_health_check=[HealthCheck.too_slow]
+)
 @given(case=_propagation_case())
 def test_propagation_pure_oracle_matches_resolver(case: dict[str, object]) -> None:
     n_stops: int = case["n_stops"]  # type: ignore[assignment]
@@ -4579,7 +4698,7 @@ def test_propagation_pure_oracle_matches_resolver(case: dict[str, object]) -> No
         assert prediction.arrival == outcome["arr_time"]
 
 
-@settings(max_examples=12, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     n_stops=st.integers(3, 5),
     data=st.data(),
@@ -4592,9 +4711,17 @@ def test_skipped_totality_over_arrivals_and_trips(
     kills exactly the origin->destination rows whose boarding OR alighting
     stop is skipped -- every other row, including the whole RT-untouched
     sibling trip, is unaffected.
+
+    The delay update and the SKIPPED marker are allowed to land on the
+    SAME call (S0), the case this property used to exclude: both address
+    stop S0, the SKIPPED one is emitted later, and last-wins placement
+    therefore DISCARDS the delay entirely -- so no stop of the trip is
+    realtime. That silent discard is asserted rather than avoided.
     """
     skipped = data.draw(st.sets(st.integers(0, n_stops - 1), max_size=n_stops))
-    with_delay = data.draw(st.booleans()) and 0 not in skipped
+    with_delay = data.draw(st.booleans())
+    # The S0 delay survives only when no SKIPPED marker takes its call.
+    delay_applies = with_delay and 0 not in skipped
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
     entity = msg.entity.add()
@@ -4625,13 +4752,13 @@ def test_skipped_totality_over_arrivals_and_trips(
             expected.add("TP")
         assert got == expected
         for row in rows:
-            if row.trip_id == "OTHER":
-                assert row.realtime is False
-            elif with_delay:
-                # The S0 delay propagates over the whole trip, so every
-                # surviving TP journey row is realtime with delay 240.
-                assert row.realtime is True
-                assert row.delay_seconds == 240
+            expected_delay = 240 if delay_applies and row.trip_id == "TP" else None
+            assert row.realtime is (expected_delay is not None)
+            assert row.delay_seconds == expected_delay
+    for arrival in arrivals:
+        expected_delay = 240 if delay_applies and arrival.trip_id == "TP" else None
+        assert arrival.realtime is (expected_delay is not None)
+        assert arrival.delay_seconds == expected_delay
 
 
 # --- TripDescriptor.start_date service-day matching properties ---------------
@@ -4641,15 +4768,49 @@ def test_skipped_totality_over_arrivals_and_trips(
 _GARBAGE_START_DATES = ["20261332", "2026073", "202607301", "garbage!", "00000000"]
 
 
-@given(raw=st.text(max_size=12))
+# Arms that actually REACH the date() call: eight ASCII digits is the only
+# input shape that gets past the guard, and st.text over the default
+# alphabet essentially never produces one. The Arabic-Indic arm probes the
+# ``raw.isascii() and raw.isdigit()`` ordering specifically -- isdigit() is
+# True for those code points while isascii() is False, and int() accepts
+# them, so dropping the isascii() half yields a date that cannot re-render
+# to the cell it came from.
+_ASCII_DIGITS = "0123456789"
+_ARABIC_INDIC_DIGITS = "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"
+_CALENDAR_INVALID_START_DATES = [
+    "20261332",
+    "00000000",
+    "20260230",
+    "20260100",
+    "20261301",
+]
+_START_DATE_RAW = st.one_of(
+    st.text(max_size=12),
+    st.text(alphabet=_ASCII_DIGITS, max_size=12),
+    st.text(alphabet=_ASCII_DIGITS, min_size=8, max_size=8),
+    st.text(alphabet=_ARABIC_INDIC_DIGITS, min_size=8, max_size=8),
+    st.text(alphabet=_ASCII_DIGITS + _ARABIC_INDIC_DIGITS, min_size=8, max_size=8),
+    st.sampled_from(_GARBAGE_START_DATES + _CALENDAR_INVALID_START_DATES),
+    st.dates().map(lambda day: f"{day.year:04d}{day.month:02d}{day.day:02d}"),
+)
+
+
+@settings(max_examples=500, deadline=None)
+@given(raw=_START_DATE_RAW)
 def test_trip_start_date_parse_is_total(raw: str) -> None:
     """Any producer string in start_date parses to a date or None -- never
-    raises (totality over the full unicode input space).
+    raises -- and a parsed date re-renders to EXACTLY the cell it came
+    from, so a calendar-invalid cell, a non-ASCII digit cell, or any other
+    garbage can only yield None.
     """
     trip = gtfs_realtime_pb2.TripDescriptor()
     trip.start_date = raw
     result = _trip_start_date(trip)
+    event(f"reaches date(): {len(raw) == 8 and raw.isascii() and raw.isdigit()}")
     assert result is None or isinstance(result, date)
+    assert (
+        result is None or f"{result.year:04d}{result.month:02d}{result.day:02d}" == raw
+    )
 
 
 @given(day=st.dates())
@@ -4744,15 +4905,17 @@ def _instance_day(scheduled_departure: datetime) -> date:
     return _TWO_DAY_A if scheduled_departure < _TWO_DAY_ANCHOR_B else _TWO_DAY_B
 
 
-# 40+ examples: 2 variants x 2 kinds x 4 date modes x 2 reps = 32 core
-# combos (before delay/lookahead variation); 12 examples undersampled it.
-@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+# The four discrete dimensions are PARAMETRIZED (2 variants x 2 kinds x 4
+# date modes x 2 reps = all 32 combinations run every time); sampling them
+# inside @given left about 9 combinations untouched on a typical run.
+# @given keeps the continuous dimensions.
+@pytest.mark.parametrize("variant", ["plain", "frequency"])
+@pytest.mark.parametrize("kind", ["prediction", "cancellation"])
+@pytest.mark.parametrize("date_mode", ["day_a", "day_b", "absent", "garbage"])
+@pytest.mark.parametrize("rep", [32400, 33000])
+@settings(max_examples=8, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
-    variant=st.sampled_from(["plain", "frequency"]),
-    kind=st.sampled_from(["prediction", "cancellation"]),
-    date_mode=st.sampled_from(["day_a", "day_b", "absent", "garbage"]),
-    rep=st.sampled_from([32400, 33000]),
-    delay=st.integers(-600, 1800),
+    delay=st.integers(-600, 1800) | st.just(0),
     lookahead_hours=st.integers(27, 48),
     garbage=st.sampled_from(_GARBAGE_START_DATES),
 )
@@ -4883,12 +5046,14 @@ def _short_window_message(
     return msg
 
 
-@settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+# delay=0 is unioned in explicitly: a PRESENT but zero delay must still
+# mark a row realtime, and a range strategy picks it only by luck.
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     kind=st.sampled_from(["prediction", "cancellation"]),
     absent_form=st.sampled_from(["absent", "garbage"]),
     garbage=st.sampled_from(_GARBAGE_START_DATES),
-    delay=st.integers(-600, 1800),
+    delay=st.integers(-600, 1800) | st.just(0),
 )
 def test_short_window_start_date_invariance(
     kind: str, absent_form: str, garbage: str, delay: int
@@ -5107,8 +5272,21 @@ def test_group_stations_partition_oracle(data: st.DataObject) -> None:
 _MULTI_RT_NOW = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
 
 
-def _multi_rt_message(kind: str, delay: int) -> gtfs_realtime_pb2.FeedMessage:
-    """One TU source's message about TP: a delay, a cancellation, or nothing."""
+_MULTI_RT_STOPS = ["S0", "S1", "S2"]
+
+
+def _multi_rt_message(
+    kind: str, delay: int, stop_index: int
+) -> gtfs_realtime_pb2.FeedMessage:
+    """One TU source's message about TP: a delay AT A NAMED STOP, a
+    cancellation, or nothing.
+
+    Which stop the delay addresses is what makes "wins wholesale"
+    observable: aggregation replaces the whole TripUpdateEntry, so only
+    the winning source's stop (and the stops after it, by propagation)
+    may be realtime. A field-level merge would light up every source's
+    stop at once.
+    """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
     if kind == "absent":
@@ -5122,15 +5300,16 @@ def _multi_rt_message(kind: str, delay: int) -> gtfs_realtime_pb2.FeedMessage:
         )
     else:
         stu = entity.trip_update.stop_time_update.add()
-        stu.stop_id = "S0"
+        stu.stop_id = _MULTI_RT_STOPS[stop_index]
         stu.departure.delay = delay
     return msg
 
 
 def _run_multi_rt_scenario(
-    msg_one: gtfs_realtime_pb2.FeedMessage, msg_two: gtfs_realtime_pb2.FeedMessage
+    messages: list[gtfs_realtime_pb2.FeedMessage],
 ) -> list[StopArrival]:
-    """Two scripted TU sources behind one DIRECT-URL handle."""
+    """Several scripted TU sources behind one DIRECT-URL handle, in the
+    order they are passed (which IS the handle's catalog order)."""
 
     async def scenario() -> list[StopArrival]:
         api = MockApi()
@@ -5142,23 +5321,21 @@ def _run_multi_rt_scenario(
                 body=_propagation_zip(3, 1),
                 content_type="application/zip",
             )
-            api.get(
-                "/rt/one",
-                body=msg_one.SerializeToString(),
-                content_type="application/octet-stream",
-            )
-            api.get(
-                "/rt/two",
-                body=msg_two.SerializeToString(),
-                content_type="application/octet-stream",
-            )
+            for index, message in enumerate(messages):
+                api.get(
+                    f"/rt/{index}",
+                    body=message.SerializeToString(),
+                    content_type="application/octet-stream",
+                )
             async with MobilityFeedsClient() as client:
                 handle = await client.get_transit_feed_from_urls(
                     api.url("/static.zip"),
-                    trip_updates_urls=[api.url("/rt/one"), api.url("/rt/two")],
+                    trip_updates_urls=[
+                        api.url(f"/rt/{index}") for index in range(len(messages))
+                    ],
                 )
                 [arrivals] = await handle.get_arrivals(
-                    [ArrivalsQuery(["S0", "S1", "S2"], limit=150)],
+                    [ArrivalsQuery(_MULTI_RT_STOPS, limit=150)],
                     lookahead=timedelta(hours=6),
                     now_utc=_MULTI_RT_NOW,
                 )
@@ -5169,45 +5346,59 @@ def _run_multi_rt_scenario(
     return asyncio.run(scenario())
 
 
-@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
-    kind_one=st.sampled_from(["delay", "cancel", "absent"]),
-    kind_two=st.sampled_from(["delay", "cancel", "absent"]),
-    delay_one=st.integers(-300, 900),
+    kinds=st.lists(
+        st.sampled_from(["delay", "cancel", "absent"]), min_size=2, max_size=4
+    ),
+    stop_indices=st.lists(st.integers(0, 2), min_size=4, max_size=4),
+    base_delay=st.integers(-300, 900),
     delay_gap=st.integers(1, 500),
 )
 def test_multi_rt_aggregation_last_feed_wins_and_cancellation_suppresses(
-    kind_one: str, kind_two: str, delay_one: int, delay_gap: int
+    kinds: list[str],
+    stop_indices: list[int],
+    base_delay: int,
+    delay_gap: int,
 ) -> None:
-    """Two TU-capable sources sharing the TP identity: when both carry an
-    entry, the LAST feed's delay wins wholesale (values drawn distinct so a
-    flip is observable); a cancellation in EITHER source suppresses the
-    rows end-to-end -- including the delay+cancel mix where the identity
-    sits in both ``trips`` and ``canceled_trips`` after aggregation -- and
-    the RT-untouched sibling trip is never affected.
+    """Two to four TU-capable sources sharing the TP identity: the LAST
+    source in catalog order that sent an entry wins WHOLESALE, a
+    cancellation in ANY source suppresses the rows end-to-end -- including
+    the delay+cancel mix where the identity sits in both ``trips`` and
+    ``canceled_trips`` after aggregation -- and the RT-untouched sibling
+    trip is never affected.
+
+    "Wholesale" is observable because each source addresses a drawn stop:
+    replacement predicts a delay from the winning source's stop onward and
+    leaves the earlier stops schedule-only, whereas a field-level merge
+    would surface a losing source's stop as realtime too. Delays are
+    distinct per source so a tiebreak flip can never be masked.
     """
-    delay_two = delay_one + delay_gap  # distinct by construction
+    delays = [base_delay + index * delay_gap for index in range(len(kinds))]
     arrivals = _run_multi_rt_scenario(
-        _multi_rt_message(kind_one, delay_one),
-        _multi_rt_message(kind_two, delay_two),
+        [
+            _multi_rt_message(kind, delays[index], stop_indices[index])
+            for index, kind in enumerate(kinds)
+        ]
     )
     other_rows = [row for row in arrivals if row.trip_id == "OTHER"]
-    assert {row.stop_id for row in other_rows} == {"S0", "S1", "S2"}
+    assert {row.stop_id for row in other_rows} == set(_MULTI_RT_STOPS)
     assert all(row.realtime is False for row in other_rows)
     tp_rows = [row for row in arrivals if row.trip_id == "TP"]
-    if "cancel" in (kind_one, kind_two):
+    if "cancel" in kinds:
         assert tp_rows == []  # cancellation wins over any sibling entry
         return
-    assert {row.stop_id for row in tp_rows} == {"S0", "S1", "S2"}
-    if kind_one == kind_two == "absent":
+    assert {row.stop_id for row in tp_rows} == set(_MULTI_RT_STOPS)
+    winners = [index for index, kind in enumerate(kinds) if kind == "delay"]
+    if not winners:
         assert all(row.realtime is False for row in tp_rows)
         return
-    # Exactly one or both feeds sent a delay entry: the LAST feed that sent
-    # one wins wholesale (the S0 delay propagates over the whole trip).
-    expected_delay = delay_two if kind_two == "delay" else delay_one
+    winner = winners[-1]  # last source in catalog order
+    first_affected = stop_indices[winner]
     for row in tp_rows:
-        assert row.realtime is True
-        assert row.delay_seconds == expected_delay
+        affected = _MULTI_RT_STOPS.index(row.stop_id) >= first_affected
+        assert row.realtime is affected
+        assert row.delay_seconds == (delays[winner] if affected else None)
 
 
 # --- get_arrivals route_ids filter properties --------------------------------
@@ -6291,3 +6482,389 @@ def test_zone_transitions_are_per_zone_and_non_empty() -> None:
         for transition in _ZONE_TRANSITIONS[tz_name]
     }
     assert all(before != after for before, after in offsets.values())
+
+
+# --- VehiclePosition.current_status tri-rule oracle --------------------------
+
+
+def _status_vehicle_message(
+    *,
+    status_value: int | None,
+    has_sequence: bool,
+    has_stop_id: bool,
+) -> gtfs_realtime_pb2.FeedMessage:
+    """One positioned vehicle with the drawn current_status presence lattice."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "v"
+    entity.vehicle.position.latitude = 34.05
+    entity.vehicle.position.longitude = -118.25
+    if status_value is not None:
+        entity.vehicle.current_status = status_value
+    if has_sequence:
+        entity.vehicle.current_stop_sequence = 7
+    if has_stop_id:
+        entity.vehicle.stop_id = "S0"
+    return msg
+
+
+@pytest.mark.parametrize("has_sequence", [True, False])
+@pytest.mark.parametrize("has_stop_id", [True, False])
+@settings(max_examples=40, deadline=None)
+@given(
+    status_value=st.none()
+    | st.sampled_from(
+        list(gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.values())
+    )
+)
+def test_vehicle_current_status_tri_rule_oracle(
+    has_sequence: bool, has_stop_id: bool, status_value: int | None
+) -> None:
+    """The documented three branches of the current_status rule, over the
+    WHOLE presence lattice (status set or not x sequence set or not x
+    stop_id set or not): an explicitly set status surfaces verbatim even
+    when it equals the proto2 default; an unset status surfaces as the
+    IN_TRANSIT_TO default only behind a stop referent; with neither
+    referent an unset status is None.
+
+    The None branch is the misreport the rule exists to prevent: proto2
+    gives current_status the implicit default IN_TRANSIT_TO, so a vehicle
+    that named no stop at all would otherwise read as "in transit to"
+    some stop it never identified.
+    """
+    msg = _status_vehicle_message(
+        status_value=status_value,
+        has_sequence=has_sequence,
+        has_stop_id=has_stop_id,
+    )
+    [vehicle] = vehicles_from_message(msg, route_names={}, trip_routes={})
+    if status_value is not None:
+        expected: VehicleStopStatus | None = VehicleStopStatus(
+            gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.Name(status_value)
+        )
+    elif has_sequence or has_stop_id:
+        expected = VehicleStopStatus.IN_TRANSIT_TO
+    else:
+        expected = None
+    assert vehicle.current_status is expected
+
+
+# --- unrecognized per-stop schedule_relationship -----------------------------
+
+# Relationship values that are NEITHER SKIPPED nor NO_DATA and are not
+# SCHEDULED either: UNSCHEDULED (a real member the propagation generators
+# never draw) plus out-of-vocabulary ints standing in for members the spec
+# may add later. TripStopUpdate's docstring commits to all of them
+# resolving exactly as SCHEDULED.
+_UNRECOGNIZED_RELATIONSHIPS = [
+    gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.UNSCHEDULED,
+    4,
+    7,
+    99,
+    2**31 - 1,
+]
+_RELATIONSHIP_POOL = [
+    gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SCHEDULED,
+    gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED,
+    gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA,
+    *_UNRECOGNIZED_RELATIONSHIPS,
+]
+
+
+def _draw_relationship_stu(
+    draw: st.DrawFn, position: int, relationship: int
+) -> TripStopUpdate:
+    """One stop_sequence-addressed STU at ``position`` with drawn content."""
+    delay = draw(st.none() | st.integers(-300, 900))
+    arrival = draw(
+        st.none() | st.just(_PROP_ANCHOR + timedelta(seconds=_prop_arr_secs(position)))
+    )
+    departure = draw(
+        st.none()
+        | st.just(
+            _PROP_ANCHOR + timedelta(seconds=_prop_arr_secs(position) + _PROP_DWELL)
+        )
+    )
+    return TripStopUpdate(
+        stop_id=f"S{position}",
+        stop_sequence=10 * (position + 1),
+        relationship=relationship,
+        arrival=arrival,
+        departure=departure,
+        delay_seconds=delay,
+    )
+
+
+@st.composite
+def _unrecognized_relationship_case(
+    draw: st.DrawFn,
+) -> tuple[TripUpdateEntry, list[tuple[int, str]]]:
+    """An entry whose STUs span the relationship pool, with at least one
+    STU forced to a non-SCHEDULED unrecognized value so no example is
+    vacuous.
+    """
+    n_calls = draw(st.integers(3, 8))
+    stop_calls = [(10 * (i + 1), f"S{i}") for i in range(n_calls)]
+    by_position: dict[int, TripStopUpdate] = {}
+    for position in range(n_calls):
+        if draw(st.booleans()):
+            by_position[position] = _draw_relationship_stu(
+                draw, position, draw(st.sampled_from(_RELATIONSHIP_POOL))
+            )
+    forced = draw(st.integers(0, n_calls - 1))
+    by_position[forced] = _draw_relationship_stu(
+        draw, forced, draw(st.sampled_from(_UNRECOGNIZED_RELATIONSHIPS))
+    )
+    entry = TripUpdateEntry(
+        stop_updates=tuple(by_position[pos] for pos in sorted(by_position)),
+        delay_seconds=draw(st.none() | st.integers(-300, 900)),
+        vehicle_id="V1",
+    )
+    return entry, stop_calls
+
+
+def _as_scheduled(entry: TripUpdateEntry) -> TripUpdateEntry:
+    """The same entry with every unrecognized relationship rewritten to
+    SCHEDULED (SKIPPED and NO_DATA, the only two the resolver recognizes,
+    are left alone)."""
+    recognized = (
+        gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED,
+        gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA,
+    )
+    return TripUpdateEntry(
+        stop_updates=tuple(
+            stu
+            if stu.relationship in recognized
+            else TripStopUpdate(
+                stop_id=stu.stop_id,
+                stop_sequence=stu.stop_sequence,
+                relationship=gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SCHEDULED,
+                arrival=stu.arrival,
+                departure=stu.departure,
+                delay_seconds=stu.delay_seconds,
+            )
+            for stu in entry.stop_updates
+        ),
+        delay_seconds=entry.delay_seconds,
+        vehicle_id=entry.vehicle_id,
+    )
+
+
+@settings(max_examples=300, deadline=None)
+@given(case=_unrecognized_relationship_case())
+def test_unrecognized_relationship_resolves_as_scheduled(
+    case: tuple[TripUpdateEntry, list[tuple[int, str]]],
+) -> None:
+    """Metamorphic law for TripStopUpdate's documented commitment: any
+    per-stop schedule_relationship outside {SKIPPED, NO_DATA} -- including
+    UNSCHEDULED and future/out-of-vocabulary values -- resolves EXACTLY as
+    SCHEDULED, delay propagation included. The generators behind the
+    propagation oracles only ever draw SCHEDULED/SKIPPED/NO_DATA, so this
+    documented branch had no coverage at all.
+    """
+    entry, stop_calls = case
+    assert resolve_trip_predictions(entry, stop_calls) == resolve_trip_predictions(
+        _as_scheduled(entry), stop_calls
+    )
+
+
+# --- alert scoping ------------------------------------------------------------
+
+# Drawn from a small pool so duplicates across informed entities actually
+# occur and the dedup/sort claim is exercised; "" is the producer's "field
+# absent" form and must never reach a scope list.
+_SCOPE_IDS = ["", "R1", "R2", "S1", "S2", "T1", "T2"]
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    informed=st.lists(
+        st.tuples(
+            st.sampled_from(_SCOPE_IDS),
+            st.sampled_from(_SCOPE_IDS),
+            st.sampled_from(_SCOPE_IDS),
+        ),
+        max_size=5,
+    )
+)
+def test_alert_scope_lists_are_exact_and_unscoped_iff_all_empty(
+    informed: list[tuple[str, str, str]],
+) -> None:
+    """Scoping law for alerts_from_message: each of route_ids, stop_ids and
+    trip_ids is exactly the sorted, distinct, empty-free set of ids the
+    informed entities named, and the alert is unscoped (feed-wide) if and
+    only if all three are empty.
+
+    The failure direction that matters is a scoped alert reading as
+    feed-wide -- a trip- or stop-scoped alert losing its ids shows up on
+    every entity in the feed.
+    """
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "a1"
+    entity.alert.SetInParent()
+    for route_id, stop_id, trip_id in informed:
+        target = entity.alert.informed_entity.add()
+        target.route_id = route_id
+        target.stop_id = stop_id
+        target.trip.trip_id = trip_id
+    [alert] = alerts_from_message(msg)
+    expected_routes = sorted({r for r, _, _ in informed if r})
+    expected_stops = sorted({s for _, s, _ in informed if s})
+    expected_trips = sorted({t for _, _, t in informed if t})
+    assert alert.route_ids == expected_routes
+    assert alert.stop_ids == expected_stops
+    assert alert.trip_ids == expected_trips
+    for scope in (alert.route_ids, alert.stop_ids, alert.trip_ids):
+        assert scope == sorted(set(scope))
+        assert "" not in scope
+    unscoped = not (alert.route_ids or alert.stop_ids or alert.trip_ids)
+    assert unscoped is not any(value for triple in informed for value in triple)
+
+
+@given(
+    languages=st.lists(st.sampled_from(["de", "en", "fr"]), max_size=3),
+)
+def test_first_translation_without_text_entries_is_none(
+    languages: list[str],
+) -> None:
+    """An empty ``translation`` list (and a message with no such field at
+    all) reads as "no text" rather than raising or inventing an empty
+    string -- the branch the en-else-first property never reaches because
+    it always adds at least one entry.
+    """
+    translated = gtfs_realtime_pb2.TranslatedString()
+    assert _first_translation(translated) is None
+    assert _first_translation(gtfs_realtime_pb2.FeedHeader()) is None
+    for language in languages:
+        entry = translated.translation.add()
+        entry.text = ""
+        entry.language = language
+    # Entries with empty text still COUNT as text (the producer sent a
+    # translation); only an absent list is "no text".
+    assert _first_translation(translated) == ("" if languages else None)
+
+
+# --- trip_updates_from_message laws ------------------------------------------
+
+_TU_RELATIONSHIPS = [
+    gtfs_realtime_pb2.TripDescriptor.SCHEDULED,
+    gtfs_realtime_pb2.TripDescriptor.ADDED,
+    gtfs_realtime_pb2.TripDescriptor.UNSCHEDULED,
+    gtfs_realtime_pb2.TripDescriptor.CANCELED,
+]
+
+
+def _draw_tu_entity_specs(
+    draw: st.DrawFn, *, distinct_keys: bool
+) -> list[dict[str, object]]:
+    """Draw TripUpdate entity specs over a two-id, few-date identity space.
+
+    ``distinct_keys`` gives every entity its own service day, so the
+    TripUpdateKeys are pairwise distinct by construction (what the
+    order-independence law needs); otherwise dates collide and duplicate
+    identities -- the documented last-wins exception -- occur.
+    """
+    count = draw(st.integers(1, 5))
+    return [
+        {
+            "trip_id": draw(st.sampled_from(["T0", "T1"])),
+            "start_date": (
+                f"2026080{index + 1}"
+                if distinct_keys
+                else draw(st.sampled_from(["", "20260801", "20260802"]))
+            ),
+            "relationship": draw(st.sampled_from(_TU_RELATIONSHIPS)),
+            "delay": draw(st.none() | st.integers(-300, 900)),
+            "stops": draw(st.lists(st.sampled_from(["S0", "S1", "S2"]), max_size=3)),
+        }
+        for index in range(count)
+    ]
+
+
+def _tu_message(specs: list[dict[str, object]]) -> gtfs_realtime_pb2.FeedMessage:
+    """Encode entity specs in list order."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    for index, spec in enumerate(specs):
+        entity = msg.entity.add()
+        entity.id = f"tu{index}"
+        trip = entity.trip_update.trip
+        trip.trip_id = spec["trip_id"]  # type: ignore[assignment]
+        if spec["start_date"]:
+            trip.start_date = spec["start_date"]  # type: ignore[assignment]
+        trip.schedule_relationship = spec["relationship"]  # type: ignore[assignment]
+        if spec["delay"] is not None:
+            entity.trip_update.delay = spec["delay"]  # type: ignore[assignment]
+        for stop_id in spec["stops"]:  # type: ignore[attr-defined]
+            stu = entity.trip_update.stop_time_update.add()
+            stu.stop_id = stop_id
+            stu.departure.delay = 60
+    return msg
+
+
+@settings(max_examples=200, deadline=None)
+@given(data=st.data())
+def test_trip_updates_cancellation_wins_as_an_invariant(data: st.DataObject) -> None:
+    """Cancellation-wins stated as an invariant of ANY message rather than
+    one hand-built message in two orderings: ``canceled_trips`` and
+    ``trips`` are disjoint, and no added stop time belongs to a trip id
+    that any cancellation in the message named.
+
+    Note the scope: this is the PER-MESSAGE law. An identity delayed in
+    one feed and canceled in another is reconciled only at the merge
+    layer, which the multi-RT aggregation property covers.
+    """
+    specs = _draw_tu_entity_specs(data.draw, distinct_keys=False)
+    updates = trip_updates_from_message(_tu_message(specs))
+    assert updates.canceled_trips.isdisjoint(set(updates.trips))
+    canceled_ids = {trip_id for trip_id, _, _ in updates.canceled_trips}
+    assert all(row.trip_id not in canceled_ids for row in updates.added)
+    # Exactness, so the law cannot pass on an empty parse: every drawn
+    # cancellation key is present, and every uncanceled non-ADDED entity
+    # keeps its entry.
+    expected_canceled = {
+        (spec["trip_id"], _trip_start_date_of(spec), None)
+        for spec in specs
+        if spec["relationship"] == gtfs_realtime_pb2.TripDescriptor.CANCELED
+    }
+    assert updates.canceled_trips == expected_canceled
+    expected_trips = {
+        (spec["trip_id"], _trip_start_date_of(spec), None)
+        for spec in specs
+        if spec["relationship"]
+        not in (
+            gtfs_realtime_pb2.TripDescriptor.CANCELED,
+            gtfs_realtime_pb2.TripDescriptor.ADDED,
+        )
+    }
+    assert set(updates.trips) == expected_trips - expected_canceled
+
+
+def _trip_start_date_of(spec: dict[str, object]) -> date | None:
+    cell: str = spec["start_date"]  # type: ignore[assignment]
+    return date.fromisoformat(cell) if cell else None
+
+
+@settings(max_examples=200, deadline=None)
+@given(data=st.data())
+def test_trip_updates_parse_is_entity_order_independent(data: st.DataObject) -> None:
+    """For a message whose TripUpdateKeys are pairwise distinct, parsing is
+    invariant under shuffling the entity list (``added`` rows modulo
+    order, since they are a list).
+
+    This documents where order DOES matter as the single intentional
+    exception -- duplicate keys resolve last-wins -- instead of leaving it
+    folklore. ADDED-vs-cancellation interactions are included: added rows
+    are dropped on a bare trip-id match, which a per-entity (rather than
+    post-pass) implementation would resolve order-dependently.
+    """
+    specs = _draw_tu_entity_specs(data.draw, distinct_keys=True)
+    order = data.draw(st.permutations(range(len(specs))))
+    baseline = trip_updates_from_message(_tu_message(specs))
+    shuffled = trip_updates_from_message(_tu_message([specs[i] for i in order]))
+    assert shuffled.trips == baseline.trips
+    assert shuffled.canceled_trips == baseline.canceled_trips
+    assert sorted(shuffled.added, key=repr) == sorted(baseline.added, key=repr)
