@@ -127,9 +127,13 @@ async def fetch_feed_message(
     ``auth_type`` follows the catalog's ``source_info.authentication_type``:
     1 = query parameter named ``api_key_name``; 2 = header named
     ``api_key_name``. ``headers`` (a direct-URL handle's custom headers)
-    are merged in BEFORE auth handling, so an explicit ``api_key`` always
-    wins over a same-named custom header rather than being silently
-    shadowed. Parsing runs in a thread (CPU-bound for large feeds).
+    are merged in BEFORE auth handling, so under header auth an explicit
+    ``api_key`` wins over a same-named custom header (case-insensitively:
+    the producer sees one header, under ``api_key_name``'s own casing,
+    carrying the explicit key) rather than being silently shadowed. Under
+    query auth the key never touches the headers, so a same-named custom
+    header is a different namespace and passes through untouched. Parsing
+    runs in a thread (CPU-bound for large feeds).
     """
     _require_http_url(url, "GTFS-RT producer URL")
     params: dict[str, str] = {}

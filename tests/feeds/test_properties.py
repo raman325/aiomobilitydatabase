@@ -6907,3 +6907,179 @@ def test_trip_updates_parse_is_entity_order_independent(data: st.DataObject) -> 
     assert shuffled.trips == baseline.trips
     assert shuffled.canceled_trips == baseline.canceled_trips
     assert sorted(shuffled.added, key=repr) == sorted(baseline.added, key=repr)
+
+
+# HTTP token characters only, so one name strategy is legal as a header name
+# AND awkward as a query-parameter name (&, %, + and # all need encoding).
+_RT_NAME_ALPHABET = "abXY09" + "!#$%&'*+-.^_`|~"
+# Legal header-value bytes (latin-1, no CTL) that also need URL encoding in a
+# query string. Edge whitespace is trimmed away by the composite: an HTTP
+# parser strips optional whitespace around a header value, which is transport
+# semantics rather than key placement.
+_RT_KEY_ALPHABET = "ab09" + " \t&=?#%/+:;ü"
+
+
+@st.composite
+def _rt_key_value(draw: st.DrawFn) -> str:
+    """An awkward-but-legal API key, including the empty string."""
+    return draw(st.text(alphabet=_RT_KEY_ALPHABET, min_size=0, max_size=8)).strip(" \t")
+
+
+_RT_KEY_NAME = st.one_of(
+    st.just(""),
+    st.sampled_from(["X-Api-Key", "api_key", "a%b&c", "k+1"]),
+    st.text(alphabet=_RT_NAME_ALPHABET, min_size=1, max_size=6),
+)
+
+
+@dataclass(frozen=True)
+class _RtAuthCase:
+    """One drawn configuration of the fetch_feed_message auth knobs."""
+
+    auth_type: int | None
+    api_key_name: str
+    api_key: str | None
+    headers: dict[str, str]
+    collide_name: str | None
+
+
+@dataclass(frozen=True)
+class _RtAuthWire:
+    """What the producer actually saw, with and without the auth knobs."""
+
+    query: dict[str, str]
+    headers: dict[str, str]
+    baseline_query: dict[str, str]
+    baseline_headers: dict[str, str]
+
+
+@st.composite
+def _rt_auth_case(draw: st.DrawFn) -> _RtAuthCase:
+    """Draw the auth knobs plus caller headers that may collide by name.
+
+    Caller header values are derived from their index rather than drawn, so
+    they can never coincide with the drawn key -- "the key is nowhere in the
+    headers" then means what it says.
+    """
+    auth_type = draw(st.sampled_from([1, 2]) | st.sampled_from([None, 0, 3, -1, 1024]))
+    api_key_name = draw(_RT_KEY_NAME)
+    api_key = draw(st.none() | _rt_key_value())
+    # Non-colliding caller headers, drawn as a size-explicit set of names
+    # that differ from api_key_name case-insensitively.
+    extra_names = draw(
+        st.lists(
+            st.text(alphabet="cdefgh", min_size=1, max_size=4),
+            min_size=0,
+            max_size=3,
+            unique_by=str.lower,
+        )
+    )
+    headers = {
+        name: f"caller-{index}"
+        for index, name in enumerate(extra_names)
+        if name.lower() != api_key_name.lower()
+    }
+    collide_name: str | None = None
+    if api_key_name and draw(st.booleans()):
+        # A same-named caller header, either exactly or differing only in
+        # case: HTTP header names are case-insensitive, so both are "the
+        # same header" to a producer.
+        collide_name = draw(st.sampled_from([api_key_name, api_key_name.swapcase()]))
+        headers[collide_name] = "caller-collision"
+    return _RtAuthCase(
+        auth_type=auth_type,
+        api_key_name=api_key_name,
+        api_key=api_key,
+        headers=headers,
+        collide_name=collide_name,
+    )
+
+
+def _run_rt_auth_probe(case: _RtAuthCase) -> _RtAuthWire:
+    """Fetch once with the drawn knobs and once with auth dropped entirely.
+
+    Both fetches share one session against one server, so every header
+    aiohttp adds itself is identical between them and "identical to the
+    no-auth request" can be asserted as plain dict equality.
+    """
+
+    async def scenario() -> _RtAuthWire:
+        api = MockApi()
+        await api.start()
+        try:
+            for _ in range(2):
+                api.get("/rt", body=_VALID_RT_BYTES, content_type="application/x-pb")
+            async with aiohttp.ClientSession() as session:
+                await fetch_feed_message(
+                    session,
+                    api.url("/rt"),
+                    auth_type=case.auth_type,
+                    api_key_name=case.api_key_name,
+                    api_key=case.api_key,
+                    headers=case.headers,
+                )
+                await fetch_feed_message(session, api.url("/rt"), headers=case.headers)
+            authed, baseline = api.requests[0], api.requests[1]
+            return _RtAuthWire(
+                query=authed.query,
+                headers=authed.headers,
+                baseline_query=baseline.query,
+                baseline_headers=baseline.headers,
+            )
+        finally:
+            await api.stop()
+
+    return asyncio.run(scenario())
+
+
+def _rt_header_variants(headers: dict[str, str], name: str) -> list[tuple[str, str]]:
+    """Recorded header entries matching ``name`` case-insensitively."""
+    return [
+        (key, value) for key, value in headers.items() if key.lower() == name.lower()
+    ]
+
+
+@given(case=_rt_auth_case())
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_rt_auth_knob_placement(case: _RtAuthCase) -> None:
+    """The auth knobs place the key EXACTLY where the catalog says.
+
+    auth_type 1 puts the key in the query string under api_key_name and
+    never in a header; auth_type 2 puts it in that header and never in the
+    query string, overriding a same-named caller header (case-insensitively
+    -- a producer sees one header, and it carries the explicit key). Any
+    other combination -- no key, a blank name, an auth_type outside {1, 2}
+    -- sends byte-for-byte what a no-auth fetch sends. Caller headers that
+    do not collide always arrive untouched.
+
+    A misplaced key reaches the user only as an authentication failure from
+    a remote producer, with nothing locally to point at.
+    """
+    wire = _run_rt_auth_probe(case)
+    applies = (
+        case.api_key is not None
+        and bool(case.api_key_name)
+        and case.auth_type in (1, 2)
+    )
+    event(f"applies={applies} type={case.auth_type} collide={case.collide_name}")
+    for name, value in case.headers.items():
+        if name == case.collide_name:
+            continue
+        assert wire.headers[name] == value
+        assert wire.baseline_headers[name] == value
+    if not applies:
+        assert wire.query == wire.baseline_query
+        assert wire.headers == wire.baseline_headers
+        return
+    if case.auth_type == 1:
+        assert wire.query == {case.api_key_name: case.api_key}
+        assert case.api_key not in wire.headers.values()
+        # Query auth leaves a same-named caller HEADER alone: it is a
+        # different namespace, so there is nothing to override there.
+        if case.collide_name is not None:
+            assert wire.headers[case.collide_name] == "caller-collision"
+        return
+    assert wire.query == {}
+    assert _rt_header_variants(wire.headers, case.api_key_name) == [
+        (case.api_key_name, case.api_key)
+    ]
