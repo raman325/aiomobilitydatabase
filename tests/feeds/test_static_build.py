@@ -1,6 +1,8 @@
 """Tests for SQLite index build and cache-open."""
 
 import io
+import os
+import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -8,7 +10,14 @@ import pytest
 
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import StopLocationType
-from aiomobilitydatabase.feeds.static_index import SCHEMA_VERSION, StaticIndex
+from aiomobilitydatabase.feeds.static_index import (
+    SCHEMA_VERSION,
+    StaticIndex,
+    _lenient_date,
+    _lenient_int,
+    _strict_int,
+    parse_gtfs_time,
+)
 
 from tests.feeds.fixtures import _FILES, build_gtfs_zip_bytes
 
@@ -233,3 +242,337 @@ def test_loaders_flush_mid_loop_past_batch_size(tmp_path: Path) -> None:
         assert progress_calls  # report() ran at least once per flushed loader
     finally:
         index.close()
+
+
+def test_unicode_digit_stop_time_fails_the_build(tmp_path: Path) -> None:
+    """A whole-build check on the ASCII-digit rule: a stop_times cell spelled
+    in unicode digits used to parse as a real departure (08:00:00), so the
+    corrupt row entered the index unnoticed. It now fails the build.
+    """
+    corrupted = dict(_FILES)
+    corrupted["stop_times.txt"] = _FILES["stop_times.txt"].replace(
+        "08:00:00", "\u0660\u0668:00:00", 1
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in corrupted.items():
+            zf.writestr(name, content)
+    zip_path = tmp_path / "unicode_time.zip"
+    zip_path.write_bytes(buf.getvalue())
+    with pytest.raises(FeedParseError, match="Invalid GTFS time"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("08:00:00", 28800),
+        ("8:00:00", 28800),
+        ("8:0:0", 28800),
+        ("0008:00:00", 28800),
+        # Service days run past midnight, so hours are unbounded above.
+        ("27:30:00", 99000),
+        ("300:00:00", 1080000),
+        # A blank cell means "no time at this stop", not a parse failure.
+        ("", None),
+        ("   ", None),
+        # Surrounding whitespace is a formatting artifact of real exporters.
+        (" 08:00:00 ", 28800),
+        ("\t08:00:00\n", 28800),
+    ],
+)
+def test_parse_gtfs_time_accepts(value: str, expected: int | None) -> None:
+    assert parse_gtfs_time(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # ASCII digits only: unicode decimals would silently turn a corrupt
+        # cell into a plausible-looking time.
+        "\u0660\u0668:00:00",
+        "08:\u0660\u0660:00",
+        "08:00:\u0660\u0660",
+        "\uff10\uff18:00:00",
+        # int() accepts sign prefixes and underscore grouping; GTFS does not.
+        "+8:00:00",
+        "-1:00:00",
+        "-0:00:00",
+        "08:+0:00",
+        "1_0:00:00",
+        # Exactly three colon-separated components.
+        "08:00",
+        "08",
+        "1:2:3:4",
+        "08:00:00:",
+        ":00:00",
+        # No fractional seconds in GTFS.
+        "08:00:00.5",
+        "08.5:00:00",
+        # Intra-component whitespace is not a digit.
+        "08: 00:00",
+        "0 8:00:00",
+        # Out-of-range minutes/seconds.
+        "08:60:00",
+        "08:75:00",
+        "08:00:60",
+        "08:00:99",
+        "garbage",
+    ],
+)
+def test_parse_gtfs_time_rejects(value: str) -> None:
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("0", 0),
+        ("1", 1),
+        ("01", 1),
+        # Leniency is about not failing the build, not about the vocabulary:
+        # any non-negative ASCII int is stored verbatim.
+        ("12", 12),
+        ("999999999999", 999999999999),
+        (" 5 ", 5),
+        (None, None),
+        ("", None),
+        ("  ", None),
+        ("x", None),
+        ("1.5", None),
+        # Same ASCII-digit rule as parse_gtfs_time/_lenient_date, but
+        # lenient in kind: garbage is None rather than an exception.
+        ("\u0665", None),
+        ("\uff11\uff12", None),
+        ("+5", None),
+        ("-5", None),
+        ("5_0", None),
+    ],
+)
+def test_lenient_int_contract(value: str | None, expected: int | None) -> None:
+    assert _lenient_int(value) == expected
+
+
+def _zip_from_files(tmp_path: Path, files: dict[str, str], name: str) -> Path:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for member, content in files.items():
+            zf.writestr(member, content)
+    zip_path = tmp_path / name
+    zip_path.write_bytes(buf.getvalue())
+    return zip_path
+
+
+def _with_cell(content: str, row: str, column: int, cell: str) -> str:
+    """Replace one field of one data row, keeping the rest of the file."""
+    lines = content.splitlines()
+    fields = lines[lines.index(row)].split(",")
+    fields[column] = cell
+    lines[lines.index(row)] = ",".join(fields)
+    return "\n".join(lines) + "\n"
+
+
+# Spellings a bare int() accepts, each turning a corrupt structural cell
+# into a plausible-looking number: unicode decimals, sign prefixes and PEP
+# 515 underscore grouping.
+_NON_ASCII_INT_CELLS = ("\u0668", "\uff11", "+1", "1_0")
+
+
+@pytest.mark.parametrize("cell", _NON_ASCII_INT_CELLS)
+@pytest.mark.parametrize(
+    ("member", "row", "column"),
+    [
+        pytest.param("stop_times.txt", "T1,08:00:00,08:00:30,S1,1", 4, id="stop_seq"),
+        pytest.param(
+            "calendar.txt", "WKDY,1,1,1,1,1,0,0,20260101,20271231", 1, id="monday"
+        ),
+        pytest.param("calendar_dates.txt", "SPECIAL,20260704,1", 2, id="exception"),
+    ],
+)
+def test_structural_int_cell_fails_the_build(
+    tmp_path: Path, member: str, row: str, column: int, cell: str
+) -> None:
+    """Structural integer columns take the same ASCII-digit rule as the time
+    columns: a corrupt cell that a bare int() would have read as a number
+    fails the build instead of entering the index as plausible data.
+    """
+    files = dict(_FILES)
+    files[member] = _with_cell(_FILES[member], row, column, cell)
+    zip_path = _zip_from_files(tmp_path, files, "structural_int.zip")
+    with pytest.raises(FeedParseError):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize("cell", _NON_ASCII_INT_CELLS)
+def test_non_ascii_headway_fails_the_build(tmp_path: Path, cell: str) -> None:
+    """headway_secs is structural too: it sets how many repetitions of the
+    template trip get materialized, so a corrupt cell must not be read as a
+    number by int()'s wider grammar.
+    """
+    files = dict(_FILES)
+    files["frequencies.txt"] = (
+        f"trip_id,start_time,end_time,headway_secs\nT1,08:00:00,09:00:00,{cell}\n"
+    )
+    zip_path = _zip_from_files(tmp_path, files, "headway.zip")
+    with pytest.raises(FeedParseError):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize("cell", _NON_ASCII_INT_CELLS)
+def test_non_ascii_location_type_is_none_not_a_build_failure(
+    tmp_path: Path, cell: str
+) -> None:
+    """location_type is DESCRIPTIVE: it already degrades to None at the model
+    boundary for anything outside its vocabulary, and a blank cell already
+    means "a plain stop", so a corrupt cell must become None rather than
+    take the whole schedule down.
+    """
+    files = dict(_FILES)
+    files["stops.txt"] = _with_cell(
+        _FILES["stops.txt"], "ST1,Depot Station,34.0705,-118.2295,,1", 5, cell
+    )
+    zip_path = _zip_from_files(tmp_path, files, "location_type.zip")
+    index = StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+    try:
+        stops = {stop.id: stop for stop in index.stops()}
+        assert stops["ST1"].location_type is None
+    finally:
+        index.close()
+
+
+@pytest.mark.parametrize("cell", _NON_ASCII_INT_CELLS)
+def test_non_ascii_route_type_is_not_a_build_failure(tmp_path: Path, cell: str) -> None:
+    """route_type is DESCRIPTIVE: nothing in this library reads it back, so a
+    corrupt cell must not fail a build that is otherwise usable.
+    """
+    files = dict(_FILES)
+    files["routes.txt"] = _with_cell(_FILES["routes.txt"], "R1,10,Main Line,3", 3, cell)
+    zip_path = _zip_from_files(tmp_path, files, "route_type.zip")
+    index = StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+    try:
+        assert {route.id for route in index.routes()} == {"R1", "R2"}
+    finally:
+        index.close()
+
+
+# Past CPython's default 4300-digit cap on int-string conversion, so int()
+# raises ValueError even though every character is an ASCII digit.
+_OVERSIZED_DIGITS = "1" * 5000
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_parse_gtfs_time_rejects_oversized_components(position: int) -> None:
+    """A component can be all ASCII digits and still refuse to convert:
+    CPython caps int-string conversion at 4300 digits. That must surface as
+    the documented FeedParseError, not the raw ValueError -- callers that
+    catch FeedParseError (rt.py's _trip_start_secs) would miss it.
+    """
+    cells = ["00", "00", "00"]
+    cells[position] = _OVERSIZED_DIGITS
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(":".join(cells))
+
+
+def test_strict_int_rejects_oversized_digits() -> None:
+    """The same digit cap on a structural integer column: FeedParseError
+    rather than the raw ValueError from int().
+    """
+    with pytest.raises(FeedParseError):
+        _strict_int(_OVERSIZED_DIGITS, "stop_sequence")
+
+
+def test_lenient_int_oversized_digits_is_none() -> None:
+    """_lenient_int is documented to answer None for anything unparseable so
+    that one bad descriptive cell cannot abort a build; a cell past the
+    4300-digit conversion cap is unparseable like any other.
+    """
+    assert _lenient_int(_OVERSIZED_DIGITS) is None
+
+
+def test_lenient_date_oversized_digits_is_none() -> None:
+    """_lenient_date needs no conversion guard of its own: its length check
+    rejects an oversized cell before any int() runs.
+    """
+    assert _lenient_date(_OVERSIZED_DIGITS) is None
+
+
+def test_open_cached_directory_at_db_path_returns_none(tmp_path: Path) -> None:
+    """A directory where the cached DB should be is a cache miss, not a
+    crash: the caller rebuilds on None but lets exceptions propagate, so a
+    raising open_cached would brick the feed permanently.
+    """
+    db_path = tmp_path / "static.db"
+    db_path.mkdir()
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_open_cached_non_regular_file_returns_none(tmp_path: Path) -> None:
+    db_path = tmp_path / "static.db"
+    os.mkfifo(db_path)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_open_cached_empty_file_returns_none(tmp_path: Path) -> None:
+    db_path = tmp_path / "static.db"
+    db_path.write_bytes(b"")
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_open_cached_missing_parent_returns_none(tmp_path: Path) -> None:
+    assert StaticIndex.open_cached(tmp_path / "gone" / "static.db", DATASET) is None
+
+
+def _open_db_fd_count(db_path: Path) -> int:
+    """Number of this process's open file descriptors pointing at db_path."""
+    target = str(db_path)
+    count = 0
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            link = os.readlink(f"/proc/self/fd/{name}")
+        except OSError:
+            continue  # fd closed while scanning (e.g. listdir's own handle)
+        count += link == target
+    return count
+
+
+@pytest.mark.parametrize(
+    "bad_timezone",
+    [
+        pytest.param("Not/A/Zone", id="unknown-key"),
+        pytest.param("", id="empty"),
+        pytest.param("123", id="numeric"),
+        pytest.param("/absolute", id="absolute"),
+        pytest.param("../escape", id="traversal"),
+        pytest.param(b"\x00\x01", id="blob"),
+    ],
+)
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="needs /proc to count open fds"
+)
+def test_open_cached_invalid_timezone_metadata_returns_none(
+    tmp_path: Path, bad_timezone: str | bytes
+) -> None:
+    """A structurally valid cache carrying an unusable timezone is a cache
+    miss, not a crash: ZoneInfo raises inside __init__, one layer below the
+    guards, and that would propagate out of the rebuild path. The
+    connection opened to read ``meta`` must not leak either.
+    """
+    db_path = tmp_path / "static.db"
+    StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ).close()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'timezone'", (bad_timezone,)
+        )
+    conn.close()
+    before = _open_db_fd_count(db_path)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+    assert _open_db_fd_count(db_path) == before
+
+
+def test_open_cached_truncated_database_returns_none(tmp_path: Path) -> None:
+    db_path = tmp_path / "static.db"
+    StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ).close()
+    intact = db_path.read_bytes()
+    db_path.write_bytes(intact[: len(intact) // 3])
+    assert StaticIndex.open_cached(db_path, DATASET) is None
