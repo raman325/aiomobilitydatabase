@@ -348,3 +348,105 @@ def test_parse_gtfs_time_rejects(value: str) -> None:
 )
 def test_lenient_int_contract(value: str | None, expected: int | None) -> None:
     assert _lenient_int(value) == expected
+
+
+def _zip_from_files(tmp_path: Path, files: dict[str, str], name: str) -> Path:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for member, content in files.items():
+            zf.writestr(member, content)
+    zip_path = tmp_path / name
+    zip_path.write_bytes(buf.getvalue())
+    return zip_path
+
+
+def _with_cell(content: str, row: str, column: int, cell: str) -> str:
+    """Replace one field of one data row, keeping the rest of the file."""
+    lines = content.splitlines()
+    fields = lines[lines.index(row)].split(",")
+    fields[column] = cell
+    lines[lines.index(row)] = ",".join(fields)
+    return "\n".join(lines) + "\n"
+
+
+# Spellings a bare int() accepts, each turning a corrupt structural cell
+# into a plausible-looking number: unicode decimals, sign prefixes and PEP
+# 515 underscore grouping.
+_NON_ASCII_INT_CELLS = ("\u0668", "\uff11", "+1", "1_0")
+
+
+@pytest.mark.parametrize("cell", _NON_ASCII_INT_CELLS)
+@pytest.mark.parametrize(
+    ("member", "row", "column"),
+    [
+        pytest.param("stop_times.txt", "T1,08:00:00,08:00:30,S1,1", 4, id="stop_seq"),
+        pytest.param(
+            "calendar.txt", "WKDY,1,1,1,1,1,0,0,20260101,20271231", 1, id="monday"
+        ),
+        pytest.param("calendar_dates.txt", "SPECIAL,20260704,1", 2, id="exception"),
+    ],
+)
+def test_structural_int_cell_fails_the_build(
+    tmp_path: Path, member: str, row: str, column: int, cell: str
+) -> None:
+    """Structural integer columns take the same ASCII-digit rule as the time
+    columns: a corrupt cell that a bare int() would have read as a number
+    fails the build instead of entering the index as plausible data.
+    """
+    files = dict(_FILES)
+    files[member] = _with_cell(_FILES[member], row, column, cell)
+    zip_path = _zip_from_files(tmp_path, files, "structural_int.zip")
+    with pytest.raises(FeedParseError):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize("cell", _NON_ASCII_INT_CELLS)
+def test_non_ascii_headway_fails_the_build(tmp_path: Path, cell: str) -> None:
+    """headway_secs is structural too: it sets how many repetitions of the
+    template trip get materialized, so a corrupt cell must not be read as a
+    number by int()'s wider grammar.
+    """
+    files = dict(_FILES)
+    files["frequencies.txt"] = (
+        f"trip_id,start_time,end_time,headway_secs\nT1,08:00:00,09:00:00,{cell}\n"
+    )
+    zip_path = _zip_from_files(tmp_path, files, "headway.zip")
+    with pytest.raises(FeedParseError):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize("cell", _NON_ASCII_INT_CELLS)
+def test_non_ascii_location_type_is_none_not_a_build_failure(
+    tmp_path: Path, cell: str
+) -> None:
+    """location_type is DESCRIPTIVE: it already degrades to None at the model
+    boundary for anything outside its vocabulary, and a blank cell already
+    means "a plain stop", so a corrupt cell must become None rather than
+    take the whole schedule down.
+    """
+    files = dict(_FILES)
+    files["stops.txt"] = _with_cell(
+        _FILES["stops.txt"], "ST1,Depot Station,34.0705,-118.2295,,1", 5, cell
+    )
+    zip_path = _zip_from_files(tmp_path, files, "location_type.zip")
+    index = StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+    try:
+        stops = {stop.id: stop for stop in index.stops()}
+        assert stops["ST1"].location_type is None
+    finally:
+        index.close()
+
+
+@pytest.mark.parametrize("cell", _NON_ASCII_INT_CELLS)
+def test_non_ascii_route_type_is_not_a_build_failure(tmp_path: Path, cell: str) -> None:
+    """route_type is DESCRIPTIVE: nothing in this library reads it back, so a
+    corrupt cell must not fail a build that is otherwise usable.
+    """
+    files = dict(_FILES)
+    files["routes.txt"] = _with_cell(_FILES["routes.txt"], "R1,10,Main Line,3", 3, cell)
+    zip_path = _zip_from_files(tmp_path, files, "route_type.zip")
+    index = StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+    try:
+        assert {route.id for route in index.routes()} == {"R1", "R2"}
+    finally:
+        index.close()

@@ -125,6 +125,23 @@ def _ascii_digits(value: str) -> bool:
     return bool(value) and value.isascii() and value.isdigit()
 
 
+def _strict_int(value: str, field: str) -> int:
+    """Parse a STRUCTURAL integer cell: anything unparseable raises.
+
+    The counterpart to ``_lenient_int`` for the columns the index
+    navigates by -- stop_sequence orders the stop calls realtime delay
+    propagation walks positionally, headway_secs sets how many
+    repetitions of a template trip exist, exception_type decides whether
+    a service day is added or removed. Same ASCII-digit rule as
+    ``parse_gtfs_time``, and the same reasoning: a corrupt structural
+    value that silently parses is worse than a failed build.
+    """
+    value = value.strip()
+    if not _ascii_digits(value):
+        raise FeedParseError(f"Invalid GTFS {field}: {value!r}")
+    return int(value)
+
+
 _GTFS_TIME_COMPONENTS = 3
 
 
@@ -547,7 +564,7 @@ class StaticIndex:
                     float(lat) if (lat := row.get("stop_lat", "").strip()) else None,
                     float(lon) if (lon := row.get("stop_lon", "").strip()) else None,
                     row.get("parent_station") or None,
-                    int(loc) if (loc := row.get("location_type", "").strip()) else None,
+                    _lenient_int(row.get("location_type")),
                     row.get("stop_code") or None,
                     row.get("platform_code") or None,
                     _lenient_int(row.get("wheelchair_boarding")),
@@ -580,9 +597,7 @@ class StaticIndex:
                     row["route_id"],
                     row.get("route_short_name") or None,
                     row.get("route_long_name") or None,
-                    int(rtype)
-                    if (rtype := row.get("route_type", "").strip())
-                    else None,
+                    _lenient_int(row.get("route_type")),
                     row.get("agency_id") or None,
                     row.get("route_color") or None,
                     row.get("route_text_color") or None,
@@ -648,7 +663,7 @@ class StaticIndex:
                     row["stop_id"],
                     parse_gtfs_time(row.get("arrival_time", "")),
                     parse_gtfs_time(row.get("departure_time", "")),
-                    int(row["stop_sequence"]),
+                    _strict_int(row["stop_sequence"], "stop_sequence"),
                     _lenient_int(row.get("pickup_type")),
                     _lenient_int(row.get("drop_off_type")),
                     _stored_timepoint(row.get("timepoint")),
@@ -809,7 +824,7 @@ class StaticIndex:
                 raise ValueError(
                     f"frequencies row for trip {trip_id!r} lacks a start/end time"
                 )
-            headway_secs = int(row["headway_secs"])
+            headway_secs = _strict_int(row["headway_secs"], "headway_secs")
             if headway_secs <= 0:
                 raise ValueError(
                     f"non-positive headway_secs for trip {trip_id!r}: {headway_secs}"
@@ -830,7 +845,10 @@ class StaticIndex:
             rows.append(
                 (
                     row["service_id"],
-                    *(int(row.get(day, "0") or 0) for day in _WEEKDAY_COLUMNS),
+                    *(
+                        _strict_int(row.get(day) or "0", day)
+                        for day in _WEEKDAY_COLUMNS
+                    ),
                     row.get("start_date") or "",
                     row.get("end_date") or "",
                 )
@@ -853,7 +871,13 @@ class StaticIndex:
         rows: list[tuple[object, ...]] = []
         sql = "INSERT INTO calendar_dates VALUES (?,?,?)"
         for row in reader:
-            rows.append((row["service_id"], row["date"], int(row["exception_type"])))
+            rows.append(
+                (
+                    row["service_id"],
+                    row["date"],
+                    _strict_int(row["exception_type"], "exception_type"),
+                )
+            )
             if len(rows) >= _BATCH_SIZE:
                 cls._batched_insert(conn, sql, rows)
                 if report is not None:
