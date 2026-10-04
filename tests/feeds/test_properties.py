@@ -4191,6 +4191,16 @@ def test_multi_rt_aggregation_last_feed_wins_and_cancellation_suppresses(
 # --- get_arrivals route_ids filter properties --------------------------------
 
 
+# The scenario board carries 7 rows (TP and OTHER at S0/S1/S2 plus the added
+# row), of which 3 pass a single-route filter: a limit of 2 therefore BINDS,
+# which is what makes filter-before-limit observable at all.
+_ROUTE_FILTER_LIMIT = 2
+# The route each trip in the scenario zip runs on, per the fixture: the
+# oracle never reads ``row.route_id``, so mislabelling a row cannot agree
+# with the filter.
+_ROUTE_FILTER_ROUTES: dict[str | None, str | None] = {"TP": "R1", "OTHER": "R2"}
+
+
 def _route_filter_added_message(
     added_route: str | None,
 ) -> gtfs_realtime_pb2.FeedMessage:
@@ -4247,12 +4257,16 @@ def _run_route_filter_scenario(
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
                 [unfiltered] = await handle.get_arrivals(
-                    [ArrivalsQuery(["S0", "S1", "S2"], limit=150)],
+                    [ArrivalsQuery(["S0", "S1", "S2"], limit=_UNLIMITED)],
                     lookahead=timedelta(hours=6),
                     now_utc=_PROP_NOW,
                 )
                 [filtered] = await handle.get_arrivals(
-                    [ArrivalsQuery(["S0", "S1", "S2"], route_ids, limit=150)],
+                    [
+                        ArrivalsQuery(
+                            ["S0", "S1", "S2"], route_ids, limit=_ROUTE_FILTER_LIMIT
+                        )
+                    ],
                     lookahead=timedelta(hours=6),
                     now_utc=_PROP_NOW,
                 )
@@ -4263,7 +4277,7 @@ def _run_route_filter_scenario(
     return asyncio.run(scenario())
 
 
-@settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     route_ids=st.sampled_from([["R1"], ["R2"], ["R1", "R2"], ["NOPE"]]),
     added_route=st.sampled_from(["R1", "R2", None]),
@@ -4271,22 +4285,31 @@ def _run_route_filter_scenario(
 def test_arrivals_route_filter_matches_oracle(
     route_ids: list[str], added_route: str | None
 ) -> None:
-    """An ArrivalsQuery's route_ids returns EXACTLY the oracle-side filter of
-    the unfiltered merge: scheduled rows by their trip's route (TP on R1,
-    OTHER on R2), RT-ADDED rows by their announced route -- and an added
-    row announcing NO route never passes any filter.
+    """An ArrivalsQuery's route_ids returns EXACTLY the fixture-side filter of
+    the unfiltered merge, truncated to the limit AFTER filtering: scheduled
+    rows by their trip's route (TP on R1, OTHER on R2), RT-ADDED rows by
+    their announced route -- and an added row announcing NO route never
+    passes any filter.
+
+    The limit BINDS here (2 against 3 passing rows), so an implementation
+    that truncated the merged board before applying the filter would return
+    the wrong rows -- the promise the batched API exists to make.
     """
     unfiltered, filtered = _run_route_filter_scenario(
         _route_filter_added_message(added_route), route_ids
     )
     # Sanity: the unfiltered merge carries both trips and the added row.
     assert {row.trip_id for row in unfiltered} == {"TP", "OTHER", "GEN-ADDED-R"}
-    allowed = set(route_ids)
-    assert filtered == [
-        row
-        for row in unfiltered
-        if row.route_id is not None and row.route_id in allowed
-    ]
+    routes: dict[str | None, str | None] = {
+        **_ROUTE_FILTER_ROUTES,
+        "GEN-ADDED-R": added_route,
+    }
+    allowed: set[str | None] = set(route_ids)
+    for row in unfiltered:
+        assert row.route_id == routes[row.trip_id]
+    keep = [row for row in unfiltered if routes[row.trip_id] in allowed]
+    event(f"limit binds: {len(keep) > _ROUTE_FILTER_LIMIT}")
+    assert filtered == keep[:_ROUTE_FILTER_LIMIT]
 
 
 # --- GBFS discovery-document and endpoint-preference properties --------------
