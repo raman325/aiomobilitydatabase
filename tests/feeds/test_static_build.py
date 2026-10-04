@@ -495,6 +495,8 @@ def test_lenient_date_oversized_digits_is_none() -> None:
     rejects an oversized cell before any int() runs.
     """
     assert _lenient_date(_OVERSIZED_DIGITS) is None
+
+
 def test_open_cached_directory_at_db_path_returns_none(tmp_path: Path) -> None:
     """A directory where the cached DB should be is a cache miss, not a
     crash: the caller rebuilds on None but lets exceptions propagate, so a
