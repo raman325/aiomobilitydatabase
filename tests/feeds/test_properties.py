@@ -70,10 +70,12 @@ from aiomobilitydatabase.feeds.rt import (
     vehicles_from_message,
 )
 from aiomobilitydatabase.feeds.static_index import (
+    _SQLITE_INT_MAX,
     ScheduledTrip,
     StaticIndex,
     _lenient_date,
     _lenient_int,
+    _strict_int,
     parse_gtfs_time,
 )
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle, group_stations
@@ -479,24 +481,39 @@ _UNCONVERTIBLE_LENGTHS = st.sampled_from(
 )
 
 
-@settings(max_examples=10, deadline=None)
+# Constructive: one below the quotient, so adding any minutes and seconds
+# still cannot cross the ceiling. Filtering afterwards would discard draws.
+_MAX_STORABLE_HOUR = _SQLITE_INT_MAX // 3600 - 1
+
+
+@settings(max_examples=25, deadline=None)
 @given(
-    length=_CONVERTIBLE_LENGTHS,
+    hours=st.integers(min_value=0, max_value=_MAX_STORABLE_HOUR),
     minutes=st.integers(min_value=0, max_value=59),
     seconds=st.integers(min_value=0, max_value=59),
 )
-def test_parse_gtfs_time_accepts_hours_up_to_the_digit_limit(
-    length: int, minutes: int, seconds: int
+def test_parse_gtfs_time_accepts_any_storable_hour(
+    hours: int, minutes: int, seconds: int
 ) -> None:
-    """Hours are unbounded in GTFS, so an hour spelled right up to the
-    conversion cap is still a time: the cap is where "ASCII digits" stops
-    meaning "a number", not an hour ceiling moved into the parser.
+    """GTFS does not cap the hour and neither does the parser -- up to the
+    point where the resulting SECONDS stop fitting in a SQLite INTEGER.
+
+    The components convert long before their sum is storable (an 18-digit
+    hour is a fine int and an impossible column value), so the ceiling has
+    to sit on the total. Hours past 23 are the normal case here: service
+    days run past midnight.
     """
-    hours = int("1" * length)
     assert (
         parse_gtfs_time(f"{hours}:{minutes:02d}:{seconds:02d}")
         == hours * 3600 + minutes * 60 + seconds
     )
+
+
+def test_parse_gtfs_time_storable_boundary_is_exact() -> None:
+    """The last storable instant parses and the next one does not."""
+    assert parse_gtfs_time("2562047788015215:30:07") == _SQLITE_INT_MAX
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time("2562047788015215:30:08")
 
 
 @settings(max_examples=10, deadline=None)
@@ -517,15 +534,37 @@ def test_parse_gtfs_time_rejects_components_past_the_digit_limit(
 @settings(max_examples=10, deadline=None)
 @given(length=st.one_of(_CONVERTIBLE_LENGTHS, _UNCONVERTIBLE_LENGTHS))
 def test_lenient_helpers_answer_none_across_the_digit_limit(length: int) -> None:
-    """The lenient helpers answer, never raise, on both sides of the cap:
-    _lenient_int keeps a convertible digit string and degrades the rest to
-    None, and _lenient_date rejects every one of them on length alone (which
-    is why it needs no conversion guard of its own).
+    """The lenient helpers answer, never raise, on both sides of the cap.
+
+    Every length here is thousands of digits past what a SQLite INTEGER
+    holds, so the answer is None on both sides: a convertible 4299-digit int
+    is still not a storable one, and conflating the two is what let a
+    descriptive cell abort a build with OverflowError. _lenient_date rejects
+    them all on length alone.
     """
     cell = "1" * length
-    expected = int(cell) if length <= _DIGIT_LIMIT else None
-    assert _lenient_int(cell) == expected
+    assert _lenient_int(cell) is None
     assert _lenient_date(cell) is None
+
+
+@settings(max_examples=50, deadline=None)
+@given(
+    value=st.integers(min_value=0, max_value=2**70),
+    field=st.sampled_from(["stop_sequence", "headway_secs", "exception_type"]),
+)
+def test_int_helpers_split_at_the_storable_ceiling(value: int, field: str) -> None:
+    """Across the SQLite INTEGER ceiling the two helpers keep their kinds:
+    the descriptive one degrades to None, the structural one raises. Neither
+    may hand back an int the index cannot store.
+    """
+    cell = str(value)
+    if value <= _SQLITE_INT_MAX:
+        assert _lenient_int(cell) == value
+        assert _strict_int(cell, field) == value
+    else:
+        assert _lenient_int(cell) is None
+        with pytest.raises(FeedParseError):
+            _strict_int(cell, field)
 
 
 @given(

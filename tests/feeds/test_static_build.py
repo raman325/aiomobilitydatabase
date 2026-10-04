@@ -576,3 +576,21 @@ def test_open_cached_truncated_database_returns_none(tmp_path: Path) -> None:
     intact = db_path.read_bytes()
     db_path.write_bytes(intact[: len(intact) // 3])
     assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_open_cached_unreadable_file_returns_none(tmp_path: Path) -> None:
+    """A regular file sqlite3 cannot open is still a cache miss.
+
+    `is_file()` screens out directories and FIFOs, so the guard around
+    `sqlite3.connect` only fires for a file the process may not read -- the
+    last way a corrupt cache entry could brick a feed instead of rebuilding.
+    """
+    db_path = tmp_path / "unreadable.db"
+    StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ).close()
+    db_path.chmod(0o000)
+    try:
+        if os.access(db_path, os.R_OK):
+            pytest.skip("cannot make a file unreadable for this process (root?)")
+        assert StaticIndex.open_cached(db_path, DATASET) is None
+    finally:
+        db_path.chmod(0o644)

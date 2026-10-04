@@ -125,21 +125,31 @@ def _ascii_digits(value: str) -> bool:
     return bool(value) and value.isascii() and value.isdigit()
 
 
-def _ascii_int(value: str) -> int | None:
-    """Convert an ASCII-digit cell to an int, or None if it is not one.
+# SQLite's INTEGER is a signed 64-bit value, so a Python int above this
+# raises OverflowError at INSERT -- thousands of rows away from the cell that
+# caused it, and outside every parse guard. Python ints are unbounded, so the
+# ceiling has to be stated here rather than discovered at the storage layer.
+_SQLITE_INT_MAX = 2**63 - 1
 
-    Folds the predicate and the conversion together because an
-    all-ASCII-digit cell can still fail to convert: CPython caps
-    int-string conversion at 4300 digits, and a cell that long is the
-    same "not a usable number" answer as a non-digit cell. Every caller
-    then decides whether that answer raises or degrades.
+
+def _ascii_int(value: str) -> int | None:
+    """Convert an ASCII-digit cell to a STORABLE int, or None if it is not one.
+
+    Folds the predicate, the conversion and the range check together
+    because an all-ASCII-digit cell can still fail to become a usable
+    number three different ways: it is not digits, CPython caps
+    int-string conversion at 4300 digits, or the value exceeds what
+    SQLite can store. All three are the same "not a usable number"
+    answer; every caller then decides whether that answer raises or
+    degrades.
     """
     if not _ascii_digits(value):
         return None
     try:
-        return int(value)
+        parsed = int(value)
     except ValueError:
         return None
+    return None if parsed > _SQLITE_INT_MAX else parsed
 
 
 def _strict_int(value: str, field: str) -> int:
@@ -169,11 +179,16 @@ def parse_gtfs_time(value: str) -> int | None:
     degrading -- a wrong departure time is worse than a failed build.
 
     Accepted: exactly three colon-separated ASCII-digit components, any
-    zero-padding or none ("8:0:0"), unbounded hours (service days run
-    past midnight), minutes and seconds in [0, 60), and whitespace around
-    the whole cell (real exporters emit it). Everything else -- unicode
+    zero-padding or none ("8:0:0"), hours past 23 (service days run past
+    midnight), minutes and seconds in [0, 60), and whitespace around the
+    whole cell (real exporters emit it). Everything else -- unicode
     digits, sign prefixes, underscore grouping, fractional seconds, wrong
     arity, intra-component whitespace -- is rejected.
+
+    Hours are bounded only by what the resulting seconds can be stored
+    as: the components are storable individually long before their sum
+    is, so an 18-digit hour converts and then overflows at INSERT. The
+    total is checked here instead.
     """
     value = value.strip()
     if not value:
@@ -192,7 +207,10 @@ def parse_gtfs_time(value: str) -> int | None:
         or seconds >= _SECONDS_OR_MINUTES_PER_UNIT
     ):
         raise FeedParseError(f"Invalid GTFS time: {value!r}")
-    return hours * 3600 + minutes * 60 + seconds
+    total = hours * 3600 + minutes * 60 + seconds
+    if total > _SQLITE_INT_MAX:
+        raise FeedParseError(f"GTFS time out of storable range: {value!r}")
+    return total
 
 
 def _lenient_int(value: str | None) -> int | None:
