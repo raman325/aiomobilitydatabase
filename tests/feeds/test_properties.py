@@ -29,8 +29,11 @@ from aiomobilitydatabase.feeds.exceptions import (
 from aiomobilitydatabase.feeds.gbfs import (
     GbfsFeedHandle,
     _as_bool,
+    _coordinate,
     _endpoints_from_discovery,
     _localized,
+    _ttl_seconds,
+    _vehicle_types,
     _version_key,
 )
 from aiomobilitydatabase.feeds.geo import Circle, haversine_m, in_circle
@@ -629,25 +632,6 @@ def test_active_service_ids_matches_naive_oracle(
 
 # --- messy-format properties (Task 13b) ---
 
-_JSONISH = st.recursive(
-    st.none()
-    | st.booleans()
-    | st.integers()
-    | st.floats(allow_nan=False)
-    | st.text(max_size=20),
-    lambda children: (
-        st.lists(children, max_size=4)
-        | st.dictionaries(st.text(max_size=8), children, max_size=4)
-    ),
-    max_leaves=10,
-)
-
-
-@given(value=_JSONISH)
-def test_localized_is_total(value: object) -> None:
-    result = _localized(value)
-    assert result is None or isinstance(result, str)
-
 
 # Localized entries with an OPTIONAL "text" key: real GBFS documents ship
 # entries missing text, and the selected entry must then yield None -- never
@@ -657,6 +641,51 @@ def _localized_entry(language: st.SearchStrategy[str]) -> st.SearchStrategy[dict
         {"language": language},
         optional={"text": st.text(min_size=1, max_size=20)},
     )
+
+
+# Keys, string leaves, and one whole list arm are biased toward the GBFS
+# localized-entry schema:
+# with free-form text keys only, 0 of 500 draws carried a "language" key at
+# all, so _localized's preferred-language branch was unreachable from here.
+_JSONISH = st.recursive(
+    st.none()
+    | st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=False)
+    | st.sampled_from(["en", "fr", "de", "Dock A", ""])
+    | st.text(max_size=20),
+    lambda children: (
+        st.lists(children, max_size=4)
+        | st.lists(_localized_entry(st.sampled_from(["en", "fr", "de"])), max_size=3)
+        | st.dictionaries(
+            st.sampled_from(["language", "text", "name"]) | st.text(max_size=8),
+            children,
+            max_size=4,
+        )
+    ),
+    max_leaves=10,
+)
+
+
+@given(value=_JSONISH)
+def test_localized_is_total(value: object) -> None:
+    """Any JSON value yields a string or None, never a raise. The event
+    tags record how often a draw actually reaches the preferred-language
+    branch (it was 0% before the schema bias above).
+    """
+    entries = (
+        [entry for entry in value if isinstance(entry, dict)]
+        if isinstance(value, list)
+        else []
+    )
+    event(
+        f"localized: entry with a language key: {any('language' in e for e in entries)}"
+    )
+    # "en" is the library's GBFS_LANGUAGE_PREFERENCE.
+    preferred = any(entry.get("language") == "en" for entry in entries)
+    event(f"localized: preferred-language branch: {preferred}")
+    result = _localized(value)
+    assert result is None or isinstance(result, str)
 
 
 @given(
@@ -690,15 +719,108 @@ def test_localized_entry_without_text_is_none() -> None:
     assert _localized([{"language": "de"}, {"language": "en", "text": "x"}]) == "x"
 
 
-@given(version=st.text(max_size=12))
-def test_version_key_is_total(version: str) -> None:
-    key = _version_key(version)
-    assert isinstance(key, tuple)
+@given(
+    left=st.lists(st.integers(0, 20), min_size=1, max_size=4),
+    right=st.lists(st.integers(0, 20), min_size=1, max_size=4),
+)
+def test_version_key_orders_like_its_components(
+    left: list[int], right: list[int]
+) -> None:
+    """The ordering law GbfsFeedHandle.create relies on to pick the newest
+    version: comparing two dotted version strings through _version_key
+    agrees with comparing their component tuples (so "2.3" < "2.3.1" and
+    "9.5" < "10.0", lexicographic string order notwithstanding).
+    """
+    key_left = _version_key(".".join(str(part) for part in left))
+    key_right = _version_key(".".join(str(part) for part in right))
+    assert key_left == tuple(left)
+    assert (key_left < key_right) is (tuple(left) < tuple(right))
+
+
+@given(version=st.text(max_size=12), other=st.text(max_size=12))
+def test_version_key_is_total(version: str, other: str) -> None:
+    """Catalog junk never raises, and ANY two keys stay mutually
+    comparable -- create() sorts a whole version list by this key, so one
+    unparseable entry must not break the sort with a TypeError.
+    """
+    key, other_key = _version_key(version), _version_key(other)
+    assert all(isinstance(part, int) for part in key)
+    assert key < other_key or other_key <= key
 
 
 def test_version_key_orders_numerically() -> None:
     assert _version_key("10.0") > _version_key("9.5")
     assert _version_key("3.0") > _version_key("2.3")
+
+
+# Duck-typed catalog stand-ins: create() only reads these attributes, and
+# defining them here keeps this property independent of catalog parsing.
+class _StubEndpoint:
+    def __init__(self, name: str | None, url: str | None) -> None:
+        self.name = name
+        self.url = url
+
+
+class _StubVersion:
+    def __init__(self, version: str, endpoints: list[_StubEndpoint]) -> None:
+        self.version = version
+        self.endpoints = endpoints
+
+
+class _StubCatalog:
+    def __init__(self, feed: object) -> None:
+        self._feed = feed
+
+    async def get_gbfs_feed(self, feed_id: str) -> object:
+        return self._feed
+
+
+class _StubClient:
+    def __init__(self, feed: object) -> None:
+        self.catalog = _StubCatalog(feed)
+
+
+@given(
+    versions=st.lists(
+        st.tuples(
+            st.lists(st.integers(0, 9), min_size=1, max_size=3),
+            st.booleans(),
+        ),
+        min_size=1,
+        max_size=5,
+        unique_by=lambda item: tuple(item[0]),
+    )
+)
+def test_create_picks_newest_version_that_has_endpoints(
+    versions: list[tuple[list[int], bool]],
+) -> None:
+    """create() resolves the _version_key-MAXIMAL version that actually
+    carries endpoints -- a newer version listing none must not shadow an
+    older one that does, and a feed with no endpoints anywhere resolves to
+    an empty table rather than raising.
+    """
+    stub_versions = [
+        _StubVersion(
+            ".".join(str(part) for part in parts),
+            [_StubEndpoint("station_information", f"https://e.com/{index}")]
+            if has_endpoints
+            else [],
+        )
+        for index, (parts, has_endpoints) in enumerate(versions)
+    ]
+    feed = _StubVersion("feed", [])  # any object carrying .versions below
+    feed.versions = stub_versions  # type: ignore[attr-defined]
+    client = _StubClient(feed)
+    handle = asyncio.run(GbfsFeedHandle.create(client, "f"))  # type: ignore[arg-type]
+    usable = [
+        (tuple(parts), index)
+        for index, (parts, has_endpoints) in enumerate(versions)
+        if has_endpoints
+    ]
+    expected = (
+        {"station_information": f"https://e.com/{max(usable)[1]}"} if usable else {}
+    )
+    assert handle._endpoints == expected
 
 
 @given(
@@ -1163,15 +1285,64 @@ def _run_gbfs_probe(status: int, body: bytes, content_type: str) -> str:
     return asyncio.run(scenario())
 
 
+# JSON-shaped bodies are assembled from spec-ish fragments because 0 of 1000
+# st.binary() draws parse as a JSON OBJECT (4 parse as scalars): with binary
+# alone the probe never got past "malformed JSON", leaving the data-envelope
+# and ttl branches of _document unreached.
+_GBFS_DATA_FRAGMENTS = [
+    b"{}",
+    b"[]",
+    b"null",
+    b'"data"',
+    b'{"stations":[]}',
+    b'{"stations":"nope"}',
+    b'{"stations":[1,null,{"station_id":null}]}',
+    b'{"stations":[{"station_id":"s1","lat":34.05,"lon":-118.25}]}',
+    b'{"stations":[{"station_id":"s1","lat":1' + b"0" * 400 + b',"lon":1e999}]}',
+    b'{"vehicles":[{"vehicle_id":"v1","lat":"34.05","lon":-118.25}]}',
+    b'{"bikes":{}}',
+    b'{"feeds":"nope"}',
+    b'{"en":{"feeds":[{"name":"system_information","url":"https://e.com/s"}]}}',
+    b'{"system_id":null}',
+]
+_GBFS_TTL_FRAGMENTS = [
+    b"0",
+    b"60",
+    b'"60"',
+    b'"60s"',
+    b"{}",
+    b"[60]",
+    b"null",
+    b"-1",
+    b"1e308",
+    b"1e999",
+    b"1" + b"0" * 400,
+]
+
+
+@st.composite
+def _gbfs_document_body(draw: st.DrawFn) -> bytes:
+    """One JSON-shaped GBFS response body: an envelope plus a ttl."""
+    data = draw(st.sampled_from(_GBFS_DATA_FRAGMENTS))
+    ttl = draw(st.sampled_from(_GBFS_TTL_FRAGMENTS))
+    missing_envelope = draw(st.booleans())
+    return b'{"ttl":' + ttl + (b"}" if missing_envelope else b',"data":' + data + b"}")
+
+
 @given(
     status=st.integers(min_value=200, max_value=599),
-    body=st.binary(max_size=64),
+    body=st.binary(max_size=64) | _gbfs_document_body(),
     content_type=st.sampled_from(["application/json", "text/html"]),
 )
-@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_gbfs_document_total_over_status_and_body(
     status: int, body: bytes, content_type: str
 ) -> None:
+    """_document() either returns a document or raises one of the library's
+    own exceptions, for any status and any body -- including the JSON-shaped
+    bodies that actually reach its envelope and ttl handling.
+    """
+    event(f"gbfs probe: json-shaped body: {body.startswith(b'{')}")
     outcome = _run_gbfs_probe(status, body, content_type)
     assert outcome in ("success", "ours")
 
@@ -1186,13 +1357,30 @@ def test_epoch_to_utc_is_total(epoch: int) -> None:
 
 
 @given(
-    raw=st.sampled_from([True, False, 0, 1, 2, "true", "false", "yes", "", None, 1.0])
+    raw=st.booleans()
+    | st.integers()
+    | st.floats(allow_nan=True)
+    | st.text()
+    | st.none()
+    | st.lists(st.integers())
+    | st.dictionaries(st.text(), st.text())
 )
 def test_station_bool_coercion_never_lies(raw: object) -> None:
+    """Over any JSON value, _as_bool answers only True/False/None, and it
+    answers None for exactly the values that aren't already numeric
+    booleans -- so no truthy container or string is ever coerced.
+    """
     result = _as_bool(raw)
     assert result in (True, False, None)
-    if isinstance(raw, str):
-        assert result is None  # bool("false") is True — strings are UNKNOWN, not truthy
+    assert (result is None) is not isinstance(raw, bool | int | float)
+
+
+@given(raw=st.text())
+def test_station_bool_coercion_rejects_every_string(raw: str) -> None:
+    """bool("false") is True in Python, so NO string is a GBFS boolean --
+    not "true" either: a producer shipping strings is shipping unknowns.
+    """
+    assert _as_bool(raw) is None
 
 
 _IDS = st.text(
@@ -2697,76 +2885,127 @@ def test_arrivals_merge_invariants(data: st.DataObject) -> None:
 
 
 _GBFS_ZONE = Circle(latitude=34.05, longitude=-118.25, radius_m=2_000.0)
-_NEARBY_LAT = st.floats(33.95, 34.15)
-_NEARBY_LON = st.floats(-118.35, -118.15)
+# Points are drawn CONSTRUCTIVELY, as a metre offset from the zone centre: a
+# wide lat/lon box (the previous ~22km x 18km one, against a 2km radius) put
+# only 1 of 1015 generated rows inside the zone, so the filter's "keep" path
+# was effectively never exercised. A +-2.5km square puts ~50% inside.
+_ZONE_OFFSET_M = st.floats(-2_500.0, 2_500.0)
+_M_PER_DEG = 111_320.0
 
 
-@given(
-    rows=st.lists(
-        st.fixed_dictionaries(
-            {
-                "bike_id": st.text(min_size=1, max_size=6),
-                "lat": _NEARBY_LAT | st.none(),
-                "lon": _NEARBY_LON | st.none(),
-            }
-        ),
-        max_size=8,
+@st.composite
+def _zone_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
+    """One GBFS row offset from the zone centre, sometimes coordinate-less.
+
+    Real documents ship rows without coordinates, and both filters must
+    drop those rather than place them at (0, 0).
+    """
+    north = draw(_ZONE_OFFSET_M)
+    east = draw(_ZONE_OFFSET_M)
+    latitude = _GBFS_ZONE.latitude + north / _M_PER_DEG
+    longitude = _GBFS_ZONE.longitude + east / (
+        _M_PER_DEG * math.cos(math.radians(_GBFS_ZONE.latitude))
     )
-)
+    return {
+        id_key: draw(st.text(min_size=1, max_size=6)),
+        "lat": draw(st.just(latitude) | st.none()),
+        "lon": draw(st.just(longitude) | st.none()),
+    }
+
+
+def _gbfs_handle(documents: dict[str, object]) -> GbfsFeedHandle:
+    """A detached handle whose named endpoints serve pre-cached documents.
+
+    The cache entries are built with an infinite ttl so no method of the
+    handle ever reaches the network; ``documents`` maps an endpoint name
+    to that document's ``data`` envelope.
+    """
+    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
+    handle._doc_cache = {
+        name: (float("inf"), float("inf"), {"data": data})
+        for name, data in documents.items()
+    }
+    handle._endpoints = dict.fromkeys(documents, "x")
+    return handle
+
+
+@given(rows=st.lists(_zone_row("bike_id"), max_size=8))
 @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_gbfs_vehicles_zone_filter_law(rows: list[dict[str, object]]) -> None:
     """get_vehicles(zone) keeps exactly the coord-having rows inside the
     zone; nothing else.
     """
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        "free_bike_status": (float("inf"), float("inf"), {"data": {"bikes": rows}}),
-    }
-    handle._endpoints = {"free_bike_status": "x"}
+    handle = _gbfs_handle({"free_bike_status": {"bikes": rows}})
     unfiltered = asyncio.run(handle.get_vehicles(None))
     filtered = asyncio.run(handle.get_vehicles(_GBFS_ZONE))
+    event(f"vehicles: any row inside the zone: {bool(filtered)}")
     assert filtered == [
         v for v in unfiltered if in_circle(_GBFS_ZONE, v.latitude, v.longitude)
     ]
 
 
-@given(
-    rows=st.lists(
-        st.fixed_dictionaries(
-            {
-                "station_id": st.text(min_size=1, max_size=6),
-                "lat": _NEARBY_LAT | st.none(),
-                "lon": _NEARBY_LON | st.none(),
-            }
-        ),
-        max_size=8,
-        unique_by=lambda row: row["station_id"],
-    )
-)
+@given(data=st.data())
 @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_gbfs_stations_zone_filter_law(rows: list[dict[str, object]]) -> None:
-    """get_stations(zone) keeps exactly the coord-having rows inside the
-    zone; nothing else.
+def test_gbfs_stations_zone_filter_and_merge_law(data: st.DataObject) -> None:
+    """get_stations: the zone keeps exactly the coord-having rows inside the
+    circle, and the status merge is keyed by station_id -- each station gets
+    ITS OWN status row's values, a station with no status row reads
+    all-unknown, status rows for unknown ids are ignored, and the result
+    does not depend on the order the status rows arrive in.
     """
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        "station_information": (
-            float("inf"),
-            float("inf"),
-            {"data": {"stations": rows}},
-        ),
-        "station_status": (float("inf"), float("inf"), {"data": {"stations": []}}),
+    info_rows = data.draw(
+        st.lists(
+            _zone_row("station_id"), max_size=6, unique_by=lambda row: row["station_id"]
+        )
+    )
+    station_ids = [str(row["station_id"]) for row in info_rows]
+    covered = data.draw(
+        st.lists(st.booleans(), min_size=len(station_ids), max_size=len(station_ids))
+    )
+    # Distinct per-station counts: a merge keyed on anything but station_id
+    # would hand a station the wrong one.
+    expected_bikes = {
+        station_id: index
+        for index, (station_id, include) in enumerate(
+            zip(station_ids, covered, strict=True)
+        )
+        if include
     }
-    handle._endpoints = {"station_information": "x", "station_status": "x"}
+    status_rows: list[dict[str, object]] = [
+        {"station_id": station_id, "num_bikes_available": bikes, "is_renting": True}
+        for station_id, bikes in expected_bikes.items()
+    ]
+    # Orphan ids are 8+ chars, so they cannot collide with a drawn id.
+    status_rows += [
+        {"station_id": f"orphan-{index}", "num_bikes_available": 99, "docks": 1}
+        for index in range(data.draw(st.integers(0, 3)))
+    ]
+
+    def documents(status: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "station_information": {"stations": info_rows},
+            "station_status": {"stations": status},
+        }
+
+    handle = _gbfs_handle(documents(status_rows))
     unfiltered = asyncio.run(handle.get_stations(None))
     filtered = asyncio.run(handle.get_stations(_GBFS_ZONE))
+    event(f"stations: any row inside the zone: {bool(filtered)}")
+    assert [station.id for station in unfiltered] == station_ids
     assert filtered == [
-        s
-        for s in unfiltered
-        if s.latitude is not None
-        and s.longitude is not None
-        and in_circle(_GBFS_ZONE, s.latitude, s.longitude)
+        station
+        for station in unfiltered
+        if station.latitude is not None
+        and station.longitude is not None
+        and in_circle(_GBFS_ZONE, station.latitude, station.longitude)
     ]
+    for station in unfiltered:
+        assert station.bikes_available == expected_bikes.get(station.id)
+        assert station.is_renting is (True if station.id in expected_bikes else None)
+    reversed_handle = _gbfs_handle(documents(list(reversed(status_rows))))
+    shuffled_handle = _gbfs_handle(documents(data.draw(st.permutations(status_rows))))
+    assert asyncio.run(reversed_handle.get_stations(None)) == unfiltered
+    assert asyncio.run(shuffled_handle.get_stations(None)) == unfiltered
 
 
 _EARTH_HALF_CIRCUMFERENCE_M = math.pi * 6_371_000.0
@@ -4587,33 +4826,24 @@ def test_endpoints_from_discovery_layouts_oracle(data: st.DataObject) -> None:
             _endpoints_from_discovery(document)
 
 
-def _vehicle_handle(endpoints: dict[str, dict[str, object]]) -> GbfsFeedHandle:
-    """A detached handle whose named endpoints serve pre-cached documents."""
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        name: (float("inf"), float("inf"), {"data": payload})
-        for name, payload in endpoints.items()
+@st.composite
+def _equivalence_row(draw: st.DrawFn) -> dict[str, object]:
+    """One descriptive vehicle row, keyed on a neutral ``id``.
+
+    The id is rewritten to each spec version's own key by the test; the
+    rest of the descriptive surface is drawn so the two paths have
+    something to disagree about.
+    """
+    return {
+        **draw(_zone_row("id")),
+        "is_reserved": draw(st.booleans() | st.none()),
+        "is_disabled": draw(st.booleans() | st.none()),
+        "vehicle_type_id": draw(st.text(min_size=1, max_size=4) | st.none()),
+        "current_range_meters": draw(st.floats(0, 50_000) | st.none()),
     }
-    handle._endpoints = dict.fromkeys(endpoints, "x")
-    return handle
 
 
-@given(
-    rows=st.lists(
-        st.fixed_dictionaries(
-            {
-                "id": st.text(min_size=1, max_size=6),
-                "lat": _NEARBY_LAT | st.none(),
-                "lon": _NEARBY_LON | st.none(),
-                "is_reserved": st.booleans() | st.none(),
-                "is_disabled": st.booleans() | st.none(),
-                "vehicle_type_id": st.text(min_size=1, max_size=4) | st.none(),
-                "current_range_meters": st.floats(0, 50_000) | st.none(),
-            }
-        ),
-        max_size=6,
-    )
-)
+@given(rows=st.lists(_equivalence_row(), max_size=6))
 @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
     rows: list[dict[str, object]],
@@ -4633,15 +4863,15 @@ def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
         for row in rows
     ]
     via_30 = asyncio.run(
-        _vehicle_handle({"vehicle_status": {"vehicles": v_rows}}).get_vehicles()
+        _gbfs_handle({"vehicle_status": {"vehicles": v_rows}}).get_vehicles()
     )
     via_23 = asyncio.run(
-        _vehicle_handle({"free_bike_status": {"bikes": b_rows}}).get_vehicles()
+        _gbfs_handle({"free_bike_status": {"bikes": b_rows}}).get_vehicles()
     )
     assert via_30 == via_23
     decoy = [{"bike_id": "DECOY", "lat": 34.05, "lon": -118.25}]
     via_both = asyncio.run(
-        _vehicle_handle(
+        _gbfs_handle(
             {
                 "vehicle_status": {"vehicles": v_rows},
                 "free_bike_status": {"bikes": decoy},
@@ -4650,3 +4880,189 @@ def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
     )
     assert via_both == via_30
     assert all(vehicle.id != "DECOY" for vehicle in via_both)
+
+
+# JSON permits an arbitrarily large integer literal and Python's json parses
+# it into an unbounded int, so a producer document can carry a number that no
+# float can represent -- float(10**400) raises OverflowError -- and "1e999"
+# parses to inf, which int() refuses in turn. 1e308 is the largest power of
+# ten that IS representable and is kept, so the boundary stays pinned.
+# The exponents stop at 400 because json.loads itself rejects an integer
+# literal over 4300 digits (CPython's int/str limit), and that ValueError is
+# already mapped to FeedParseError at the fetch boundary.
+_TOO_LARGE_FOR_FLOAT = [10**400, -(10**400)]
+_TOO_LARGE_FOR_INT = [1e309, -1e309]
+
+
+# Dictionary keys are drawn from the GBFS vocabulary, since free-form keys
+# would never spell "stations"/"lat"/"ttl" and the documents would all be
+# uniformly empty rather than adversarially mis-shaped.
+_GBFS_KEY = st.sampled_from(
+    [
+        "data",
+        "ttl",
+        "feeds",
+        "name",
+        "url",
+        "en",
+        "stations",
+        "vehicles",
+        "bikes",
+        "station_id",
+        "vehicle_id",
+        "bike_id",
+        "system_id",
+        "lat",
+        "lon",
+        "count",
+        "vehicle_type_id",
+        "vehicle_types_available",
+        "num_bikes_available",
+        "num_vehicles_available",
+        "is_renting",
+        "rental_uris",
+    ]
+) | st.text(max_size=6)
+_GBFS_JSON = st.recursive(
+    st.none()
+    | st.booleans()
+    | st.integers(-200, 200)
+    | st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT)
+    | st.floats(allow_nan=True)
+    | st.sampled_from(["", "34.05", "nope", "s1", "en"])
+    | st.text(max_size=6),
+    lambda children: (
+        st.lists(children, max_size=3)
+        | st.dictionaries(_GBFS_KEY, children, max_size=4)
+    ),
+    max_leaves=12,
+)
+
+
+# A row whose numeric cells are unrepresentable: _GBFS_JSON on its own
+# almost never spells one of those numbers into a "lat"/"lon"/"count" key,
+# so the coordinate and vehicle-count coercions were never handed one.
+@st.composite
+def _unrepresentable_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
+    unrepresentable = st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT)
+    return {
+        id_key: draw(st.text(min_size=1, max_size=4)),
+        "lat": draw(unrepresentable),
+        "lon": draw(unrepresentable),
+        "vehicle_types_available": [
+            {"vehicle_type_id": "v1", "count": draw(unrepresentable)}
+        ],
+    }
+
+
+# Half-valid envelopes: real rows (near the zone, so the filter has work to
+# do) mixed with junk rows. Pure _GBFS_JSON almost never spells a usable
+# document, so on its own it proves totality without proving non-vacuity.
+_MESSY_STATION_DOC = st.builds(
+    lambda rows: {"stations": rows},
+    st.lists(
+        _zone_row("station_id") | _unrepresentable_row("station_id") | _GBFS_JSON,
+        max_size=3,
+    ),
+)
+_MESSY_VEHICLE_DOC = st.builds(
+    # Both id keys on every row: one document serves either endpoint.
+    lambda rows: {"vehicles": rows, "bikes": rows},
+    st.lists(
+        (_zone_row("vehicle_id") | _unrepresentable_row("vehicle_id")).map(
+            lambda row: {**row, "bike_id": row["vehicle_id"]}
+        )
+        | _GBFS_JSON,
+        max_size=3,
+    ),
+)
+
+
+@given(
+    info=_GBFS_JSON | _MESSY_STATION_DOC,
+    status=_GBFS_JSON | _MESSY_STATION_DOC,
+    zone=st.none() | st.just(_GBFS_ZONE),
+)
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_get_stations_total_over_json_documents(
+    info: object, status: object, zone: Circle | None
+) -> None:
+    """get_stations is TOTAL over arbitrary JSON ``data`` envelopes: a list
+    of stations, never a KeyError/TypeError/AttributeError leaking producer
+    data shapes. Every returned station carries a real id: never empty and
+    never the synthesized literal "None" (duplicates are NOT asserted
+    against -- a document with two rows sharing an id really does describe
+    two stations with that id, and the library does not dedupe).
+    """
+    stations = asyncio.run(
+        _gbfs_handle(
+            {"station_information": info, "station_status": status}
+        ).get_stations(zone)
+    )
+    event(f"stations parsed from arbitrary json: {bool(stations)}")
+    ids = [station.id for station in stations]
+    assert all(ids)
+    assert "None" not in ids
+
+
+@given(
+    document=_GBFS_JSON | _MESSY_VEHICLE_DOC,
+    endpoint=st.sampled_from(["vehicle_status", "free_bike_status"]),
+    zone=st.none() | st.just(_GBFS_ZONE),
+)
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_get_vehicles_total_over_json_documents(
+    document: object, endpoint: str, zone: Circle | None
+) -> None:
+    """get_vehicles is TOTAL over arbitrary JSON ``data`` envelopes on both
+    the 3.x and 2.x endpoint, and every surfaced vehicle has a real id (never
+    the synthesized literal "None") and real float coordinates.
+    """
+    vehicles = asyncio.run(_gbfs_handle({endpoint: document}).get_vehicles(zone))
+    event(f"vehicles parsed from arbitrary json: {bool(vehicles)}")
+    ids = [vehicle.id for vehicle in vehicles]
+    assert all(ids)
+    assert "None" not in ids
+    assert all(isinstance(vehicle.latitude, float) for vehicle in vehicles)
+    assert all(isinstance(vehicle.longitude, float) for vehicle in vehicles)
+
+
+@given(document=_GBFS_JSON)
+@settings(max_examples=200, deadline=None)
+def test_endpoints_from_discovery_total_over_json_documents(document: object) -> None:
+    """_endpoints_from_discovery is TOTAL over arbitrary JSON: either a
+    NON-EMPTY name->url table of strings, or FeedParseError. A missing
+    ``data`` key used to escape as KeyError.
+    """
+    endpoints: dict[str, str] | None
+    try:
+        endpoints = _endpoints_from_discovery(document)
+    except FeedParseError:
+        endpoints = None
+    event(f"discovery resolved endpoints: {endpoints is not None}")
+    assert endpoints is None or (
+        endpoints
+        and all(
+            isinstance(name, str) and isinstance(url, str)
+            for name, url in endpoints.items()
+        )
+    )
+
+
+@given(
+    number=st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT),
+    count=st.sampled_from(_TOO_LARGE_FOR_INT),
+)
+def test_numeric_helpers_treat_unrepresentable_numbers_as_unknown(
+    number: float, count: float
+) -> None:
+    """A number no float can hold is UNKNOWN, not an escaping OverflowError.
+
+    Each helper answers with what it already answers for other malformed
+    input: no coordinate, no caching, and a dropped vehicle-type count.
+    """
+    assert _coordinate(number) is None
+    assert _ttl_seconds(number) == 0.0
+    assert _vehicle_types([{"vehicle_type_id": "v1", "count": count}]) is None
+    assert _coordinate(1e308) == 1e308
+    assert _ttl_seconds(1e308) == 1e308
