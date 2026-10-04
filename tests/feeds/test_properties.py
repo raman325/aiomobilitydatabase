@@ -1218,6 +1218,12 @@ def test_upcoming_departures_deterministic(
     """Identical queries must return identical row sequences (HA sensors must
     not flap between tied departures), and a drawn route_ids subset returns
     exactly the oracle-side filter of the unfiltered rows.
+
+    Determinism is checked against a SEPARATELY BUILT index over the same
+    bytes, not just a repeated call on one connection: two calls through one
+    connection only catch set/dict iteration order leaking into results,
+    while a fresh build also re-runs the loaders and gets a new query plan,
+    which is what "the sensor shows the same thing after a restart" means.
     """
     try:
         index = _index_from_zip_bytes(zip_bytes)
@@ -1252,6 +1258,13 @@ def test_upcoming_departures_deterministic(
         first = index.upcoming_departures(queried, None, now, lookahead, 5)
         second = index.upcoming_departures(queried, None, now, lookahead, 5)
         assert first == second
+        rebuilt = _index_from_zip_bytes(zip_bytes)
+        try:
+            assert (
+                rebuilt.upcoming_departures(queried, None, now, lookahead, 5) == first
+            )
+        finally:
+            rebuilt.close()
         assert first == sorted(
             first, key=lambda dep: (dep.departure, dep.trip_id, dep.stop_id)
         )
@@ -4014,3 +4027,594 @@ def test_gbfs_vehicle_status_and_free_bike_status_equivalent(
     )
     assert via_both == via_30
     assert all(vehicle.id != "DECOY" for vehicle in via_both)
+
+
+# --- static-index query-method properties (Task 16: pair semantics, window
+# monotonicity, limit truncation, call ordering) ------------------------------
+
+
+def _raw_trip_rows(
+    index: StaticIndex,
+) -> dict[str, list[tuple[int, str, int | None, int | None]]]:
+    """Stored ``(stop_sequence, stop_id, arrival_secs, departure_secs)`` per trip.
+
+    Read straight from the table so the oracles below never route through a
+    query method under test. Rows are deliberately NOT deduplicated: a messy
+    feed can repeat a call, and an oracle has to model what is stored.
+    """
+    rows: dict[str, list[tuple[int, str, int | None, int | None]]] = {}
+    for trip_id, seq, stop_id, arrival, departure in index._conn.execute(
+        "SELECT trip_id, stop_sequence, stop_id, arrival_secs, departure_secs "
+        "FROM stop_times"
+    ):
+        rows.setdefault(trip_id, []).append((seq, stop_id, arrival, departure))
+    return rows
+
+
+def _oracle_service_days(
+    index: StaticIndex, now: datetime, lookahead: timedelta, grace: timedelta
+) -> list[tuple[date, datetime, set[str]]]:
+    """``(service_date, anchor_utc, active_ids)`` for every day that can contribute.
+
+    Three days of margin before the window and one after: the generator's
+    largest GTFS time (47:59:59) spills at most two service days forward, so
+    a day outside this range can never land a departure in the window — which
+    makes the range a bound on the production scan, not a copy of it, and the
+    oracle therefore catches under-scanning.
+    """
+    tz = ZoneInfo(index.timezone_name)
+    first = (now - grace).astimezone(tz).date() - timedelta(days=3)
+    last = (now + lookahead).astimezone(tz).date() + timedelta(days=1)
+    return [
+        (service_date, _oracle_anchor_utc(service_date, tz), active)
+        for offset in range((last - first).days + 1)
+        if (service_date := first + timedelta(days=offset))
+        and (active := index.active_service_ids(service_date))
+    ]
+
+
+def _pair_oracle(
+    index: StaticIndex,
+    origin: str,
+    destination: str,
+    *,
+    now: datetime,
+    lookahead: timedelta,
+    grace: timedelta,
+) -> dict[tuple[date, str, int], tuple[set[datetime], datetime, set[int]]]:
+    """Expected ``upcoming_trips`` rows keyed by ``(service day, trip, origin seq)``.
+
+    A row is expected iff the trip's service is active that day, the origin
+    call has a departure inside the window, and SOME later-sequence call at
+    the destination has an arrival. The value is the set of departures the
+    grouped query may legitimately report (a messy feed can store the same
+    origin call twice with different times, which the ``GROUP BY`` collapses
+    into one row), the EARLIEST qualifying destination arrival, and the
+    destination sequences achieving it.
+    """
+    services: dict[str, str] = dict(
+        index._conn.execute("SELECT id, service_id FROM trips")
+    )
+    trip_rows = _raw_trip_rows(index)
+    expected: dict[tuple[date, str, int], tuple[set[datetime], datetime, set[int]]] = {}
+    for service_date, anchor, active in _oracle_service_days(
+        index, now, lookahead, grace
+    ):
+        for trip_id, rows in trip_rows.items():
+            if services.get(trip_id) not in active:
+                continue
+            for o_seq, o_stop, _o_arrival, o_departure in rows:
+                if o_stop != origin or o_departure is None:
+                    continue
+                departure = anchor + timedelta(seconds=o_departure)
+                if not now - grace <= departure <= now + lookahead:
+                    continue
+                later = [
+                    (d_arrival, d_seq)
+                    for d_seq, d_stop, d_arrival, _d_departure in rows
+                    if d_stop == destination and d_seq > o_seq and d_arrival is not None
+                ]
+                if not later:
+                    continue
+                earliest = min(arrival for arrival, _ in later)
+                key = (service_date, trip_id, o_seq)
+                departures = expected[key][0] if key in expected else set()
+                expected[key] = (
+                    departures | {departure},
+                    anchor + timedelta(seconds=earliest),
+                    {seq for arrival, seq in later if arrival == earliest},
+                )
+    return expected
+
+
+def _biased_pair(
+    index: StaticIndex, data: st.DataObject
+) -> tuple[str, str, datetime] | None:
+    """An origin/destination pair plus a probe instant, biased toward rows.
+
+    Picks an in-window departure (a known-good origin: non-null, in-window
+    departure time) and a LATER call of the same trip as the destination,
+    probing both generator calendar years. A drawn fraction of examples still
+    uses arbitrary — usually unrelated — stops.
+    """
+    stops = [stop.id for stop in index.stops()]
+    if not stops:
+        return None
+    lookahead = timedelta(hours=30)
+    if data.draw(st.integers(0, 9)) < 8:
+        for probe_now in _GEN_PROBE_NOWS:
+            departures = index.upcoming_departures(
+                stops, None, probe_now, lookahead, 10_000
+            )
+            calls = index.trip_stop_calls(sorted({dep.trip_id for dep in departures}))
+            candidates = [
+                (dep.stop_id, later)
+                for dep in departures
+                if (
+                    later := [
+                        call
+                        for call in calls.get(dep.trip_id, [])
+                        if call[0] > dep.stop_sequence
+                    ]
+                )
+            ]
+            if candidates:
+                origin, later_calls = data.draw(st.sampled_from(candidates))
+                return origin, data.draw(st.sampled_from(later_calls))[1], probe_now
+    return (
+        data.draw(st.sampled_from(stops)),
+        data.draw(st.sampled_from(stops)),
+        _GEN_PROBE_NOWS[0],
+    )
+
+
+@given(zip_bytes=_random_gtfs_zip(), data=st.data())
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_upcoming_trips_matches_pair_semantics_oracle(
+    zip_bytes: bytes, data: st.DataObject
+) -> None:
+    """The pair semantics `upcoming_trips` exists for, against an oracle built
+    from the stored rows plus ``active_service_ids``: a row exists exactly
+    when a later-sequence destination call is reachable from an in-window
+    origin departure, and its arrival is the EARLIEST such call (a loop trip
+    serving the destination twice must report the first one). The direction
+    law is asserted on every row — nothing in the repo asserted
+    ``origin_stop_sequence`` at all before this.
+    """
+    try:
+        index = _index_from_zip_bytes(zip_bytes)
+    except FeedParseError:
+        return  # acceptable outcome for genuinely unbuildable feeds
+    try:
+        probe = _biased_pair(index, data)
+        if probe is None:
+            return
+        origin, destination, now = probe
+        lookahead = timedelta(hours=data.draw(st.sampled_from([1, 6, 30, 36])))
+        grace = timedelta(minutes=data.draw(st.sampled_from([0, 30, 90])))
+        rows = index.upcoming_trips(
+            origin, destination, now, lookahead, None, grace=grace
+        )
+        expected = _pair_oracle(
+            index, origin, destination, now=now, lookahead=lookahead, grace=grace
+        )
+        event(f"pair oracle non-empty: {bool(expected)}")
+        got: dict[tuple[date, str, int], ScheduledTrip] = {}
+        for trip in rows:
+            assert trip.origin_stop_sequence < trip.destination_stop_sequence
+            key = (trip.service_date, trip.trip_id, trip.origin_stop_sequence)
+            assert key not in got, "one row per (service day, trip, origin call)"
+            got[key] = trip
+        assert set(got) == set(expected)
+        for key, trip in got.items():
+            departures, earliest, destination_seqs = expected[key]
+            assert trip.departure in departures
+            assert trip.arrival == earliest
+            assert trip.destination_stop_sequence in destination_seqs
+    finally:
+        index.close()
+
+
+@given(zip_bytes=_random_gtfs_zip(), data=st.data())
+@settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_query_windows_are_monotone(zip_bytes: bytes, data: st.DataObject) -> None:
+    """Widening the window may only ADD rows, never move or drop one.
+
+    Both methods sort by a total key whose first component is the departure,
+    so a longer ``lookahead`` must leave the shorter query's result as an
+    exact PREFIX, and a longer ``grace`` must keep every shorter-grace row,
+    in the same relative order. No hand-built oracle is involved, which is
+    what makes this a direct guard on the regression class recorded in
+    ``_service_day_windows``: a scan range that ignores ``lookahead``
+    silently truncates the longer query.
+    """
+    try:
+        index = _index_from_zip_bytes(zip_bytes)
+    except FeedParseError:
+        return  # acceptable outcome for genuinely unbuildable feeds
+    try:
+        probe = _biased_pair(index, data)
+        if probe is None:
+            return
+        origin, destination, now = probe
+        stops = [stop.id for stop in index.stops()]
+        short = timedelta(hours=data.draw(st.integers(1, 24)))
+        long = short + timedelta(hours=data.draw(st.integers(0, 48)))
+        narrow = timedelta(minutes=data.draw(st.sampled_from([0, 15])))
+        wide = narrow + timedelta(minutes=data.draw(st.sampled_from([0, 45, 600])))
+
+        few = index.upcoming_departures(stops, None, now, short)
+        many = index.upcoming_departures(stops, None, now, long)
+        event(f"lookahead prefix non-empty: {bool(few)}")
+        assert many[: len(few)] == few
+        few_trips = index.upcoming_trips(origin, destination, now, short)
+        many_trips = index.upcoming_trips(origin, destination, now, long)
+        assert many_trips[: len(few_trips)] == few_trips
+
+        # Window COMPOSITION: splitting the long window at the short one's end
+        # must return the same rows as querying it whole. The prefix law above
+        # cannot see rows the long query never produced (an under-scanning bug
+        # only drops TRAILING rows), while the split query -- whose own scan
+        # starts later -- does find them.
+        rest = index.upcoming_departures(stops, None, now + short, long - short)
+        assert set(many) == set(few) | set(rest)
+        rest_trips = index.upcoming_trips(
+            origin, destination, now + short, long - short
+        )
+        assert set(many_trips) == set(few_trips) | set(rest_trips)
+
+        tight = index.upcoming_departures(stops, None, now, short, grace=narrow)
+        loose = index.upcoming_departures(stops, None, now, short, grace=wide)
+        kept = set(tight)
+        assert kept <= set(loose)
+        assert [dep for dep in loose if dep in kept] == tight
+        tight_trips = index.upcoming_trips(
+            origin, destination, now, short, grace=narrow
+        )
+        loose_trips = index.upcoming_trips(origin, destination, now, short, grace=wide)
+        kept_trips = set(tight_trips)
+        assert kept_trips <= set(loose_trips)
+        assert [trip for trip in loose_trips if trip in kept_trips] == tight_trips
+    finally:
+        index.close()
+
+
+@given(zip_bytes=_random_gtfs_zip(), data=st.data())
+@settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_query_limits_truncate_the_unlimited_result(
+    zip_bytes: bytes, data: st.DataObject
+) -> None:
+    """A limited query is exactly the unlimited one, truncated.
+
+    For ``per_stop_limit`` over SEVERAL stops that means the greedy per-stop
+    truncation of the globally sorted rows: a quota consumed at one stop must
+    never drop a nearer row at another stop. For ``upcoming_trips``'s
+    ``limit`` it means a plain prefix, which fails if truncation is ever
+    applied before the final sort.
+    """
+    try:
+        index = _index_from_zip_bytes(zip_bytes)
+    except FeedParseError:
+        return  # acceptable outcome for genuinely unbuildable feeds
+    try:
+        probe = _biased_pair(index, data)
+        if probe is None:
+            return
+        origin, destination, now = probe
+        stops = [stop.id for stop in index.stops()]
+        lookahead = timedelta(hours=data.draw(st.sampled_from([6, 30, 36])))
+
+        # The per-stop law only bites on a MULTI-stop result, so probe both
+        # generator calendar years for the instant that yields departures
+        # (the pair probe above optimizes for the origin/destination pair,
+        # which is a different, sometimes emptier, target).
+        now_departures = now
+        unlimited = index.upcoming_departures(stops, None, now_departures, lookahead)
+        for probe_now in _GEN_PROBE_NOWS:
+            if unlimited:
+                break
+            now_departures = probe_now
+            unlimited = index.upcoming_departures(
+                stops, None, now_departures, lookahead
+            )
+        event(f"stops with departures: {len({dep.stop_id for dep in unlimited})}")
+        # A limit at or above every stop's row count makes the law vacuous, so
+        # draw it BELOW the busiest stop's count on most examples -- the
+        # quota then really runs out at one stop while another still has
+        # nearer rows, which is the asymmetry a naive limiter gets wrong.
+        rows_per_stop: dict[str, int] = {}
+        for dep in unlimited:
+            rows_per_stop[dep.stop_id] = rows_per_stop.get(dep.stop_id, 0) + 1
+        busiest = max(rows_per_stop.values(), default=0)
+        per_stop_limit = data.draw(st.integers(1, 3))
+        if busiest > 1 and data.draw(st.integers(0, 9)) < 8:
+            per_stop_limit = data.draw(st.integers(1, busiest - 1))
+        counts: dict[str, int] = {}
+        greedy = []
+        for dep in unlimited:
+            if counts.get(dep.stop_id, 0) < per_stop_limit:
+                counts[dep.stop_id] = counts.get(dep.stop_id, 0) + 1
+                greedy.append(dep)
+        event(f"per_stop_limit truncated rows: {len(greedy) < len(unlimited)}")
+        assert (
+            index.upcoming_departures(
+                stops, None, now_departures, lookahead, per_stop_limit
+            )
+            == greedy
+        )
+
+        limit = data.draw(st.integers(1, 3))
+        all_trips = index.upcoming_trips(origin, destination, now, lookahead)
+        assert (
+            index.upcoming_trips(origin, destination, now, lookahead, limit)
+            == all_trips[:limit]
+        )
+    finally:
+        index.close()
+
+
+@st.composite
+def _shuffled_calls_feed(
+    draw: st.DrawFn,
+) -> tuple[bytes, dict[str, list[tuple[int, str]]]]:
+    """A feed whose ``stop_times`` rows are written SHUFFLED, plus the expected
+    per-trip ordered calls.
+
+    Source order is exactly what a dropped ``ORDER BY`` silently inherits, so
+    rows that happen to be stored in sequence order cannot witness the
+    ordering law at all. ``TEMPTY`` is declared in ``trips.txt`` with no
+    ``stop_times`` rows, pinning the documented "absent, not empty" result.
+    """
+    stops = [f"S{index}" for index in range(3)]
+    trips: dict[str, list[tuple[int, str]]] = {}
+    for trip_index in range(draw(st.integers(1, 3))):
+        sequences = sorted(
+            draw(st.lists(st.integers(0, 40), min_size=1, max_size=4, unique=True))
+        )
+        trips[f"T{trip_index}"] = [
+            (sequence, draw(st.sampled_from(stops))) for sequence in sequences
+        ]
+    rows = draw(
+        st.permutations(
+            [
+                f"{trip_id},08:00:00,08:00:00,{stop_id},{sequence}"
+                for trip_id, calls in trips.items()
+                for sequence, stop_id in calls
+            ]
+        )
+    )
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
+        + "".join(f"{stop_id},{stop_id},0,0\n" for stop_id in stops),
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\n"
+        + "".join(f"R1,ONE,{trip_id},H\n" for trip_id in [*trips, "TEMPTY"]),
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        + "".join(f"{row}\n" for row in rows),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return buf.getvalue(), trips
+
+
+@given(feed=_shuffled_calls_feed(), data=st.data())
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_trip_stop_calls_ordered_and_scoped(
+    feed: tuple[bytes, dict[str, list[tuple[int, str]]]], data: st.DataObject
+) -> None:
+    """``trip_stop_calls`` returns each trip's calls in ``stop_sequence`` order,
+    only for requested trips, and omits trips with no ``stop_times`` rows.
+
+    RT delay propagation walks these lists POSITIONALLY, so a drifting
+    ``ORDER BY`` would misattribute every delay rather than fail loudly.
+    """
+    zip_bytes, trips = feed
+    index = _index_from_zip_bytes(zip_bytes)
+    try:
+        requested = data.draw(
+            st.lists(
+                st.sampled_from([*trips, "TEMPTY", "MISSING"]),
+                min_size=1,
+                max_size=5,
+                unique=True,
+            )
+        )
+        calls = index.trip_stop_calls(requested)
+        assert set(calls) <= set(requested)
+        assert "TEMPTY" not in calls
+        assert "MISSING" not in calls
+        for trip_id, trip_calls in calls.items():
+            sequences = [sequence for sequence, _stop_id in trip_calls]
+            assert sequences == sorted(set(sequences))
+            assert trip_calls == trips[trip_id]
+        assert set(calls) == {trip_id for trip_id in requested if trip_id in trips}
+    finally:
+        index.close()
+
+
+def _hms(seconds: int) -> str:
+    """Format elapsed seconds as a GTFS ``HH:MM:SS`` cell (hours may exceed 23)."""
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+@st.composite
+def _loop_pair_feed(draw: st.DrawFn) -> tuple[bytes, int, int, int]:
+    """A feed engineered for the pair semantics the generated feeds rarely hit.
+
+    ``T1`` calls the destination SEVERAL times after the origin with
+    non-monotonic arrival times, so the earliest arrival is not simply the
+    first later call: ``MIN`` and "the first destination call after the
+    origin" give different answers, and so does ``MAX``. ``T9`` serves the
+    same two stops in reverse (destination call first, both ends timed), so
+    only the ``o.stop_sequence < d.stop_sequence`` predicate excludes it.
+    Returns the zip plus the expected origin departure, earliest destination
+    arrival, and that arrival's stop_sequence, all in GTFS seconds.
+    """
+    origin_seq = draw(st.integers(1, 3))
+    destination_seqs = draw(
+        st.lists(st.integers(4, 9), min_size=2, max_size=3, unique=True)
+    )
+    arrivals = draw(
+        st.lists(
+            st.integers(8 * 3600, 26 * 3600),
+            min_size=len(destination_seqs),
+            max_size=len(destination_seqs),
+            unique=True,
+        )
+    )
+    departure = draw(st.integers(0, 7 * 3600))
+    rows = [
+        f"T1,{_hms(departure)},{_hms(departure)},S1,{origin_seq}",
+        # A later destination call with no arrival time can never be ridden
+        # to, so it must not become the "earliest" one.
+        "T1,,,S2,10",
+        # The return trip: its destination call PRECEDES its origin call.
+        "T9,09:00:00,09:00:00,S2,1",
+        "T9,09:30:00,09:30:00,S1,2",
+        *(
+            f"T1,{_hms(arrival)},{_hms(arrival)},S2,{seq}"
+            for seq, arrival in zip(destination_seqs, arrivals, strict=True)
+        ),
+    ]
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,A,0,0\nS2,B,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": (
+            "route_id,service_id,trip_id,trip_headsign\nR1,ONE,T1,Out\nR1,ONE,T9,Back\n"
+        ),
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        + "".join(f"{row}\n" for row in draw(st.permutations(rows))),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    earliest = min(arrivals)
+    earliest_seq = destination_seqs[arrivals.index(earliest)]
+    return buf.getvalue(), departure, earliest, earliest_seq
+
+
+@given(feed=_loop_pair_feed())
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_upcoming_trips_rides_to_the_earliest_destination_call(
+    feed: tuple[bytes, int, int, int],
+) -> None:
+    """A loop trip serving the destination repeatedly reports the EARLIEST
+    arrival (ride until the vehicle first gets there), and the reverse trip
+    is excluded in both query directions. Non-vacuous by construction: the
+    outbound row always exists.
+    """
+    zip_bytes, departure, earliest, earliest_seq = feed
+    index = _index_from_zip_bytes(zip_bytes)
+    try:
+        # _ONE_DAY_CALENDAR serves 2026-07-30 only, and the feed is UTC, so
+        # the service-day anchor is exactly midnight UTC.
+        anchor = datetime(2026, 7, 30, tzinfo=UTC)
+        lookahead = timedelta(hours=30)
+        outbound = index.upcoming_trips("S1", "S2", anchor, lookahead)
+        assert [trip.trip_id for trip in outbound] == ["T1"]
+        trip = outbound[0]
+        assert trip.departure == anchor + timedelta(seconds=departure)
+        assert trip.arrival == anchor + timedelta(seconds=earliest)
+        assert trip.destination_stop_sequence == earliest_seq
+        assert trip.origin_stop_sequence < trip.destination_stop_sequence
+        # Symmetry: the reverse query keeps T9 and drops T1.
+        assert [
+            trip.trip_id for trip in index.upcoming_trips("S2", "S1", anchor, lookahead)
+        ] == ["T9"]
+        # The generated-feed oracle must reach the same verdict here.
+        assert _pair_oracle(
+            index, "S1", "S2", now=anchor, lookahead=lookahead, grace=timedelta(0)
+        ) == {
+            (date(2026, 7, 30), "T1", trip.origin_stop_sequence): (
+                {trip.departure},
+                trip.arrival,
+                {earliest_seq},
+            )
+        }
+    finally:
+        index.close()
+
+
+@st.composite
+def _descending_pair_feed(draw: st.DrawFn) -> tuple[bytes, list[tuple[int, str]]]:
+    """One stop pair served by several trips, rows written in DESCENDING
+    departure order, plus the expected ``(departure_secs, trip_id)`` sequence.
+
+    Writing the rows backwards is the point: the SQL scan order then differs
+    from the sorted order, so applying a limit before the final sort keeps
+    the LATEST departures instead of the earliest.
+    """
+    departures = draw(
+        st.lists(st.integers(0, 20 * 3600), min_size=2, max_size=5, unique=True)
+    )
+    expected = sorted((departure, f"T{i}") for i, departure in enumerate(departures))
+    rows = [
+        row
+        for departure, trip_id in sorted(expected, reverse=True)
+        for row in (
+            f"{trip_id},{_hms(departure)},{_hms(departure)},S1,1",
+            f"{trip_id},{_hms(departure + 600)},{_hms(departure + 600)},S2,2",
+        )
+    ]
+    files = {
+        "agency.txt": _UTC_AGENCY,
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,A,0,0\nS2,B,0,0\n",
+        "routes.txt": (
+            "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\n"
+        + "".join(f"R1,ONE,{trip_id},Out\n" for _departure, trip_id in expected),
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        + "".join(f"{row}\n" for row in rows),
+        "calendar.txt": _ONE_DAY_CALENDAR,
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return buf.getvalue(), expected
+
+
+@given(feed=_descending_pair_feed(), limit=st.integers(min_value=1, max_value=5))
+@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_limits_keep_the_earliest_departures_not_the_scan_order(
+    feed: tuple[bytes, list[tuple[int, str]]], limit: int
+) -> None:
+    """Both limits keep the EARLIEST rows even when the scan order is the exact
+    reverse of the sorted order -- the case a limit applied before the final
+    sort gets backwards. Non-vacuous by construction: at least two rows exist.
+    """
+    zip_bytes, expected = feed
+    index = _index_from_zip_bytes(zip_bytes)
+    try:
+        anchor = datetime(2026, 7, 30, tzinfo=UTC)
+        lookahead = timedelta(hours=30)
+        trips = index.upcoming_trips("S1", "S2", anchor, lookahead)
+        assert [
+            (int((trip.departure - anchor).total_seconds()), trip.trip_id)
+            for trip in trips
+        ] == expected
+        assert (
+            index.upcoming_trips("S1", "S2", anchor, lookahead, limit)
+            == (trips[:limit])
+        )
+        departures = index.upcoming_departures(["S1"], None, anchor, lookahead)
+        assert (
+            index.upcoming_departures(["S1"], None, anchor, lookahead, limit)
+            == (departures[:limit])
+        )
+    finally:
+        index.close()
