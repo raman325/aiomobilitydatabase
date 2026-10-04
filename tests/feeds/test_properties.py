@@ -4,6 +4,7 @@ import asyncio
 import csv
 import io
 import math
+import sys
 import tempfile
 import zipfile
 from datetime import UTC, date, datetime, time, timedelta
@@ -62,6 +63,8 @@ from aiomobilitydatabase.feeds.rt import (
 from aiomobilitydatabase.feeds.static_index import (
     ScheduledTrip,
     StaticIndex,
+    _lenient_date,
+    _lenient_int,
     parse_gtfs_time,
 )
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle, group_stations
@@ -370,6 +373,67 @@ def test_parse_gtfs_time_rejects_fractional_components(
     cells[position] = f"{whole}.{frac}"
     with pytest.raises(FeedParseError):
         parse_gtfs_time(":".join(cells))
+
+
+# CPython caps int-string conversion at 4300 digits by default, so a cell
+# can be nothing but ASCII digits and still refuse to convert. No other
+# generator in this suite draws strings that long, so the boundary is drawn
+# explicitly: the last accepted lengths, the first rejected ones, and a few
+# thousand digits past the cap.
+_DIGIT_LIMIT = sys.get_int_max_str_digits()
+_CONVERTIBLE_LENGTHS = st.sampled_from([_DIGIT_LIMIT - 1, _DIGIT_LIMIT])
+_UNCONVERTIBLE_LENGTHS = st.sampled_from(
+    [_DIGIT_LIMIT + 1, _DIGIT_LIMIT + 2, _DIGIT_LIMIT + 3000]
+)
+
+
+@settings(max_examples=10, deadline=None)
+@given(
+    length=_CONVERTIBLE_LENGTHS,
+    minutes=st.integers(min_value=0, max_value=59),
+    seconds=st.integers(min_value=0, max_value=59),
+)
+def test_parse_gtfs_time_accepts_hours_up_to_the_digit_limit(
+    length: int, minutes: int, seconds: int
+) -> None:
+    """Hours are unbounded in GTFS, so an hour spelled right up to the
+    conversion cap is still a time: the cap is where "ASCII digits" stops
+    meaning "a number", not an hour ceiling moved into the parser.
+    """
+    hours = int("1" * length)
+    assert (
+        parse_gtfs_time(f"{hours}:{minutes:02d}:{seconds:02d}")
+        == hours * 3600 + minutes * 60 + seconds
+    )
+
+
+@settings(max_examples=10, deadline=None)
+@given(length=_UNCONVERTIBLE_LENGTHS, position=st.integers(min_value=0, max_value=2))
+def test_parse_gtfs_time_rejects_components_past_the_digit_limit(
+    length: int, position: int
+) -> None:
+    """Past the cap, any component is rejected the way every other
+    unparseable component is -- FeedParseError, never the raw ValueError
+    int() raises (which callers catching FeedParseError would miss).
+    """
+    cells = ["00", "00", "00"]
+    cells[position] = "1" * length
+    with pytest.raises(FeedParseError):
+        parse_gtfs_time(":".join(cells))
+
+
+@settings(max_examples=10, deadline=None)
+@given(length=st.one_of(_CONVERTIBLE_LENGTHS, _UNCONVERTIBLE_LENGTHS))
+def test_lenient_helpers_answer_none_across_the_digit_limit(length: int) -> None:
+    """The lenient helpers answer, never raise, on both sides of the cap:
+    _lenient_int keeps a convertible digit string and degrades the rest to
+    None, and _lenient_date rejects every one of them on length alone (which
+    is why it needs no conversion guard of its own).
+    """
+    cell = "1" * length
+    expected = int(cell) if length <= _DIGIT_LIMIT else None
+    assert _lenient_int(cell) == expected
+    assert _lenient_date(cell) is None
 
 
 @given(
@@ -1438,6 +1502,11 @@ _INT_CELL = st.one_of(
     # plausible vocabulary value: unicode decimals, sign prefixes and
     # PEP 515 underscore grouping are all garbage (-> None).
     st.sampled_from(["\u0665", "\uff11\uff12", "+1", "1_0"]),
+    # Past CPython's int-string conversion cap: all ASCII digits, and still
+    # not a number. Only lengths past the cap are drawn here -- a
+    # convertible 4300-digit int is outside SQLite's INTEGER range, which is
+    # a storage limit rather than a parsing rule.
+    _UNCONVERTIBLE_LENGTHS.map(lambda length: "1" * length),
 )
 # Text-column cells: empty (-> None) or CSV-safe text kept verbatim
 # (including whitespace-only and digit-only values).
@@ -1471,9 +1540,12 @@ def _csv_row(*values: str) -> str:
 def _expected_lenient_int(cell: str) -> int | None:
     """Oracle for descriptive int cells: a cell of nothing but ASCII digits
     is that int (even outside every vocabulary); anything else -- blank,
-    signed, unicode-digit, underscore-grouped, garbage -- is None."""
+    signed, unicode-digit, underscore-grouped, past the int-string
+    conversion cap, garbage -- is None."""
     cell = cell.strip()
     if not cell or not (cell.isascii() and cell.isdigit()):
+        return None
+    if len(cell) > _DIGIT_LIMIT:
         return None
     return int(cell)
 
@@ -1739,6 +1811,9 @@ _DATE_CELL = st.one_of(
             "2026\u0660\u0667\u0663\u0660",
         ]
     ),
+    # Past the int-string conversion cap: _lenient_date's length check
+    # rejects it before any conversion is attempted.
+    _UNCONVERTIBLE_LENGTHS.map(lambda length: "1" * length),
 )
 
 
