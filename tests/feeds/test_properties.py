@@ -4289,8 +4289,10 @@ def test_query_limits_truncate_the_unlimited_result(
     For ``per_stop_limit`` over SEVERAL stops that means the greedy per-stop
     truncation of the globally sorted rows: a quota consumed at one stop must
     never drop a nearer row at another stop. For ``upcoming_trips``'s
-    ``limit`` it means a plain prefix, which fails if truncation is ever
-    applied before the final sort.
+    ``limit`` it means a plain prefix, so a limiter that keeps the farthest
+    rows rather than the nearest fails. (Truncating before the final sort is
+    NOT caught, and is not a defect: the scan already yields these rows in
+    departure order, so the two orderings coincide.)
     """
     try:
         index = _index_from_zip_bytes(zip_bytes)
