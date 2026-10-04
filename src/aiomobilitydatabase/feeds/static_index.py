@@ -17,7 +17,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
 from typing import IO, Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .exceptions import FeedParseError
 from .models import (
@@ -114,22 +114,82 @@ _WEEKDAY_COLUMNS = (
 )
 
 
+def _ascii_digits(value: str) -> bool:
+    """Report whether a cell component is ASCII digits and nothing else.
+
+    ``int()`` also accepts any unicode decimal ("\u0660\u0668"), a sign prefix
+    ("+8") and PEP 515 underscore grouping ("1_0"), each of which turns a
+    corrupt GTFS cell into a plausible-looking number instead of a
+    detected problem. Every GTFS numeric field is spelled in ASCII digits.
+    """
+    return bool(value) and value.isascii() and value.isdigit()
+
+
+def _ascii_int(value: str) -> int | None:
+    """Convert an ASCII-digit cell to an int, or None if it is not one.
+
+    Folds the predicate and the conversion together because an
+    all-ASCII-digit cell can still fail to convert: CPython caps
+    int-string conversion at 4300 digits, and a cell that long is the
+    same "not a usable number" answer as a non-digit cell. Every caller
+    then decides whether that answer raises or degrades.
+    """
+    if not _ascii_digits(value):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _strict_int(value: str, field: str) -> int:
+    """Parse a STRUCTURAL integer cell: anything unparseable raises.
+
+    The counterpart to ``_lenient_int`` for the columns the index
+    navigates by -- stop_sequence orders the stop calls realtime delay
+    propagation walks positionally, headway_secs sets how many
+    repetitions of a template trip exist, exception_type decides whether
+    a service day is added or removed. Same ASCII-digit rule as
+    ``parse_gtfs_time``, and the same reasoning: a corrupt structural
+    value that silently parses is worse than a failed build.
+    """
+    if (parsed := _ascii_int(value.strip())) is None:
+        raise FeedParseError(f"Invalid GTFS {field}: {value!r}")
+    return parsed
+
+
+_GTFS_TIME_COMPONENTS = 3
+
+
 def parse_gtfs_time(value: str) -> int | None:
-    """Parse an ``HH:MM:SS`` GTFS time (hours may exceed 23) to seconds."""
+    """Parse an ``HH:MM:SS`` GTFS time (hours may exceed 23) to seconds.
+
+    STRUCTURAL field: a blank cell means "no time here" (None), but
+    anything else unparseable raises ``FeedParseError`` rather than
+    degrading -- a wrong departure time is worse than a failed build.
+
+    Accepted: exactly three colon-separated ASCII-digit components, any
+    zero-padding or none ("8:0:0"), unbounded hours (service days run
+    past midnight), minutes and seconds in [0, 60), and whitespace around
+    the whole cell (real exporters emit it). Everything else -- unicode
+    digits, sign prefixes, underscore grouping, fractional seconds, wrong
+    arity, intra-component whitespace -- is rejected.
+    """
     value = value.strip()
     if not value:
         return None
-    try:
-        hours, minutes, seconds = (int(part) for part in value.split(":"))
-    except ValueError as err:
-        raise FeedParseError(f"Invalid GTFS time: {value!r}") from err
-    # int() also accepts signed and out-of-range components (e.g. "-1",
-    # "08:75:00"); GTFS times are never negative and minutes/seconds are
-    # bounded to [0, 60).
+    parts = value.split(":")
+    if len(parts) != _GTFS_TIME_COMPONENTS:
+        raise FeedParseError(f"Invalid GTFS time: {value!r}")
+    components: list[int] = []
+    for part in parts:
+        if (parsed := _ascii_int(part)) is None:
+            raise FeedParseError(f"Invalid GTFS time: {value!r}")
+        components.append(parsed)
+    hours, minutes, seconds = components
     if (
-        hours < 0
-        or not (0 <= minutes < _SECONDS_OR_MINUTES_PER_UNIT)
-        or not (0 <= seconds < _SECONDS_OR_MINUTES_PER_UNIT)
+        minutes >= _SECONDS_OR_MINUTES_PER_UNIT
+        or seconds >= _SECONDS_OR_MINUTES_PER_UNIT
     ):
         raise FeedParseError(f"Invalid GTFS time: {value!r}")
     return hours * 3600 + minutes * 60 + seconds
@@ -141,18 +201,17 @@ def _lenient_int(value: str | None) -> int | None:
     Descriptive metadata (wheelchair flags, pickup types, direction ids)
     must never fail a build the way structural fields (stop_sequence,
     times) do -- a producer's typo in an accessibility column should not
-    take the whole schedule down. Parseable ints are stored as-is, even
+    take the whole schedule down. In-range values are stored as-is, even
     outside the closed vocabulary; the model boundary maps those to None.
+
+    Same ASCII-digit rule as ``parse_gtfs_time`` and ``_lenient_date``
+    (every column read through here is a GTFS non-negative integer, so a
+    sign prefix is garbage too), but lenient in KIND: garbage yields None
+    instead of raising. Whitespace around the cell is tolerated.
     """
     if value is None:
         return None
-    value = value.strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
+    return _ascii_int(value.strip())
 
 
 _GTFS_DATE_LENGTH = 8  # YYYYMMDD
@@ -163,13 +222,13 @@ def _lenient_date(value: str | None) -> date | None:
 
     Same contract as ``_lenient_int``: absent, blank, wrong-length,
     non-digit, or calendar-invalid (month 13, day 32) cells become None
-    rather than failing the build. ASCII digits only -- ``int()`` would
-    happily accept unicode digits a GTFS date can never contain.
+    rather than failing the build. ASCII digits only, like every other
+    scalar helper here.
     """
     if value is None:
         return None
     value = value.strip()
-    if len(value) != _GTFS_DATE_LENGTH or not (value.isascii() and value.isdigit()):
+    if len(value) != _GTFS_DATE_LENGTH or not _ascii_digits(value):
         return None
     try:
         return date(int(value[:4]), int(value[4:6]), int(value[6:8]))
@@ -398,13 +457,25 @@ class StaticIndex:
 
     @classmethod
     def open_cached(cls, db_path: Path, dataset_id: str) -> StaticIndex | None:
-        """Open an existing DB if it matches dataset ID and schema version."""
-        if not Path(db_path).exists():
+        """Open an existing DB if it matches dataset ID and schema version.
+
+        Total over whatever sits at ``db_path``: anything that is not a
+        usable cached database is a cache miss (None). The caller rebuilds
+        on None but lets exceptions propagate, so raising here would brick
+        a feed instead of letting a corrupt entry self-heal. Non-regular
+        files (a directory, a FIFO) are rejected before connecting --
+        sqlite3.connect itself raises on those, outside any query guard.
+        Every failure path closes the connection it opened.
+        """
+        if not Path(db_path).is_file():
             return None
-        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        try:
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        except (sqlite3.Error, OSError):
+            return None
         try:
             meta = dict(conn.execute("SELECT key, value FROM meta"))
-        except sqlite3.DatabaseError:
+        except (sqlite3.Error, OSError):
             conn.close()
             return None
         if (
@@ -414,7 +485,15 @@ class StaticIndex:
         ):
             conn.close()
             return None
-        return cls(conn, dataset_id, meta["timezone"])
+        try:
+            return cls(conn, dataset_id, meta["timezone"])
+        except (ZoneInfoNotFoundError, TypeError, ValueError):
+            # Unusable cached timezone metadata (unknown key, empty, or a
+            # non-string the column's TEXT affinity left as a blob) is a
+            # cache miss like any other corruption: ZoneInfo raises in
+            # __init__, one layer below the guards above.
+            conn.close()
+            return None
 
     @staticmethod
     def _timezone_from_agency(archive: zipfile.ZipFile, names: set[str]) -> str | None:
@@ -523,7 +602,7 @@ class StaticIndex:
                     float(lat) if (lat := row.get("stop_lat", "").strip()) else None,
                     float(lon) if (lon := row.get("stop_lon", "").strip()) else None,
                     row.get("parent_station") or None,
-                    int(loc) if (loc := row.get("location_type", "").strip()) else None,
+                    _lenient_int(row.get("location_type")),
                     row.get("stop_code") or None,
                     row.get("platform_code") or None,
                     _lenient_int(row.get("wheelchair_boarding")),
@@ -556,9 +635,7 @@ class StaticIndex:
                     row["route_id"],
                     row.get("route_short_name") or None,
                     row.get("route_long_name") or None,
-                    int(rtype)
-                    if (rtype := row.get("route_type", "").strip())
-                    else None,
+                    _lenient_int(row.get("route_type")),
                     row.get("agency_id") or None,
                     row.get("route_color") or None,
                     row.get("route_text_color") or None,
@@ -624,7 +701,7 @@ class StaticIndex:
                     row["stop_id"],
                     parse_gtfs_time(row.get("arrival_time", "")),
                     parse_gtfs_time(row.get("departure_time", "")),
-                    int(row["stop_sequence"]),
+                    _strict_int(row["stop_sequence"], "stop_sequence"),
                     _lenient_int(row.get("pickup_type")),
                     _lenient_int(row.get("drop_off_type")),
                     _stored_timepoint(row.get("timepoint")),
@@ -785,7 +862,7 @@ class StaticIndex:
                 raise ValueError(
                     f"frequencies row for trip {trip_id!r} lacks a start/end time"
                 )
-            headway_secs = int(row["headway_secs"])
+            headway_secs = _strict_int(row["headway_secs"], "headway_secs")
             if headway_secs <= 0:
                 raise ValueError(
                     f"non-positive headway_secs for trip {trip_id!r}: {headway_secs}"
@@ -806,7 +883,10 @@ class StaticIndex:
             rows.append(
                 (
                     row["service_id"],
-                    *(int(row.get(day, "0") or 0) for day in _WEEKDAY_COLUMNS),
+                    *(
+                        _strict_int(row.get(day) or "0", day)
+                        for day in _WEEKDAY_COLUMNS
+                    ),
                     row.get("start_date") or "",
                     row.get("end_date") or "",
                 )
@@ -829,7 +909,13 @@ class StaticIndex:
         rows: list[tuple[object, ...]] = []
         sql = "INSERT INTO calendar_dates VALUES (?,?,?)"
         for row in reader:
-            rows.append((row["service_id"], row["date"], int(row["exception_type"])))
+            rows.append(
+                (
+                    row["service_id"],
+                    row["date"],
+                    _strict_int(row["exception_type"], "exception_type"),
+                )
+            )
             if len(rows) >= _BATCH_SIZE:
                 cls._batched_insert(conn, sql, rows)
                 if report is not None:

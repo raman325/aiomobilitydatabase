@@ -1,5 +1,6 @@
 """Tests for MobilityFeedsClient construction, catalog access, and close()."""
 
+import shutil
 from pathlib import Path
 
 import aiohttp
@@ -136,4 +137,110 @@ async def test_purge_cache_rejects_symlink_escape(
         await client.purge_cache("mdb-100")
     assert victim.exists()
     assert (victim / "data").exists()
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "feed_id_template",
+    ["{root}/mdb-200", "{root}/./mdb-200", "mdb-100/../mdb-200"],
+)
+async def test_purge_cache_rejects_ids_that_resolve_to_a_child(
+    mock_api: MockApi, tmp_path: Path, feed_id_template: str
+) -> None:
+    """An id that reaches a feed by an absolute path or through ``..`` must
+    be rejected even though it resolves to a direct child: the documented
+    contract is a bare child name, and accepting these lets a caller purge
+    a feed it cannot name directly.
+    """
+    root = tmp_path / "cache"
+    for name in ("mdb-100", "mdb-200"):
+        (root / name).mkdir(parents=True)
+        (root / name / "static.db").write_bytes(b"x")
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(ValueError, match="escapes"):
+        await client.purge_cache(feed_id_template.format(root=root))
+    assert (root / "mdb-200" / "static.db").exists()
+    assert (root / "mdb-100" / "static.db").exists()
+    await client.close()
+
+
+async def test_purge_cache_rejects_symlink_to_sibling_feed(
+    mock_api: MockApi, tmp_path: Path
+) -> None:
+    """A symlinked cache entry pointing at a sibling feed must raise
+    ValueError, not let rmtree follow the link (or fail with OSError).
+    """
+    root = tmp_path / "cache"
+    (root / "mdb-200").mkdir(parents=True)
+    (root / "mdb-200" / "static.db").write_bytes(b"x")
+    (root / "evil").symlink_to(root / "mdb-200", target_is_directory=True)
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(ValueError, match="escapes"):
+        await client.purge_cache("evil")
+    assert (root / "mdb-200" / "static.db").exists()
+    assert (root / "evil").is_symlink()
+    await client.close()
+
+
+@pytest.mark.parametrize("feed_id", ["", ".", "./", "nested/inner"])
+async def test_purge_cache_rejects_non_child_feed_ids(
+    mock_api: MockApi, tmp_path: Path, feed_id: str
+) -> None:
+    """A feed_id that does not name a direct child of cache_dir must raise
+    rather than resolve to (and delete) the cache root itself: ``""`` and
+    ``"."`` both resolve to cache_dir, which the containment check accepts
+    because a path is relative to itself -- wiping every other feed's cache.
+    """
+    root = tmp_path / "cache"
+    (root / "mdb-200").mkdir(parents=True)
+    (root / "mdb-200" / "static.db").write_bytes(b"x")
+    (root / "sentinel").write_bytes(b"s")
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(ValueError, match="escapes"):
+        await client.purge_cache(feed_id)
+    assert (root / "mdb-200" / "static.db").exists()
+    assert (root / "sentinel").exists()
+    await client.close()
+
+
+async def test_purge_cache_is_idempotent(mock_api: MockApi, tmp_path: Path) -> None:
+    root = tmp_path / "cache"
+    (root / "mdb-100").mkdir(parents=True)
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    await client.purge_cache("mdb-100")
+    await client.purge_cache("mdb-100")
+    assert not (root / "mdb-100").exists()
+    assert root.exists()
+    await client.close()
+
+
+@pytest.mark.parametrize("feed_id", ["/", "//", "/.", "/etc"])
+async def test_purge_cache_rejects_root_like_feed_ids(
+    mock_api: MockApi,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    feed_id: str,
+) -> None:
+    """Root-like ids must be rejected before any deletion happens. rmtree is
+    stubbed to a recorder so a regression in the guard cannot delete real
+    filesystem contents while this test runs.
+    """
+    removed: list[object] = []
+    monkeypatch.setattr(shutil, "rmtree", lambda *args, **kwargs: removed.append(args))
+    root = tmp_path / "cache"
+    root.mkdir()
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(ValueError, match="escapes"):
+        await client.purge_cache(feed_id)
+    assert not removed
     await client.close()
