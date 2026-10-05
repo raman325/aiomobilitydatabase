@@ -83,7 +83,8 @@ async def test_get_vehicles_resolves_route_names(
     assert len(vehicles) == 2
     v2 = next(v for v in vehicles if v.vehicle_id == "V2")
     assert v2.route_id == "R2"  # via trip T3 -> R2 static lookup
-    assert v2.route_name == "20 Night Owl"
+    assert v2.route is not None
+    assert v2.route.display_name == "20 Night Owl"
 
 
 async def test_get_vehicles_skips_rt_feed_without_producer_url(

@@ -200,3 +200,45 @@ async def test_vehicle_matches_a_repetition_on_the_template_trip_id(
     assert matched, "no repetition matched the template-id vehicle"
     assert all(a.trip_id.startswith("F1#") for a in matched if a.trip_id)
     assert {a.vehicle.vehicle_id for a in matched if a.vehicle} == {"VF1"}
+
+
+async def test_concurrent_repetitions_match_their_own_vehicle(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """start_time disambiguates repetitions that share a template trip id.
+
+    Two buses are out on F1 at once. Both name trip "F1"; only their
+    start_time says which repetition each is running. Without that pair
+    exposed on VehiclePosition the two are indistinguishable and the
+    library has to attach nothing to either.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    for vehicle_id, start_time, lat in (
+        ("VA", "06:10:00", 34.1),  # the F1#22200 repetition
+        ("VB", "06:20:00", 34.2),  # the F1#22800 repetition
+    ):
+        entity = message.entity.add()
+        entity.id = f"v-{vehicle_id}"
+        entity.vehicle.vehicle.id = vehicle_id
+        entity.vehicle.trip.trip_id = "F1"
+        entity.vehicle.trip.start_time = start_time
+        entity.vehicle.position.latitude = lat
+        entity.vehicle.position.longitude = -118.0
+    _mock_catalog_with_rt(mock_api, message.SerializeToString())
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])],
+        lookahead=timedelta(hours=6),
+        now_utc=NOW,
+        with_vehicles=True,
+    )
+    matched = {
+        a.trip_id: a.vehicle.vehicle_id
+        for a in arrivals
+        if a.vehicle is not None and a.trip_id
+    }
+    assert matched["F1#22200"] == "VA"
+    assert matched["F1#22800"] == "VB"
+    # Siblings the producer said nothing about stay unattached.
+    assert "F1#21600" not in matched
