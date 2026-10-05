@@ -261,6 +261,17 @@ Notes on direct mode:
   fails the build, because a wrong departure time or a wrong call order is
   worse than no feed at all. A malformed **descriptive** cell still degrades
   to `None`.
+- **Detours are applied, not annotated**: a GTFS-RT `TripModifications`
+  entity REPLACES a span of a trip's calls, so a board that ignored it
+  would keep showing departures at stops the vehicle no longer serves, and
+  would miss `propagated_modification_delay` on every stop after the
+  detour. Replacement times are measured from the reference stop the spec
+  names, a replacement stop may be defined only by an RT `Stop` entity, and
+  a detour that routes a trip through a stop its static schedule never
+  served shows up there.
+- **Schedule over a range**: `scheduled_departures(stops, start, end)` is
+  the calendar query — every departure between two instants, schedule only,
+  no limit and no grace, rather than `get_arrivals` stretched to days.
 - **Service calendars are answerable**: `services_on(date)` returns the
   service ids running on a GTFS service date — `calendar.txt` resolved
   against `calendar_dates` exceptions, removals winning when a producer
@@ -340,12 +351,13 @@ in the zip is ignored:
 Service calendars **are** answerable — `services_on(date)` resolves
 `calendar.txt` against `calendar_dates` exceptions, and rows carry their
 `service_id` — but the raw weekday pattern and validity range behind a
-service are not exposed as a model.
+service are not exposed as a model. `scheduled_departures(stops, start, end)`
+covers the range query a calendar view needs.
 
-**GTFS-RT: TripModifications.** Detours that splice replacement stops into a
-trip's call sequence mid-journey, and the `shape`/`stop` entities that come
-with them, are not handled. Everything else a `VehiclePosition`, `TripUpdate`
-or `Alert` carries is surfaced.
+**GTFS-RT: trip shapes.** The RT `shape` entity (a detour's new geometry) is
+not read, for the same reason `shapes.txt` is not: nothing here draws a line
+on a map. Detours themselves ARE applied — see *Detours are applied, not
+annotated* — and the `stop` entities they define are read.
 
 **GBFS endpoints not fetched.** `geofencing_zones`, because it is GeoJSON
 polygon geometry while zones here are deliberately circles — supporting it
