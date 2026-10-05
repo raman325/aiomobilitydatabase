@@ -224,6 +224,7 @@ def test_vehicle_and_station_construct() -> None:
         lang="en",
         phone=None,
         fare_url=None,
+        email=None,
     )
     assert agency.name == "Test Transit"
 

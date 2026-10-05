@@ -42,10 +42,10 @@ _CALENDAR = (
 _DESCRIPTIVE_FILES = {
     "agency.txt": (
         "agency_id,agency_name,agency_url,agency_timezone,agency_lang,"
-        "agency_phone,agency_fare_url\n"
+        "agency_phone,agency_fare_url,agency_email\n"
         "A1,Test Transit,https://example.com,America/Los_Angeles,en,"
-        "555-0100,https://example.com/fares\n"
-        "A2,Bare Transit,,America/Los_Angeles,,,\n"
+        "555-0100,https://example.com/fares,ops@example.com\n"
+        "A2,Bare Transit,,America/Los_Angeles,,,,\n"
     ),
     "stops.txt": (
         "stop_id,stop_name,stop_lat,stop_lon,parent_station,location_type,"
@@ -205,6 +205,7 @@ def test_agency_records_full_and_blank_fields(tmp_path: Path) -> None:
             lang="en",
             phone="555-0100",
             fare_url="https://example.com/fares",
+            email="ops@example.com",
         ),
         Agency(
             id="A2",
@@ -214,6 +215,7 @@ def test_agency_records_full_and_blank_fields(tmp_path: Path) -> None:
             lang=None,
             phone=None,
             fare_url=None,
+            email=None,
         ),
     ]
     index.close()
@@ -240,6 +242,7 @@ def test_agency_without_id_column_and_timezone_fallback_kept(tmp_path: Path) -> 
             lang=None,
             phone=None,
             fare_url=None,
+            email=None,
         )
     ]
     index.close()
@@ -444,8 +447,9 @@ def test_feed_info_full_record(tmp_path: Path) -> None:
     files = dict(_FEED_INFO_BASE)
     files["feed_info.txt"] = (
         "feed_publisher_name,feed_publisher_url,feed_lang,feed_version,"
-        "feed_start_date,feed_end_date\n"
-        "Example Transit,https://example.com,en,2026.07,20260101,20271231\n"
+        "feed_start_date,feed_end_date,feed_contact_email,feed_contact_url\n"
+        "Example Transit,https://example.com,en,2026.07,20260101,20271231,"
+        "feeds@example.com,https://example.com/feedback\n"
     )
     index = _index_from_files(tmp_path, files)
     info = index.feed_info()
@@ -456,6 +460,8 @@ def test_feed_info_full_record(tmp_path: Path) -> None:
         version="2026.07",
         start_date=date(2026, 1, 1),
         end_date=date(2027, 12, 31),
+        contact_email="feeds@example.com",
+        contact_url="https://example.com/feedback",
     )
     index.close()
 
@@ -500,6 +506,8 @@ def test_feed_info_missing_columns_are_none(tmp_path: Path) -> None:
         version=None,
         start_date=None,
         end_date=None,
+        contact_email=None,
+        contact_url=None,
     )
     index.close()
 
