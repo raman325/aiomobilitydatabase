@@ -324,6 +324,7 @@ class ScheduledDeparture:
 
     trip_id: str
     route_id: str
+    service_id: str
     headsign: str | None
     stop_id: str
     stop_sequence: int
@@ -366,6 +367,7 @@ class ScheduledTrip:
 
     trip_id: str
     route_id: str
+    service_id: str
     headsign: str | None
     origin_stop_id: str
     destination_stop_id: str
@@ -1289,7 +1291,7 @@ class StaticIndex:
             stop_marks = ",".join("?" * len(stop_ids))
             service_marks = ",".join("?" * len(active))
             sql = (
-                "SELECT st.trip_id, t.route_id, t.headsign, st.stop_id, "
+                "SELECT st.trip_id, t.route_id, t.service_id, t.headsign, st.stop_id, "
                 "st.stop_sequence, "
                 "st.arrival_secs, st.departure_secs, t.source_trip_id, t.start_secs, "
                 "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
@@ -1308,6 +1310,7 @@ class StaticIndex:
             for (
                 trip_id,
                 route_id,
+                service_id,
                 headsign,
                 stop_id,
                 stop_sequence,
@@ -1329,6 +1332,7 @@ class StaticIndex:
                     ScheduledDeparture(
                         trip_id=trip_id,
                         route_id=route_id,
+                        service_id=service_id,
                         headsign=headsign,
                         stop_id=stop_id,
                         stop_sequence=stop_sequence,
@@ -1472,7 +1476,7 @@ class StaticIndex:
             # the row MIN(d.arrival_secs) selected, i.e. the destination
             # call actually ridden to.
             sql = (
-                "SELECT o.trip_id, t.route_id, t.headsign, "
+                "SELECT o.trip_id, t.route_id, t.service_id, t.headsign, "
                 "o.departure_secs, MIN(d.arrival_secs), "
                 "t.source_trip_id, t.start_secs, "
                 "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
@@ -1499,6 +1503,7 @@ class StaticIndex:
             for (
                 trip_id,
                 route_id,
+                service_id,
                 headsign,
                 dep_secs,
                 arr_secs,
@@ -1524,6 +1529,7 @@ class StaticIndex:
                     ScheduledTrip(
                         trip_id=trip_id,
                         route_id=route_id,
+                        service_id=service_id,
                         headsign=headsign,
                         origin_stop_id=origin_stop_id,
                         destination_stop_id=destination_stop_id,

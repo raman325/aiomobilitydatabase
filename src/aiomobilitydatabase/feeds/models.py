@@ -312,6 +312,7 @@ class StopArrival:
     route_id: str | None
     route: Route | None
     trip_id: str | None
+    service_id: str | None
     headsign: str | None
     scheduled_arrival: datetime | None
     scheduled_departure: datetime | None
@@ -368,6 +369,7 @@ class UpcomingTrip:
 
     trip_id: str
     route_id: str
+    service_id: str
     route: Route | None
     headsign: str | None
     origin_stop_id: str
@@ -395,6 +397,32 @@ class UpcomingTrip:
     is_last: bool
     trip_short_name: str | None
     block_id: str | None
+
+
+@dataclass(frozen=True)
+class CarriageDetail:
+    """One carriage of a multi-carriage vehicle (GTFS-RT 2.1).
+
+    ``occupancy_percentage`` is -1 in the protobuf when unset; that
+    sentinel becomes None here rather than surfacing as a negative
+    percentage. ``carriage_sequence`` orders the carriages from the
+    vehicle's front.
+    """
+
+    id: str | None
+    label: str | None
+    occupancy_status: OccupancyStatus | None
+    occupancy_percentage: int | None
+    carriage_sequence: int | None
+
+
+@dataclass(frozen=True)
+class AlertImage:
+    """One localized variant of an alert's image."""
+
+    url: str
+    media_type: str | None
+    language: str | None
 
 
 @dataclass(frozen=True)
@@ -439,6 +467,10 @@ class VehiclePosition:
     trip_start_date: date | None
     trip_start_secs: int | None
     occupancy_status: OccupancyStatus | None
+    occupancy_percentage: int | None
+    carriages: list[CarriageDetail]
+    wheelchair_accessible: WheelchairAccess | None
+    odometer: float | None
     timestamp: datetime | None
     current_status: VehicleStopStatus | None
     congestion_level: CongestionLevel | None
@@ -468,9 +500,15 @@ class ServiceAlert:
     id: str
     header: str | None
     description: str | None
+    tts_header: str | None
+    tts_description: str | None
     cause: AlertCause | None
+    cause_detail: str | None
     effect: AlertEffect | None
+    effect_detail: str | None
     severity: AlertSeverity | None
+    images: list[AlertImage]
+    image_alternative_text: str | None
     agency_ids: list[str]
     route_ids: list[str]
     route_types: list[int]
@@ -571,6 +609,70 @@ class FeedInfo:
     end_date: date | None
     contact_email: str | None
     contact_url: str | None
+
+
+@dataclass(frozen=True)
+class VehicleType:
+    """One vehicle type a GBFS system rents.
+
+    Resolves the ``vehicle_type_id`` that stations and vehicles reference.
+    ``form_factor``/``propulsion_type`` stay raw strings: GBFS adds new
+    values across minor versions, so a closed enum would reject a feed
+    that is merely newer than this library.
+    """
+
+    id: str
+    form_factor: str | None
+    propulsion_type: str | None
+    name: str | None
+    max_range_m: float | None
+    rider_capacity: int | None
+
+
+@dataclass(frozen=True)
+class PricingPlan:
+    """One pricing plan, resolving a vehicle's ``pricing_plan_id``.
+
+    ``price`` is the base price in ``currency``; GBFS also allows per-km
+    and per-minute segment tables, which are not modeled -- the plan's
+    ``description`` is the human-readable fallback for those.
+    """
+
+    id: str
+    name: str | None
+    currency: str | None
+    price: float | None
+    is_taxable: bool | None
+    description: str | None
+
+
+@dataclass(frozen=True)
+class SystemRegion:
+    """A named service region, resolving a station's ``region_id``."""
+
+    id: str
+    name: str | None
+
+
+@dataclass(frozen=True)
+class GbfsAlert:
+    """A GBFS system alert.
+
+    Distinct from :class:`ServiceAlert`, which is GTFS-RT: this one scopes
+    to GBFS stations and regions rather than routes and trips, and its
+    ``type`` is a raw string for the same reason as
+    :attr:`VehicleType.form_factor`.
+    """
+
+    id: str
+    type: str | None
+    summary: str | None
+    description: str | None
+    url: str | None
+    station_ids: list[str]
+    region_ids: list[str]
+    last_updated: datetime | None
+    active_periods: list[tuple[datetime | None, datetime | None]]
 
 
 @dataclass(frozen=True)

@@ -18,6 +18,7 @@ from aiomobilitydatabase.feeds.models import (
     OccupancyStatus,
     Route,
     VehicleStopStatus,
+    WheelchairAccess,
 )
 from aiomobilitydatabase.feeds.rt import (
     TripStopUpdate,
@@ -720,3 +721,92 @@ def test_resolve_unrecognized_relationship_behaves_as_scheduled() -> None:
             2: 120,
             3: 120,
         }
+
+
+def _rich_vehicle_message() -> gtfs_realtime_pb2.FeedMessage:
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "v1"
+    vehicle = entity.vehicle
+    vehicle.vehicle.id = "V1"
+    vehicle.vehicle.wheelchair_accessible = (
+        gtfs_realtime_pb2.VehicleDescriptor.WHEELCHAIR_ACCESSIBLE
+    )
+    vehicle.position.latitude = 34.0
+    vehicle.position.longitude = -118.0
+    vehicle.position.odometer = 123456.75
+    vehicle.occupancy_percentage = 55
+    for index, (label, percent) in enumerate((("A", 10), ("B", -1))):
+        carriage = vehicle.multi_carriage_details.add()
+        carriage.id = f"c{index}"
+        carriage.label = label
+        carriage.occupancy_percentage = percent
+        carriage.carriage_sequence = index + 1
+    return message
+
+
+def test_vehicle_rich_fields_are_surfaced() -> None:
+    (vehicle,) = vehicles_from_message(
+        _rich_vehicle_message(), routes_by_id={}, stops_by_id={}, trip_routes={}
+    )
+    assert vehicle.odometer == 123456.75
+    assert vehicle.occupancy_percentage == 55
+    # RT numbers WheelchairAccessible 0-3 and the static cell 0-2, so this
+    # must map by name; mapping by value would make ACCESSIBLE (2) read as
+    # the static NOT_POSSIBLE (2).
+    assert vehicle.wheelchair_accessible is WheelchairAccess.POSSIBLE
+    assert [c.label for c in vehicle.carriages] == ["A", "B"]
+    assert vehicle.carriages[0].occupancy_percentage == 10
+    # -1 is the proto's "no data" sentinel, not a negative percentage.
+    assert vehicle.carriages[1].occupancy_percentage is None
+    assert [c.carriage_sequence for c in vehicle.carriages] == [1, 2]
+
+
+def test_vehicle_unset_rich_fields_are_none() -> None:
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "v2"
+    entity.vehicle.position.latitude = 1.0
+    entity.vehicle.position.longitude = 2.0
+    (vehicle,) = vehicles_from_message(
+        message, routes_by_id={}, stops_by_id={}, trip_routes={}
+    )
+    assert vehicle.odometer is None
+    assert vehicle.occupancy_percentage is None
+    # NO_VALUE is the proto default: the producer said nothing at all, which
+    # is not the same as an explicit UNKNOWN.
+    assert vehicle.wheelchair_accessible is None
+    assert vehicle.carriages == []
+
+
+def test_alert_text_detail_and_images_are_surfaced() -> None:
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "a1"
+    alert = entity.alert
+    alert.header_text.translation.add().text = "Detour"
+    alert.tts_header_text.translation.add().text = "Dee tour"
+    alert.description_text.translation.add().text = "Via 5th"
+    alert.tts_description_text.translation.add().text = "Via fifth"
+    alert.cause_detail.translation.add().text = "Water main"
+    alert.effect_detail.translation.add().text = "Stops skipped"
+    alert.image_alternative_text.translation.add().text = "Map of the detour"
+    first = alert.image.localized_image.add()
+    first.url = "https://example.com/detour.png"
+    first.media_type = "image/png"
+    first.language = "en"
+    # A localized variant with no url is not an image.
+    alert.image.localized_image.add().media_type = "image/png"
+
+    [parsed] = alerts_from_message(message)
+    assert parsed.tts_header == "Dee tour"
+    assert parsed.tts_description == "Via fifth"
+    assert parsed.cause_detail == "Water main"
+    assert parsed.effect_detail == "Stops skipped"
+    assert parsed.image_alternative_text == "Map of the detour"
+    assert [(i.url, i.media_type, i.language) for i in parsed.images] == [
+        ("https://example.com/detour.png", "image/png", "en")
+    ]

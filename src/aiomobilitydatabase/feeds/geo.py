@@ -1,4 +1,4 @@
-"""Circular-zone geometry: bbox prefilter + haversine."""
+"""Circular-zone geometry: bbox prefilter + great-circle distance."""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ import math
 from dataclasses import dataclass
 
 _EARTH_RADIUS_M = 6_371_000.0
-# Derived from _EARTH_RADIUS_M so it stays consistent with haversine_m forever.
+# Derived from _EARTH_RADIUS_M so it stays consistent with great_circle_m forever.
 _M_PER_DEG_LAT = _EARTH_RADIUS_M * math.pi / 180.0
 # The bbox prefilter must strictly enclose the circle. A slightly generous box
-# only costs a few extra haversine calls; a tight box wrongly rejects boundary
+# only costs a few extra distance calls; a tight box wrongly rejects boundary
 # points (e.g. the cos(lat) linearization under-sizes the box at high latitude).
 _BBOX_SAFETY = 1.01
 _HALF_TURN_DEG = 180.0
@@ -25,16 +25,29 @@ class Circle:
     radius_m: float
 
 
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance in meters."""
+def great_circle_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters.
+
+    The atan2 (Vincenty-sphere) form rather than haversine. Haversine
+    computes ``asin(sqrt(a))``, and asin's derivative diverges as a -> 1,
+    so near-antipodal pairs lose all precision: a and (0, 0) to
+    (1e-06, 180) saturates at exactly half the circumference, reporting
+    the two points 0.111 m further apart than they are and VIOLATING the
+    triangle inequality. The atan2 form is conditioned well at both ends
+    of the range, costs the same, and agrees with haversine to float
+    precision over the short distances this library actually queries.
+    """
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-    a = (
-        math.sin(dphi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    sin_dlambda, cos_dlambda = math.sin(dlambda), math.cos(dlambda)
+    cos_phi1, sin_phi1 = math.cos(phi1), math.sin(phi1)
+    cos_phi2, sin_phi2 = math.cos(phi2), math.sin(phi2)
+    numerator = math.hypot(
+        cos_phi2 * sin_dlambda,
+        cos_phi1 * sin_phi2 - sin_phi1 * cos_phi2 * cos_dlambda,
     )
-    return 2 * _EARTH_RADIUS_M * math.asin(math.sqrt(a))
+    denominator = sin_phi1 * sin_phi2 + cos_phi1 * cos_phi2 * cos_dlambda
+    return _EARTH_RADIUS_M * math.atan2(numerator, denominator)
 
 
 def in_circle(zone: Circle, latitude: float, longitude: float) -> bool:
@@ -57,5 +70,5 @@ def in_circle(zone: Circle, latitude: float, longitude: float) -> bool:
         dlon = _FULL_TURN_DEG - dlon
     if dlon > dlon_deg:
         return False
-    distance = haversine_m(zone.latitude, zone.longitude, latitude, longitude)
+    distance = great_circle_m(zone.latitude, zone.longitude, latitude, longitude)
     return distance <= zone.radius_m

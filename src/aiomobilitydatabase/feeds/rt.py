@@ -18,7 +18,9 @@ from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnect
 from .models import (
     AlertCause,
     AlertEffect,
+    AlertImage,
     AlertSeverity,
+    CarriageDetail,
     CongestionLevel,
     OccupancyStatus,
     Route,
@@ -26,6 +28,7 @@ from .models import (
     Stop,
     VehiclePosition,
     VehicleStopStatus,
+    WheelchairAccess,
 )
 from .static_index import parse_gtfs_time
 
@@ -194,6 +197,84 @@ async def fetch_feed_message(
     return message, (fresh if fresh.etag or fresh.last_modified else None)
 
 
+# GTFS-RT's WheelchairAccessible is NOT the static wheelchair_accessible
+# vocabulary: it numbers NO_VALUE/UNKNOWN/ACCESSIBLE/INACCESSIBLE 0-3, while
+# the static cell numbers no-info/possible/not-possible 0-2. The concept is
+# the same, so it maps onto the same model enum -- but by name, never by
+# value, since the ints mean different things.
+_RT_WHEELCHAIR = {
+    "WHEELCHAIR_ACCESSIBLE": WheelchairAccess.POSSIBLE,
+    "WHEELCHAIR_INACCESSIBLE": WheelchairAccess.NOT_POSSIBLE,
+    "UNKNOWN": WheelchairAccess.UNKNOWN,
+}
+
+
+def _rt_wheelchair(
+    descriptor: gtfs_realtime_pb2.VehicleDescriptor,
+) -> WheelchairAccess | None:
+    """Vehicle accessibility from a VehicleDescriptor, or None when unstated.
+
+    NO_VALUE is the proto's "field not populated" default and means the
+    producer said nothing, which is distinct from an explicit UNKNOWN.
+    """
+    if not descriptor.HasField("wheelchair_accessible"):
+        return None
+    name = _pb_enum_name(
+        gtfs_realtime_pb2.VehicleDescriptor.WheelchairAccessible,
+        descriptor.wheelchair_accessible,
+    )
+    return _RT_WHEELCHAIR.get(name) if name else None
+
+
+def _occupancy_percentage(holder: Any) -> int | None:
+    """Read an occupancy_percentage, treating the proto's -1 as unset.
+
+    The field defaults to -1 ("no data"), so surfacing it verbatim would
+    hand consumers a negative percentage.
+    """
+    if not holder.HasField("occupancy_percentage"):
+        return None
+    value = holder.occupancy_percentage
+    return None if value < 0 else int(value)
+
+
+def _carriages(vehicle: gtfs_realtime_pb2.VehiclePosition) -> list[CarriageDetail]:
+    """Per-carriage occupancy for a multi-carriage vehicle."""
+    return [
+        CarriageDetail(
+            id=carriage.id or None,
+            label=carriage.label or None,
+            occupancy_status=_vocab_or_none(
+                OccupancyStatus,
+                _pb_enum_name(
+                    gtfs_realtime_pb2.VehiclePosition.OccupancyStatus,
+                    carriage.occupancy_status,
+                ),
+            )
+            if carriage.HasField("occupancy_status")
+            else None,
+            occupancy_percentage=_occupancy_percentage(carriage),
+            carriage_sequence=carriage.carriage_sequence
+            if carriage.HasField("carriage_sequence")
+            else None,
+        )
+        for carriage in vehicle.multi_carriage_details
+    ]
+
+
+def _alert_images(image: gtfs_realtime_pb2.TranslatedImage) -> list[AlertImage]:
+    """Every localized variant of an alert image that names a url."""
+    return [
+        AlertImage(
+            url=localized.url,
+            media_type=localized.media_type or None,
+            language=localized.language or None,
+        )
+        for localized in image.localized_image
+        if localized.url
+    ]
+
+
 def vehicles_from_message(
     message: gtfs_realtime_pb2.FeedMessage,
     *,
@@ -273,6 +354,12 @@ def vehicles_from_message(
                 trip_start_date=_trip_start_date(vehicle.trip),
                 trip_start_secs=_trip_start_secs(vehicle.trip),
                 occupancy_status=occupancy,
+                occupancy_percentage=_occupancy_percentage(vehicle),
+                carriages=_carriages(vehicle),
+                wheelchair_accessible=_rt_wheelchair(vehicle.vehicle),
+                odometer=vehicle.position.odometer
+                if vehicle.position.HasField("odometer")
+                else None,
                 timestamp=_epoch_to_utc(vehicle.timestamp),
                 current_status=current_status,
                 congestion_level=congestion,
@@ -664,18 +751,22 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
                 id=entity.id,
                 header=_first_translation(alert.header_text),
                 description=_first_translation(alert.description_text),
+                tts_header=_first_translation(alert.tts_header_text),
+                tts_description=_first_translation(alert.tts_description_text),
                 cause=_vocab_or_none(
                     AlertCause,
                     _pb_enum_name(gtfs_realtime_pb2.Alert.Cause, alert.cause),
                 )
                 if alert.HasField("cause")
                 else None,
+                cause_detail=_first_translation(alert.cause_detail),
                 effect=_vocab_or_none(
                     AlertEffect,
                     _pb_enum_name(gtfs_realtime_pb2.Alert.Effect, alert.effect),
                 )
                 if alert.HasField("effect")
                 else None,
+                effect_detail=_first_translation(alert.effect_detail),
                 severity=(
                     _vocab_or_none(
                         AlertSeverity,
@@ -687,6 +778,8 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
                     if alert.HasField("severity_level")
                     else None
                 ),
+                images=_alert_images(alert.image),
+                image_alternative_text=_first_translation(alert.image_alternative_text),
                 agency_ids=agency_ids,
                 route_ids=route_ids,
                 route_types=route_types,

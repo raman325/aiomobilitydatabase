@@ -38,7 +38,7 @@ from aiomobilitydatabase.feeds.gbfs import (
     _vehicle_types,
     _version_key,
 )
-from aiomobilitydatabase.feeds.geo import Circle, haversine_m, in_circle
+from aiomobilitydatabase.feeds.geo import Circle, great_circle_m, in_circle
 from aiomobilitydatabase.feeds.models import (
     AlertCause,
     AlertEffect,
@@ -581,7 +581,7 @@ def test_in_circle_equivalent_to_exact_distance(
     lat, lon = zone_lat + dlat, zone_lon + dlon
     # The bbox prefilter may only admit candidates, never change the answer.
     assert in_circle(zone, lat, lon) == (
-        haversine_m(zone_lat, zone_lon, lat, lon) <= radius_m
+        great_circle_m(zone_lat, zone_lon, lat, lon) <= radius_m
     )
 
 
@@ -676,7 +676,7 @@ def test_in_circle_admits_points_across_the_antimeridian(
     admitted. ``in_circle``'s bbox prefilter compared raw (non-wrapped)
     longitude deltas, so a point that wrapped from ~180.4 to ~-179.6 looked
     (falsely) like it was ~360 degrees away instead of ~0.8 degrees away,
-    and got rejected by the prefilter before haversine ever ran.
+    and got rejected by the prefilter before the distance ever ran.
 
     Falsifying example captured pre-fix (verbatim, via a standalone repro
     script, not shrunk by hypothesis): zone_lat=20.0, zone_lon=179.5,
@@ -688,7 +688,7 @@ def test_in_circle_admits_points_across_the_antimeridian(
     lat, lon = _point_at(zone_lat, zone_lon, bearing, fraction * radius_m)
     # Sanity-check the oracle itself: the point must actually be well inside
     # the circle by true great-circle distance, independent of in_circle.
-    true_distance = haversine_m(zone_lat, zone_lon, lat, lon)
+    true_distance = great_circle_m(zone_lat, zone_lon, lat, lon)
     assert true_distance <= 0.999 * radius_m
     assert in_circle(zone, lat, lon)
 
@@ -3765,7 +3765,7 @@ _M_PER_DEG_LAT = 6_371_000.0 * math.pi / 180.0
     lon2=st.floats(-180, 180),
     third=st.tuples(st.floats(-90, 90), st.floats(-180, 180)),
 )
-def test_haversine_metric_laws(
+def test_great_circle_metric_laws(
     lat1: float,
     lon1: float,
     lat2: float,
@@ -3783,12 +3783,12 @@ def test_haversine_metric_laws(
     below is what catches that.
     """
     lat3, lon3 = third
-    d_ab = haversine_m(lat1, lon1, lat2, lon2)
-    d_bc = haversine_m(lat2, lon2, lat3, lon3)
-    d_ac = haversine_m(lat1, lon1, lat3, lon3)
+    d_ab = great_circle_m(lat1, lon1, lat2, lon2)
+    d_bc = great_circle_m(lat2, lon2, lat3, lon3)
+    d_ac = great_circle_m(lat1, lon1, lat3, lon3)
     assert d_ab >= 0
-    assert abs(d_ab - haversine_m(lat2, lon2, lat1, lon1)) < 1e-6
-    assert haversine_m(lat1, lon1, lat1, lon1) < 1e-6
+    assert abs(d_ab - great_circle_m(lat2, lon2, lat1, lon1)) < 1e-6
+    assert great_circle_m(lat1, lon1, lat1, lon1) < 1e-6
     assert d_ab <= _EARTH_HALF_CIRCUMFERENCE_M + 1.0
     # Epsilon in metres: these distances reach ~2e7, so float rounding in
     # sqrt/asin is worth more slack than the 1e-6 used for the exact laws.
@@ -3796,7 +3796,7 @@ def test_haversine_metric_laws(
 
 
 @given(lat1=st.floats(-90, 90), lat2=st.floats(-90, 90), lon=st.floats(-180, 180))
-def test_haversine_along_a_meridian_equals_arc_length(
+def test_great_circle_along_a_meridian_equals_arc_length(
     lat1: float, lat2: float, lon: float
 ) -> None:
     """Calibration, not just structure: two points on the SAME meridian are
@@ -3808,7 +3808,7 @@ def test_haversine_along_a_meridian_equals_arc_length(
     Earth radius; this one fails on both (verified over a 150-point probe
     grid: 58 violations under the swap, 145 under a halved radius).
     """
-    distance = haversine_m(lat1, lon, lat2, lon)
+    distance = great_circle_m(lat1, lon, lat2, lon)
     expected = abs(lat2 - lat1) * _M_PER_DEG_LAT
     assert math.isclose(distance, expected, rel_tol=1e-9, abs_tol=1e-6)
 
