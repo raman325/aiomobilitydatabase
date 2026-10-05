@@ -1,6 +1,6 @@
 """Tests for TransitFeedHandle.upcoming_trips: schedule + RT overlay."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.models import ArrivalsQuery
@@ -344,3 +344,26 @@ async def test_past_schedule_only_trip_is_dropped(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW_LATE
     )
     assert trips == []
+
+
+async def test_services_on_answers_future_dates(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """service_id on a row plus services_on(date) answers "does it run then".
+
+    Neither half is useful alone: the id is opaque without a calendar
+    query, and the calendar query returns opaque ids without rows naming
+    them.
+    """
+    _mock_catalog(mock_api, rt=False)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+    weekday_service = arrivals[0].service_id
+    assert weekday_service == "WKDY"
+
+    thursday = date(2026, 7, 30)
+    saturday = date(2026, 8, 1)
+    assert weekday_service in await handle.services_on(thursday)
+    assert weekday_service not in await handle.services_on(saturday)
+    # The NIGHT calendar in the fixture runs on its own days.
+    assert await handle.services_on(thursday) != await handle.services_on(saturday)
