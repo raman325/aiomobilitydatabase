@@ -61,6 +61,7 @@ def test_stop_arrival_realtime_flags() -> None:
         stop_name="Main St",
         route_id="R1",
         route_name="10 Main Line",
+        route_type=3,
         trip_id="T1",
         headsign="Downtown",
         scheduled_arrival=scheduled,

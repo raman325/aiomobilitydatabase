@@ -890,6 +890,7 @@ class TransitFeedHandle:
             )
             stop_names = await self._index_read(self._index.stop_names)
             route_names = await self._index_read(self._index.route_display_names)
+            route_types = await self._index_read(self._index.route_types)
             # Per-row RT matching: each scheduled row's (identity, service day)
             # resolves to at most one TripUpdates key via _rt_key_for_row —
             # dated keys hit exactly their service day's instance, date-less
@@ -939,6 +940,7 @@ class TransitFeedHandle:
                         stop_name=stop_names.get(dep.stop_id),
                         route_id=dep.route_id,
                         route_name=route_names.get(dep.route_id),
+                        route_type=route_types.get(dep.route_id),
                         trip_id=dep.trip_id,
                         headsign=dep.headsign,
                         scheduled_arrival=dep.arrival,
@@ -984,6 +986,9 @@ class TransitFeedHandle:
                         stop_name=stop_names.get(row.stop_id),
                         route_id=row.route_id,
                         route_name=route_names.get(row.route_id)
+                        if row.route_id
+                        else None,
+                        route_type=route_types.get(row.route_id)
                         if row.route_id
                         else None,
                         trip_id=row.trip_id,

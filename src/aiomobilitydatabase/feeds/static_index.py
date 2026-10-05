@@ -1070,6 +1070,10 @@ class StaticIndex:
         """Map of route_id to display name (for RT joins)."""
         return {route.id: route.display_name for route in self.routes()}
 
+    def route_types(self) -> dict[str, int | None]:
+        """Map of route_id to GTFS route_type (raw int, open vocabulary)."""
+        return {route.id: route.type for route in self.routes()}
+
     def stop_names(self) -> dict[str, str | None]:
         """Map of stop_id to name."""
         return {

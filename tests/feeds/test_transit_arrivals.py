@@ -113,6 +113,7 @@ async def test_schedule_only_arrivals(
     assert first.scheduled_departure == datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC)
     assert first.stop_name == "Main St"
     assert first.route_name == "10 Main Line"
+    assert first.route_type == 3
     assert first.headsign == "Downtown"
     # The base fixture ships no descriptive stop_times/trips columns: every
     # descriptor is None EXCEPT timepoint_exact, whose GTFS default for an
@@ -171,6 +172,9 @@ async def test_rt_merge_delay_cancellation_and_added(
     assert added.realtime is True
     assert added.scheduled_departure is None
     assert added.route_name == "10 Main Line"
+    # An RT-added trip carries no static row, but it does name a route, so
+    # the route-level descriptors still resolve against the index.
+    assert added.route_type == 3
     # An RT-added trip has no static schedule row: every descriptor is None,
     # INCLUDING timepoint_exact (the absent-means-exact default only applies
     # to stop_times rows that exist).

@@ -287,6 +287,9 @@ class StopArrival:
     outside the 0/1 vocabulary. ``trip_short_name``/``block_id`` are the
     trip's verbatim ``trip_short_name``/``block_id`` cells -- ``block_id``
     is raw string exposure only (no block-continuation computation).
+    ``route_type`` is the route's GTFS ``route_type``, kept a raw int for
+    the same reason as :attr:`Route.type`: Google's extended route types
+    are an open vocabulary a closed enum could not represent.
     RT-added rows have no static schedule row, so every descriptive field
     is None.
     """
@@ -295,6 +298,7 @@ class StopArrival:
     stop_name: str | None
     route_id: str | None
     route_name: str | None
+    route_type: int | None
     trip_id: str | None
     headsign: str | None
     scheduled_arrival: datetime | None
