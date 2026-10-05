@@ -577,3 +577,72 @@ async def test_static_dataset_tracks_the_published_index(
     assert handle._index.dataset_id == NEW_DATASET != old_dataset
     assert handle.static_dataset is not None
     assert handle.static_dataset.id == NEW_DATASET
+
+
+async def test_rt_revalidates_with_etag_and_reuses_the_parse_on_304(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A 304 is the producer stating the bytes are unchanged, so the prior
+    parse is reused: correct by definition, unlike a TTL cache which can
+    serve data the producer has already superseded.
+    """
+    _mock_catalog(mock_api)
+    mock_api.get(
+        "/rt/all", body=VEHICLE_POSITIONS, content_type=PB, headers={"ETag": '"v1"'}
+    )
+    mock_api.get("/rt/all", status=304)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+
+    first = await handle.get_vehicles()
+    second = await handle.get_vehicles()
+
+    assert [v.vehicle_id for v in second] == [v.vehicle_id for v in first]
+    rt_requests = [r for r in mock_api.requests if r.path == "/rt/all"]
+    assert len(rt_requests) == 2
+    # The first visit cannot revalidate; the second must.
+    assert "If-None-Match" not in rt_requests[0].headers
+    assert rt_requests[1].headers["If-None-Match"] == '"v1"'
+
+
+async def test_rt_revalidates_with_last_modified_when_no_etag(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api)
+    stamp = "Wed, 21 Oct 2026 07:28:00 GMT"
+    mock_api.get(
+        "/rt/all",
+        body=VEHICLE_POSITIONS,
+        content_type=PB,
+        headers={"Last-Modified": stamp},
+    )
+    mock_api.get("/rt/all", status=304)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    await handle.get_vehicles()
+    assert await handle.get_vehicles()
+    rt_requests = [r for r in mock_api.requests if r.path == "/rt/all"]
+    assert rt_requests[1].headers["If-Modified-Since"] == stamp
+
+
+async def test_rt_without_validators_never_revalidates(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A producer offering no validators leaves nothing to revalidate against.
+
+    The stored entry is also dropped when a producer STOPS offering them,
+    so a later request cannot be conditioned on a validator the producer
+    has forgotten -- which would answer 304 against content we no longer
+    hold a matching parse for.
+    """
+    _mock_catalog(mock_api)
+    mock_api.get(
+        "/rt/all", body=VEHICLE_POSITIONS, content_type=PB, headers={"ETag": '"v1"'}
+    )
+    mock_api.get("/rt/all", body=VEHICLE_POSITIONS, content_type=PB)
+    mock_api.get("/rt/all", body=VEHICLE_POSITIONS, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    await handle.get_vehicles()
+    await handle.get_vehicles()  # answered 200 with no validators
+    await handle.get_vehicles()
+    rt_requests = [r for r in mock_api.requests if r.path == "/rt/all"]
+    assert rt_requests[1].headers["If-None-Match"] == '"v1"'
+    assert "If-None-Match" not in rt_requests[2].headers

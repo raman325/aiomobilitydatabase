@@ -54,6 +54,7 @@ from .models import (
     VehiclePosition,
 )
 from .rt import (
+    FeedValidators,
     TripPredictions,
     TripUpdateKey,
     TripUpdates,
@@ -391,6 +392,10 @@ class TransitFeedHandle:
         self._api_key = api_key
         self._guard = _IndexGuard()
         self._refresh_lock = asyncio.Lock()
+        # Per-url HTTP validators plus the parse they belong to. Only ever
+        # reused on a 304, i.e. when the producer itself states the bytes
+        # are unchanged -- this is revalidation, not a TTL cache.
+        self._rt_validators: dict[str, tuple[FeedValidators, Any]] = {}
         self.stops: list[Stop] = index.stops()
         self.routes: list[Route] = index.routes()
         self.agencies: list[Agency] = index.agencies()
@@ -742,17 +747,30 @@ class TransitFeedHandle:
             source = feed.source_info
             if source is None or not source.producer_url:
                 continue
-            messages.append(
-                await fetch_feed_message(
-                    session,
-                    source.producer_url,
-                    auth_type=source.authentication_type,
-                    api_key_name=source.api_key_parameter_name,
-                    api_key=self._api_key,
-                    headers=self._headers,
-                    timeout_seconds=self._client.timeout_seconds,
-                )
+            url = source.producer_url
+            cached = self._rt_validators.get(url)
+            message, fresh = await fetch_feed_message(
+                session,
+                url,
+                auth_type=source.authentication_type,
+                api_key_name=source.api_key_parameter_name,
+                api_key=self._api_key,
+                headers=self._headers,
+                timeout_seconds=self._client.timeout_seconds,
+                validators=cached[0] if cached else None,
             )
+            if message is None:
+                # 304: the producer confirmed our copy is current.
+                assert cached is not None
+                messages.append(cached[1])
+                continue
+            if fresh is not None:
+                self._rt_validators[url] = (fresh, message)
+            else:
+                # A producer that stops offering validators must not leave a
+                # stale entry behind to be revalidated against forever.
+                self._rt_validators.pop(url, None)
+            messages.append(message)
         return messages
 
     async def _aggregated_trip_updates(self) -> TripUpdates:
