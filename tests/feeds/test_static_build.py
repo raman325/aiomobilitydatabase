@@ -609,8 +609,7 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
     built = StaticIndex.build(_write_zip(tmp_path), ":memory:", DATASET, TZ)
     fingerprint = {
         table: sorted(
-            row[1]
-            for row in built._conn.execute(f"PRAGMA table_info({table})")
+            row[1] for row in built._conn.execute(f"PRAGMA table_info({table})")
         )
         for (table,) in built._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
