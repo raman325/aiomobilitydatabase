@@ -3617,6 +3617,19 @@ _ZONE_OFFSET_M = st.floats(-2_500.0, 2_500.0)
 _M_PER_DEG = 111_320.0
 
 
+def _gbfs_id_text(max_size: int) -> st.SearchStrategy[str]:
+    """Row ids that never spell the sentinel the "None"-coercion properties use.
+
+    A producer may legitimately send the string "None" as an id, and the
+    library passes it through verbatim -- which the properties cannot tell
+    apart from the library synthesizing str(None). Mapped rather than
+    filtered so no draw is rejected.
+    """
+    return st.text(min_size=1, max_size=max_size).map(
+        lambda value: "id" if value == "None" else value
+    )
+
+
 @st.composite
 def _zone_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
     """One GBFS row offset from the zone centre, sometimes coordinate-less.
@@ -3631,7 +3644,7 @@ def _zone_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
         _M_PER_DEG * math.cos(math.radians(_GBFS_ZONE.latitude))
     )
     return {
-        id_key: draw(st.text(min_size=1, max_size=6)),
+        id_key: draw(_gbfs_id_text(6)),
         "lat": draw(st.just(latitude) | st.none()),
         "lon": draw(st.just(longitude) | st.none()),
     }
@@ -5770,7 +5783,7 @@ _GBFS_JSON = st.recursive(
 def _unrepresentable_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
     unrepresentable = st.sampled_from(_TOO_LARGE_FOR_FLOAT + _TOO_LARGE_FOR_INT)
     return {
-        id_key: draw(st.text(min_size=1, max_size=4)),
+        id_key: draw(_gbfs_id_text(4)),
         "lat": draw(unrepresentable),
         "lon": draw(unrepresentable),
         "vehicle_types_available": [
