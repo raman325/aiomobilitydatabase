@@ -594,3 +594,139 @@ def test_open_cached_unreadable_file_returns_none(tmp_path: Path) -> None:
         assert StaticIndex.open_cached(db_path, DATASET) is None
     finally:
         db_path.chmod(0o644)
+
+
+def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
+    """The schema's shape is pinned to SCHEMA_VERSION.
+
+    A cache is discarded only when its stamped version differs, so adding
+    a column without bumping the version makes an OLD cache pass
+    validation and then raise OperationalError on the first query that
+    selects the new column. No upgrade test catches that on its own,
+    because tests build fresh indexes; this one fails the moment the
+    schema and the version drift apart.
+    """
+    built = StaticIndex.build(_write_zip(tmp_path), ":memory:", DATASET, TZ)
+    fingerprint = {
+        table: sorted(
+            row[1]
+            for row in built._conn.execute(f"PRAGMA table_info({table})")
+        )
+        for (table,) in built._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+    }
+    built.close()
+    assert (SCHEMA_VERSION, fingerprint) == (
+        4,
+        {
+            "agencies": [
+                "email",
+                "fare_url",
+                "id",
+                "lang",
+                "name",
+                "phone",
+                "timezone",
+                "url",
+            ],
+            "calendar": [
+                "end_date",
+                "friday",
+                "monday",
+                "saturday",
+                "service_id",
+                "start_date",
+                "sunday",
+                "thursday",
+                "tuesday",
+                "wednesday",
+            ],
+            "calendar_dates": ["date", "exception_type", "service_id"],
+            "feed_info": [
+                "contact_email",
+                "contact_url",
+                "end_date",
+                "lang",
+                "publisher_name",
+                "publisher_url",
+                "start_date",
+                "version",
+            ],
+            "meta": ["key", "value"],
+            "routes": [
+                "agency_id",
+                "color",
+                "description",
+                "id",
+                "long_name",
+                "short_name",
+                "sort_order",
+                "text_color",
+                "type",
+                "url",
+            ],
+            "stop_times": [
+                "arrival_secs",
+                "departure_secs",
+                "drop_off_type",
+                "pickup_type",
+                "stop_headsign",
+                "stop_id",
+                "stop_sequence",
+                "timepoint",
+                "trip_id",
+            ],
+            "stops": [
+                "description",
+                "id",
+                "lat",
+                "location_type",
+                "lon",
+                "name",
+                "parent_station",
+                "platform_code",
+                "stop_code",
+                "timezone",
+                "url",
+                "wheelchair_boarding",
+                "zone_id",
+            ],
+            "trips": [
+                "bikes_allowed",
+                "block_id",
+                "direction_id",
+                "headsign",
+                "id",
+                "route_id",
+                "service_id",
+                "short_name",
+                "source_trip_id",
+                "start_secs",
+                "wheelchair_accessible",
+            ],
+        },
+    ), "schema changed: bump SCHEMA_VERSION and update this fingerprint"
+
+
+def test_cache_from_the_previous_schema_is_discarded(tmp_path: Path) -> None:
+    """The real upgrade path: a cache built by the PREVIOUS release.
+
+    v3 had no agencies.email. Stamped v3, it must read as a cache miss and
+    be rebuilt -- not be accepted and then raise on the first agencies()
+    query.
+    """
+    db_path = tmp_path / "static.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        "CREATE TABLE agencies (id TEXT, name TEXT, url TEXT, timezone TEXT,"
+        " lang TEXT, phone TEXT, fare_url TEXT);"
+    )
+    conn.executemany(
+        "INSERT INTO meta VALUES (?, ?)",
+        [("dataset_id", DATASET), ("schema_version", "3"), ("timezone", TZ)],
+    )
+    conn.commit()
+    conn.close()
+    assert StaticIndex.open_cached(db_path, DATASET) is None

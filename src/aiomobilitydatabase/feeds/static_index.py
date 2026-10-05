@@ -33,7 +33,13 @@ from .models import (
 
 # v3: descriptive surface sweep (stop desc/url/zone/timezone, route
 # desc/sort_order, trip short_name/block_id, feed_info table).
-SCHEMA_VERSION = 3
+# v4: agencies.email, feed_info.contact_email/contact_url.
+# BUMP THIS whenever _SCHEMA changes. A cache stamped with an older
+# version is discarded and rebuilt; leaving the number alone makes a
+# stale cache pass validation and then fail on the first query for a
+# column it does not have. test_schema_fingerprint_matches_version
+# fails if the two drift apart.
+SCHEMA_VERSION = 4
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
