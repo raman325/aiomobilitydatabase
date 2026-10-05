@@ -1254,19 +1254,6 @@ class StaticIndex:
             found.setdefault(source_trip_id, []).append(trip_id)
         return found
 
-    def trips_serving_any(self, stop_ids: list[str]) -> set[str]:
-        """Concrete trip ids with a scheduled call at any of the stops."""
-        if not stop_ids:
-            return set()
-        marks = ",".join("?" * len(stop_ids))
-        return {
-            row[0]
-            for row in self._conn.execute(
-                f"SELECT DISTINCT trip_id FROM stop_times WHERE stop_id IN ({marks})",
-                stop_ids,
-            )
-        }
-
     def trip_stop_calls(self, trip_ids: list[str]) -> dict[str, list[tuple[int, str]]]:
         """Ordered ``(stop_sequence, stop_id)`` calls per trip.
 
