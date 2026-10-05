@@ -80,6 +80,7 @@ def test_stop_arrival_realtime_flags() -> None:
         route_id="R1",
         route=_route("R1", "10", "Main Line"),
         trip_id="T1",
+        service_id="WKDY",
         headsign="Downtown",
         scheduled_arrival=scheduled,
         scheduled_departure=scheduled,

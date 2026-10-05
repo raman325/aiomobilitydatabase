@@ -1082,6 +1082,7 @@ class TransitFeedHandle:
                         route_id=dep.route_id,
                         route=routes_by_id.get(dep.route_id),
                         trip_id=dep.trip_id,
+                        service_id=dep.service_id,
                         headsign=dep.headsign,
                         scheduled_arrival=dep.arrival,
                         scheduled_departure=dep.departure,
@@ -1135,6 +1136,7 @@ class TransitFeedHandle:
                         route_id=row.route_id,
                         route=routes_by_id.get(row.route_id) if row.route_id else None,
                         trip_id=row.trip_id,
+                        service_id=None,
                         vehicle=_match_vehicle(
                             row.vehicle_id,
                             row.trip_id,
@@ -1296,6 +1298,7 @@ class TransitFeedHandle:
                     UpcomingTrip(
                         trip_id=trip.trip_id,
                         route_id=trip.route_id,
+                        service_id=trip.service_id,
                         route=routes_by_id.get(trip.route_id),
                         headsign=trip.headsign,
                         origin_stop_id=origin_stop_id,
@@ -1386,6 +1389,23 @@ class TransitFeedHandle:
                     )
                 )
             return vehicles
+
+    async def services_on(self, service_date: date) -> set[str]:
+        """Service ids running on a GTFS service date.
+
+        Pairs with ``StopArrival.service_id``/``UpcomingTrip.service_id``:
+        those say which calendar a departure belongs to, this says whether
+        that calendar runs on a given day -- so "does this trip run next
+        Tuesday" is answerable without a second arrivals query.
+
+        calendar_dates exceptions are applied over calendar.txt, with
+        removals winning when a producer lists both types for one date.
+        The date is a GTFS SERVICE date, which for a past-midnight
+        departure is the day the service STARTED, not the clock day it
+        lands on.
+        """
+        async with self._guard.reader():
+            return await self._index_read(self._index.active_service_ids, service_date)
 
     async def get_alerts(self) -> list[ServiceAlert]:
         """Service alerts across the feed's SA-capable RT sources.

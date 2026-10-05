@@ -312,6 +312,7 @@ class StopArrival:
     route_id: str | None
     route: Route | None
     trip_id: str | None
+    service_id: str | None
     headsign: str | None
     scheduled_arrival: datetime | None
     scheduled_departure: datetime | None
@@ -368,6 +369,7 @@ class UpcomingTrip:
 
     trip_id: str
     route_id: str
+    service_id: str
     route: Route | None
     headsign: str | None
     origin_stop_id: str
