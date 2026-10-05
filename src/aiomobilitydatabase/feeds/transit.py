@@ -1630,6 +1630,83 @@ class TransitFeedHandle:
                 )
         return rows, touched
 
+    async def scheduled_departures(
+        self,
+        stop_ids: Sequence[str],
+        *,
+        start: datetime,
+        end: datetime,
+        route_ids: Sequence[str] | None = None,
+        headsigns: Sequence[str] | None = None,
+    ) -> list[StopArrival]:
+        """Every scheduled departure in an absolute window, schedule only.
+
+        The shape a calendar view needs, and deliberately not
+        :meth:`get_arrivals` with a long lookahead: no realtime overlay
+        (predictions are meaningless days out and a producer only
+        publishes them for the current service day), no ``grace`` window,
+        and no per-query limit -- a calendar wants every departure in the
+        range, not the next few.
+
+        Rows come back ``realtime=False`` with no predictions and no
+        vehicle, sorted by departure. ``end`` is exclusive of nothing in
+        particular: it is simply the window's upper bound, and a window
+        whose end precedes its start returns [].
+        """
+        if end <= start or not stop_ids:
+            return []
+        async with self._guard.reader():
+            scheduled = await self._index_read(
+                self._index.upcoming_departures,
+                sorted(set(stop_ids)),
+                sorted(set(route_ids)) if route_ids else None,
+                start,
+                end - start,
+                None,
+                grace=timedelta(0),
+            )
+            stops_by_id = await self._index_read(self._index.stops_by_id)
+            routes_by_id = await self._index_read(self._index.routes_by_id)
+        wanted = set(headsigns) if headsigns else None
+        rows = [
+            StopArrival(
+                stop_id=dep.stop_id,
+                stop=stops_by_id.get(dep.stop_id),
+                route_id=dep.route_id,
+                route=routes_by_id.get(dep.route_id),
+                trip_id=dep.trip_id,
+                service_id=dep.service_id,
+                headsign=dep.headsign,
+                scheduled_arrival=dep.arrival,
+                scheduled_departure=dep.departure,
+                predicted_arrival=None,
+                predicted_departure=None,
+                delay_seconds=None,
+                realtime=False,
+                vehicle_id=None,
+                vehicle=None,
+                wheelchair_accessible=dep.wheelchair_accessible,
+                bikes_allowed=dep.bikes_allowed,
+                direction_id=dep.direction_id,
+                pickup_type=dep.pickup_type,
+                drop_off_type=dep.drop_off_type,
+                timepoint_exact=dep.timepoint_exact,
+                stop_headsign=dep.stop_headsign,
+                trip_short_name=dep.trip_short_name,
+                block_id=dep.block_id,
+            )
+            for dep in scheduled
+            if wanted is None or dep.headsign in wanted
+        ]
+        rows.sort(
+            key=lambda row: (
+                row.scheduled_departure or start,
+                row.trip_id or "",
+                row.stop_id,
+            )
+        )
+        return rows
+
     async def services_on(self, service_date: date) -> set[str]:
         """Service ids running on a GTFS service date.
 

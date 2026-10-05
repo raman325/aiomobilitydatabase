@@ -367,3 +367,61 @@ async def test_services_on_answers_future_dates(
     assert weekday_service not in await handle.services_on(saturday)
     # The NIGHT calendar in the fixture runs on its own days.
     assert await handle.services_on(thursday) != await handle.services_on(saturday)
+
+
+async def test_scheduled_departures_covers_a_multi_day_window(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A calendar wants every departure in a range, not the next few.
+
+    get_arrivals with a long lookahead is the wrong tool: it applies a
+    per-query limit and a grace window, and overlays realtime that no
+    producer publishes days ahead.
+    """
+    _mock_catalog(mock_api, rt=False)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    start = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
+    rows = await handle.scheduled_departures(
+        ["S1", "S2"], start=start, end=start + timedelta(days=7)
+    )
+    assert rows, "a week of a weekday service should not be empty"
+    # Every row is schedule-only: no realtime was fetched at all.
+    assert all(not row.realtime for row in rows)
+    assert all(row.predicted_departure is None for row in rows)
+    assert all(row.vehicle is None for row in rows)
+    # The window is respected at BOTH ends: no grace pulling in earlier
+    # departures, and nothing past the requested end.
+    assert all(
+        start <= row.scheduled_departure < start + timedelta(days=7)
+        for row in rows
+        if row.scheduled_departure
+    )
+    # Several service days, not just today's.
+    days = {row.scheduled_departure.date() for row in rows if row.scheduled_departure}
+    assert len(days) > 1
+    # Sorted by departure, and the static records come along.
+    departures = [row.scheduled_departure for row in rows]
+    assert departures == sorted(departures)
+    assert rows[0].stop is not None
+    assert rows[0].route is not None
+
+
+async def test_scheduled_departures_filters_and_degenerate_windows(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=False)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    start = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
+    end = start + timedelta(days=2)
+    everything = await handle.scheduled_departures(["S1", "S2"], start=start, end=end)
+    downtown = await handle.scheduled_departures(
+        ["S1", "S2"], start=start, end=end, headsigns=["Downtown"]
+    )
+    assert downtown, "the fixture has Downtown service"
+    assert len(downtown) < len(everything)
+    assert {row.headsign for row in downtown} == {"Downtown"}
+
+    # A window that ends before it starts, and an empty stop list, are
+    # questions with no answer rather than errors.
+    assert await handle.scheduled_departures(["S1"], start=end, end=start) == []
+    assert await handle.scheduled_departures([], start=start, end=end) == []
