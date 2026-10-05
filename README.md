@@ -233,6 +233,19 @@ Notes on direct mode:
   information, `NO_DATA` makes a stop schedule-only, `SKIPPED` suppresses it
   (and any origin→destination row boarding or alighting there), and the
   trip-level delay covers stops no StopTimeUpdate reaches.
+- **Rows carry whole records, not copied columns**: `StopArrival`,
+  `UpcomingTrip`, and `VehiclePosition` each expose the full `Stop` and
+  `Route` they refer to, so platform codes, coordinates, route colours and
+  `route_type` are reachable without a second lookup — use
+  `route.display_name` / `stop.name` for the human-readable strings. The raw
+  `stop_id`/`route_id` stay alongside, since those are what feeds reference
+  and what filters key on; a `route_id` naming a route absent from
+  `routes.txt` leaves `route` as `None` rather than inventing one.
+- **Vehicle positions name their trip instance**: `VehiclePosition` carries
+  the parsed `trip_start_date`/`trip_start_secs`, the pair a GTFS-RT
+  `TripDescriptor` uses to address one run. That is what lets two buses out
+  on the same headway-based trip be told apart — without it, concurrent
+  repetitions of one template trip are indistinguishable.
 - **The full descriptive surface is exposed, typed by shape**: closed GTFS
   vocabularies are enums (`WheelchairAccess`, `BikesAllowed`,
   `PickupDropOffType`, `StopLocationType`, alert cause/effect/severity,
@@ -248,14 +261,44 @@ Notes on direct mode:
   fails the build, because a wrong departure time or a wrong call order is
   worse than no feed at all. A malformed **descriptive** cell still degrades
   to `None`.
+- **Detours are applied, not annotated**: a GTFS-RT `TripModifications`
+  entity REPLACES a span of a trip's calls, so a board that ignored it
+  would keep showing departures at stops the vehicle no longer serves, and
+  would miss `propagated_modification_delay` on every stop after the
+  detour. Replacement times are measured from the reference stop the spec
+  names, a replacement stop may be defined only by an RT `Stop` entity, and
+  a detour that routes a trip through a stop its static schedule never
+  served shows up there.
+- **Schedule over a range**: `scheduled_departures(stops, start, end)` is
+  the calendar query — every departure between two instants, schedule only,
+  no limit and no grace, rather than `get_arrivals` stretched to days.
+- **Service calendars are answerable**: `services_on(date)` returns the
+  service ids running on a GTFS service date — `calendar.txt` resolved
+  against `calendar_dates` exceptions, removals winning when a producer
+  lists both types for one date — and every row carries its `service_id`,
+  so "does this trip run next Tuesday" needs no second arrivals query.
+- **GBFS ids resolve**: `get_vehicle_types()`, `get_pricing_plans()`,
+  `get_regions()`, and `get_system_alerts()` turn the `vehicle_type_id`,
+  `pricing_plan_id`, and `region_id` on stations and vehicles into records.
+  All four documents are optional in GBFS, so an unpublished one is `[]`
+  rather than an error.
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
   `headsigns_serving()` alongside the stop/route helpers.
-- **Alert scoping**: `ServiceAlert` carries `route_ids`, `stop_ids`, and
-  `trip_ids`; an alert is agency-wide only when all three are empty.
-  `is_active(at)` evaluates its active periods.
-- **GBFS extras**: `rental_uris` deep links on stations and vehicles,
-  `get_system_info()`, and TTL-based document caching.
+- **Alert scoping covers every selector GTFS-RT offers**: `ServiceAlert`
+  carries `agency_ids`, `route_ids`, `route_types`, `direction_ids`,
+  `stop_ids`, and `trip_ids` — an alert is feed-wide only when *all* of them
+  are empty. Collecting a subset is not a missing nicety but a correctness
+  bug: an alert scoped to one agency, or to a whole mode, would otherwise
+  read as applying everywhere. `is_active(at)` evaluates its active periods.
+- **GBFS exposes what the documents carry**: the full station surface
+  (`is_installed` alongside `is_renting`/`is_returning` — a station removed
+  from the street is not "operational"; disabled counts, address, region,
+  virtual-station flag), free-floating vehicle docking and fuel state, and a
+  `SystemInfo` with the operator's contact, licensing, and terms URLs.
+  `last_reported` is exposed on both stations and vehicles so you can tell
+  fresh data from stale, and is parsed from either GBFS 2.x POSIX seconds or
+  3.0 RFC3339. Plus `rental_uris` deep links and TTL-based document caching.
 - **`cache_dir` strongly recommended**: the static index is cached on disk
   keyed by feed, validated against the dataset ID, so restarts are instant and
   rebuilds only happen when the agency publishes a new dataset
@@ -285,6 +328,45 @@ Notes on direct mode:
   filtering happens client-side because GBFS feeds are full-system dumps by
   design, with no server-side geo-query.
 - **Timestamps are tz-aware UTC** throughout the feeds layer.
+
+## What this does not expose
+
+Deliberate omissions, so you can tell "not supported" from "not found yet".
+
+**GTFS files not ingested.** The static index reads `agency.txt`, `stops.txt`,
+`routes.txt`, `trips.txt`, `stop_times.txt`, `calendar.txt`,
+`calendar_dates.txt`, `frequencies.txt`, and `feed_info.txt`. Everything else
+in the zip is ignored:
+
+- `shapes.txt` — route geometry. Nothing here draws a line on a map, so trips
+  carry no `shape_id`.
+- `transfers.txt` — no transfer rules, minimum transfer times, or
+  trip-to-trip continuations, and no journey planning across a transfer.
+- `pathways.txt` / `levels.txt` — no in-station walking graph.
+- `fare_attributes.txt` / `fare_rules.txt` and all GTFS-Fares v2 files — no
+  fares, zone pricing, or rider categories. (`Stop.zone_id` is exposed as a
+  raw cell, but nothing interprets it.)
+- `translations.txt` — text is returned as the feed wrote it.
+
+Service calendars **are** answerable — `services_on(date)` resolves
+`calendar.txt` against `calendar_dates` exceptions, and rows carry their
+`service_id` — but the raw weekday pattern and validity range behind a
+service are not exposed as a model. `scheduled_departures(stops, start, end)`
+covers the range query a calendar view needs.
+
+**GTFS-RT: trip shapes.** The RT `shape` entity (a detour's new geometry) is
+not read, for the same reason `shapes.txt` is not: nothing here draws a line
+on a map. Detours themselves ARE applied — see *Detours are applied, not
+annotated* — and the `stop` entities they define are read.
+
+**GBFS endpoints not fetched.** `geofencing_zones`, because it is GeoJSON
+polygon geometry while zones here are deliberately circles — supporting it
+means polygon containment, which is a geometry feature rather than another
+document. And `system_hours`, which GBFS 3.0 removed in favour of
+`system_information.opening_hours` (exposed as `SystemInfo.opening_hours`).
+
+**Behaviour, not data.** There is no polling loop or scheduler (see *Pull, not
+push*), no write access of any kind, and no cross-feed journey planning.
 
 ## Error handling
 
@@ -371,7 +453,7 @@ The suite combines example-based, property-based, and conformance testing:
     resolver at volume), and `start_date`/`start_time` instance matching over
     windows containing two service-day instances of the same trip;
   - the circular-zone geometry (`in_circle`'s bbox prefilter is checked
-    against the exact haversine distance at generated boundary points);
+    against the exact great-circle distance at generated boundary points);
   - GBFS field parsing (`_localized`, `_version_key`, station/vehicle merging)
     and GTFS-RT protobuf parsing, both checked for **totality** — every
     generated input must produce a typed result or a documented
