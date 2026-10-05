@@ -595,3 +595,36 @@ async def test_two_vehicles_claiming_one_trip_attach_nothing(
     assert t1.vehicle_id is None
     # Two vehicles claim T1 and nothing distinguishes them: no guess.
     assert t1.vehicle is None
+
+
+async def test_revalidated_bundled_feed_still_costs_one_request_per_call(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """The memo and the 304 cache have to compose.
+
+    A 304 carries no body, so the reused parse must still land in the
+    per-call memo -- otherwise the second entity type off the same url
+    finds nothing memoized and spends another round trip, and the poll
+    costs two requests again.
+    """
+    _mock_catalog(mock_api, rt=True)
+    body = _bundled_message()
+    mock_api.get("/rt/all", body=body, content_type=PB, headers={"ETag": '"v1"'})
+    mock_api.get("/rt/all", status=304)
+    mock_api.get("/rt/all", status=304)  # spare: a 2nd GET here would be the bug
+    handle = await feeds_client.get_transit_feed("mdb-100")
+
+    for _ in range(2):
+        [arrivals] = await handle.get_arrivals(
+            [ArrivalsQuery(["S1", "S2"])],
+            lookahead=timedelta(hours=18),
+            now_utc=NOW,
+            with_vehicles=True,
+        )
+        # The revalidated parse still carries the positions.
+        assert any(a.vehicle is not None for a in arrivals)
+
+    rt_requests = [r for r in mock_api.requests if r.path == "/rt/all"]
+    assert len(rt_requests) == 2, "one request per poll, not one per entity type"
+    assert "If-None-Match" not in rt_requests[0].headers
+    assert rt_requests[1].headers["If-None-Match"] == '"v1"'

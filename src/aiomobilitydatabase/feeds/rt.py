@@ -112,6 +112,14 @@ def _vocab_or_none[StrEnumT: StrEnum](
         return None
 
 
+@dataclass(frozen=True)
+class FeedValidators:
+    """HTTP cache validators a producer offered for one RT url."""
+
+    etag: str | None
+    last_modified: str | None
+
+
 async def fetch_feed_message(
     session: aiohttp.ClientSession,
     url: str,
@@ -121,7 +129,8 @@ async def fetch_feed_message(
     api_key: str | None = None,
     headers: Mapping[str, str] | None = None,
     timeout_seconds: float = 30.0,
-) -> gtfs_realtime_pb2.FeedMessage:
+    validators: FeedValidators | None = None,
+) -> tuple[gtfs_realtime_pb2.FeedMessage | None, FeedValidators | None]:
     """GET a GTFS-RT producer URL and parse the protobuf FeedMessage.
 
     ``auth_type`` follows the catalog's ``source_info.authentication_type``:
@@ -143,6 +152,11 @@ async def fetch_feed_message(
             params[api_key_name] = api_key
         elif auth_type == _AUTH_TYPE_HEADER:
             req_headers[api_key_name] = api_key
+    if validators is not None:
+        if validators.etag:
+            req_headers["If-None-Match"] = validators.etag
+        if validators.last_modified:
+            req_headers["If-Modified-Since"] = validators.last_modified
     try:
         async with session.get(
             url,
@@ -154,10 +168,19 @@ async def fetch_feed_message(
                 raise SourceAuthenticationError(
                     f"Producer rejected credentials ({resp.status}): {url}"
                 )
+            # 304 is the producer confirming the bytes are unchanged, so
+            # reusing the previous parse is not a staleness risk the way a
+            # TTL cache would be -- there is nothing newer to have missed.
+            if resp.status == HTTPStatus.NOT_MODIFIED:
+                return None, validators
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
                     f"Producer error {resp.status}: {url}", status=resp.status
                 )
+            fresh = FeedValidators(
+                etag=resp.headers.get("ETag"),
+                last_modified=resp.headers.get("Last-Modified"),
+            )
             raw = await resp.read()
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
@@ -166,7 +189,7 @@ async def fetch_feed_message(
         await asyncio.to_thread(message.ParseFromString, raw)
     except Exception as err:  # DecodeError subclasses Exception, not a shared base
         raise FeedParseError(f"Undecodable GTFS-RT protobuf from {url}") from err
-    return message
+    return message, (fresh if fresh.etag or fresh.last_modified else None)
 
 
 def vehicles_from_message(

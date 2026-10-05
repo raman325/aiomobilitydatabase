@@ -54,6 +54,7 @@ from .models import (
     VehiclePosition,
 )
 from .rt import (
+    FeedValidators,
     TripPredictions,
     TripUpdateKey,
     TripUpdates,
@@ -435,6 +436,10 @@ class TransitFeedHandle:
         self._api_key = api_key
         self._guard = _IndexGuard()
         self._refresh_lock = asyncio.Lock()
+        # Per-url HTTP validators plus the parse they belong to. Only ever
+        # reused on a 304, i.e. when the producer itself states the bytes
+        # are unchanged -- this is revalidation, not a TTL cache.
+        self._rt_validators: dict[str, tuple[FeedValidators, Any]] = {}
         self.stops: list[Stop] = index.stops()
         self.routes: list[Route] = index.routes()
         self.agencies: list[Agency] = index.agencies()
@@ -789,7 +794,9 @@ class TransitFeedHandle:
         single producer_url is selected once per declared type. ``memo``
         (a per-call dict keyed by url) makes a call that needs two entity
         types off one bundled feed fetch it once; every consumer already
-        filters the parsed message for its own field.
+        filters the parsed message for its own field. Across calls the url
+        is revalidated with its stored ETag/Last-Modified, so an unchanged
+        feed costs a 304 rather than a re-download and re-parse.
         """
         session = self._client._get_session()
         messages = []
@@ -798,10 +805,14 @@ class TransitFeedHandle:
             if source is None or not source.producer_url:
                 continue
             url = source.producer_url
-            if memo is not None and (cached := memo.get(url)) is not None:
-                messages.append(cached)
+            # A memo hit means THIS call already downloaded this url, so
+            # even a conditional request would spend a round trip to learn
+            # nothing.
+            if memo is not None and (memoed := memo.get(url)) is not None:
+                messages.append(memoed)
                 continue
-            message = await fetch_feed_message(
+            known = self._rt_validators.get(url)
+            message, fresh = await fetch_feed_message(
                 session,
                 url,
                 auth_type=source.authentication_type,
@@ -809,7 +820,20 @@ class TransitFeedHandle:
                 api_key=self._api_key,
                 headers=self._headers,
                 timeout_seconds=self._client.timeout_seconds,
+                validators=known[0] if known else None,
             )
+            if message is None:
+                # 304: the producer confirmed our copy is current. It still
+                # goes in the memo -- a second entity type off this same
+                # url must not re-ask within the one call.
+                assert known is not None
+                message = known[1]
+            elif fresh is not None:
+                self._rt_validators[url] = (fresh, message)
+            else:
+                # A producer that stops offering validators must not leave a
+                # stale entry behind to be revalidated against forever.
+                self._rt_validators.pop(url, None)
             if memo is not None:
                 memo[url] = message
             messages.append(message)
