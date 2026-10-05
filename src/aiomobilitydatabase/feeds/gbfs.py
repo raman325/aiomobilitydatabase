@@ -192,10 +192,21 @@ def _count(value: Any) -> int | None:
 
 
 def _number(value: Any) -> float | None:
-    """Return a finite number; bools, strings and junk degrade to None."""
+    """Return a finite number; bools, strings and junk degrade to None.
+
+    An int wider than a float can hold raises OverflowError from
+    ``float()``, so the conversion is guarded rather than the result
+    checked -- a producer's absurd integer is malformed input like any
+    other, and this boundary degrades instead of raising (see
+    ``_ttl_seconds``).
+    """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return converted if math.isfinite(converted) else None
 
 
 def _id_list(value: Any) -> list[str]:
@@ -546,11 +557,17 @@ class GbfsFeedHandle:
                     short_name=_localized(info.get("short_name")),
                     latitude=latitude,
                     longitude=longitude,
-                    capacity=info.get("capacity"),
-                    bikes_available=status.get(
-                        "num_bikes_available", status.get("num_vehicles_available")
+                    # Same _count guard as the disabled counts beside them:
+                    # these are declared int | None, and a producer string
+                    # would otherwise flow straight through the type.
+                    capacity=_count(info.get("capacity")),
+                    bikes_available=_count(
+                        status.get(
+                            "num_bikes_available",
+                            status.get("num_vehicles_available"),
+                        )
                     ),
-                    docks_available=status.get("num_docks_available"),
+                    docks_available=_count(status.get("num_docks_available")),
                     bikes_disabled=_count(
                         status.get(
                             "num_bikes_disabled",
@@ -608,9 +625,13 @@ class GbfsFeedHandle:
                     longitude=longitude,
                     is_reserved=_as_bool(row.get("is_reserved")),
                     is_disabled=_as_bool(row.get("is_disabled")),
-                    vehicle_type_id=row.get("vehicle_type_id"),
-                    current_range_m=row.get("current_range_meters"),
-                    current_fuel_percent=row.get("current_fuel_percent"),
+                    # _record_id, matching _vehicle_types and
+                    # get_vehicle_types: a producer using numeric type ids
+                    # would otherwise yield int 7 here and "7" there, and
+                    # the VehicleType join would never match.
+                    vehicle_type_id=_record_id(row.get("vehicle_type_id")),
+                    current_range_m=_number(row.get("current_range_meters")),
+                    current_fuel_percent=_number(row.get("current_fuel_percent")),
                     last_reported=_reported_at(row.get("last_reported")),
                     station_id=_record_id(row.get("station_id")),
                     home_station_id=_record_id(row.get("home_station_id")),
