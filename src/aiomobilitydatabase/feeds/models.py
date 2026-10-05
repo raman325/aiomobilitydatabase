@@ -287,6 +287,12 @@ class StopArrival:
     outside the 0/1 vocabulary. ``trip_short_name``/``block_id`` are the
     trip's verbatim ``trip_short_name``/``block_id`` cells -- ``block_id``
     is raw string exposure only (no block-continuation computation).
+    ``vehicle`` is the live position of the vehicle serving this call,
+    present only when the query asked for vehicles AND exactly one
+    vehicle could be pinned to the row; it stays None when the feed
+    publishes no positions, when none matches, or when the match would be
+    a guess. ``vehicle_id`` is the id the TripUpdates feed named, and is
+    independent of whether a position for it was found.
     ``stop`` and ``route`` are the whole static records rather than a
     handful of copied columns, so platform codes, coordinates, route
     colours and the rest are reachable without a second lookup; use
@@ -313,6 +319,7 @@ class StopArrival:
     delay_seconds: int | None
     realtime: bool
     vehicle_id: str | None
+    vehicle: VehiclePosition | None
     wheelchair_accessible: WheelchairAccess | None
     bikes_allowed: BikesAllowed | None
     direction_id: int | None

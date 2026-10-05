@@ -4,6 +4,7 @@ import io
 import zipfile
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
@@ -14,9 +15,11 @@ from tests.feeds.fixtures import (
     GTFS_FEED,
     GTFS_RT_FEED,
     TOKEN_RESPONSE,
+    TRIP_UPDATES_BASELINE,
     TRIP_UPDATES_T1_CANCELED_TOMORROW,
     TRIP_UPDATES_T1_DATED_TOMORROW_DELAY,
     TRIP_UPDATES_T1_DELAYED,
+    VEHICLE_POSITIONS,
     _writestr,
     build_gtfs_zip_bytes,
     with_base,
@@ -490,3 +493,105 @@ async def test_arrival_only_added_row_is_dropped_once_past(
         [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert [a.trip_id for a in arrivals] == ["T1", "T2"]
+
+
+def _bundled_message(*, extra_vehicles: tuple[tuple[str, str], ...] = ()) -> bytes:
+    """One FeedMessage carrying both TripUpdates and VehiclePositions.
+
+    The shape the canonical RT fixture declares (``entity_types`` lists vp,
+    tu and sa against a single producer_url), so both entity types come off
+    the same download.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.ParseFromString(TRIP_UPDATES_BASELINE)
+    vehicles = gtfs_realtime_pb2.FeedMessage()
+    vehicles.ParseFromString(VEHICLE_POSITIONS)
+    message.entity.extend(vehicles.entity)
+    for vehicle_id, trip_id in extra_vehicles:
+        entity = message.entity.add()
+        entity.id = f"extra-{vehicle_id}"
+        entity.vehicle.vehicle.id = vehicle_id
+        entity.vehicle.trip.trip_id = trip_id
+        entity.vehicle.position.latitude = 1.0
+        entity.vehicle.position.longitude = 2.0
+    return message.SerializeToString()
+
+
+async def test_with_vehicles_attaches_the_matching_position(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=_bundled_message(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    # 18h reaches T3's 25:30 spillover departure, which V2 claims.
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2"])],
+        lookahead=timedelta(hours=18),
+        now_utc=NOW,
+        with_vehicles=True,
+    )
+    by_trip = {a.trip_id: a for a in arrivals}
+    # T1: matched on the vehicle id its TripUpdate names.
+    t1 = by_trip["T1"]
+    assert t1.vehicle_id == "V1"
+    assert t1.vehicle is not None
+    assert (t1.vehicle.latitude, t1.vehicle.longitude) == (
+        pytest.approx(34.055),
+        pytest.approx(-118.245),
+    )
+    # T3: no TripUpdate at all, so no vehicle id -- matched on the plain
+    # trip id instead, the fallback frequency-based service depends on.
+    t3 = by_trip["T3"]
+    assert t3.vehicle_id is None
+    assert t3.vehicle is not None
+    assert t3.vehicle.vehicle_id == "V2"
+    # RT-added row that no position claims.
+    assert by_trip["ADDED-9"].vehicle is None
+
+
+async def test_vehicles_are_not_fetched_unless_asked(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=_bundled_message(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+    # The positions are sitting in the very message that was parsed for
+    # TripUpdates, and are still not surfaced: the flag gates the join too.
+    assert arrivals
+    assert all(arrival.vehicle is None for arrival in arrivals)
+
+
+async def test_bundled_feed_is_downloaded_once_per_call(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    for _ in range(4):
+        mock_api.get("/rt/all", body=_bundled_message(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    await handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW, with_vehicles=True)
+    # TripUpdates and VehiclePositions are different entity types off the
+    # SAME producer_url: without the per-call memo this is two GETs.
+    assert sum(1 for r in mock_api.requests if r.path == "/rt/all") == 1
+
+
+async def test_two_vehicles_claiming_one_trip_attach_nothing(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    # V9 also claims T1, and T1's TripUpdate names no vehicle to break the
+    # tie (the baseline names V1, so drop that association first).
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.ParseFromString(_bundled_message(extra_vehicles=(("V9", "T1"),)))
+    for entity in message.entity:
+        if entity.HasField("trip_update") and entity.trip_update.trip.trip_id == "T1":
+            entity.trip_update.ClearField("vehicle")
+    mock_api.get("/rt/all", body=message.SerializeToString(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])], now_utc=NOW, with_vehicles=True
+    )
+    t1 = next(a for a in arrivals if a.trip_id == "T1")
+    assert t1.vehicle_id is None
+    # Two vehicles claim T1 and nothing distinguishes them: no guess.
+    assert t1.vehicle is None

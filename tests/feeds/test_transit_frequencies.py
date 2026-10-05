@@ -9,6 +9,8 @@ start_time affects no repetition at all.
 
 from datetime import UTC, datetime, timedelta
 
+from google.transit import gtfs_realtime_pb2
+
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.models import ArrivalsQuery
 
@@ -167,3 +169,34 @@ async def test_tomorrow_repetition_cancellation_spares_todays(
     )
     assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
     assert all(a.realtime is False for a in arrivals)
+
+
+async def test_vehicle_matches_a_repetition_on_the_template_trip_id(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A VehiclePosition names the PLAIN trip id, never a repetition.
+
+    Repetitions surface as synthetic ``F1#{start}`` ids, so matching an
+    arrival to a vehicle on ``trip_id`` would never hit for frequency-based
+    service. The join uses the template id the producer actually sent.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "v-f1"
+    entity.vehicle.vehicle.id = "VF1"
+    entity.vehicle.trip.trip_id = "F1"  # plain template id, no start_time
+    entity.vehicle.position.latitude = 34.1
+    entity.vehicle.position.longitude = -118.3
+    _mock_catalog_with_rt(mock_api, message.SerializeToString())
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])],
+        lookahead=timedelta(hours=6),
+        now_utc=NOW,
+        with_vehicles=True,
+    )
+    matched = [a for a in arrivals if a.vehicle is not None]
+    assert matched, "no repetition matched the template-id vehicle"
+    assert all(a.trip_id.startswith("F1#") for a in matched if a.trip_id)
+    assert {a.vehicle.vehicle_id for a in matched if a.vehicle} == {"VF1"}
