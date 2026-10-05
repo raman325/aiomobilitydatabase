@@ -506,11 +506,21 @@ class Station:
     name: str | None
     latitude: float | None
     longitude: float | None
+    short_name: str | None
     capacity: int | None
     bikes_available: int | None
     docks_available: int | None
+    bikes_disabled: int | None
+    docks_disabled: int | None
+    is_installed: bool | None
     is_renting: bool | None
     is_returning: bool | None
+    is_virtual_station: bool | None
+    last_reported: datetime | None
+    address: str | None
+    cross_street: str | None
+    post_code: str | None
+    region_id: str | None
     vehicle_types_available: dict[str, int] | None
     rental_uris: dict[str, str] | None
 
@@ -531,6 +541,11 @@ class GbfsVehicle:
     is_disabled: bool | None
     vehicle_type_id: str | None
     current_range_m: float | None
+    current_fuel_percent: float | None
+    last_reported: datetime | None
+    station_id: str | None
+    home_station_id: str | None
+    pricing_plan_id: str | None
     rental_uris: dict[str, str] | None
 
 
@@ -561,8 +576,20 @@ class SystemInfo:
 
     system_id: str
     name: str | None
+    short_name: str | None
     operator: str | None
     timezone: str | None
+    languages: list[str]
+    url: str | None
+    purchase_url: str | None
+    start_date: date | None
+    phone_number: str | None
+    email: str | None
+    feed_contact_email: str | None
+    license_url: str | None
+    terms_url: str | None
+    privacy_url: str | None
+    opening_hours: str | None
 
 
 @dataclass(frozen=True)

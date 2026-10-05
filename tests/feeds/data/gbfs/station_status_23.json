@@ -18,14 +18,19 @@
             "vehicle_type_id": "ebike",
             "count": 1
           }
-        ]
+        ],
+        "num_bikes_disabled": 2,
+        "num_docks_disabled": 1,
+        "is_installed": 1,
+        "last_reported": 1785500000
       },
       {
         "station_id": "st2",
         "num_bikes_available": 0,
         "num_docks_available": 10,
         "is_renting": 0,
-        "is_returning": 1
+        "is_returning": 1,
+        "is_installed": 0
       }
     ]
   }

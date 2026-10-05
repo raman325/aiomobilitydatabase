@@ -5,6 +5,18 @@
     "system_id": "test-bikes",
     "name": "Test Bikes",
     "operator": "Test Op",
-    "timezone": "America/Los_Angeles"
+    "timezone": "America/Los_Angeles",
+    "short_name": "TB",
+    "language": "en",
+    "url": "https://example.com",
+    "purchase_url": "https://example.com/buy",
+    "start_date": "2026-01-15",
+    "phone_number": "555-0100",
+    "email": "hello@example.com",
+    "feed_contact_email": "feeds@example.com",
+    "license_url": "https://example.com/license",
+    "terms_url": "https://example.com/terms",
+    "privacy_url": "https://example.com/privacy",
+    "opening_hours": "Mo-Su 00:00-24:00"
   }
 }

@@ -13,7 +13,13 @@
           "android": "https://example.com/app?station=st1&platform=android",
           "ios": "https://example.com/app?station=st1&platform=ios",
           "web": "https://example.com/stations/st1"
-        }
+        },
+        "short_name": "A",
+        "address": "1 Main St",
+        "cross_street": "2nd Ave",
+        "post_code": "90001",
+        "region_id": "r1",
+        "is_virtual_station": false
       },
       {
         "station_id": "st2",
