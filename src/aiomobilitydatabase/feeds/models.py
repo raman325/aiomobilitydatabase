@@ -193,6 +193,7 @@ class Agency:
     lang: str | None
     phone: str | None
     fare_url: str | None
+    email: str | None
 
 
 @dataclass(frozen=True)
@@ -529,6 +530,8 @@ class FeedInfo:
     version: str | None
     start_date: date | None
     end_date: date | None
+    contact_email: str | None
+    contact_url: str | None
 
 
 @dataclass(frozen=True)

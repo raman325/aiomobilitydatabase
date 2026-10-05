@@ -44,7 +44,7 @@ _SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE agencies (
     id TEXT, name TEXT, url TEXT, timezone TEXT,
-    lang TEXT, phone TEXT, fare_url TEXT
+    lang TEXT, phone TEXT, fare_url TEXT, email TEXT
 );
 CREATE TABLE stops (
     id TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL,
@@ -75,7 +75,7 @@ CREATE TABLE trips (
 -- descriptive value.
 CREATE TABLE feed_info (
     publisher_name TEXT, publisher_url TEXT, lang TEXT, version TEXT,
-    start_date TEXT, end_date TEXT
+    start_date TEXT, end_date TEXT, contact_email TEXT, contact_url TEXT
 );
 CREATE TABLE stop_times (
     trip_id TEXT NOT NULL, stop_id TEXT NOT NULL,
@@ -583,7 +583,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT INTO agencies VALUES (?,?,?,?,?,?,?)"
+        sql = "INSERT INTO agencies VALUES (?,?,?,?,?,?,?,?)"
         for row in reader:
             rows.append(
                 (
@@ -594,6 +594,7 @@ class StaticIndex:
                     row.get("agency_lang") or None,
                     row.get("agency_phone") or None,
                     row.get("agency_fare_url") or None,
+                    row.get("agency_email") or None,
                 )
             )
             if len(rows) >= _BATCH_SIZE:
@@ -959,7 +960,7 @@ class StaticIndex:
         """
         for row in reader:
             conn.execute(
-                "INSERT INTO feed_info VALUES (?,?,?,?,?,?)",
+                "INSERT INTO feed_info VALUES (?,?,?,?,?,?,?,?)",
                 (
                     row.get("feed_publisher_name") or None,
                     row.get("feed_publisher_url") or None,
@@ -967,6 +968,8 @@ class StaticIndex:
                     row.get("feed_version") or None,
                     row.get("feed_start_date") or None,
                     row.get("feed_end_date") or None,
+                    row.get("feed_contact_email") or None,
+                    row.get("feed_contact_url") or None,
                 ),
             )
             break
@@ -1037,7 +1040,7 @@ class StaticIndex:
         """
         row = self._conn.execute(
             "SELECT publisher_name, publisher_url, lang, version, "
-            "start_date, end_date FROM feed_info"
+            "start_date, end_date, contact_email, contact_url FROM feed_info"
         ).fetchone()
         if row is None:
             return None
@@ -1048,6 +1051,8 @@ class StaticIndex:
             version=row[3],
             start_date=_lenient_date(row[4]),
             end_date=_lenient_date(row[5]),
+            contact_email=row[6],
+            contact_url=row[7],
         )
 
     def agencies(self) -> list[Agency]:
@@ -1061,9 +1066,11 @@ class StaticIndex:
                 lang=row[4],
                 phone=row[5],
                 fare_url=row[6],
+                email=row[7],
             )
             for row in self._conn.execute(
-                "SELECT id, name, url, timezone, lang, phone, fare_url FROM agencies"
+                "SELECT id, name, url, timezone, lang, phone, fare_url, email "
+                "FROM agencies"
             )
         ]
 

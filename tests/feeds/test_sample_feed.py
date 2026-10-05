@@ -167,6 +167,7 @@ def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> N
             lang=None,
             phone=None,
             fare_url=None,
+            email=None,
         )
     ]
     # feed_info.txt: publisher name/url populated; the feed's language
@@ -179,6 +180,8 @@ def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> N
         version=None,
         start_date=None,
         end_date=None,
+        contact_email=None,
+        contact_url=None,
     )
     index.close()
 
@@ -557,5 +560,7 @@ async def test_handle_answers_from_canonical_feed(
         version=None,
         start_date=None,
         end_date=None,
+        contact_email=None,
+        contact_url=None,
     )
     handle.close()

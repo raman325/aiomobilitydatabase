@@ -2378,6 +2378,8 @@ def test_feed_info_cells_parse_total_and_map_per_rules(cells: dict[str, str]) ->
             version=_expected_text(cells["version"]),
             start_date=_expected_lenient_date(cells["start"]),
             end_date=_expected_lenient_date(cells["end"]),
+            contact_email=None,
+            contact_url=None,
         )
     finally:
         index.close()
