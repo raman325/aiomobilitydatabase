@@ -1,0 +1,15 @@
+{
+  "data": {
+    "regions": [
+      {
+        "region_id": "r1",
+        "name": "Downtown"
+      },
+      {
+        "region_id": "r2"
+      }
+    ]
+  },
+  "last_updated": 1785500000,
+  "ttl": 60
+}

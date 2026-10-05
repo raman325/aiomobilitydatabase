@@ -1,0 +1,33 @@
+{
+  "data": {
+    "alerts": [
+      {
+        "alert_id": "a1",
+        "type": "SYSTEM_CLOSURE",
+        "summary": "Closed for a storm",
+        "description": "All stations closed",
+        "url": "https://example.com/alert",
+        "station_ids": [
+          "st1",
+          7,
+          null
+        ],
+        "region_ids": [
+          "r1"
+        ],
+        "last_updated": 1785500000,
+        "times": [
+          {
+            "start": 1785500000,
+            "end": 1785503600
+          }
+        ]
+      },
+      {
+        "type": "no id"
+      }
+    ]
+  },
+  "last_updated": 1785500000,
+  "ttl": 60
+}
