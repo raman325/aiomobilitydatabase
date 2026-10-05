@@ -287,6 +287,12 @@ class StopArrival:
     outside the 0/1 vocabulary. ``trip_short_name``/``block_id`` are the
     trip's verbatim ``trip_short_name``/``block_id`` cells -- ``block_id``
     is raw string exposure only (no block-continuation computation).
+    ``vehicle`` is the live position of the vehicle serving this call,
+    present only when the query asked for vehicles AND exactly one
+    vehicle could be pinned to the row; it stays None when the feed
+    publishes no positions, when none matches, or when the match would be
+    a guess. ``vehicle_id`` is the id the TripUpdates feed named, and is
+    independent of whether a position for it was found.
     ``stop`` and ``route`` are the whole static records rather than a
     handful of copied columns, so platform codes, coordinates, route
     colours and the rest are reachable without a second lookup; use
@@ -313,6 +319,7 @@ class StopArrival:
     delay_seconds: int | None
     realtime: bool
     vehicle_id: str | None
+    vehicle: VehiclePosition | None
     wheelchair_accessible: WheelchairAccess | None
     bikes_allowed: BikesAllowed | None
     direction_id: int | None
@@ -343,6 +350,13 @@ class UpcomingTrip:
     :class:`StopArrival` fields (``timepoint_exact`` defaults to True when
     the GTFS column is absent or blank).
 
+    ``route``/``origin_stop``/``destination_stop`` are the whole static
+    records, matching :class:`StopArrival`: route colours, platform codes
+    and coordinates are reachable without a second lookup, and
+    ``route.display_name``/``stop.name`` give the human-readable strings.
+    The ``*_stop_id`` fields stay as the ids the query named, which is
+    what callers passed in and what RT rows key on.
+
     ``is_first``/``is_last`` mark whether this departure is the first/last
     departure OF ITS SERVICE DAY for this origin->destination pair --
     legacy ``gtfs`` sensor parity. A past-midnight departure (>24:00:00)
@@ -353,10 +367,12 @@ class UpcomingTrip:
 
     trip_id: str
     route_id: str
-    route_name: str | None
+    route: Route | None
     headsign: str | None
     origin_stop_id: str
+    origin_stop: Stop | None
     destination_stop_id: str
+    destination_stop: Stop | None
     scheduled_departure: datetime
     predicted_departure: datetime | None
     scheduled_arrival: datetime

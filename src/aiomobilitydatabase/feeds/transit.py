@@ -227,6 +227,50 @@ def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
     )
 
 
+def _vehicle_index(
+    vehicles: Sequence[VehiclePosition],
+) -> tuple[dict[str, VehiclePosition], dict[str, VehiclePosition | None]]:
+    """Index live vehicles for arrival matching, by vehicle id and trip id.
+
+    The trip-id map holds None where two or more vehicles claim the same
+    trip id. VehiclePosition carries no start_date/start_time, so
+    concurrent frequency repetitions of one template trip are
+    indistinguishable here -- which bus a row means is unknowable, and
+    guessing would put the wrong vehicle on the map.
+    """
+    by_vehicle_id: dict[str, VehiclePosition] = {}
+    by_trip_id: dict[str, VehiclePosition | None] = {}
+    for vehicle in vehicles:
+        if vehicle.vehicle_id:
+            by_vehicle_id[vehicle.vehicle_id] = vehicle
+        if vehicle.trip_id:
+            # A second claimant poisons the entry rather than overwriting it.
+            by_trip_id[vehicle.trip_id] = (
+                None if vehicle.trip_id in by_trip_id else vehicle
+            )
+    return by_vehicle_id, by_trip_id
+
+
+def _match_vehicle(
+    vehicle_id: str | None,
+    plain_trip_id: str | None,
+    by_vehicle_id: Mapping[str, VehiclePosition],
+    by_trip_id: Mapping[str, VehiclePosition | None],
+) -> VehiclePosition | None:
+    """Return the vehicle serving an arrival, or None if it is not pinnable.
+
+    ``plain_trip_id`` must be the PRODUCER-facing trip id (a repetition's
+    template id, not its synthetic ``{trip_id}#{start_secs}`` id): vehicle
+    trip references keep plain ids, so matching on the synthetic id would
+    never hit for frequency-based service.
+    """
+    if vehicle_id and (vehicle := by_vehicle_id.get(vehicle_id)) is not None:
+        return vehicle
+    if plain_trip_id:
+        return by_trip_id.get(plain_trip_id)
+    return None
+
+
 def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
     """Predicted origin departure if any, else scheduled."""
     return trip.predicted_departure or trip.scheduled_departure
@@ -739,8 +783,21 @@ class TransitFeedHandle:
         ]
 
     async def _fetch_entity_messages(
-        self, entity_type: EntityType
+        self,
+        entity_type: EntityType,
+        memo: dict[str, gtfs_realtime_pb2.FeedMessage] | None = None,
     ) -> list[gtfs_realtime_pb2.FeedMessage]:
+        """Fetch and parse every feed declaring ``entity_type``.
+
+        One GTFS-RT FeedMessage can carry TripUpdates, VehiclePositions and
+        Alerts together, and a feed declares every type it serves -- so a
+        single producer_url is selected once per declared type. ``memo``
+        (a per-call dict keyed by url) makes a call that needs two entity
+        types off one bundled feed fetch it once; every consumer already
+        filters the parsed message for its own field. Across calls the url
+        is revalidated with its stored ETag/Last-Modified, so an unchanged
+        feed costs a 304 rather than a re-download and re-parse.
+        """
         session = self._client._get_session()
         messages = []
         for feed in self._rt_feeds_for(entity_type):
@@ -748,7 +805,13 @@ class TransitFeedHandle:
             if source is None or not source.producer_url:
                 continue
             url = source.producer_url
-            cached = self._rt_validators.get(url)
+            # A memo hit means THIS call already downloaded this url, so
+            # even a conditional request would spend a round trip to learn
+            # nothing.
+            if memo is not None and (memoed := memo.get(url)) is not None:
+                messages.append(memoed)
+                continue
+            known = self._rt_validators.get(url)
             message, fresh = await fetch_feed_message(
                 session,
                 url,
@@ -757,23 +820,28 @@ class TransitFeedHandle:
                 api_key=self._api_key,
                 headers=self._headers,
                 timeout_seconds=self._client.timeout_seconds,
-                validators=cached[0] if cached else None,
+                validators=known[0] if known else None,
             )
             if message is None:
-                # 304: the producer confirmed our copy is current.
-                assert cached is not None
-                messages.append(cached[1])
-                continue
-            if fresh is not None:
+                # 304: the producer confirmed our copy is current. It still
+                # goes in the memo -- a second entity type off this same
+                # url must not re-ask within the one call.
+                assert known is not None
+                message = known[1]
+            elif fresh is not None:
                 self._rt_validators[url] = (fresh, message)
             else:
                 # A producer that stops offering validators must not leave a
                 # stale entry behind to be revalidated against forever.
                 self._rt_validators.pop(url, None)
+            if memo is not None:
+                memo[url] = message
             messages.append(message)
         return messages
 
-    async def _aggregated_trip_updates(self) -> TripUpdates:
+    async def _aggregated_trip_updates(
+        self, memo: dict[str, gtfs_realtime_pb2.FeedMessage] | None = None
+    ) -> TripUpdates:
         """Merge TripUpdates across every TU-capable sibling RT source.
 
         Deliberate tiebreak: when multiple TU-capable sibling feeds report
@@ -782,7 +850,7 @@ class TransitFeedHandle:
         v1).
         """
         aggregate = TripUpdates()
-        for message in await self._fetch_entity_messages(EntityType.TRIP_UPDATES):
+        for message in await self._fetch_entity_messages(EntityType.TRIP_UPDATES, memo):
             updates = trip_updates_from_message(message)
             aggregate.trips.update(updates.trips)
             aggregate.canceled_trips |= updates.canceled_trips
@@ -827,6 +895,7 @@ class TransitFeedHandle:
         lookahead: timedelta = timedelta(hours=2),
         grace: timedelta = timedelta(hours=1),
         now_utc: datetime | None = None,
+        with_vehicles: bool = False,
     ) -> list[list[StopArrival]]:
         """Upcoming arrivals for each query: schedule merged with RT.
 
@@ -885,6 +954,12 @@ class TransitFeedHandle:
         with a sub-24h lookahead is the only instance and preserves the
         pre-start_date behavior exactly.
 
+        ``with_vehicles`` attaches each row's live
+        :class:`VehiclePosition` when one can be pinned down -- off by
+        default because vehicle positions are a SEPARATE network fetch,
+        and a board that shows no vehicles should not pay for one. A
+        producer serving both entity types off one url is fetched once
+        either way, so there the flag costs no extra request.
         ``now_utc`` exists for deterministic testing; omit it in production.
         """
         now = now_utc or datetime.now(UTC)
@@ -893,7 +968,15 @@ class TransitFeedHandle:
         )
         if not all_stop_ids:
             return [[] for _ in queries]
-        updates = await self._aggregated_trip_updates()
+        # One memo per call: a bundled feed serving both TripUpdates and
+        # VehiclePositions is downloaded and parsed once, not once per type.
+        rt_memo: dict[str, gtfs_realtime_pb2.FeedMessage] = {}
+        updates = await self._aggregated_trip_updates(rt_memo)
+        vehicle_messages = (
+            await self._fetch_entity_messages(EntityType.VEHICLE_POSITIONS, rt_memo)
+            if with_vehicles
+            else []
+        )
         canceled = updates.canceled_trips
         added_rows = updates.added
         async with self._guard.reader():
@@ -908,6 +991,34 @@ class TransitFeedHandle:
             )
             stops_by_id = await self._index_read(self._index.stops_by_id)
             routes_by_id = await self._index_read(self._index.routes_by_id)
+            vehicles: list[VehiclePosition] = []
+            if vehicle_messages:
+                vp_trip_ids = sorted(
+                    {
+                        entity.vehicle.trip.trip_id
+                        for message in vehicle_messages
+                        for entity in message.entity
+                        if entity.HasField("vehicle") and entity.vehicle.trip.trip_id
+                    }
+                )
+                vp_trip_routes = await self._index_read(
+                    self._index.routes_for_trips, vp_trip_ids
+                )
+                # Derived, not a second index read: routes_by_id already
+                # holds every Route and display_name is a property on it.
+                vp_route_names = {
+                    route_id: route.display_name
+                    for route_id, route in routes_by_id.items()
+                }
+                for message in vehicle_messages:
+                    vehicles.extend(
+                        vehicles_from_message(
+                            message,
+                            route_names=vp_route_names,
+                            trip_routes=vp_trip_routes,
+                        )
+                    )
+            by_vehicle_id, by_trip_id = _vehicle_index(vehicles)
             # Per-row RT matching: each scheduled row's (identity, service day)
             # resolves to at most one TripUpdates key via _rt_key_for_row —
             # dated keys hit exactly their service day's instance, date-less
@@ -982,6 +1093,12 @@ class TransitFeedHandle:
                         delay_seconds=prediction.delay_seconds if prediction else None,
                         realtime=prediction is not None,
                         vehicle_id=prediction.vehicle_id if prediction else None,
+                        vehicle=_match_vehicle(
+                            prediction.vehicle_id if prediction else None,
+                            dep.source_trip_id,
+                            by_vehicle_id,
+                            by_trip_id,
+                        ),
                         wheelchair_accessible=dep.wheelchair_accessible,
                         bikes_allowed=dep.bikes_allowed,
                         direction_id=dep.direction_id,
@@ -1004,6 +1121,9 @@ class TransitFeedHandle:
                         route_id=row.route_id,
                         route=routes_by_id.get(row.route_id) if row.route_id else None,
                         trip_id=row.trip_id,
+                        vehicle=_match_vehicle(
+                            row.vehicle_id, row.trip_id, by_vehicle_id, by_trip_id
+                        ),
                         headsign=None,
                         scheduled_arrival=None,
                         scheduled_departure=None,
@@ -1107,7 +1227,8 @@ class TransitFeedHandle:
                 None,
                 grace=grace,
             )
-            route_names = await self._index_read(self._index.route_display_names)
+            routes_by_id = await self._index_read(self._index.routes_by_id)
+            stops_by_id = await self._index_read(self._index.stops_by_id)
             # Same per-instance RT matching as get_arrivals (_rt_key_for_row):
             # dated keys hit their service day's row, date-less keys only the
             # earliest in-window instance of the identity.
@@ -1157,10 +1278,12 @@ class TransitFeedHandle:
                     UpcomingTrip(
                         trip_id=trip.trip_id,
                         route_id=trip.route_id,
-                        route_name=route_names.get(trip.route_id),
+                        route=routes_by_id.get(trip.route_id),
                         headsign=trip.headsign,
                         origin_stop_id=origin_stop_id,
+                        origin_stop=stops_by_id.get(origin_stop_id),
                         destination_stop_id=destination_stop_id,
+                        destination_stop=stops_by_id.get(destination_stop_id),
                         scheduled_departure=trip.departure,
                         predicted_departure=(
                             _predicted_time(
