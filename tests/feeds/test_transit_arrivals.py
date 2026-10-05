@@ -111,14 +111,17 @@ async def test_schedule_only_arrivals(
     assert first.realtime is False
     assert first.predicted_departure is None
     assert first.scheduled_departure == datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC)
-    assert first.stop_name == "Main St"
-    assert first.route_name == "10 Main Line"
-    assert first.route_type == 3
+    assert first.stop is not None
+    assert first.stop.name == "Main St"
+    assert first.route is not None
+    assert first.route.display_name == "10 Main Line"
+    assert first.route.type == 3
     assert first.headsign == "Downtown"
     # The base fixture ships no descriptive stop_times/trips columns: every
     # descriptor is None EXCEPT timepoint_exact, whose GTFS default for an
     # absent column is "times are exact".
     assert first.wheelchair_accessible is None
+    assert first.direction_id is None
     assert first.bikes_allowed is None
     assert first.pickup_type is None
     assert first.drop_off_type is None
@@ -171,10 +174,13 @@ async def test_rt_merge_delay_cancellation_and_added(
     added = by_key[("ADDED-9", "S2")]
     assert added.realtime is True
     assert added.scheduled_departure is None
-    assert added.route_name == "10 Main Line"
     # An RT-added trip carries no static row, but it does name a route, so
-    # the route-level descriptors still resolve against the index.
-    assert added.route_type == 3
+    # the whole Route record still resolves against the index.
+    assert added.route is not None
+    assert added.route.display_name == "10 Main Line"
+    assert added.route.type == 3
+    # ... while trip-level descriptors, direction_id included, stay None.
+    assert added.direction_id is None
     # An RT-added trip has no static schedule row: every descriptor is None,
     # INCLUDING timepoint_exact (the absent-means-exact default only applies
     # to stop_times rows that exist).
