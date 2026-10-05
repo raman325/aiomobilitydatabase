@@ -1089,7 +1089,8 @@ class TransitFeedHandle:
                 None,
                 grace=grace,
             )
-            route_names = await self._index_read(self._index.route_display_names)
+            routes_by_id = await self._index_read(self._index.routes_by_id)
+            stops_by_id = await self._index_read(self._index.stops_by_id)
             # Same per-instance RT matching as get_arrivals (_rt_key_for_row):
             # dated keys hit their service day's row, date-less keys only the
             # earliest in-window instance of the identity.
@@ -1139,10 +1140,12 @@ class TransitFeedHandle:
                     UpcomingTrip(
                         trip_id=trip.trip_id,
                         route_id=trip.route_id,
-                        route_name=route_names.get(trip.route_id),
+                        route=routes_by_id.get(trip.route_id),
                         headsign=trip.headsign,
                         origin_stop_id=origin_stop_id,
+                        origin_stop=stops_by_id.get(origin_stop_id),
                         destination_stop_id=destination_stop_id,
+                        destination_stop=stops_by_id.get(destination_stop_id),
                         scheduled_departure=trip.departure,
                         predicted_departure=(
                             _predicted_time(

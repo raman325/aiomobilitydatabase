@@ -61,7 +61,14 @@ async def test_schedule_only_trips(
     assert trip.scheduled_arrival == datetime(2026, 7, 30, 15, 20, tzinfo=UTC)
     assert trip.origin_stop_id == "S1"
     assert trip.destination_stop_id == "S3"
-    assert trip.route_name == "10 Main Line"
+    # Both ends resolve to whole Stop records, not just the ids passed in.
+    assert trip.origin_stop is not None
+    assert trip.origin_stop.name == "Main St"
+    assert trip.destination_stop is not None
+    assert trip.destination_stop.id == "S3"
+    assert trip.route is not None
+    assert trip.route.display_name == "10 Main Line"
+    assert trip.route.type == 3
     assert trip.headsign == "Downtown"
     # Descriptor pass-through from the index: the base fixture ships no
     # descriptive columns (None everywhere, timepoint defaulting to exact),

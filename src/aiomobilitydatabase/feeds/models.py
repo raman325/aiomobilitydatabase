@@ -343,6 +343,13 @@ class UpcomingTrip:
     :class:`StopArrival` fields (``timepoint_exact`` defaults to True when
     the GTFS column is absent or blank).
 
+    ``route``/``origin_stop``/``destination_stop`` are the whole static
+    records, matching :class:`StopArrival`: route colours, platform codes
+    and coordinates are reachable without a second lookup, and
+    ``route.display_name``/``stop.name`` give the human-readable strings.
+    The ``*_stop_id`` fields stay as the ids the query named, which is
+    what callers passed in and what RT rows key on.
+
     ``is_first``/``is_last`` mark whether this departure is the first/last
     departure OF ITS SERVICE DAY for this origin->destination pair --
     legacy ``gtfs`` sensor parity. A past-midnight departure (>24:00:00)
@@ -353,10 +360,12 @@ class UpcomingTrip:
 
     trip_id: str
     route_id: str
-    route_name: str | None
+    route: Route | None
     headsign: str | None
     origin_stop_id: str
+    origin_stop: Stop | None
     destination_stop_id: str
+    destination_stop: Stop | None
     scheduled_departure: datetime
     predicted_departure: datetime | None
     scheduled_arrival: datetime

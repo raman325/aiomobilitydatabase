@@ -532,7 +532,10 @@ async def test_handle_answers_from_canonical_feed(
             datetime(2007, 6, 1, 15, 10, tzinfo=UTC),
         )
     ]
-    assert trips[0].route_name == "10 Airport - Bullfrog"
+    assert trips[0].route is not None
+    assert trips[0].route.display_name == "10 Airport - Bullfrog"
+    assert trips[0].origin_stop is not None
+    assert trips[0].origin_stop.name == "Nye County Airport (Demo)"
     assert trips[0].headsign == "to Bullfrog"
     assert trips[0].realtime is False
     # AB1 is Friday's ONLY BEATTY_AIRPORT->BULLFROG candidate (AB2 runs the
