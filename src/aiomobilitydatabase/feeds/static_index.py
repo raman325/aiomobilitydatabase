@@ -334,6 +334,7 @@ class ScheduledDeparture:
     service_date: date
     wheelchair_accessible: WheelchairAccess | None
     bikes_allowed: BikesAllowed | None
+    direction_id: int | None
     pickup_type: PickupDropOffType | None
     drop_off_type: PickupDropOffType | None
     timepoint_exact: bool | None
@@ -1070,6 +1071,20 @@ class StaticIndex:
         """Map of route_id to display name (for RT joins)."""
         return {route.id: route.display_name for route in self.routes()}
 
+    def routes_by_id(self) -> dict[str, Route]:
+        """Map of route_id to the full Route record.
+
+        Supersedes building a per-attribute map off :meth:`routes`: the
+        rows are materialized into Route objects either way, so handing
+        back the whole record costs nothing over discarding all but one
+        field.
+        """
+        return {route.id: route for route in self.routes()}
+
+    def stops_by_id(self) -> dict[str, Stop]:
+        """Map of stop_id to the full Stop record."""
+        return {stop.id: stop for stop in self.stops()}
+
     def stop_names(self) -> dict[str, str | None]:
         """Map of stop_id to name."""
         return {
@@ -1270,7 +1285,7 @@ class StaticIndex:
                 "SELECT st.trip_id, t.route_id, t.headsign, st.stop_id, "
                 "st.stop_sequence, "
                 "st.arrival_secs, st.departure_secs, t.source_trip_id, t.start_secs, "
-                "t.wheelchair_accessible, t.bikes_allowed, "
+                "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
                 "st.pickup_type, st.drop_off_type, st.timepoint, st.stop_headsign, "
                 "t.short_name, t.block_id "
                 "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
@@ -1295,6 +1310,7 @@ class StaticIndex:
                 start_secs,
                 wheelchair,
                 bikes,
+                direction_id,
                 pickup_type,
                 drop_off_type,
                 timepoint,
@@ -1322,6 +1338,7 @@ class StaticIndex:
                             WheelchairAccess, wheelchair
                         ),
                         bikes_allowed=_enum_or_none(BikesAllowed, bikes),
+                        direction_id=direction_id,
                         pickup_type=_enum_or_none(PickupDropOffType, pickup_type),
                         drop_off_type=_enum_or_none(PickupDropOffType, drop_off_type),
                         timepoint_exact=_timepoint_exact(timepoint),

@@ -123,7 +123,10 @@ async def main() -> None:
         for arrival in arrivals:
             when = arrival.predicted_departure or arrival.scheduled_departure
             live = "live" if arrival.realtime else "scheduled"
-            print(f"{arrival.route_name} -> {arrival.headsign}: {when} ({live})")
+            # .stop and .route are the whole static records: platform codes,
+            # coordinates, route_type and route colours all come along.
+            route = arrival.route.display_name if arrival.route else arrival.route_id
+            print(f"{route} -> {arrival.headsign}: {when} ({live})")
 
         # Origin→destination: the next departures from stop A on trips that
         # later reach stop B, with the same realtime overlay. is_first/is_last

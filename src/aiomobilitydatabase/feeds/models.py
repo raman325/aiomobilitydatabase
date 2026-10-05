@@ -287,14 +287,23 @@ class StopArrival:
     outside the 0/1 vocabulary. ``trip_short_name``/``block_id`` are the
     trip's verbatim ``trip_short_name``/``block_id`` cells -- ``block_id``
     is raw string exposure only (no block-continuation computation).
+    ``stop`` and ``route`` are the whole static records rather than a
+    handful of copied columns, so platform codes, coordinates, route
+    colours and the rest are reachable without a second lookup; use
+    ``route.display_name``/``stop.name`` for the human-readable strings.
+    ``stop_id``/``route_id`` stay as the raw ids a feed referenced, which
+    is what RT rows and filters key on, and a ``route_id`` naming a route
+    absent from routes.txt leaves ``route`` None rather than inventing
+    one. ``direction_id`` stays a raw int (0/1 with feed-defined meaning),
+    matching :attr:`UpcomingTrip.direction_id`.
     RT-added rows have no static schedule row, so every descriptive field
     is None.
     """
 
     stop_id: str
-    stop_name: str | None
+    stop: Stop | None
     route_id: str | None
-    route_name: str | None
+    route: Route | None
     trip_id: str | None
     headsign: str | None
     scheduled_arrival: datetime | None
@@ -306,6 +315,7 @@ class StopArrival:
     vehicle_id: str | None
     wheelchair_accessible: WheelchairAccess | None
     bikes_allowed: BikesAllowed | None
+    direction_id: int | None
     pickup_type: PickupDropOffType | None
     drop_off_type: PickupDropOffType | None
     timepoint_exact: bool | None

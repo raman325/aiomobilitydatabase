@@ -888,8 +888,8 @@ class TransitFeedHandle:
                 None,
                 grace=grace,
             )
-            stop_names = await self._index_read(self._index.stop_names)
-            route_names = await self._index_read(self._index.route_display_names)
+            stops_by_id = await self._index_read(self._index.stops_by_id)
+            routes_by_id = await self._index_read(self._index.routes_by_id)
             # Per-row RT matching: each scheduled row's (identity, service day)
             # resolves to at most one TripUpdates key via _rt_key_for_row —
             # dated keys hit exactly their service day's instance, date-less
@@ -936,9 +936,9 @@ class TransitFeedHandle:
                 arrivals.append(
                     StopArrival(
                         stop_id=dep.stop_id,
-                        stop_name=stop_names.get(dep.stop_id),
+                        stop=stops_by_id.get(dep.stop_id),
                         route_id=dep.route_id,
-                        route_name=route_names.get(dep.route_id),
+                        route=routes_by_id.get(dep.route_id),
                         trip_id=dep.trip_id,
                         headsign=dep.headsign,
                         scheduled_arrival=dep.arrival,
@@ -966,6 +966,7 @@ class TransitFeedHandle:
                         vehicle_id=prediction.vehicle_id if prediction else None,
                         wheelchair_accessible=dep.wheelchair_accessible,
                         bikes_allowed=dep.bikes_allowed,
+                        direction_id=dep.direction_id,
                         pickup_type=dep.pickup_type,
                         drop_off_type=dep.drop_off_type,
                         timepoint_exact=dep.timepoint_exact,
@@ -981,11 +982,9 @@ class TransitFeedHandle:
                 arrivals.append(
                     StopArrival(
                         stop_id=row.stop_id,
-                        stop_name=stop_names.get(row.stop_id),
+                        stop=stops_by_id.get(row.stop_id),
                         route_id=row.route_id,
-                        route_name=route_names.get(row.route_id)
-                        if row.route_id
-                        else None,
+                        route=routes_by_id.get(row.route_id) if row.route_id else None,
                         trip_id=row.trip_id,
                         headsign=None,
                         scheduled_arrival=None,
@@ -1001,6 +1000,7 @@ class TransitFeedHandle:
                         # that exist in stop_times.
                         wheelchair_accessible=None,
                         bikes_allowed=None,
+                        direction_id=None,
                         pickup_type=None,
                         drop_off_type=None,
                         timepoint_exact=None,

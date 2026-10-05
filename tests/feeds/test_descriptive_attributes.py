@@ -305,6 +305,7 @@ def test_departure_stop_time_and_trip_descriptors(tmp_path: Path) -> None:
     t1_s1 = by_key[("T1", "S1")]
     assert t1_s1.wheelchair_accessible is WheelchairAccess.POSSIBLE
     assert t1_s1.bikes_allowed is BikesAllowed.NOT_ALLOWED
+    assert t1_s1.direction_id == 0
     assert t1_s1.trip_short_name == "42"
     assert t1_s1.block_id == "B1"
     assert t1_s1.pickup_type is PickupDropOffType.REGULAR
@@ -320,6 +321,7 @@ def test_departure_stop_time_and_trip_descriptors(tmp_path: Path) -> None:
     t2_s1 = by_key[("T2", "S1")]
     assert t2_s1.wheelchair_accessible is None  # 9: out of vocabulary
     assert t2_s1.bikes_allowed is None  # "x": garbage
+    assert t2_s1.direction_id == 1
     assert t2_s1.pickup_type is None  # 7: out of vocabulary
     assert t2_s1.drop_off_type is None  # "x": garbage
     assert t2_s1.timepoint_exact is None  # 2: outside the 0/1 vocabulary
@@ -331,6 +333,7 @@ def test_departure_stop_time_and_trip_descriptors(tmp_path: Path) -> None:
     assert t3_s1.wheelchair_accessible is None
     assert t3_s1.bikes_allowed is None
     assert t3_s1.timepoint_exact is True
+    assert t3_s1.direction_id is None  # blank value
     assert t3_s1.trip_short_name is None  # blank value
     assert t3_s1.block_id is None
     t3_s2 = by_key[("T3", "S2")]

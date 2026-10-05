@@ -506,8 +506,11 @@ async def test_handle_answers_from_canonical_feed(
         ("STBA#23400", datetime(2007, 6, 1, 13, 30, tzinfo=UTC)),
     ]
     shuttle = arrivals[1]
-    assert shuttle.stop_name == "Stagecoach Hotel & Casino (Demo)"
-    assert shuttle.route_name == "30 Stagecoach - Airport Shuttle"
+    assert shuttle.stop is not None
+    assert shuttle.stop.name == "Stagecoach Hotel & Casino (Demo)"
+    assert shuttle.route is not None
+    assert shuttle.route.display_name == "30 Stagecoach - Airport Shuttle"
+    assert shuttle.route.type == 3
     assert shuttle.headsign == "Shuttle"
     assert shuttle.realtime is False
     assert shuttle.predicted_departure is None

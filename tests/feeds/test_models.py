@@ -54,13 +54,31 @@ def _route(route_id: str, short_name: str | None, long_name: str | None) -> Rout
     )
 
 
+def _stop(stop_id: str, name: str) -> Stop:
+    return Stop(
+        id=stop_id,
+        name=name,
+        latitude=34.05,
+        longitude=-118.25,
+        parent_station=None,
+        location_type=None,
+        stop_code=None,
+        platform_code="A",
+        wheelchair_boarding=None,
+        description=None,
+        url=None,
+        zone_id=None,
+        timezone=None,
+    )
+
+
 def test_stop_arrival_realtime_flags() -> None:
     scheduled = datetime(2026, 7, 31, 15, 0, tzinfo=UTC)
     arrival = StopArrival(
         stop_id="S1",
-        stop_name="Main St",
+        stop=_stop("S1", "Main St"),
         route_id="R1",
-        route_name="10 Main Line",
+        route=_route("R1", "10", "Main Line"),
         trip_id="T1",
         headsign="Downtown",
         scheduled_arrival=scheduled,
@@ -72,6 +90,7 @@ def test_stop_arrival_realtime_flags() -> None:
         vehicle_id=None,
         wheelchair_accessible=WheelchairAccess.POSSIBLE,
         bikes_allowed=BikesAllowed.NOT_ALLOWED,
+        direction_id=0,
         pickup_type=PickupDropOffType.REGULAR,
         drop_off_type=PickupDropOffType.NONE,
         timepoint_exact=True,
