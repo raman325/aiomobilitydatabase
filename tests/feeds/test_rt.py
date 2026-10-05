@@ -16,6 +16,7 @@ from aiomobilitydatabase.feeds.models import (
     AlertEffect,
     CongestionLevel,
     OccupancyStatus,
+    Route,
     VehicleStopStatus,
 )
 from aiomobilitydatabase.feeds.rt import (
@@ -40,6 +41,21 @@ from tests.feeds.fixtures import (
 from tests.mock_server import MockApi
 
 PB = "application/octet-stream"
+
+
+def _route(route_id: str, short_name: str, long_name: str) -> Route:
+    return Route(
+        id=route_id,
+        short_name=short_name,
+        long_name=long_name,
+        type=3,
+        agency_id=None,
+        color=None,
+        text_color=None,
+        url=None,
+        description=None,
+        sort_order=None,
+    )
 
 
 async def _fetch(
@@ -114,13 +130,18 @@ def test_vehicles_from_message() -> None:
     msg.ParseFromString(VEHICLE_POSITIONS)
     vehicles = vehicles_from_message(
         msg,
-        route_names={"R1": "10 Main Line", "R2": "20 Night Owl"},
+        routes_by_id={
+            "R1": _route("R1", "10", "Main Line"),
+            "R2": _route("R2", "20", "Night Owl"),
+        },
+        stops_by_id={},
         trip_routes={"T3": "R2"},
     )
     assert len(vehicles) == 2
     v1 = next(v for v in vehicles if v.vehicle_id == "V1")
     assert v1.route_id == "R1"
-    assert v1.route_name == "10 Main Line"
+    assert v1.route is not None
+    assert v1.route.display_name == "10 Main Line"
     # Typed vocabulary: the StrEnum member IS the old raw string, so both
     # identity and legacy string comparisons hold.
     assert v1.occupancy_status is OccupancyStatus.MANY_SEATS_AVAILABLE
@@ -135,7 +156,8 @@ def test_vehicles_from_message() -> None:
     assert v1.license_plate is None
     v2 = next(v for v in vehicles if v.vehicle_id == "V2")
     assert v2.route_id == "R2"  # resolved via trip_routes fallback
-    assert v2.route_name == "20 Night Owl"
+    assert v2.route is not None
+    assert v2.route.display_name == "20 Night Owl"
 
 
 def test_vehicles_from_message_status_surface() -> None:
@@ -146,7 +168,9 @@ def test_vehicles_from_message_status_surface() -> None:
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(VEHICLE_POSITIONS_STATUS)
-    vehicles = vehicles_from_message(msg, route_names={}, trip_routes={})
+    vehicles = vehicles_from_message(
+        msg, routes_by_id={}, stops_by_id={}, trip_routes={}
+    )
     v7, v8, v9 = (
         next(v for v in vehicles if v.vehicle_id == vid) for vid in ("V7", "V8", "V9")
     )
@@ -179,7 +203,9 @@ def test_vehicles_stop_id_referent_alone_surfaces_default() -> None:
     entity.vehicle.position.latitude = 1.0
     entity.vehicle.position.longitude = 2.0
     entity.vehicle.stop_id = "S9"
-    (vehicle,) = vehicles_from_message(msg, route_names={}, trip_routes={})
+    (vehicle,) = vehicles_from_message(
+        msg, routes_by_id={}, stops_by_id={}, trip_routes={}
+    )
     assert vehicle.stop_id == "S9"
     assert vehicle.current_status is VehicleStopStatus.IN_TRANSIT_TO
 

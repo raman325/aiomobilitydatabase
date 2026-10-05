@@ -21,7 +21,9 @@ from .models import (
     AlertSeverity,
     CongestionLevel,
     OccupancyStatus,
+    Route,
     ServiceAlert,
+    Stop,
     VehiclePosition,
     VehicleStopStatus,
 )
@@ -195,8 +197,9 @@ async def fetch_feed_message(
 def vehicles_from_message(
     message: gtfs_realtime_pb2.FeedMessage,
     *,
-    route_names: dict[str, str],
-    trip_routes: dict[str, str],
+    routes_by_id: Mapping[str, Route],
+    stops_by_id: Mapping[str, Stop],
+    trip_routes: Mapping[str, str],
 ) -> list[VehiclePosition]:
     """Extract vehicle positions, resolving route via trip when unset."""
     vehicles: list[VehiclePosition] = []
@@ -265,13 +268,16 @@ def vehicles_from_message(
                 if vehicle.position.HasField("speed")
                 else None,
                 route_id=route_id,
-                route_name=route_names.get(route_id) if route_id else None,
+                route=routes_by_id.get(route_id) if route_id else None,
                 trip_id=vehicle.trip.trip_id or None,
+                trip_start_date=_trip_start_date(vehicle.trip),
+                trip_start_secs=_trip_start_secs(vehicle.trip),
                 occupancy_status=occupancy,
                 timestamp=_epoch_to_utc(vehicle.timestamp),
                 current_status=current_status,
                 congestion_level=congestion,
                 stop_id=vehicle.stop_id or None,
+                stop=stops_by_id.get(vehicle.stop_id) if vehicle.stop_id else None,
                 current_stop_sequence=(
                     vehicle.current_stop_sequence
                     if vehicle.HasField("current_stop_sequence")

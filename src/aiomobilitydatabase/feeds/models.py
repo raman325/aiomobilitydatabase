@@ -412,6 +412,18 @@ class VehiclePosition:
     ``congestion_level`` is None when unset (its protobuf default,
     UNKNOWN_CONGESTION_LEVEL, carries no information to synthesize);
     ``license_plate`` is the vehicle descriptor's verbatim plate.
+
+    ``route``/``stop`` are the whole static records, matching
+    :class:`StopArrival`; ``route_id``/``stop_id`` stay as the raw ids the
+    producer sent, which may name something the static dataset does not
+    have (leaving the record None).
+
+    ``trip_start_date``/``trip_start_secs`` are the parsed
+    ``TripDescriptor.start_date``/``start_time`` -- the pair that pins
+    WHICH instance of a trip this vehicle is running. Without them a
+    frequency-based trip's concurrent repetitions cannot be told apart.
+    Both degrade to None on absent or malformed values, like every other
+    RT descriptor here.
     """
 
     vehicle_id: str | None
@@ -421,13 +433,16 @@ class VehiclePosition:
     bearing: float | None
     speed: float | None
     route_id: str | None
-    route_name: str | None
+    route: Route | None
     trip_id: str | None
+    trip_start_date: date | None
+    trip_start_secs: int | None
     occupancy_status: OccupancyStatus | None
     timestamp: datetime | None
     current_status: VehicleStopStatus | None
     congestion_level: CongestionLevel | None
     stop_id: str | None
+    stop: Stop | None
     current_stop_sequence: int | None
     license_plate: str | None
 

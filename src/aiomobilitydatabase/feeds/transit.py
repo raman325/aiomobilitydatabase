@@ -229,33 +229,40 @@ def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
 
 def _vehicle_index(
     vehicles: Sequence[VehiclePosition],
-) -> tuple[dict[str, VehiclePosition], dict[str, VehiclePosition | None]]:
-    """Index live vehicles for arrival matching, by vehicle id and trip id.
+) -> tuple[
+    dict[str, VehiclePosition],
+    dict[tuple[str, int | None], VehiclePosition | None],
+]:
+    """Index live vehicles for arrival matching, by vehicle id and instance.
 
-    The trip-id map holds None where two or more vehicles claim the same
-    trip id. VehiclePosition carries no start_date/start_time, so
-    concurrent frequency repetitions of one template trip are
-    indistinguishable here -- which bus a row means is unknowable, and
-    guessing would put the wrong vehicle on the map.
+    The second map is keyed by (trip id, start seconds) -- the pair a
+    TripDescriptor uses to address ONE repetition of a frequency-based
+    trip -- so concurrent repetitions of a template trip no longer
+    collide. A vehicle without start_time is filed under
+    ``(trip_id, None)``, which is exactly how a plain trip is addressed.
+
+    An entry still holds None where two vehicles claim the same instance:
+    that is a genuinely ambiguous feed, not a resolvable one, and guessing
+    would put the wrong vehicle on the map.
     """
     by_vehicle_id: dict[str, VehiclePosition] = {}
-    by_trip_id: dict[str, VehiclePosition | None] = {}
+    by_instance: dict[tuple[str, int | None], VehiclePosition | None] = {}
     for vehicle in vehicles:
         if vehicle.vehicle_id:
             by_vehicle_id[vehicle.vehicle_id] = vehicle
         if vehicle.trip_id:
+            key = (vehicle.trip_id, vehicle.trip_start_secs)
             # A second claimant poisons the entry rather than overwriting it.
-            by_trip_id[vehicle.trip_id] = (
-                None if vehicle.trip_id in by_trip_id else vehicle
-            )
-    return by_vehicle_id, by_trip_id
+            by_instance[key] = None if key in by_instance else vehicle
+    return by_vehicle_id, by_instance
 
 
 def _match_vehicle(
     vehicle_id: str | None,
     plain_trip_id: str | None,
+    start_secs: int | None,
     by_vehicle_id: Mapping[str, VehiclePosition],
-    by_trip_id: Mapping[str, VehiclePosition | None],
+    by_instance: Mapping[tuple[str, int | None], VehiclePosition | None],
 ) -> VehiclePosition | None:
     """Return the vehicle serving an arrival, or None if it is not pinnable.
 
@@ -263,12 +270,23 @@ def _match_vehicle(
     template id, not its synthetic ``{trip_id}#{start_secs}`` id): vehicle
     trip references keep plain ids, so matching on the synthetic id would
     never hit for frequency-based service.
+
+    A repetition is addressed by (template id, its start); the exact
+    instance is tried first. A producer that sends no start_time has not
+    said which repetition it means, so its position falls back to the
+    date-less key and serves whichever repetition asks -- the same
+    leniency the TripUpdates path applies, and better than attaching
+    nothing at all.
     """
     if vehicle_id and (vehicle := by_vehicle_id.get(vehicle_id)) is not None:
         return vehicle
-    if plain_trip_id:
-        return by_trip_id.get(plain_trip_id)
-    return None
+    if not plain_trip_id:
+        return None
+    if start_secs is not None and (
+        exact := by_instance.get((plain_trip_id, start_secs))
+    ):
+        return exact
+    return by_instance.get((plain_trip_id, None))
 
 
 def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
@@ -1004,21 +1022,16 @@ class TransitFeedHandle:
                 vp_trip_routes = await self._index_read(
                     self._index.routes_for_trips, vp_trip_ids
                 )
-                # Derived, not a second index read: routes_by_id already
-                # holds every Route and display_name is a property on it.
-                vp_route_names = {
-                    route_id: route.display_name
-                    for route_id, route in routes_by_id.items()
-                }
                 for message in vehicle_messages:
                     vehicles.extend(
                         vehicles_from_message(
                             message,
-                            route_names=vp_route_names,
+                            routes_by_id=routes_by_id,
+                            stops_by_id=stops_by_id,
                             trip_routes=vp_trip_routes,
                         )
                     )
-            by_vehicle_id, by_trip_id = _vehicle_index(vehicles)
+            by_vehicle_id, by_instance = _vehicle_index(vehicles)
             # Per-row RT matching: each scheduled row's (identity, service day)
             # resolves to at most one TripUpdates key via _rt_key_for_row —
             # dated keys hit exactly their service day's instance, date-less
@@ -1096,8 +1109,9 @@ class TransitFeedHandle:
                         vehicle=_match_vehicle(
                             prediction.vehicle_id if prediction else None,
                             dep.source_trip_id,
+                            dep.start_secs,
                             by_vehicle_id,
-                            by_trip_id,
+                            by_instance,
                         ),
                         wheelchair_accessible=dep.wheelchair_accessible,
                         bikes_allowed=dep.bikes_allowed,
@@ -1122,7 +1136,11 @@ class TransitFeedHandle:
                         route=routes_by_id.get(row.route_id) if row.route_id else None,
                         trip_id=row.trip_id,
                         vehicle=_match_vehicle(
-                            row.vehicle_id, row.trip_id, by_vehicle_id, by_trip_id
+                            row.vehicle_id,
+                            row.trip_id,
+                            None,
+                            by_vehicle_id,
+                            by_instance,
                         ),
                         headsign=None,
                         scheduled_arrival=None,
@@ -1355,12 +1373,16 @@ class TransitFeedHandle:
         )
         async with self._guard.reader():
             trip_routes = await self._index_read(self._index.routes_for_trips, trip_ids)
-            route_names = await self._index_read(self._index.route_display_names)
+            routes_by_id = await self._index_read(self._index.routes_by_id)
+            stops_by_id = await self._index_read(self._index.stops_by_id)
             vehicles: list[VehiclePosition] = []
             for message in messages:
                 vehicles.extend(
                     vehicles_from_message(
-                        message, route_names=route_names, trip_routes=trip_routes
+                        message,
+                        routes_by_id=routes_by_id,
+                        stops_by_id=stops_by_id,
+                        trip_routes=trip_routes,
                     )
                 )
             return vehicles

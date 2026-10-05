@@ -1269,7 +1269,9 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
             canceled_keys |= entity_canceled
         elif kind == "alert":
             expected_alert_trip_ids.append(result)  # type: ignore[arg-type]
-    vehicles = vehicles_from_message(msg, route_names={}, trip_routes={})
+    vehicles = vehicles_from_message(
+        msg, routes_by_id={}, stops_by_id={}, trip_routes={}
+    )
     assert len(vehicles) == len(expected_vehicles)
     for vehicle, expected in zip(vehicles, expected_vehicles, strict=True):
         assert vehicle.latitude is not None and vehicle.longitude is not None
@@ -6590,7 +6592,9 @@ def test_vehicle_current_status_tri_rule_oracle(
         has_sequence=has_sequence,
         has_stop_id=has_stop_id,
     )
-    [vehicle] = vehicles_from_message(msg, route_names={}, trip_routes={})
+    [vehicle] = vehicles_from_message(
+        msg, routes_by_id={}, stops_by_id={}, trip_routes={}
+    )
     if status_value is not None:
         expected: VehicleStopStatus | None = VehicleStopStatus(
             gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.Name(status_value)

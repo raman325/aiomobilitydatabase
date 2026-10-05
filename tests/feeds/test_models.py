@@ -3,7 +3,7 @@
 import dataclasses
 import io
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 from google.transit import gtfs_realtime_pb2
@@ -139,13 +139,16 @@ def test_vehicle_and_station_construct() -> None:
         bearing=90.0,
         speed=None,
         route_id="R1",
-        route_name="10 Main Line",
+        route=_route("R1", "10", "Main Line"),
         trip_id="T1",
+        trip_start_date=date(2026, 7, 31),
+        trip_start_secs=28800,
         occupancy_status=OccupancyStatus.MANY_SEATS_AVAILABLE,
         timestamp=datetime(2026, 7, 31, 15, 0, tzinfo=UTC),
         current_status=VehicleStopStatus.STOPPED_AT,
         congestion_level=CongestionLevel.RUNNING_SMOOTHLY,
         stop_id="S1",
+        stop=_stop("S1", "Main St"),
         current_stop_sequence=3,
         license_plate="8ABC123",
     )
