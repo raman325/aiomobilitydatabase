@@ -400,6 +400,32 @@ class UpcomingTrip:
 
 
 @dataclass(frozen=True)
+class CarriageDetail:
+    """One carriage of a multi-carriage vehicle (GTFS-RT 2.1).
+
+    ``occupancy_percentage`` is -1 in the protobuf when unset; that
+    sentinel becomes None here rather than surfacing as a negative
+    percentage. ``carriage_sequence`` orders the carriages from the
+    vehicle's front.
+    """
+
+    id: str | None
+    label: str | None
+    occupancy_status: OccupancyStatus | None
+    occupancy_percentage: int | None
+    carriage_sequence: int | None
+
+
+@dataclass(frozen=True)
+class AlertImage:
+    """One localized variant of an alert's image."""
+
+    url: str
+    media_type: str | None
+    language: str | None
+
+
+@dataclass(frozen=True)
 class VehiclePosition:
     """A live vehicle position from a GTFS-RT feed.
 
@@ -441,6 +467,10 @@ class VehiclePosition:
     trip_start_date: date | None
     trip_start_secs: int | None
     occupancy_status: OccupancyStatus | None
+    occupancy_percentage: int | None
+    carriages: list[CarriageDetail]
+    wheelchair_accessible: WheelchairAccess | None
+    odometer: float | None
     timestamp: datetime | None
     current_status: VehicleStopStatus | None
     congestion_level: CongestionLevel | None
@@ -470,9 +500,15 @@ class ServiceAlert:
     id: str
     header: str | None
     description: str | None
+    tts_header: str | None
+    tts_description: str | None
     cause: AlertCause | None
+    cause_detail: str | None
     effect: AlertEffect | None
+    effect_detail: str | None
     severity: AlertSeverity | None
+    images: list[AlertImage]
+    image_alternative_text: str | None
     agency_ids: list[str]
     route_ids: list[str]
     route_types: list[int]
