@@ -135,7 +135,8 @@ async def main() -> None:
             nearby_stops[0].id, nearby_stops[1].id, limit=2
         )
         for trip in trips:
-            print(trip.route_name, trip.scheduled_departure, trip.is_last)
+            name = trip.route.display_name if trip.route else trip.route_id
+            print(name, trip.scheduled_departure, trip.is_last)
 
         vehicles = await transit.get_vehicles()
         alerts = await transit.get_alerts()
