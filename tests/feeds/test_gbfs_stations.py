@@ -12,11 +12,15 @@ from aiomobilitydatabase.feeds.geo import Circle
 from tests.feeds.fixtures import (
     GBFS_FEED,
     GTFS_FEED,
+    PRICING_PLANS,
     STATION_INFO_23,
     STATION_STATUS_23,
+    SYSTEM_ALERTS,
     SYSTEM_INFO_23,
     SYSTEM_INFO_30,
+    SYSTEM_REGIONS,
     TOKEN_RESPONSE,
+    VEHICLE_TYPES,
     with_base,
 )
 from tests.mock_server import MockApi
@@ -509,3 +513,77 @@ async def test_system_info_full_surface(
     assert info.terms_url == "https://example.com/terms"
     assert info.privacy_url == "https://example.com/privacy"
     assert info.opening_hours == "Mo-Su 00:00-24:00"
+
+
+async def _lookup_handle(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> object:
+    base = mock_api.url()
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=with_base(GBFS_FEED, base))
+    mock_api.get("/gbfs/vehicle_types.json", payload=VEHICLE_TYPES)
+    mock_api.get("/gbfs/system_pricing_plans.json", payload=PRICING_PLANS)
+    mock_api.get("/gbfs/system_regions.json", payload=SYSTEM_REGIONS)
+    mock_api.get("/gbfs/system_alerts.json", payload=SYSTEM_ALERTS)
+    return await feeds_client.get_gbfs_feed("gbfs-300")
+
+
+async def test_lookup_documents_resolve_the_ids_rows_reference(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """vehicle_type_id / pricing_plan_id / region_id stop being opaque."""
+    handle = await _lookup_handle(mock_api, feeds_client)
+
+    types = {t.id: t for t in await handle.get_vehicle_types()}
+    assert set(types) == {"ebike", "scooter"}  # the id-less row is skipped
+    assert types["ebike"].form_factor == "bicycle"
+    assert types["ebike"].propulsion_type == "electric_assist"
+    assert types["ebike"].max_range_m == 60000.0
+    assert types["ebike"].rider_capacity == 1
+    assert types["scooter"].name is None
+
+    [plan] = await handle.get_pricing_plans()
+    assert (plan.id, plan.currency, plan.price) == ("plan-a", "USD", 3.5)
+    assert plan.is_taxable is False
+
+    regions = {r.id: r.name for r in await handle.get_regions()}
+    assert regions == {"r1": "Downtown", "r2": None}
+
+
+async def test_system_alerts_scope_to_stations_and_regions(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    handle = await _lookup_handle(mock_api, feeds_client)
+    [alert] = await handle.get_system_alerts()
+    assert alert.id == "a1"
+    assert alert.type == "SYSTEM_CLOSURE"
+    assert alert.summary == "Closed for a storm"
+    # A numeric id is a legitimate GBFS id and is coerced, matching
+    # _record_id elsewhere; only a null entry is dropped.
+    assert alert.station_ids == ["st1", "7"]
+    assert alert.region_ids == ["r1"]
+    assert alert.last_updated == datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC)
+    assert alert.active_periods == [
+        (
+            datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC),
+            datetime(2026, 7, 31, 13, 13, 20, tzinfo=UTC),
+        )
+    ]
+
+
+async def test_unpublished_lookup_documents_are_empty_not_an_error(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Every one of these endpoints is optional in GBFS.
+
+    Discovery lists only what a system serves, so "not published" means
+    "no such records" -- it must not raise the way a missing required
+    document does.
+    """
+    _mock_catalog(mock_api)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    handle._endpoints = {}  # a system publishing none of them
+    assert await handle.get_vehicle_types() == []
+    assert await handle.get_pricing_plans() == []
+    assert await handle.get_regions() == []
+    assert await handle.get_system_alerts() == []

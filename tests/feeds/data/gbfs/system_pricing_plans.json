@@ -1,0 +1,19 @@
+{
+  "data": {
+    "plans": [
+      {
+        "plan_id": "plan-a",
+        "name": "Pay as you go",
+        "currency": "USD",
+        "price": 3.5,
+        "is_taxable": false,
+        "description": "First 30 minutes included"
+      },
+      {
+        "name": "nameless"
+      }
+    ]
+  },
+  "last_updated": 1785500000,
+  "ttl": 60
+}

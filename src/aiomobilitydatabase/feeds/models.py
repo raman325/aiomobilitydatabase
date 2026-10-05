@@ -612,6 +612,70 @@ class FeedInfo:
 
 
 @dataclass(frozen=True)
+class VehicleType:
+    """One vehicle type a GBFS system rents.
+
+    Resolves the ``vehicle_type_id`` that stations and vehicles reference.
+    ``form_factor``/``propulsion_type`` stay raw strings: GBFS adds new
+    values across minor versions, so a closed enum would reject a feed
+    that is merely newer than this library.
+    """
+
+    id: str
+    form_factor: str | None
+    propulsion_type: str | None
+    name: str | None
+    max_range_m: float | None
+    rider_capacity: int | None
+
+
+@dataclass(frozen=True)
+class PricingPlan:
+    """One pricing plan, resolving a vehicle's ``pricing_plan_id``.
+
+    ``price`` is the base price in ``currency``; GBFS also allows per-km
+    and per-minute segment tables, which are not modeled -- the plan's
+    ``description`` is the human-readable fallback for those.
+    """
+
+    id: str
+    name: str | None
+    currency: str | None
+    price: float | None
+    is_taxable: bool | None
+    description: str | None
+
+
+@dataclass(frozen=True)
+class SystemRegion:
+    """A named service region, resolving a station's ``region_id``."""
+
+    id: str
+    name: str | None
+
+
+@dataclass(frozen=True)
+class GbfsAlert:
+    """A GBFS system alert.
+
+    Distinct from :class:`ServiceAlert`, which is GTFS-RT: this one scopes
+    to GBFS stations and regions rather than routes and trips, and its
+    ``type`` is a raw string for the same reason as
+    :attr:`VehicleType.form_factor`.
+    """
+
+    id: str
+    type: str | None
+    summary: str | None
+    description: str | None
+    url: str | None
+    station_ids: list[str]
+    region_ids: list[str]
+    last_updated: datetime | None
+    active_periods: list[tuple[datetime | None, datetime | None]]
+
+
+@dataclass(frozen=True)
 class SystemInfo:
     """GBFS system information."""
 

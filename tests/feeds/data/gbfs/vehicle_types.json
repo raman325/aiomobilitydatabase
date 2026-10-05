@@ -1,0 +1,24 @@
+{
+  "data": {
+    "vehicle_types": [
+      {
+        "vehicle_type_id": "ebike",
+        "form_factor": "bicycle",
+        "propulsion_type": "electric_assist",
+        "name": "E-Bike",
+        "max_range_meters": 60000,
+        "rider_capacity": 1
+      },
+      {
+        "vehicle_type_id": "scooter",
+        "form_factor": "scooter_standing",
+        "propulsion_type": "electric"
+      },
+      {
+        "form_factor": "bicycle"
+      }
+    ]
+  },
+  "last_updated": 1785500000,
+  "ttl": 60
+}

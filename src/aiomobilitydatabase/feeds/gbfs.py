@@ -14,7 +14,15 @@ import aiohttp
 from .const import GBFS_LANGUAGE_PREFERENCE
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
-from .models import GbfsVehicle, Station, SystemInfo
+from .models import (
+    GbfsAlert,
+    GbfsVehicle,
+    PricingPlan,
+    Station,
+    SystemInfo,
+    SystemRegion,
+    VehicleType,
+)
 from .rt import _require_http_url  # deliberate friend access: shared URL guard
 
 if TYPE_CHECKING:
@@ -181,6 +189,31 @@ def _count(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if value >= 0 else None
+
+
+def _number(value: Any) -> float | None:
+    """Return a finite number; bools, strings and junk degrade to None."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _id_list(value: Any) -> list[str]:
+    """Ids from a GBFS array, dropping entries that are not usable ids."""
+    if not isinstance(value, list):
+        return []
+    return [found for item in value if (found := _record_id(item)) is not None]
+
+
+def _alert_times(value: Any) -> list[tuple[datetime | None, datetime | None]]:
+    """Return a GBFS alert's ``times`` array as (start, end) pairs."""
+    if not isinstance(value, list):
+        return []
+    return [
+        (_reported_at(item.get("start")), _reported_at(item.get("end")))
+        for item in value
+        if isinstance(item, Mapping)
+    ]
 
 
 def _rows(document: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
@@ -408,6 +441,77 @@ class GbfsFeedHandle:
             privacy_url=_plain_text(data.get("privacy_url")),
             opening_hours=_plain_text(data.get("opening_hours")),
         )
+
+    async def _optional_rows(self, name: str, key: str) -> list[Mapping[str, Any]]:
+        """Rows from a document a system need not publish at all.
+
+        Every one of these endpoints is optional in GBFS, and discovery
+        only lists what a system actually serves -- so "not published"
+        is a normal answer meaning "no such records", not a failure.
+        """
+        if name not in self._endpoints:
+            return []
+        return _rows(await self._document(name), key)
+
+    async def get_vehicle_types(self) -> list[VehicleType]:
+        """Vehicle types, resolving the ids stations and vehicles reference."""
+        return [
+            VehicleType(
+                id=type_id,
+                form_factor=_plain_text(row.get("form_factor")),
+                propulsion_type=_plain_text(row.get("propulsion_type")),
+                name=_localized(row.get("name")),
+                max_range_m=_number(row.get("max_range_meters")),
+                rider_capacity=_count(row.get("rider_capacity")),
+            )
+            for row in await self._optional_rows("vehicle_types", "vehicle_types")
+            if (type_id := _record_id(row.get("vehicle_type_id"))) is not None
+        ]
+
+    async def get_pricing_plans(self) -> list[PricingPlan]:
+        """Pricing plans, resolving a vehicle's ``pricing_plan_id``."""
+        return [
+            PricingPlan(
+                id=plan_id,
+                name=_localized(row.get("name")),
+                currency=_plain_text(row.get("currency")),
+                price=_number(row.get("price")),
+                is_taxable=_as_bool(row.get("is_taxable")),
+                description=_localized(row.get("description")),
+            )
+            for row in await self._optional_rows("system_pricing_plans", "plans")
+            if (plan_id := _record_id(row.get("plan_id"))) is not None
+        ]
+
+    async def get_regions(self) -> list[SystemRegion]:
+        """Service regions, resolving a station's ``region_id``."""
+        return [
+            SystemRegion(id=region_id, name=_localized(row.get("name")))
+            for row in await self._optional_rows("system_regions", "regions")
+            if (region_id := _record_id(row.get("region_id"))) is not None
+        ]
+
+    async def get_system_alerts(self) -> list[GbfsAlert]:
+        """GBFS system alerts.
+
+        Named apart from the GTFS-RT ``get_alerts`` on the transit handle:
+        these scope to GBFS stations and regions, not routes and trips.
+        """
+        return [
+            GbfsAlert(
+                id=alert_id,
+                type=_plain_text(row.get("type")),
+                summary=_localized(row.get("summary")),
+                description=_localized(row.get("description")),
+                url=_plain_text(row.get("url")),
+                station_ids=_id_list(row.get("station_ids")),
+                region_ids=_id_list(row.get("region_ids")),
+                last_updated=_reported_at(row.get("last_updated")),
+                active_periods=_alert_times(row.get("times")),
+            )
+            for row in await self._optional_rows("system_alerts", "alerts")
+            if (alert_id := _record_id(row.get("alert_id"))) is not None
+        ]
 
     async def get_stations(self, zone: Circle | None = None) -> list[Station]:
         """Stations with information and status merged by station_id.

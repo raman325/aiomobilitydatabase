@@ -46,6 +46,10 @@ def with_base(payload: dict[str, Any], base_url: str) -> dict[str, Any]:
 # -- GBFS 2.3 and 3.0 JSON documents ----------------------------------------
 
 DISCOVERY_23: dict[str, Any] = _load_json(_GBFS_DIR, "discovery_23")
+VEHICLE_TYPES: dict[str, Any] = _load_json(_GBFS_DIR, "vehicle_types")
+PRICING_PLANS: dict[str, Any] = _load_json(_GBFS_DIR, "system_pricing_plans")
+SYSTEM_REGIONS: dict[str, Any] = _load_json(_GBFS_DIR, "system_regions")
+SYSTEM_ALERTS: dict[str, Any] = _load_json(_GBFS_DIR, "system_alerts")
 DISCOVERY_30: dict[str, Any] = _load_json(_GBFS_DIR, "discovery_30")
 SYSTEM_INFO_23: dict[str, Any] = _load_json(_GBFS_DIR, "system_info_23")
 STATION_INFO_23: dict[str, Any] = _load_json(_GBFS_DIR, "station_info_23")
