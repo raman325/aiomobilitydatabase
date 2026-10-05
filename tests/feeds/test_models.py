@@ -88,6 +88,7 @@ def test_stop_arrival_realtime_flags() -> None:
         delay_seconds=None,
         realtime=False,
         vehicle_id=None,
+        vehicle=None,
         wheelchair_accessible=WheelchairAccess.POSSIBLE,
         bikes_allowed=BikesAllowed.NOT_ALLOWED,
         direction_id=0,
