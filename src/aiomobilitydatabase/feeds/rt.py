@@ -620,18 +620,35 @@ def _first_translation(translated: object) -> str | None:
 def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceAlert]:
     """Extract service alerts with best-effort English text.
 
-    Scoping: every informed_entity's route_id, stop_id, AND trip
-    descriptor trip_id is collected, so a trip-scoped alert carries its
-    trip ids instead of reading as unscoped -- an alert is unscoped
-    (feed-wide) only when route_ids, stop_ids, and trip_ids are ALL empty
-    (see :class:`~.models.ServiceAlert`).
+    Scoping: EVERY selector an informed_entity can carry is collected --
+    agency_id, route_id, route_type, direction_id, stop_id and the trip
+    descriptor's trip_id -- so an alert is unscoped (feed-wide) only when
+    all of them are empty. Collecting a subset would make an alert scoped
+    by an uncollected selector (an agency, or a whole mode) read as
+    applying everywhere (see :class:`~.models.ServiceAlert`).
     """
     alerts: list[ServiceAlert] = []
     for entity in message.entity:
         if not entity.HasField("alert"):
             continue
         alert = entity.alert
+        agency_ids = sorted(
+            {ie.agency_id for ie in alert.informed_entity if ie.agency_id}
+        )
         route_ids = sorted({ie.route_id for ie in alert.informed_entity if ie.route_id})
+        # route_type/direction_id have 0 as a meaningful value (tram,
+        # and the feed's first direction), so presence is HasField, not
+        # truthiness.
+        route_types = sorted(
+            {ie.route_type for ie in alert.informed_entity if ie.HasField("route_type")}
+        )
+        direction_ids = sorted(
+            {
+                ie.direction_id
+                for ie in alert.informed_entity
+                if ie.HasField("direction_id")
+            }
+        )
         stop_ids = sorted({ie.stop_id for ie in alert.informed_entity if ie.stop_id})
         trip_ids = sorted(
             {ie.trip.trip_id for ie in alert.informed_entity if ie.trip.trip_id}
@@ -664,7 +681,10 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
                     if alert.HasField("severity_level")
                     else None
                 ),
+                agency_ids=agency_ids,
                 route_ids=route_ids,
+                route_types=route_types,
+                direction_ids=direction_ids,
                 stop_ids=stop_ids,
                 trip_ids=trip_ids,
                 active_periods=[
