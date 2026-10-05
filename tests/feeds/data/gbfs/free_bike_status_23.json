@@ -12,7 +12,12 @@
         "rental_uris": {
           "android": "https://example.com/app?bike=b1&platform=android",
           "ios": "https://example.com/app?bike=b1&platform=ios"
-        }
+        },
+        "current_fuel_percent": 0.62,
+        "last_reported": 1785500000,
+        "station_id": "st1",
+        "home_station_id": "st2",
+        "pricing_plan_id": "plan-a"
       },
       {
         "bike_id": "b2",

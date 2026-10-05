@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Mapping
+from datetime import UTC, date, datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
@@ -125,6 +126,61 @@ def _vehicle_types(value: Any) -> dict[str, int] | None:
         if type_id is not None:
             types[type_id] = count
     return types or None
+
+
+def _reported_at(value: Any) -> datetime | None:
+    """Parse a GBFS ``last_reported``, which changed type across versions.
+
+    2.x ships POSIX seconds, 3.0 ships an RFC3339 string. Anything else --
+    including a bool, which is an int in Python -- degrades to None like
+    every other malformed scalar at this boundary.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        try:
+            return datetime.fromtimestamp(value, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        # A naive RFC3339 value is UTC by GBFS's own definition.
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None
+
+
+def _iso_date(value: Any) -> date | None:
+    """Parse a GBFS ``YYYY-MM-DD`` cell, degrading to None on anything else."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _languages(data: Mapping[str, Any]) -> list[str]:
+    """GBFS 3.0 ``languages`` (array) or 2.x ``language`` (single string)."""
+    raw = data.get("languages")
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, str) and item]
+    single = data.get("language")
+    return [single] if isinstance(single, str) and single else []
+
+
+def _plain_text(value: Any) -> str | None:
+    """Return a verbatim string cell; empty or non-string degrades to None."""
+    return value if isinstance(value, str) and value else None
+
+
+def _count(value: Any) -> int | None:
+    """Return a non-negative count; bools and junk degrade to None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
 
 
 def _rows(document: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
@@ -337,8 +393,20 @@ class GbfsFeedHandle:
         return SystemInfo(
             system_id=system_id,
             name=_localized(data.get("name")),
+            short_name=_localized(data.get("short_name")),
             operator=_localized(data.get("operator")),
-            timezone=data.get("timezone"),
+            timezone=_plain_text(data.get("timezone")),
+            languages=_languages(data),
+            url=_plain_text(data.get("url")),
+            purchase_url=_plain_text(data.get("purchase_url")),
+            start_date=_iso_date(data.get("start_date")),
+            phone_number=_plain_text(data.get("phone_number")),
+            email=_plain_text(data.get("email")),
+            feed_contact_email=_plain_text(data.get("feed_contact_email")),
+            license_url=_plain_text(data.get("license_url")),
+            terms_url=_plain_text(data.get("terms_url")),
+            privacy_url=_plain_text(data.get("privacy_url")),
+            opening_hours=_plain_text(data.get("opening_hours")),
         )
 
     async def get_stations(self, zone: Circle | None = None) -> list[Station]:
@@ -371,6 +439,7 @@ class GbfsFeedHandle:
                 Station(
                     id=station_id,
                     name=_localized(info.get("name")),
+                    short_name=_localized(info.get("short_name")),
                     latitude=latitude,
                     longitude=longitude,
                     capacity=info.get("capacity"),
@@ -378,8 +447,22 @@ class GbfsFeedHandle:
                         "num_bikes_available", status.get("num_vehicles_available")
                     ),
                     docks_available=status.get("num_docks_available"),
+                    bikes_disabled=_count(
+                        status.get(
+                            "num_bikes_disabled",
+                            status.get("num_vehicles_disabled"),
+                        )
+                    ),
+                    docks_disabled=_count(status.get("num_docks_disabled")),
+                    is_installed=_as_bool(status.get("is_installed")),
                     is_renting=_as_bool(status.get("is_renting")),
                     is_returning=_as_bool(status.get("is_returning")),
+                    is_virtual_station=_as_bool(info.get("is_virtual_station")),
+                    last_reported=_reported_at(status.get("last_reported")),
+                    address=_plain_text(info.get("address")),
+                    cross_street=_plain_text(info.get("cross_street")),
+                    post_code=_plain_text(info.get("post_code")),
+                    region_id=_record_id(info.get("region_id")),
                     vehicle_types_available=_vehicle_types(
                         status.get("vehicle_types_available")
                     ),
@@ -423,6 +506,11 @@ class GbfsFeedHandle:
                     is_disabled=_as_bool(row.get("is_disabled")),
                     vehicle_type_id=row.get("vehicle_type_id"),
                     current_range_m=row.get("current_range_meters"),
+                    current_fuel_percent=row.get("current_fuel_percent"),
+                    last_reported=_reported_at(row.get("last_reported")),
+                    station_id=_record_id(row.get("station_id")),
+                    home_station_id=_record_id(row.get("home_station_id")),
+                    pricing_plan_id=_record_id(row.get("pricing_plan_id")),
                     rental_uris=_rental_uris(row.get("rental_uris")),
                 )
             )

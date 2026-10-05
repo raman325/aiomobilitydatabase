@@ -1,5 +1,7 @@
 """Tests for GBFS free-floating vehicles and circular-zone filtering."""
 
+from datetime import UTC, datetime
+
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.geo import Circle
 
@@ -148,3 +150,29 @@ async def test_vehicles_without_an_id_are_skipped(
     )
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     assert [v.id for v in await handle.get_vehicles()] == ["real"]
+
+
+async def test_vehicle_full_surface(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """The docking and freshness fields a free-floating row can carry.
+
+    last_reported in particular: without it a consumer cannot tell a
+    vehicle that moved a second ago from one whose position is hours old.
+    """
+    base = mock_api.url()
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=with_base(GBFS_FEED, base))
+    mock_api.get("/gbfs/free_bike_status.json", payload=FREE_BIKE_STATUS_23)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    by_id = {vehicle.id: vehicle for vehicle in await handle.get_vehicles()}
+    full = by_id["b1"]
+    assert full.current_fuel_percent == 0.62
+    assert full.last_reported == datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC)
+    assert full.station_id == "st1"
+    assert full.home_station_id == "st2"
+    assert full.pricing_plan_id == "plan-a"
+    # A row that carries none of them stays None rather than guessing.
+    sparse = by_id["b2"]
+    assert sparse.last_reported is None
+    assert sparse.station_id is None

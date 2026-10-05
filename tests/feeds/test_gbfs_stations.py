@@ -1,5 +1,7 @@
 """Tests for GBFS endpoint resolution, ttl caching, system info, stations."""
 
+from datetime import UTC, date, datetime
+
 import pytest
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
@@ -451,3 +453,59 @@ async def test_station_coordinates_normalized_and_zone_filter_stays_total(
         zone=Circle(latitude=34.05, longitude=-118.25, radius_m=1000)
     )
     assert [s.id for s in zoned] == ["stringy"]
+
+
+async def test_station_full_status_and_information_surface(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Every GBFS station field the documents carry reaches the model.
+
+    is_installed in particular: a station can be renting and returning
+    while not being installed at all, so exposing only the first two of
+    the triple makes a removed station read as operational.
+    """
+    _mock_catalog(mock_api)
+    mock_api.get("/gbfs/station_information.json", payload=STATION_INFO_23)
+    mock_api.get("/gbfs/station_status.json", payload=STATION_STATUS_23)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    by_id = {station.id: station for station in await handle.get_stations()}
+
+    full = by_id["st1"]
+    assert full.short_name == "A"
+    assert full.bikes_disabled == 2
+    assert full.docks_disabled == 1
+    assert full.is_installed is True
+    assert full.is_virtual_station is False
+    assert full.last_reported == datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC)
+    assert full.address == "1 Main St"
+    assert full.cross_street == "2nd Ave"
+    assert full.post_code == "90001"
+    assert full.region_id == "r1"
+
+    # st2 is renting/returning per its status but has been uninstalled.
+    removed = by_id["st2"]
+    assert removed.is_installed is False
+    assert removed.is_returning is True
+    assert removed.bikes_disabled is None  # absent, not zero
+    assert removed.address is None
+
+
+async def test_system_info_full_surface(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api)
+    mock_api.get("/gbfs/system_information.json", payload=SYSTEM_INFO_23)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    info = await handle.get_system_info()
+    assert info.short_name == "TB"
+    assert info.languages == ["en"]  # 2.x singular "language"
+    assert info.url == "https://example.com"
+    assert info.purchase_url == "https://example.com/buy"
+    assert info.start_date == date(2026, 1, 15)
+    assert info.phone_number == "555-0100"
+    assert info.email == "hello@example.com"
+    assert info.feed_contact_email == "feeds@example.com"
+    assert info.license_url == "https://example.com/license"
+    assert info.terms_url == "https://example.com/terms"
+    assert info.privacy_url == "https://example.com/privacy"
+    assert info.opening_hours == "Mo-Su 00:00-24:00"
