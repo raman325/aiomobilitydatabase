@@ -176,3 +176,43 @@ async def test_vehicle_full_surface(
     sparse = by_id["b2"]
     assert sparse.last_reported is None
     assert sparse.station_id is None
+
+
+async def test_numeric_vehicle_type_id_joins_against_vehicle_types(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A numeric vehicle_type_id must normalize the same on both sides.
+
+    get_vehicle_types() and Station.vehicle_types_available both key on
+    _record_id, so a raw passthrough here yields int 7 against "7" and the
+    join this release added VehicleType for never matches.
+    """
+    base = mock_api.url()
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=with_base(GBFS_FEED, base))
+    mock_api.get(
+        "/gbfs/free_bike_status.json",
+        payload={
+            "last_updated": 1785500000,
+            "ttl": 30,
+            "data": {
+                "bikes": [
+                    {
+                        "bike_id": "b9",
+                        "lat": 34.05,
+                        "lon": -118.25,
+                        "vehicle_type_id": 7,
+                        "current_range_meters": 10**400,
+                        "current_fuel_percent": "nonsense",
+                    }
+                ]
+            },
+        },
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    (vehicle,) = await handle.get_vehicles()
+    assert vehicle.vehicle_type_id == "7"
+    # An integer too wide for a float degrades like any other malformed
+    # scalar at this boundary rather than raising OverflowError.
+    assert vehicle.current_range_m is None
+    assert vehicle.current_fuel_percent is None

@@ -1154,11 +1154,11 @@ class TransitFeedHandle:
             stops_by_id = await self._index_read(self._index.stops_by_id)
             routes_by_id = await self._index_read(self._index.routes_by_id)
             modified_rows: list[StopArrival] = []
-            modified_trip_ids: set[str] = set()
+            modified_instances: set[tuple[str, date]] = set()
             if modifications:
                 (
                     modified_rows,
-                    modified_trip_ids,
+                    modified_instances,
                 ) = await self._apply_trip_modifications(
                     modifications,
                     set(all_stop_ids),
@@ -1170,9 +1170,14 @@ class TransitFeedHandle:
                     routes_by_id=routes_by_id,
                 )
                 # The unmodified schedule for these instances describes a
-                # route the vehicle is no longer taking.
+                # route the vehicle is no longer taking. Keyed by INSTANCE,
+                # not by trip: the day scan always reaches beyond the
+                # window, so a detour dated yesterday would otherwise
+                # delete today's run of the same trip.
                 scheduled = [
-                    dep for dep in scheduled if dep.trip_id not in modified_trip_ids
+                    dep
+                    for dep in scheduled
+                    if (dep.trip_id, dep.service_date) not in modified_instances
                 ]
             vehicles: list[VehiclePosition] = []
             if vehicle_messages:
@@ -1567,12 +1572,18 @@ class TransitFeedHandle:
         rt_stops: Mapping[str, Stop],
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
-    ) -> tuple[list[StopArrival], set[str]]:
+    ) -> tuple[list[StopArrival], set[tuple[str, date]]]:
         """Rebuild the affected trip instances around their detours.
 
         Returns the rows the modified trips now produce at the queried
-        stops, and the concrete trip ids whose ORIGINAL schedule must be
-        discarded. Caller must already hold the reader guard.
+        stops, and the (trip id, service date) INSTANCES whose original
+        schedule must be discarded. Caller must already hold the reader
+        guard.
+
+        Instances, not trip ids: ``trip_instance_calls`` yields one per
+        service day and the day scan deliberately overshoots the window,
+        so a detour that names one date must not disturb the same trip's
+        other runs.
 
         A detour can route a trip through a stop its static schedule never
         served, so this cannot filter by stop before applying: the whole
@@ -1586,7 +1597,11 @@ class TransitFeedHandle:
             self._index.trip_instance_calls, wanted_concrete, now, lookahead, grace
         )
         rows: list[StopArrival] = []
-        touched: set[str] = set()
+        touched: set[tuple[str, date]] = set()
+        # trip_instance_calls does not window the calls themselves (a
+        # modification's reference stop may sit outside the window), so the
+        # rebuilt rows have to be held to the caller's horizon here.
+        horizon = now + lookahead
         for instance in instances:
             applicable = [
                 modification
@@ -1605,10 +1620,10 @@ class TransitFeedHandle:
             calls = _modified_calls(instance, applicable, rt_stops, stops_by_id)
             if calls == instance.calls:
                 continue
-            touched.add(instance.trip_id)
+            touched.add((instance.trip_id, instance.service_date))
             route = routes_by_id.get(instance.route_id)
             for call in calls:
-                if call.stop_id not in wanted_stops:
+                if call.stop_id not in wanted_stops or call.departure > horizon:
                     continue
                 rows.append(
                     StopArrival(
