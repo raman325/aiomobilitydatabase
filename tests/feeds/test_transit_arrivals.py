@@ -777,3 +777,71 @@ async def test_propagated_delay_shifts_stops_after_the_detour(
     # S1's original arrival (15:00Z).
     assert by_stop["S3"].scheduled_departure == datetime(2026, 7, 30, 15, 1, tzinfo=UTC)
     assert "S1" not in by_stop
+
+
+async def test_detour_on_another_day_leaves_todays_board_alone(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A detour names service dates; suppression must honour them.
+
+    trip_instance_calls yields one instance per service day and the day
+    scan deliberately overshoots the window, so suppressing by trip id
+    alone deletes every run of that trip in range -- the whole board for
+    T1 vanished with nothing replacing it.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all", body=_detour_message(service_dates=("20260729",)), content_type=PB
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2", "S3"])], now_utc=NOW
+    )
+    calls = {(a.trip_id, a.stop_id): a for a in arrivals}
+    # Yesterday's detour: today's T1 runs its normal route, untouched.
+    assert ("T1", "S1") in calls
+    assert ("T1", "S2") in calls
+    assert ("T1", "S3") not in calls
+    assert calls[("T1", "S2")].scheduled_departure == datetime(
+        2026, 7, 30, 15, 10, 30, tzinfo=UTC
+    )
+
+
+async def test_detour_rows_respect_the_lookahead_horizon(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Rebuilt rows are bounded by the caller's horizon.
+
+    trip_instance_calls deliberately does not window the calls, because a
+    modification's reference stop may sit outside the window -- so the
+    rebuilt rows have to be bounded explicitly. T3 departs 25:31 of its
+    service day, ~18h past a two-hour board.
+    """
+    _mock_catalog(mock_api, rt=True)
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "mod-t3"
+    modifications = entity.trip_modifications
+    modifications.selected_trips.add().trip_ids.append("T3")
+    modifications.service_dates.append("20260730")
+    modification = modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = "S3"
+    replacement.travel_time_to_stop = 900
+    mock_api.get("/rt/all", body=message.SerializeToString(), content_type=PB)
+
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    horizon = NOW + timedelta(hours=2)
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2", "S3"])], lookahead=timedelta(hours=2), now_utc=NOW
+    )
+    assert arrivals, "the ordinary board is unaffected"
+    assert all(
+        row.scheduled_departure <= horizon
+        for row in arrivals
+        if row.scheduled_departure
+    )
+    assert not any(row.trip_id == "T3" for row in arrivals)
