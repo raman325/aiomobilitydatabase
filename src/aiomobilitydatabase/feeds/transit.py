@@ -55,6 +55,8 @@ from .models import (
 )
 from .rt import (
     FeedValidators,
+    Modification,
+    TripModifications,
     TripPredictions,
     TripUpdateKey,
     TripUpdates,
@@ -62,10 +64,12 @@ from .rt import (
     alerts_from_message,
     fetch_feed_message,
     resolve_trip_predictions,
+    stops_from_message,
+    trip_modifications_from_message,
     trip_updates_from_message,
     vehicles_from_message,
 )
-from .static_index import StaticIndex
+from .static_index import StaticIndex, TripCall, TripInstanceCalls
 
 if TYPE_CHECKING:
     from .client import MobilityFeedsClient
@@ -287,6 +291,125 @@ def _match_vehicle(
     ):
         return exact
     return by_instance.get((plain_trip_id, None))
+
+
+def _selector_index(
+    calls: Sequence[TripCall], stop_sequence: int | None, stop_id: str | None
+) -> int | None:
+    """Resolve a StopSelector to an index into a trip's calls.
+
+    The spec says both fields must match the GTFS feed, so when a selector
+    carries both they must agree -- a selector naming stop_sequence 5 and
+    stop_id "X" where call 5 is stop "Y" describes no call of this trip,
+    and guessing which half the producer meant would silently detour the
+    wrong span.
+    """
+    for index, call in enumerate(calls):
+        if stop_sequence is not None and call.stop_sequence != stop_sequence:
+            continue
+        if stop_id is not None and call.stop_id != stop_id:
+            continue
+        if stop_sequence is None and stop_id is None:
+            return None
+        return index
+    return None
+
+
+def _apply_modification(
+    calls: list[TripCall],
+    modification: Modification,
+    rt_stops: Mapping[str, Stop],
+    static_stops: Mapping[str, Stop],
+) -> list[TripCall] | None:
+    """Replace a span of calls, returning the new sequence.
+
+    Returns None when the modification does not describe this trip -- an
+    unresolvable selector, or an end before its start. Dropping it is the
+    conservative read: applying half a detour would be worse than applying
+    none of it.
+    """
+    start = _selector_index(
+        calls, modification.start_stop_sequence, modification.start_stop_id
+    )
+    end = _selector_index(
+        calls, modification.end_stop_sequence, modification.end_stop_id
+    )
+    if start is None or end is None or end < start:
+        return None
+    # The reference is the call BEFORE the span -- or the span's own first
+    # call when the span starts the trip, which is the only case the spec
+    # allows a negative travel_time_to_stop for.
+    reference = calls[start - 1] if start > 0 else calls[start]
+    anchor_time = reference.arrival or reference.departure
+    replacements: list[TripCall] = []
+    for offset, replacement in enumerate(modification.replacements):
+        if (
+            replacement.stop_id not in rt_stops
+            and replacement.stop_id not in static_stops
+        ):
+            # A replacement naming a stop nothing defines cannot be placed
+            # on a map or named in a board.
+            continue
+        if replacement.travel_time_to_stop is None:
+            continue
+        when = anchor_time + timedelta(seconds=replacement.travel_time_to_stop)
+        replacements.append(
+            TripCall(
+                # Synthetic sequence numbers keep the span ordered between
+                # its neighbours without colliding with real ones.
+                stop_sequence=reference.stop_sequence * 1000 + offset + 1,
+                stop_id=replacement.stop_id,
+                arrival=when,
+                departure=when,
+                pickup_type=None,
+                drop_off_type=None,
+                timepoint_exact=None,
+                stop_headsign=None,
+            )
+        )
+    tail = calls[end + 1 :]
+    delay = timedelta(seconds=modification.propagated_delay_seconds)
+    shifted = [
+        TripCall(
+            stop_sequence=call.stop_sequence,
+            stop_id=call.stop_id,
+            arrival=call.arrival + delay if call.arrival else None,
+            departure=call.departure + delay,
+            pickup_type=call.pickup_type,
+            drop_off_type=call.drop_off_type,
+            timepoint_exact=call.timepoint_exact,
+            stop_headsign=call.stop_headsign,
+        )
+        for call in tail
+    ]
+    return calls[:start] + replacements + shifted
+
+
+def _modified_calls(
+    instance: TripInstanceCalls,
+    modifications: Sequence[Modification],
+    rt_stops: Mapping[str, Stop],
+    static_stops: Mapping[str, Stop],
+) -> list[TripCall]:
+    """Apply every modification of one entity to one trip instance.
+
+    Applied latest-span-first so an earlier modification's indices are not
+    invalidated by a later one rewriting the tail.
+    """
+    calls = list(instance.calls)
+    ordered = sorted(
+        modifications,
+        key=lambda m: (
+            _selector_index(calls, m.start_stop_sequence, m.start_stop_id) or 0
+        ),
+        reverse=True,
+    )
+    for modification in ordered:
+        if (
+            applied := _apply_modification(calls, modification, rt_stops, static_stops)
+        ) is not None:
+            calls = applied
+    return calls
 
 
 def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
@@ -995,6 +1118,15 @@ class TransitFeedHandle:
             if with_vehicles
             else []
         )
+        # TripModifications ride the TripUpdates feed, so the memo means
+        # they cost nothing extra; so do the Stop entities their
+        # replacement stops may be the only definition of.
+        tu_messages = list(rt_memo.values())
+        rt_stops: dict[str, Stop] = {}
+        modifications: list[TripModifications] = []
+        for message in tu_messages:
+            rt_stops.update(stops_from_message(message))
+            modifications.extend(trip_modifications_from_message(message))
         canceled = updates.canceled_trips
         added_rows = updates.added
         async with self._guard.reader():
@@ -1009,6 +1141,27 @@ class TransitFeedHandle:
             )
             stops_by_id = await self._index_read(self._index.stops_by_id)
             routes_by_id = await self._index_read(self._index.routes_by_id)
+            modified_rows: list[StopArrival] = []
+            modified_trip_ids: set[str] = set()
+            if modifications:
+                (
+                    modified_rows,
+                    modified_trip_ids,
+                ) = await self._apply_trip_modifications(
+                    modifications,
+                    set(all_stop_ids),
+                    now=now,
+                    lookahead=lookahead,
+                    grace=grace,
+                    rt_stops=rt_stops,
+                    stops_by_id=stops_by_id,
+                    routes_by_id=routes_by_id,
+                )
+                # The unmodified schedule for these instances describes a
+                # route the vehicle is no longer taking.
+                scheduled = [
+                    dep for dep in scheduled if dep.trip_id not in modified_trip_ids
+                ]
             vehicles: list[VehiclePosition] = []
             if vehicle_messages:
                 vp_trip_ids = sorted(
@@ -1167,6 +1320,7 @@ class TransitFeedHandle:
                         block_id=None,
                     )
                 )
+            arrivals.extend(modified_rows)
             # The grace window admitted scheduled rows before `now` so their
             # predictions could attach; now only rows still ahead survive.
             arrivals = [
@@ -1389,6 +1543,92 @@ class TransitFeedHandle:
                     )
                 )
             return vehicles
+
+    async def _apply_trip_modifications(
+        self,
+        modifications: Sequence[TripModifications],
+        wanted_stops: set[str],
+        *,
+        now: datetime,
+        lookahead: timedelta,
+        grace: timedelta,
+        rt_stops: Mapping[str, Stop],
+        stops_by_id: Mapping[str, Stop],
+        routes_by_id: Mapping[str, Route],
+    ) -> tuple[list[StopArrival], set[str]]:
+        """Rebuild the affected trip instances around their detours.
+
+        Returns the rows the modified trips now produce at the queried
+        stops, and the concrete trip ids whose ORIGINAL schedule must be
+        discarded. Caller must already hold the reader guard.
+
+        A detour can route a trip through a stop its static schedule never
+        served, so this cannot filter by stop before applying: the whole
+        call sequence is rebuilt, then the queried stops are selected out
+        of the result.
+        """
+        source_ids = sorted({tid for mod in modifications for tid in mod.trip_ids})
+        concrete = await self._index_read(self._index.concrete_trip_ids, source_ids)
+        wanted_concrete = sorted({c for ids in concrete.values() for c in ids})
+        instances = await self._index_read(
+            self._index.trip_instance_calls, wanted_concrete, now, lookahead, grace
+        )
+        rows: list[StopArrival] = []
+        touched: set[str] = set()
+        for instance in instances:
+            applicable = [
+                modification
+                for mod in modifications
+                if instance.source_trip_id in mod.trip_ids
+                and (
+                    not mod.service_dates or instance.service_date in mod.service_dates
+                )
+                # An entity listing start_times addresses specific
+                # repetitions; one listing none addresses every instance.
+                and (not mod.start_secs or instance.start_secs in mod.start_secs)
+                for modification in mod.modifications
+            ]
+            if not applicable:
+                continue
+            calls = _modified_calls(instance, applicable, rt_stops, stops_by_id)
+            if calls == instance.calls:
+                continue
+            touched.add(instance.trip_id)
+            route = routes_by_id.get(instance.route_id)
+            for call in calls:
+                if call.stop_id not in wanted_stops:
+                    continue
+                rows.append(
+                    StopArrival(
+                        stop_id=call.stop_id,
+                        # An RT-added stop is the ONLY definition of itself.
+                        stop=rt_stops.get(call.stop_id)
+                        or stops_by_id.get(call.stop_id),
+                        route_id=instance.route_id,
+                        route=route,
+                        trip_id=instance.trip_id,
+                        service_id=instance.service_id,
+                        headsign=instance.headsign,
+                        scheduled_arrival=call.arrival,
+                        scheduled_departure=call.departure,
+                        predicted_arrival=None,
+                        predicted_departure=None,
+                        delay_seconds=None,
+                        realtime=True,
+                        vehicle_id=None,
+                        vehicle=None,
+                        wheelchair_accessible=instance.wheelchair_accessible,
+                        bikes_allowed=instance.bikes_allowed,
+                        direction_id=instance.direction_id,
+                        pickup_type=call.pickup_type,
+                        drop_off_type=call.drop_off_type,
+                        timepoint_exact=call.timepoint_exact,
+                        stop_headsign=call.stop_headsign,
+                        trip_short_name=instance.trip_short_name,
+                        block_id=instance.block_id,
+                    )
+                )
+        return rows, touched
 
     async def services_on(self, service_date: date) -> set[str]:
         """Service ids running on a GTFS service date.

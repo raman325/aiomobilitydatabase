@@ -300,6 +300,47 @@ def _reporter(
 
 
 @dataclass(frozen=True)
+class TripCall:
+    """One stop_time row of a trip, as absolute instants."""
+
+    stop_sequence: int
+    stop_id: str
+    arrival: datetime | None
+    departure: datetime
+    pickup_type: PickupDropOffType | None
+    drop_off_type: PickupDropOffType | None
+    timepoint_exact: bool | None
+    stop_headsign: str | None
+
+
+@dataclass(frozen=True)
+class TripInstanceCalls:
+    """One trip instance's COMPLETE ordered call sequence.
+
+    ``upcoming_departures`` returns only the calls at queried stops, which
+    is all a board needs -- but a TripModifications detour replaces a SPAN
+    of a trip's calls, so applying one requires the whole sequence (the
+    stop before the span is the reference point its replacement times are
+    measured from).
+    """
+
+    trip_id: str
+    source_trip_id: str
+    start_secs: int | None
+    service_date: date
+    day_start_utc: datetime
+    route_id: str
+    service_id: str
+    headsign: str | None
+    wheelchair_accessible: WheelchairAccess | None
+    bikes_allowed: BikesAllowed | None
+    direction_id: int | None
+    trip_short_name: str | None
+    block_id: str | None
+    calls: list[TripCall]
+
+
+@dataclass(frozen=True)
 class ScheduledDeparture:
     """A scheduled stop event resolved to tz-aware datetimes.
 
@@ -1111,6 +1152,120 @@ class StaticIndex:
                 trip_ids,
             )
         )
+
+    def trip_instance_calls(
+        self,
+        trip_ids: list[str],
+        now_utc: datetime,
+        lookahead: timedelta,
+        grace: timedelta = timedelta(0),
+    ) -> list[TripInstanceCalls]:
+        """Complete call sequences for the named trips, per service day.
+
+        Keyed on CONCRETE trip ids, so a frequency repetition resolves to
+        its own instance. Unlike ``upcoming_departures`` this filters by
+        trip rather than by stop and does not window the calls themselves:
+        a modification's reference stop may sit outside the query window
+        while the stops it affects sit inside it.
+        """
+        if not trip_ids:
+            return []
+        marks = ",".join("?" * len(trip_ids))
+        instances: list[TripInstanceCalls] = []
+        for (
+            service_date,
+            day_start_utc,
+            active,
+            _window_lo,
+            _window_hi,
+        ) in self._service_day_windows(now_utc, lookahead, grace):
+            service_marks = ",".join("?" * len(active))
+            rows = self._conn.execute(
+                "SELECT t.id, t.source_trip_id, t.start_secs, t.route_id, "
+                "t.service_id, t.headsign, t.wheelchair_accessible, "
+                "t.bikes_allowed, t.direction_id, t.short_name, t.block_id, "
+                "st.stop_sequence, st.stop_id, st.arrival_secs, "
+                "st.departure_secs, st.pickup_type, st.drop_off_type, "
+                "st.timepoint, st.stop_headsign "
+                "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
+                f"WHERE t.id IN ({marks}) "
+                f"AND t.service_id IN ({service_marks}) "
+                "ORDER BY t.id, st.stop_sequence",
+                [*trip_ids, *sorted(active)],
+            ).fetchall()
+            by_trip: dict[str, list[Any]] = {}
+            for row in rows:
+                by_trip.setdefault(row[0], []).append(row)
+            for trip_id, trip_rows in by_trip.items():
+                head = trip_rows[0]
+                instances.append(
+                    TripInstanceCalls(
+                        trip_id=trip_id,
+                        source_trip_id=head[1],
+                        start_secs=head[2],
+                        service_date=service_date,
+                        day_start_utc=day_start_utc,
+                        route_id=head[3],
+                        service_id=head[4],
+                        headsign=head[5],
+                        wheelchair_accessible=_enum_or_none(WheelchairAccess, head[6]),
+                        bikes_allowed=_enum_or_none(BikesAllowed, head[7]),
+                        direction_id=head[8],
+                        trip_short_name=head[9],
+                        block_id=head[10],
+                        calls=[
+                            TripCall(
+                                stop_sequence=row[11],
+                                stop_id=row[12],
+                                arrival=(
+                                    day_start_utc + timedelta(seconds=row[13])
+                                    if row[13] is not None
+                                    else None
+                                ),
+                                departure=day_start_utc + timedelta(seconds=row[14]),
+                                pickup_type=_enum_or_none(PickupDropOffType, row[15]),
+                                drop_off_type=_enum_or_none(PickupDropOffType, row[16]),
+                                timepoint_exact=_timepoint_exact(row[17]),
+                                stop_headsign=row[18],
+                            )
+                            for row in trip_rows
+                        ],
+                    )
+                )
+        return instances
+
+    def concrete_trip_ids(self, source_trip_ids: list[str]) -> dict[str, list[str]]:
+        """Map each PRODUCER-facing trip id to its concrete instances.
+
+        A plain trip is its own only instance; a frequency template fans
+        out to every materialized repetition. TripModifications name the
+        producer's id, so applying one means finding the repetitions it
+        covers.
+        """
+        if not source_trip_ids:
+            return {}
+        marks = ",".join("?" * len(source_trip_ids))
+        found: dict[str, list[str]] = {}
+        for source_trip_id, trip_id in self._conn.execute(
+            "SELECT source_trip_id, id FROM trips "
+            f"WHERE source_trip_id IN ({marks}) ORDER BY source_trip_id, id",
+            source_trip_ids,
+        ):
+            found.setdefault(source_trip_id, []).append(trip_id)
+        return found
+
+    def trips_serving_any(self, stop_ids: list[str]) -> set[str]:
+        """Concrete trip ids with a scheduled call at any of the stops."""
+        if not stop_ids:
+            return set()
+        marks = ",".join("?" * len(stop_ids))
+        return {
+            row[0]
+            for row in self._conn.execute(
+                f"SELECT DISTINCT trip_id FROM stop_times WHERE stop_id IN ({marks})",
+                stop_ids,
+            )
+        }
 
     def trip_stop_calls(self, trip_ids: list[str]) -> dict[str, list[tuple[int, str]]]:
         """Ordered ``(stop_sequence, stop_id)`` calls per trip.

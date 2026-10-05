@@ -628,3 +628,152 @@ async def test_revalidated_bundled_feed_still_costs_one_request_per_call(
     assert len(rt_requests) == 2, "one request per poll, not one per entity type"
     assert "If-None-Match" not in rt_requests[0].headers
     assert rt_requests[1].headers["If-None-Match"] == '"v1"'
+
+
+def _detour_message(
+    *,
+    replacement_stop: str = "S3",
+    travel_time: int = 900,
+    propagated_delay: int = 0,
+    service_dates: tuple[str, ...] = ("20260730",),
+    define_stop: bool = False,
+) -> bytes:
+    """T1 detoured: its S2 call is replaced by one at ``replacement_stop``."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "mod-1"
+    modifications = entity.trip_modifications
+    modifications.selected_trips.add().trip_ids.append("T1")
+    modifications.service_dates.extend(service_dates)
+    modification = modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 2
+    modification.end_stop_selector.stop_sequence = 2
+    modification.propagated_modification_delay = propagated_delay
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = replacement_stop
+    replacement.travel_time_to_stop = travel_time
+    if define_stop:
+        stop_entity = message.entity.add()
+        stop_entity.id = "stop-new"
+        stop_entity.stop.stop_id = replacement_stop
+        stop_entity.stop.stop_name.translation.add().text = "Pop-up Stop"
+        stop_entity.stop.stop_lat = 34.09
+        stop_entity.stop.stop_lon = -118.21
+    return message.SerializeToString()
+
+
+async def test_detour_moves_the_trip_off_the_replaced_stop(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A Modification REPLACES a span of calls, it does not annotate them.
+
+    Ignoring it would keep showing T1 at S2 — a departure the vehicle is
+    not making — which is wrong output, not merely missing output.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=_detour_message(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2", "S3"])], now_utc=NOW
+    )
+    calls = {(a.trip_id, a.stop_id): a for a in arrivals}
+    # The replaced call is gone...
+    assert ("T1", "S2") not in calls
+    # ...replaced by one at S3, 900s after the reference stop's arrival.
+    # S1 is the call before the span, arriving 08:00 local = 15:00Z.
+    assert ("T1", "S3") in calls
+    assert calls[("T1", "S3")].scheduled_departure == datetime(
+        2026, 7, 30, 15, 15, tzinfo=UTC
+    )
+    # Calls before the span are untouched.
+    assert ("T1", "S1") in calls
+    assert calls[("T1", "S1")].scheduled_departure == datetime(
+        2026, 7, 30, 15, 0, 30, tzinfo=UTC
+    )
+
+
+async def test_detour_defines_its_own_replacement_stop(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A replacement stop may exist only as an RT Stop entity.
+
+    The static feed has never heard of it, so the RT entity is the only
+    definition of its name and position there is.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all",
+        body=_detour_message(replacement_stop="POPUP", define_stop=True),
+        content_type=PB,
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2", "POPUP"])], now_utc=NOW
+    )
+    popup = next(a for a in arrivals if a.stop_id == "POPUP")
+    assert popup.stop is not None
+    assert popup.stop.name == "Pop-up Stop"
+    assert (popup.stop.latitude, popup.stop.longitude) == (
+        pytest.approx(34.09),
+        pytest.approx(-118.21),
+    )
+
+
+async def test_detour_ignores_a_service_date_it_does_not_name(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all", body=_detour_message(service_dates=("20260731",)), content_type=PB
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2", "S3"])], now_utc=NOW
+    )
+    calls = {(a.trip_id, a.stop_id) for a in arrivals}
+    # The detour is tomorrow's; today's trip still serves S2.
+    assert ("T1", "S2") in calls
+    assert ("T1", "S3") not in calls
+
+
+async def test_propagated_delay_shifts_stops_after_the_detour(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """propagated_modification_delay applies to calls AFTER the span.
+
+    This is the half that makes ignoring TripModifications wrong even for
+    stops nowhere near the detour: S2 is not replaced, but a trip running
+    ten minutes late out of its detour reaches S2 ten minutes late.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "mod-delay"
+    modifications = entity.trip_modifications
+    modifications.selected_trips.add().trip_ids.append("T1")
+    modifications.service_dates.append("20260730")
+    modification = modifications.modifications.add()
+    # Replace the FIRST call, so S2 is strictly after the span.
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    modification.propagated_modification_delay = 600
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = "S3"
+    replacement.travel_time_to_stop = 60
+
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=message.SerializeToString(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2", "S3"])], now_utc=NOW
+    )
+    by_stop = {a.stop_id: a for a in arrivals if a.trip_id == "T1"}
+    # S2 scheduled 08:10:30 local = 15:10:30Z, now +600s.
+    assert by_stop["S2"].scheduled_departure == datetime(
+        2026, 7, 30, 15, 20, 30, tzinfo=UTC
+    )
+    # The span's own first call is its own reference, so S3 sits 60s after
+    # S1's original arrival (15:00Z).
+    assert by_stop["S3"].scheduled_departure == datetime(2026, 7, 30, 15, 1, tzinfo=UTC)
+    assert "S1" not in by_stop
