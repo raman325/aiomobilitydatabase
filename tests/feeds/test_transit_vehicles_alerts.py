@@ -14,6 +14,7 @@ from google.transit import gtfs_realtime_pb2
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.geo import Circle
 from aiomobilitydatabase.feeds.models import ArrivalsQuery, ServiceAlert, StationGroup
+from aiomobilitydatabase.feeds.rt import alerts_from_message
 from aiomobilitydatabase.feeds.static_index import StaticIndex
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle
 
@@ -289,7 +290,10 @@ def test_service_alert_is_active() -> None:
             cause=None,
             effect=None,
             severity=None,
+            agency_ids=[],
             route_ids=[],
+            route_types=[],
+            direction_ids=[],
             stop_ids=[],
             trip_ids=[],
             active_periods=periods,
@@ -646,3 +650,51 @@ async def test_rt_without_validators_never_revalidates(
     rt_requests = [r for r in mock_api.requests if r.path == "/rt/all"]
     assert rt_requests[1].headers["If-None-Match"] == '"v1"'
     assert "If-None-Match" not in rt_requests[2].headers
+
+
+def _scoped_alert(**selectors: object) -> gtfs_realtime_pb2.FeedMessage:
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "a1"
+    informed = entity.alert.informed_entity.add()
+    for field, value in selectors.items():
+        setattr(informed, field, value)
+    entity.alert.header_text.translation.add().text = "Scoped alert"
+    return message
+
+
+@pytest.mark.parametrize(
+    ("selector", "attribute", "expected"),
+    [
+        pytest.param(
+            {"agency_id": "AGENCY-A"}, "agency_ids", ["AGENCY-A"], id="agency"
+        ),
+        pytest.param({"route_type": 1}, "route_types", [1], id="route_type"),
+        # route_type 0 is tram -- meaningful AND falsy.
+        pytest.param({"route_type": 0}, "route_types", [0], id="route_type_tram"),
+        pytest.param({"direction_id": 0}, "direction_ids", [0], id="direction"),
+    ],
+)
+def test_alert_scoped_by_any_selector_is_not_feed_wide(
+    selector: dict[str, object], attribute: str, expected: list[object]
+) -> None:
+    """An alert naming ONLY an agency, a mode or a direction is scoped.
+
+    Collecting just route/stop/trip ids would leave every one of these
+    reading as unscoped, i.e. applying to the whole feed -- wrong the
+    moment a feed carries more than one agency. route_type 1 and
+    direction_id 0 are also the falsy values, so presence must be
+    HasField rather than truthiness.
+    """
+    [alert] = alerts_from_message(_scoped_alert(**selector))
+    assert getattr(alert, attribute) == expected
+    scope = (
+        alert.agency_ids
+        + alert.route_ids
+        + alert.route_types
+        + alert.direction_ids
+        + alert.stop_ids
+        + alert.trip_ids
+    )
+    assert scope, "alert read as feed-wide despite naming a selector"

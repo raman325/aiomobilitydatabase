@@ -436,11 +436,17 @@ class VehiclePosition:
 class ServiceAlert:
     """A service alert from a GTFS-RT feed.
 
-    ``route_ids``/``stop_ids``/``trip_ids`` are the alert's scope: the
-    distinct route ids, stop ids, and informed-entity trip descriptor
-    trip ids across ``informed_entity``, each sorted. An alert is
-    UNSCOPED (applies feed-wide) only when ALL THREE lists are empty --
-    an alert informing only trips is trip-scoped, not agency-wide.
+    ``agency_ids``/``route_ids``/``route_types``/``direction_ids``/
+    ``stop_ids``/``trip_ids`` are the alert's scope: the distinct values
+    an ``informed_entity`` named, each sorted. GTFS-RT's EntitySelector
+    can scope by any of these, so an alert is UNSCOPED (applies
+    feed-wide) only when EVERY list is empty. An alert informing only one
+    agency is agency-scoped, not feed-wide -- which matters as soon as a
+    feed carries more than one agency.
+
+    ``route_types`` holds raw ints for the same reason as
+    :attr:`Route.type`: Google's extended route types are an open
+    vocabulary. ``direction_ids`` are raw 0/1 with feed-defined meaning.
     """
 
     id: str
@@ -449,7 +455,10 @@ class ServiceAlert:
     cause: AlertCause | None
     effect: AlertEffect | None
     severity: AlertSeverity | None
+    agency_ids: list[str]
     route_ids: list[str]
+    route_types: list[int]
+    direction_ids: list[int]
     stop_ids: list[str]
     trip_ids: list[str]
     active_periods: list[tuple[datetime | None, datetime | None]]
