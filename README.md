@@ -261,6 +261,16 @@ Notes on direct mode:
   fails the build, because a wrong departure time or a wrong call order is
   worse than no feed at all. A malformed **descriptive** cell still degrades
   to `None`.
+- **Service calendars are answerable**: `services_on(date)` returns the
+  service ids running on a GTFS service date — `calendar.txt` resolved
+  against `calendar_dates` exceptions, removals winning when a producer
+  lists both types for one date — and every row carries its `service_id`,
+  so "does this trip run next Tuesday" needs no second arrivals query.
+- **GBFS ids resolve**: `get_vehicle_types()`, `get_pricing_plans()`,
+  `get_regions()`, and `get_system_alerts()` turn the `vehicle_type_id`,
+  `pricing_plan_id`, and `region_id` on stations and vehicles into records.
+  All four documents are optional in GBFS, so an unpublished one is `[]`
+  rather than an error.
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
   `headsigns_serving()` alongside the stop/route helpers.
@@ -323,27 +333,25 @@ in the zip is ignored:
   trip-to-trip continuations, and no journey planning across a transfer.
 - `pathways.txt` / `levels.txt` — no in-station walking graph.
 - `fare_attributes.txt` / `fare_rules.txt` and all GTFS-Fares v2 files — no
-  fares, zones pricing, or rider categories. (`Stop.zone_id` is exposed as a
+  fares, zone pricing, or rider categories. (`Stop.zone_id` is exposed as a
   raw cell, but nothing interprets it.)
 - `translations.txt` — text is returned as the feed wrote it.
 
-Service calendars are read to decide which trips run, but are not exposed as a
-model: there is no "is this service running on date X" query, and
-`trips.service_id` is not surfaced.
+Service calendars **are** answerable — `services_on(date)` resolves
+`calendar.txt` against `calendar_dates` exceptions, and rows carry their
+`service_id` — but the raw weekday pattern and validity range behind a
+service are not exposed as a model.
 
-**GTFS-RT fields not surfaced.** `VehiclePosition` omits `odometer`,
-`occupancy_percentage`, `multi_carriage_details`, and the vehicle descriptor's
-`wheelchair_accessible`. `ServiceAlert` omits `tts_header_text` /
-`tts_description_text`, `image` / `image_alternative_text`, and
-`cause_detail` / `effect_detail`. TripModifications and the `modified_trip`
-descriptor are not handled.
+**GTFS-RT: TripModifications.** Detours that splice replacement stops into a
+trip's call sequence mid-journey, and the `shape`/`stop` entities that come
+with them, are not handled. Everything else a `VehiclePosition`, `TripUpdate`
+or `Alert` carries is surfaced.
 
-**GBFS endpoints not fetched.** Only `system_information`,
-`station_information`, `station_status`, and `vehicle_status` (falling back to
-2.x `free_bike_status`). Not read: `vehicle_types`, `system_pricing_plans`,
-`system_regions`, `system_alerts`, `geofencing_zones`, `system_hours`.
-Consequently `vehicle_type_id`, `pricing_plan_id`, and `region_id` are exposed
-as raw ids you would have to resolve yourself.
+**GBFS endpoints not fetched.** `geofencing_zones`, because it is GeoJSON
+polygon geometry while zones here are deliberately circles — supporting it
+means polygon containment, which is a geometry feature rather than another
+document. And `system_hours`, which GBFS 3.0 removed in favour of
+`system_information.opening_hours` (exposed as `SystemInfo.opening_hours`).
 
 **Behaviour, not data.** There is no polling loop or scheduler (see *Pull, not
 push*), no write access of any kind, and no cross-feed journey planning.
