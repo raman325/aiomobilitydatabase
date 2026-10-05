@@ -226,6 +226,160 @@ def _rt_wheelchair(
     return _RT_WHEELCHAIR.get(name) if name else None
 
 
+@dataclass(frozen=True)
+class ReplacementCall:
+    """One stop a modification routes a trip through instead.
+
+    ``travel_time_to_stop`` is seconds from the REFERENCE stop's arrival --
+    the call before the replaced span, or the trip's first call when the
+    span starts there. The spec requires it to increase monotonically and
+    allows it to be negative only in that first-call case.
+    """
+
+    stop_id: str
+    travel_time_to_stop: int | None
+
+
+@dataclass(frozen=True)
+class Modification:
+    """One replaced span of a trip's calls."""
+
+    start_stop_sequence: int | None
+    start_stop_id: str | None
+    end_stop_sequence: int | None
+    end_stop_id: str | None
+    propagated_delay_seconds: int
+    replacements: list[ReplacementCall]
+
+
+@dataclass(frozen=True)
+class TripModifications:
+    """Modifications applying to a set of trip instances."""
+
+    trip_ids: list[str]
+    service_dates: frozenset[date]
+    start_secs: frozenset[int]
+    modifications: list[Modification]
+
+
+def _stop_from_rt(stop: Any) -> Stop:
+    """Return a GTFS-RT Stop entity as the model a static stop uses.
+
+    A replacement stop may be one the static feed has never heard of, so
+    the RT entity is the only definition of it that exists.
+    """
+    return Stop(
+        id=stop.stop_id,
+        name=stop.stop_name.translation[0].text if stop.stop_name.translation else None,
+        latitude=stop.stop_lat if stop.HasField("stop_lat") else None,
+        longitude=stop.stop_lon if stop.HasField("stop_lon") else None,
+        parent_station=stop.parent_station or None,
+        location_type=None,
+        stop_code=stop.stop_code or None,
+        platform_code=stop.platform_code or None,
+        wheelchair_boarding=None,
+        description=stop.stop_desc.translation[0].text
+        if stop.stop_desc.translation
+        else None,
+        url=stop.stop_url.translation[0].text if stop.stop_url.translation else None,
+        zone_id=stop.zone_id or None,
+        timezone=stop.stop_timezone or None,
+    )
+
+
+def stops_from_message(message: gtfs_realtime_pb2.FeedMessage) -> dict[str, Stop]:
+    """RT-added stops, keyed by id; rows without an id are not stops."""
+    return {
+        entity.stop.stop_id: _stop_from_rt(entity.stop)
+        for entity in message.entity
+        if entity.HasField("stop") and entity.stop.stop_id
+    }
+
+
+def trip_modifications_from_message(
+    message: gtfs_realtime_pb2.FeedMessage,
+) -> list[TripModifications]:
+    """Trip modifications, one record per selected_trips group.
+
+    service_dates parse leniently: a malformed date degrades to "not this
+    day" rather than failing the message, like every other RT descriptor.
+    """
+    found: list[TripModifications] = []
+    for entity in message.entity:
+        if not entity.HasField("trip_modifications"):
+            continue
+        modifications = entity.trip_modifications
+        parsed = [
+            Modification(
+                start_stop_sequence=(
+                    modification.start_stop_selector.stop_sequence
+                    if modification.start_stop_selector.HasField("stop_sequence")
+                    else None
+                ),
+                start_stop_id=modification.start_stop_selector.stop_id or None,
+                end_stop_sequence=(
+                    modification.end_stop_selector.stop_sequence
+                    if modification.end_stop_selector.HasField("stop_sequence")
+                    else None
+                ),
+                end_stop_id=modification.end_stop_selector.stop_id or None,
+                propagated_delay_seconds=modification.propagated_modification_delay,
+                replacements=[
+                    ReplacementCall(
+                        stop_id=replacement.stop_id,
+                        travel_time_to_stop=(
+                            replacement.travel_time_to_stop
+                            if replacement.HasField("travel_time_to_stop")
+                            else None
+                        ),
+                    )
+                    for replacement in modification.replacement_stops
+                    if replacement.stop_id
+                ],
+            )
+            for modification in modifications.modifications
+        ]
+        if not parsed:
+            continue
+        dates = frozenset(
+            parsed_date
+            for raw in modifications.service_dates
+            if (parsed_date := _lenient_service_date(raw)) is not None
+        )
+        starts = frozenset(
+            secs
+            for raw in modifications.start_times
+            if (secs := _lenient_start_secs(raw)) is not None
+        )
+        for selected in modifications.selected_trips:
+            if trip_ids := list(selected.trip_ids):
+                found.append(
+                    TripModifications(
+                        trip_ids=trip_ids,
+                        service_dates=dates,
+                        start_secs=starts,
+                        modifications=parsed,
+                    )
+                )
+    return found
+
+
+def _lenient_service_date(raw: str) -> date | None:
+    """YYYYMMDD to a date; anything else is "not a day this applies to"."""
+    try:
+        return datetime.strptime(raw, "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _lenient_start_secs(raw: str) -> int | None:
+    """Return a start_time in seconds; hours may exceed 24, garbage degrades."""
+    try:
+        return parse_gtfs_time(raw)
+    except FeedParseError:
+        return None
+
+
 def _occupancy_percentage(holder: Any) -> int | None:
     """Read an occupancy_percentage, treating the proto's -1 as unset.
 
