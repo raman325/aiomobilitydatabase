@@ -9,6 +9,13 @@ from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.models import ArrivalsQuery
+from aiomobilitydatabase.feeds.rt import Modification, ReplacementCall
+from aiomobilitydatabase.feeds.static_index import TripCall
+from aiomobilitydatabase.feeds.transit import (
+    _apply_modification,
+    _match_vehicle,
+    _selector_index,
+)
 
 from tests.feeds.fixtures import (
     ADDED_TRIPS_S1,
@@ -884,3 +891,149 @@ async def test_detours_do_not_depend_on_with_vehicles(
     # Sourced from declared TU feeds, and this one declares none, so the
     # detour applies in neither -- consistently.
     assert ("T1", "S2") in boards[0]
+
+
+def _call(sequence: int, stop_id: str, minute: int) -> TripCall:
+    when = datetime(2026, 7, 30, 15, minute, tzinfo=UTC)
+    return TripCall(
+        stop_sequence=sequence,
+        stop_id=stop_id,
+        arrival=when,
+        departure=when,
+        pickup_type=None,
+        drop_off_type=None,
+        timepoint_exact=None,
+        stop_headsign=None,
+    )
+
+
+_CALLS = [_call(1, "S1", 0), _call(2, "S2", 10), _call(3, "S3", 20)]
+
+
+@pytest.mark.parametrize(
+    ("sequence", "stop_id", "expected"),
+    [
+        pytest.param(2, None, 1, id="by-sequence"),
+        pytest.param(None, "S3", 2, id="by-stop-id"),
+        pytest.param(2, "S2", 1, id="both-agreeing"),
+        # The spec says both fields must match the GTFS feed, so a selector
+        # whose halves disagree describes no call of this trip. Guessing
+        # which half the producer meant would detour the wrong span.
+        pytest.param(2, "S3", None, id="both-disagreeing"),
+        pytest.param(9, None, None, id="sequence-not-on-this-trip"),
+        pytest.param(None, "NOPE", None, id="stop-not-on-this-trip"),
+        pytest.param(None, None, None, id="selector-names-nothing"),
+    ],
+)
+def test_selector_index_resolution(
+    sequence: int | None, stop_id: str | None, expected: int | None
+) -> None:
+    assert _selector_index(_CALLS, sequence, stop_id) == expected
+
+
+@pytest.mark.parametrize(
+    ("start_seq", "end_seq", "reason"),
+    [
+        pytest.param(9, 2, "start selector matches nothing", id="bad-start"),
+        pytest.param(1, 9, "end selector matches nothing", id="bad-end"),
+        pytest.param(3, 1, "end precedes start", id="inverted-span"),
+    ],
+)
+def test_unresolvable_modification_is_dropped(
+    start_seq: int, end_seq: int, reason: str
+) -> None:
+    """Half a detour would be worse than none of it."""
+    modification = Modification(
+        start_stop_sequence=start_seq,
+        start_stop_id=None,
+        end_stop_sequence=end_seq,
+        end_stop_id=None,
+        propagated_delay_seconds=0,
+        replacements=[ReplacementCall(stop_id="S9", travel_time_to_stop=60)],
+    )
+    assert _apply_modification(list(_CALLS), modification, {}, {}) is None, reason
+
+
+@pytest.mark.parametrize(
+    ("replacement", "reason"),
+    [
+        pytest.param(
+            ReplacementCall(stop_id="UNKNOWN", travel_time_to_stop=60),
+            "a stop nothing defines cannot be placed on a map",
+            id="undefined-stop",
+        ),
+        pytest.param(
+            ReplacementCall(stop_id="S1", travel_time_to_stop=None),
+            "without a travel time there is no instant to show",
+            id="no-travel-time",
+        ),
+    ],
+)
+def test_unusable_replacement_stops_are_skipped(
+    replacement: ReplacementCall, reason: str
+) -> None:
+    modification = Modification(
+        start_stop_sequence=2,
+        start_stop_id=None,
+        end_stop_sequence=2,
+        end_stop_id=None,
+        propagated_delay_seconds=0,
+        replacements=[replacement],
+    )
+    applied = _apply_modification(
+        list(_CALLS),
+        modification,
+        {},
+        {"S1": None},  # type: ignore[dict-item]
+    )
+    assert applied is not None
+    # The replaced call is still removed; it simply gains no substitute.
+    assert [c.stop_id for c in applied] == ["S1", "S3"], reason
+
+
+def test_match_vehicle_without_any_identity() -> None:
+    """A row naming neither a vehicle nor a trip cannot be matched.
+
+    Reachable from an RT-added row whose TripDescriptor carries no
+    trip_id: there is nothing to join on, and the first vehicle in the
+    feed is not an answer.
+    """
+    assert _match_vehicle(None, None, None, {}, {}) is None
+
+
+async def test_unresolvable_detour_leaves_the_schedule_intact(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A modification that resolves to no change must not suppress rows.
+
+    Suppression is driven by "this instance was rebuilt". If a
+    modification applies to the trip but its selectors match none of that
+    instance's calls, the rebuild is a no-op -- and treating it as a
+    rebuild would delete the trip's real departures and put nothing back,
+    the same data loss #39 fixed from the other direction.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "mod-nowhere"
+    modifications = entity.trip_modifications
+    modifications.selected_trips.add().trip_ids.append("T1")
+    modifications.service_dates.append("20260730")
+    modification = modifications.modifications.add()
+    # T1 has stop_sequence 1 and 2 only.
+    modification.start_stop_selector.stop_sequence = 97
+    modification.end_stop_selector.stop_sequence = 98
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = "S3"
+    replacement.travel_time_to_stop = 60
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=message.SerializeToString(), content_type=PB)
+
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2", "S3"])], now_utc=NOW
+    )
+    calls = {(a.trip_id, a.stop_id) for a in arrivals}
+    assert ("T1", "S1") in calls
+    assert ("T1", "S2") in calls
+    assert ("T1", "S3") not in calls

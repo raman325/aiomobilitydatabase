@@ -23,11 +23,14 @@ from aiomobilitydatabase.feeds.models import (
 from aiomobilitydatabase.feeds.rt import (
     TripStopUpdate,
     TripUpdateEntry,
+    _lenient_service_date,
+    _lenient_start_secs,
     _pb_enum_name,
     _vocab_or_none,
     alerts_from_message,
     fetch_feed_message,
     resolve_trip_predictions,
+    trip_modifications_from_message,
     trip_updates_from_message,
     vehicles_from_message,
 )
@@ -810,3 +813,54 @@ def test_alert_text_detail_and_images_are_surfaced() -> None:
     assert [(i.url, i.media_type, i.language) for i in parsed.images] == [
         ("https://example.com/detour.png", "image/png", "en")
     ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("20260730", date(2026, 7, 30), id="valid"),
+        pytest.param("2026-07-30", None, id="dashed"),
+        pytest.param("20261345", None, id="impossible"),
+        pytest.param("", None, id="empty"),
+    ],
+)
+def test_lenient_service_date(raw: str, expected: date | None) -> None:
+    """A malformed service_date means "not a day this applies to"."""
+    assert _lenient_service_date(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("06:10:00", 22200, id="valid"),
+        pytest.param("25:30:00", 91800, id="past-midnight"),
+        pytest.param("ten past six", None, id="garbage"),
+        pytest.param("", None, id="empty"),
+    ],
+)
+def test_lenient_start_secs(raw: str, expected: int | None) -> None:
+    assert _lenient_start_secs(raw) == expected
+
+
+def test_trip_modifications_without_modifications_is_skipped() -> None:
+    """An entity selecting trips but describing no change is not a detour."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "empty-mod"
+    entity.trip_modifications.selected_trips.add().trip_ids.append("T1")
+    entity.trip_modifications.service_dates.append("20260730")
+    assert trip_modifications_from_message(message) == []
+
+
+def test_trip_modifications_without_selected_trips_is_skipped() -> None:
+    """A modification naming no trip applies to nothing."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "no-trips"
+    modification = entity.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    entity.trip_modifications.selected_trips.add()  # no trip_ids
+    assert trip_modifications_from_message(message) == []

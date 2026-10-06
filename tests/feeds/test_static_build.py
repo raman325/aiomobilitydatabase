@@ -4,6 +4,7 @@ import io
 import os
 import sqlite3
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -729,3 +730,20 @@ def test_cache_from_the_previous_schema_is_discarded(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def test_trip_queries_with_no_ids_do_not_touch_the_database(tmp_path: Path) -> None:
+    """An empty id list is a question with no answer, not an empty query.
+
+    Both of these interpolate their ids into an IN (...) clause, which an
+    empty list would render as `IN ()` -- a SQLite syntax error.
+    """
+    built = StaticIndex.build(_write_zip(tmp_path), ":memory:", DATASET, TZ)
+    assert built.concrete_trip_ids([]) == {}
+    assert (
+        built.trip_instance_calls(
+            [], datetime(2026, 7, 30, 14, 45, tzinfo=UTC), timedelta(hours=2)
+        )
+        == []
+    )
+    built.close()

@@ -6,7 +6,14 @@ import pytest
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import FeedParseError, SourceConnectionError
-from aiomobilitydatabase.feeds.gbfs import _endpoints_from_discovery
+from aiomobilitydatabase.feeds.gbfs import (
+    _alert_times,
+    _endpoints_from_discovery,
+    _id_list,
+    _iso_date,
+    _languages,
+    _reported_at,
+)
 from aiomobilitydatabase.feeds.geo import Circle
 
 from tests.feeds.fixtures import (
@@ -587,3 +594,89 @@ async def test_unpublished_lookup_documents_are_empty_not_an_error(
     assert await handle.get_pricing_plans() == []
     assert await handle.get_regions() == []
     assert await handle.get_system_alerts() == []
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(
+            1785500000, datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC), id="2x-epoch"
+        ),
+        pytest.param(
+            "2026-07-31T12:13:20+00:00",
+            datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC),
+            id="3x-rfc3339",
+        ),
+        # GBFS defines its timestamps as UTC, so a naive one is not ambiguous.
+        pytest.param(
+            "2026-07-31T12:13:20",
+            datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC),
+            id="3x-naive-is-utc",
+        ),
+        pytest.param(True, None, id="bool-is-not-an-epoch"),
+        pytest.param(10**20, None, id="epoch-out-of-range"),
+        pytest.param("yesterday", None, id="unparseable-string"),
+        pytest.param({"at": 1}, None, id="wrong-shape"),
+        pytest.param(None, None, id="absent"),
+    ],
+)
+def test_reported_at_degrades(value: object, expected: datetime | None) -> None:
+    """last_reported changed type across GBFS versions; both parse, junk doesn't."""
+    assert _reported_at(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param("2026-01-15", date(2026, 1, 15), id="iso"),
+        pytest.param("15/01/2026", None, id="wrong-format"),
+        pytest.param("2026-13-45", None, id="impossible-date"),
+        pytest.param(20260115, None, id="not-a-string"),
+    ],
+)
+def test_iso_date_degrades(value: object, expected: date | None) -> None:
+    assert _iso_date(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        pytest.param({"languages": ["en", "fr"]}, ["en", "fr"], id="3x-array"),
+        pytest.param({"language": "en"}, ["en"], id="2x-singular"),
+        pytest.param({"languages": ["en", 7, "", None]}, ["en"], id="array-with-junk"),
+        # The 3.0 key is specified as an array; a bare string there is
+        # malformed, and the 2.x fallback key is absent, so neither
+        # applies. Guessing would invent a language the feed never named.
+        pytest.param({"languages": "en"}, [], id="3x-key-with-2x-shape"),
+        pytest.param({}, [], id="neither"),
+    ],
+)
+def test_languages_reads_either_version(data: dict, expected: list[str]) -> None:
+    assert _languages(data) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(["a", "b"], ["a", "b"], id="ids"),
+        pytest.param(["a", 7], ["a", "7"], id="numeric-ids-coerce"),
+        pytest.param(["a", None], ["a"], id="null-dropped"),
+        pytest.param("a,b", [], id="not-a-list"),
+        pytest.param(None, [], id="absent"),
+    ],
+)
+def test_id_list_degrades(value: object, expected: list[str]) -> None:
+    assert _id_list(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_count"),
+    [
+        pytest.param([{"start": 1785500000, "end": 1785503600}], 1, id="pair"),
+        pytest.param([{"start": 1785500000}], 1, id="open-ended"),
+        pytest.param([{}, 7, None], 1, id="junk-entries-skipped"),
+        pytest.param("soon", 0, id="not-a-list"),
+    ],
+)
+def test_alert_times_degrades(value: object, expected_count: int) -> None:
+    assert len(_alert_times(value)) == expected_count
