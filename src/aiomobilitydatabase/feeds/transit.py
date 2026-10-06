@@ -967,7 +967,15 @@ class TransitFeedHandle:
                 # 304: the producer confirmed our copy is current. It still
                 # goes in the memo -- a second entity type off this same
                 # url must not re-ask within the one call.
-                assert known is not None
+                if known is None:
+                    # Unsolicited: nothing was revalidated, so there is no
+                    # previous parse to reuse. A misbehaving proxy must
+                    # raise the library's own error, not AssertionError --
+                    # which `python -O` would strip into a TypeError.
+                    raise SourceConnectionError(
+                        f"Producer answered 304 to an unconditional request: {url}",
+                        status=int(HTTPStatus.NOT_MODIFIED),
+                    )
                 message = known[1]
             elif fresh is not None:
                 self._rt_validators[url] = (fresh, message)
@@ -1118,10 +1126,14 @@ class TransitFeedHandle:
             if with_vehicles
             else []
         )
-        # TripModifications ride the TripUpdates feed, so the memo means
-        # they cost nothing extra; so do the Stop entities their
-        # replacement stops may be the only definition of.
-        tu_messages = list(rt_memo.values())
+        # Sourced from the TU-declaring feeds, NOT from whatever the memo
+        # happens to hold: reading the memo made a vp-declaring feed that
+        # also bundles trip_modifications contribute detours only when
+        # with_vehicles was set, so a display flag changed the schedule.
+        # These are all memo hits, so this costs no request.
+        tu_messages = await self._fetch_entity_messages(
+            EntityType.TRIP_UPDATES, rt_memo
+        )
         rt_stops: dict[str, Stop] = {}
         modifications: list[TripModifications] = []
         for message in tu_messages:
@@ -1742,12 +1754,12 @@ class TransitFeedHandle:
     async def get_alerts(self) -> list[ServiceAlert]:
         """Service alerts across the feed's SA-capable RT sources.
 
-        Alert scoping contract: each alert carries the route ids, stop
-        ids, AND informed-entity trip ids it names. An alert is unscoped
-        ("applies everywhere") ONLY when ``route_ids``, ``stop_ids``, and
-        ``trip_ids`` are all empty -- a trip-scoped alert (informed
-        entities carrying only trip descriptors) is scoped to those
-        trips, not agency-wide. Alert trip references keep the producer's
+        Alert scoping contract: each alert carries EVERY selector an
+        informed entity named -- agency ids, route ids, route types,
+        direction ids, stop ids, and trip ids. An alert is unscoped
+        ("applies everywhere") ONLY when all six are empty, so an alert
+        naming just an agency, or just a mode, is scoped to that rather
+        than feed-wide. Alert trip references keep the producer's
         PLAIN trip ids (like vehicles): a display-only association with
         no per-repetition matching for frequency-based trips.
         """

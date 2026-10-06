@@ -845,3 +845,42 @@ async def test_detour_rows_respect_the_lookahead_horizon(
         if row.scheduled_departure
     )
     assert not any(row.trip_id == "T3" for row in arrivals)
+
+
+async def test_detours_do_not_depend_on_with_vehicles(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A display flag must not change which schedule you get.
+
+    Reading modifications out of the per-call memo made them depend on
+    what the memo happened to hold. The feed here declares vp but NOT tu
+    while still bundling trip_modifications, so only with_vehicles=True
+    put its message in the memo -- and the two boards disagreed about
+    whether T1 serves S2 or S3.
+    """
+    boards = []
+    for flag in (False, True):
+        base = mock_api.url()
+        rt_feed = with_base(GTFS_RT_FEED, base)
+        rt_feed["entity_types"] = ["vp"]
+        mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+        mock_api.get("/v1/feeds/mdb-100", payload=with_base(GTFS_FEED, base))
+        mock_api.get("/v1/gtfs_feeds/mdb-100", payload=with_base(GTFS_FEED, base))
+        mock_api.get("/v1/gtfs_feeds/mdb-100/gtfs_rt_feeds", payload=[rt_feed])
+        mock_api.get(
+            "/hosted/mdb-100.zip",
+            body=build_gtfs_zip_bytes(),
+            content_type="application/zip",
+        )
+        for _ in range(3):
+            mock_api.get("/rt/all", body=_detour_message(), content_type=PB)
+        handle = await feeds_client.get_transit_feed("mdb-100")
+        [arrivals] = await handle.get_arrivals(
+            [ArrivalsQuery(["S1", "S2", "S3"])], now_utc=NOW, with_vehicles=flag
+        )
+        boards.append(sorted((a.trip_id, a.stop_id) for a in arrivals))
+        handle.close()
+    assert boards[0] == boards[1], "with_vehicles changed the schedule"
+    # Sourced from declared TU feeds, and this one declares none, so the
+    # detour applies in neither -- consistently.
+    assert ("T1", "S2") in boards[0]

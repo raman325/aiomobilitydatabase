@@ -12,6 +12,7 @@ import pytest
 from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
+from aiomobilitydatabase.feeds.exceptions import SourceConnectionError
 from aiomobilitydatabase.feeds.geo import Circle
 from aiomobilitydatabase.feeds.models import ArrivalsQuery, ServiceAlert, StationGroup
 from aiomobilitydatabase.feeds.rt import alerts_from_message
@@ -705,3 +706,20 @@ def test_alert_scoped_by_any_selector_is_not_feed_wide(
         + alert.trip_ids
     )
     assert scope, "alert read as feed-wide despite naming a selector"
+
+
+async def test_unsolicited_304_raises_a_typed_error(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A 304 with nothing to revalidate against is a producer fault.
+
+    There is no previous parse to reuse, so this must raise the library's
+    own error rather than AssertionError -- which `python -O` strips,
+    turning the failure into a TypeError instead.
+    """
+    _mock_catalog(mock_api)
+    mock_api.get("/rt/all", status=304)  # first request, no validators sent
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    with pytest.raises(SourceConnectionError) as caught:
+        await handle.get_vehicles()
+    assert caught.value.status == 304
