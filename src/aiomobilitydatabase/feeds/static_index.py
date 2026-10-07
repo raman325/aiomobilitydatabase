@@ -1123,10 +1123,6 @@ class StaticIndex:
             )
         ]
 
-    def route_display_names(self) -> dict[str, str]:
-        """Map of route_id to display name (for RT joins)."""
-        return {route.id: route.display_name for route in self.routes()}
-
     def routes_by_id(self) -> dict[str, Route]:
         """Map of route_id to the full Route record.
 
@@ -1140,12 +1136,6 @@ class StaticIndex:
     def stops_by_id(self) -> dict[str, Stop]:
         """Map of stop_id to the full Stop record."""
         return {stop.id: stop for stop in self.stops()}
-
-    def stop_names(self) -> dict[str, str | None]:
-        """Map of stop_id to name."""
-        return {
-            row[0]: row[1] for row in self._conn.execute("SELECT id, name FROM stops")
-        }
 
     def routes_for_trips(self, trip_ids: list[str]) -> dict[str, str]:
         """Map trip_id -> route_id for the given trips."""
