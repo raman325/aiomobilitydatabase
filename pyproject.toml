@@ -27,7 +27,7 @@ dependencies = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
-feeds = ["gtfs-realtime-bindings>=1.0.0"]
+feeds = ["gtfs-realtime-bindings>=3.0.0"]
 
 [project.urls]
 "Source Code" = "https://github.com/raman325/aiomobilitydatabase"
@@ -35,7 +35,7 @@ feeds = ["gtfs-realtime-bindings>=1.0.0"]
 
 [dependency-groups]
 dev = [
-  "gtfs-realtime-bindings>=1.0.0",
+  "gtfs-realtime-bindings>=3.0.0",
   "hypothesis>=6.100",
   "mypy>=1.14",
   "pre-commit>=4.0",

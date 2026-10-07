@@ -27,3 +27,17 @@ jobs:
         run: uv run mypy src
       - name: Test
         run: uv run pytest --cov=aiomobilitydatabase --cov-report=term-missing
+
+  test-lowest:
+    # Consumers such as Home Assistant can pin a dependency to its declared
+    # floor, so the floors must actually work.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install lowest direct dependencies
+        run: uv sync --dev --resolution lowest-direct
+      - name: Test
+        run: uv run --no-sync pytest

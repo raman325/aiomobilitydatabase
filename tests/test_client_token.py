@@ -120,10 +120,14 @@ async def test_concurrent_401s_single_forced_refresh(
     """
     mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
     for _ in range(5):
-        mock_api.get("/v1/metadata", status=401)
+        mock_api.get("/v1/metadata", status=401, auth=TOKEN_RESPONSE["access_token"])
     mock_api.post("/v1/tokens", payload=REFRESHED_TOKEN_RESPONSE)
     for _ in range(5):
-        mock_api.get("/v1/metadata", payload=METADATA)
+        mock_api.get(
+            "/v1/metadata",
+            payload=METADATA,
+            auth=REFRESHED_TOKEN_RESPONSE["access_token"],
+        )
     await asyncio.gather(*(client.get_metadata() for _ in range(5)))
     token_requests = [r for r in mock_api.requests if r.path == "/v1/tokens"]
     assert len(token_requests) == 2
