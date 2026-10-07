@@ -43,6 +43,10 @@ class _MockResponse:
     # Extra response headers (e.g. ETag/Last-Modified validators for the
     # direct-URL dataset-identity probes).
     headers: dict[str, str] | None = None
+    # Serve only to requests bearing this token. Concurrent requests reach
+    # the server in an order aiohttp does not guarantee, so a script keyed
+    # purely on arrival order can hand a retry the response meant for a peer.
+    auth: str | None = None
 
 
 @dataclass
@@ -95,13 +99,22 @@ class MockApi:
                 raw_path=request.raw_path.split("?", 1)[0],
             )
         )
-        queue = self._queues.get((request.method, request.path))
-        if not queue:
+        queue = self._queues.get((request.method, request.path), deque())
+        bearer = request.headers.get("Authorization")
+        scripted = next(
+            (
+                candidate
+                for candidate in queue
+                if candidate.auth is None or bearer == f"Bearer {candidate.auth}"
+            ),
+            None,
+        )
+        if scripted is None:
             return web.Response(
                 status=599,
                 text=f"UNREGISTERED MOCK ROUTE: {request.method} {request.path}",
             )
-        scripted = queue.popleft()
+        queue.remove(scripted)
         if scripted.payload is not None:
             return web.Response(
                 status=scripted.status,
