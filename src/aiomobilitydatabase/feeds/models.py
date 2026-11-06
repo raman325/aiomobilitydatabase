@@ -539,6 +539,10 @@ class Station:
     ``rental_uris`` passes through the station's deep-link table as
     provided (keys ``android``/``ios``/``web`` per the spec, any string
     key kept); None when the document omits it.
+
+    ``vehicle_types_available`` maps vehicle type id -> count; {} when the
+    station publishes an empty breakdown (zero of every type), None when it
+    is absent or has no usable entries.
     """
 
     id: str
