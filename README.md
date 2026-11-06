@@ -7,7 +7,7 @@ agencies and bike/scooter share systems around the world.
 The core package wraps the catalog's
 [REST API](https://mobilitydata.github.io/mobility-feed-api/SwaggerUI/index.html)
 with a fully typed asyncio client: search feeds, look up their metadata, find the
-hosted dataset URL. An optional `feeds` layer goes one step further and consumes
+hosted dataset URL. The `feeds` layer goes one step further and consumes
 the actual transit/bike-share data those feeds point to — scheduled and live
 arrivals, origin→destination trip queries, vehicle positions, service alerts,
 GBFS stations and vehicles — giving you a feed ID (or a plain feed URL) in and
@@ -19,8 +19,8 @@ typed snapshots out.
 pip install aiomobilitydatabase
 ```
 
-That installs the catalog client only. To also consume feed data (schedules,
-GTFS-RT, GBFS), install the `feeds` extra, which pulls in
+That installs the catalog client and GBFS feeds. To also consume GTFS
+schedules and GTFS-RT, install the `feeds` extra, which pulls in
 [`gtfs-realtime-bindings`](https://pypi.org/project/gtfs-realtime-bindings/) for
 protobuf parsing:
 
@@ -28,9 +28,8 @@ protobuf parsing:
 pip install aiomobilitydatabase[feeds]
 ```
 
-Importing `aiomobilitydatabase.feeds` without the extra installed raises an
-`ImportError` telling you to install it — there is no silent partial-functionality
-mode.
+Using `TransitFeedHandle` or `MobilityFeedsClient.get_transit_feed*` without
+the extra raises an `ImportError` telling you to install it.
 
 Requires Python 3.12+.
 
@@ -71,11 +70,11 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-## Quick start — feeds (optional extra)
+## Quick start — feeds
 
 `MobilityFeedsClient` resolves a feed ID (GTFS, GTFS-RT, or GBFS) into a handle
-that fetches and caches the actual data. Requires `pip install
-aiomobilitydatabase[feeds]`.
+that fetches and caches the actual data. GBFS needs no extra; GTFS and GTFS-RT
+(`get_transit_feed*`) require `pip install aiomobilitydatabase[feeds]`.
 
 ```python
 import asyncio
