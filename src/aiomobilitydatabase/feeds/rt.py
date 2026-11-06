@@ -9,11 +9,11 @@ from datetime import UTC, date, datetime
 from enum import StrEnum
 from http import HTTPStatus
 from typing import Any
-from urllib.parse import urlsplit
 
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
+from ._urls import _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
     AlertCause,
@@ -37,8 +37,6 @@ _AUTH_STATUSES = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
 _AUTH_TYPE_QUERY_PARAM = 1
 _AUTH_TYPE_HEADER = 2
 
-_ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
-
 # The RT identity a TripDescriptor addresses: (trip_id, start_date,
 # start_secs). start_date pins ONE service day's instance of the trip
 # (adjacent daily instances are exactly 24h apart); start_secs pins ONE
@@ -47,25 +45,6 @@ _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 TripUpdateKey = tuple[str, date | None, int | None]
 
 _START_DATE_LENGTH = 8  # YYYYMMDD
-
-
-def _require_http_url(url: str, context: str) -> None:
-    """Reject a data-origin URL whose scheme isn't http/https before fetch.
-
-    Producer URLs, hosted dataset URLs, and GBFS endpoint URLs all
-    originate from data (catalog payloads, GBFS documents an agency
-    controls) rather than from a caller-supplied parameter, so a malicious
-    or corrupt source could point at a local resource (``file://``) or
-    another unintended scheme. This is a proportionate library-level guard,
-    not full SSRF prevention -- producer hosts are legitimately arbitrary,
-    so host/IP validation is out of scope; a stricter policy belongs in the
-    consuming application (e.g. the HA integration) if needed.
-    """
-    scheme = urlsplit(url).scheme.lower()
-    if scheme not in _ALLOWED_URL_SCHEMES:
-        raise SourceConnectionError(
-            f"Refusing to fetch {context}: unsupported URL scheme {scheme!r} ({url})"
-        )
 
 
 def _epoch_to_utc(value: int) -> datetime | None:

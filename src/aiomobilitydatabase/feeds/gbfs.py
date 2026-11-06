@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
+from ._urls import _require_http_url  # deliberate friend access: shared URL guard
 from .const import GBFS_LANGUAGE_PREFERENCE
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
@@ -23,7 +24,6 @@ from .models import (
     SystemRegion,
     VehicleType,
 )
-from .rt import _require_http_url  # deliberate friend access: shared URL guard
 
 if TYPE_CHECKING:
     from ..models import GbfsFeed
