@@ -122,11 +122,9 @@ async def test_gbfs_feed_id_resolving_to_gtfs_shaped_payload(
 
     - get_system_info() needs one specific endpoint -> raises
       SourceConnectionError("... not published").
-    - get_stations() ALSO needs an endpoint up front (station_information)
-      -> ALSO raises SourceConnectionError, not an empty list.
-    - get_vehicles() degrades gracefully by design (docstring: "Returns []
-      for docked-only systems") since it checks endpoint presence itself
-      before ever calling _document -> returns [].
+    - get_stations() and get_vehicles() degrade gracefully by design
+      (dockless-only / docked-only systems) since they check endpoint
+      presence themselves before ever calling _document -> return [].
     """
     base = mock_api.url()
     mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
@@ -134,8 +132,7 @@ async def test_gbfs_feed_id_resolving_to_gtfs_shaped_payload(
     handle = await feeds_client.get_gbfs_feed("mdb-100")
     with pytest.raises(SourceConnectionError, match="not published"):
         await handle.get_system_info()
-    with pytest.raises(SourceConnectionError, match="not published"):
-        await handle.get_stations()
+    assert await handle.get_stations() == []
     assert await handle.get_vehicles() == []
 
 
@@ -217,6 +214,31 @@ async def test_gbfs_30_localized_name(
     info = await handle.get_system_info()
     assert info.system_id == "test-bikes-3"
     assert info.name == "Test Bikes 3"
+
+
+async def test_stations_empty_without_station_endpoints(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    base = mock_api.url()
+    feed_30 = with_base(GBFS_FEED, base)
+    feed_30["versions"] = [
+        {
+            "version": "3.0",
+            "source": "gbfs_versions",
+            "endpoints": [
+                {
+                    "name": "system_information",
+                    "url": f"{base}/gbfs3/system_information.json",
+                },
+                {"name": "vehicle_status", "url": f"{base}/gbfs3/vehicle_status.json"},
+            ],
+        }
+    ]
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=feed_30)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    assert await handle.get_stations() == []
+    assert not [r for r in mock_api.requests if r.path.startswith("/gbfs3/")]
 
 
 @pytest.mark.parametrize(
