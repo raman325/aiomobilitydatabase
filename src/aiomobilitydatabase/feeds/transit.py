@@ -32,6 +32,9 @@ from ..models import (
     LatestDataset,
     SourceInfo,
 )
+from ._urls import (
+    _require_http_url,  # deliberate friend access: shared data-origin URL guard
+)
 from .const import STATIC_DB_FILENAME
 from .exceptions import (
     FeedParseError,
@@ -60,7 +63,6 @@ from .rt import (
     TripPredictions,
     TripUpdateKey,
     TripUpdates,
-    _require_http_url,  # deliberate friend access: shared data-origin URL guard
     alerts_from_message,
     fetch_feed_message,
     resolve_trip_predictions,

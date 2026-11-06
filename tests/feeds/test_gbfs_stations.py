@@ -219,6 +219,31 @@ async def test_gbfs_30_localized_name(
     assert info.name == "Test Bikes 3"
 
 
+async def test_stations_empty_without_station_endpoints(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    base = mock_api.url()
+    feed_30 = with_base(GBFS_FEED, base)
+    feed_30["versions"] = [
+        {
+            "version": "3.0",
+            "source": "gbfs_versions",
+            "endpoints": [
+                {
+                    "name": "system_information",
+                    "url": f"{base}/gbfs3/system_information.json",
+                },
+                {"name": "vehicle_status", "url": f"{base}/gbfs3/vehicle_status.json"},
+            ],
+        }
+    ]
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=feed_30)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    assert await handle.get_stations() == []
+    assert not [r for r in mock_api.requests if r.path.startswith("/gbfs3/")]
+
+
 @pytest.mark.parametrize(
     "document",
     [

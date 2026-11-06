@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
+from ._urls import _require_http_url  # deliberate friend access: shared URL guard
 from .const import GBFS_LANGUAGE_PREFERENCE
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
@@ -23,7 +24,6 @@ from .models import (
     SystemRegion,
     VehicleType,
 )
-from .rt import _require_http_url  # deliberate friend access: shared URL guard
 
 if TYPE_CHECKING:
     from ..models import GbfsFeed
@@ -531,8 +531,14 @@ class GbfsFeedHandle:
         without coordinates are excluded when filtering) — this powers both
         the config-flow station multi-select and zone-scoped station sensors.
         Information rows without a usable ``station_id`` are skipped: the
-        merge and the returned ``id`` both key on it.
+        merge and the returned ``id`` both key on it. Systems that publish no
+        ``station_information`` return ``[]``; an empty endpoint table (a
+        non-GBFS payload) still raises.
         """
+        # Dockless-only systems publish no stations; mirror get_vehicles()'s
+        # [] for docked-only systems instead of failing.
+        if self._endpoints and "station_information" not in self._endpoints:
+            return []
         info_rows = _rows(await self._document("station_information"), "stations")
         status_rows = _rows(await self._document("station_status"), "stations")
         status_by_id = {_record_id(row.get("station_id")): row for row in status_rows}
