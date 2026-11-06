@@ -122,9 +122,11 @@ async def test_gbfs_feed_id_resolving_to_gtfs_shaped_payload(
 
     - get_system_info() needs one specific endpoint -> raises
       SourceConnectionError("... not published").
-    - get_stations() and get_vehicles() degrade gracefully by design
-      (dockless-only / docked-only systems) since they check endpoint
-      presence themselves before ever calling _document -> return [].
+    - get_stations() ALSO needs an endpoint up front (station_information)
+      -> ALSO raises SourceConnectionError, not an empty list.
+    - get_vehicles() degrades gracefully by design (docstring: "Returns []
+      for docked-only systems") since it checks endpoint presence itself
+      before ever calling _document -> returns [].
     """
     base = mock_api.url()
     mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
@@ -132,7 +134,8 @@ async def test_gbfs_feed_id_resolving_to_gtfs_shaped_payload(
     handle = await feeds_client.get_gbfs_feed("mdb-100")
     with pytest.raises(SourceConnectionError, match="not published"):
         await handle.get_system_info()
-    assert await handle.get_stations() == []
+    with pytest.raises(SourceConnectionError, match="not published"):
+        await handle.get_stations()
     assert await handle.get_vehicles() == []
 
 

@@ -29,7 +29,9 @@ pip install aiomobilitydatabase[feeds]
 ```
 
 Using `TransitFeedHandle` or `MobilityFeedsClient.get_transit_feed*` without
-the extra raises an `ImportError` telling you to install it.
+the extra raises an `ImportError` telling you to install it. This is fail-loud
+by design: without the extra, `from aiomobilitydatabase.feeds import *` and
+`hasattr(feeds, "TransitFeedHandle")` raise that `ImportError` too.
 
 Requires Python 3.12+.
 

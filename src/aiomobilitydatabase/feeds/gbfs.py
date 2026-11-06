@@ -532,11 +532,12 @@ class GbfsFeedHandle:
         the config-flow station multi-select and zone-scoped station sensors.
         Information rows without a usable ``station_id`` are skipped: the
         merge and the returned ``id`` both key on it. Systems that publish no
-        ``station_information`` return ``[]``.
+        ``station_information`` return ``[]``; an empty endpoint table (a
+        non-GBFS payload) still raises.
         """
         # Dockless-only systems publish no stations; mirror get_vehicles()'s
         # [] for docked-only systems instead of failing.
-        if "station_information" not in self._endpoints:
+        if self._endpoints and "station_information" not in self._endpoints:
             return []
         info_rows = _rows(await self._document("station_information"), "stations")
         status_rows = _rows(await self._document("station_status"), "stations")

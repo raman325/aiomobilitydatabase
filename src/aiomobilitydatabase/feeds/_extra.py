@@ -18,5 +18,7 @@ def load_transit_handle() -> type[TransitFeedHandle]:
     try:
         from .transit import TransitFeedHandle  # noqa: PLC0415
     except ImportError as err:
-        raise ImportError(EXTRA_HINT) from err
+        if (err.name or "").startswith("google"):
+            raise ImportError(EXTRA_HINT, name=err.name) from err
+        raise
     return TransitFeedHandle

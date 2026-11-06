@@ -25,8 +25,10 @@ def feeds_without_extra(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]
     real_import = builtins.__import__
 
     def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "google.transit" or name.startswith("google.transit."):
-            raise ImportError("simulated: gtfs-realtime-bindings not installed")
+        if name.split(".")[:2] in (["google", "transit"], ["google", "protobuf"]):
+            raise ModuleNotFoundError(
+                "simulated: gtfs-realtime-bindings not installed", name=name
+            )
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(aiomobilitydatabase, "feeds", aiomobilitydatabase.feeds)
@@ -46,6 +48,23 @@ def test_transit_handle_without_extra_raises(feeds_without_extra: ModuleType) ->
         feeds_without_extra.TransitFeedHandle  # noqa: B018
 
 
+def test_unrelated_import_error_propagates_unchanged(
+    feeds_without_extra: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_import = builtins.__import__
+
+    def failing_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "aiohttp":
+            raise ImportError("unrelated breakage", name="somethingelse")
+        return fixture_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    with pytest.raises(ImportError, match="unrelated breakage") as excinfo:
+        feeds_without_extra.TransitFeedHandle  # noqa: B018
+    assert excinfo.value.name == "somethingelse"
+    assert "feeds" not in str(excinfo.value)
+
+
 @pytest.mark.parametrize(
     ("method", "args"),
     [
@@ -59,11 +78,20 @@ async def test_transit_methods_without_extra_raise(
     feeds_without_extra: ModuleType, method: str, args: tuple[str, ...]
 ) -> None:
     client = feeds_without_extra.MobilityFeedsClient()
-    with pytest.raises(ImportError, match=EXTRA_HINT):
-        await getattr(client, method)(*args)
-    await client.close()
+    try:
+        with pytest.raises(ImportError, match=EXTRA_HINT):
+            await getattr(client, method)(*args)
+    finally:
+        await client.close()
 
 
 def test_unknown_attribute_raises_attribute_error() -> None:
     with pytest.raises(AttributeError, match="NoSuchThing"):
         aiomobilitydatabase.feeds.NoSuchThing  # noqa: B018
+
+
+def test_transit_handle_resolves_to_transit_module_with_extra() -> None:
+    assert (
+        aiomobilitydatabase.feeds.TransitFeedHandle
+        is aiomobilitydatabase.feeds.transit.TransitFeedHandle
+    )

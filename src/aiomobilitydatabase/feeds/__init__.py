@@ -8,7 +8,7 @@ without it raises an ``ImportError`` naming the extra.
 
 from typing import TYPE_CHECKING, Any
 
-from ._extra import load_transit_handle
+from . import _extra
 from .client import MobilityFeedsClient
 from .exceptions import (
     FeedParseError,
@@ -56,11 +56,13 @@ if TYPE_CHECKING:
     from .transit import TransitFeedHandle
 
 
-def __getattr__(name: str) -> Any:
-    """Load TransitFeedHandle on first access, so GBFS needs no protobuf."""
-    if name == "TransitFeedHandle":
-        return load_transit_handle()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> Any:
+        """Load TransitFeedHandle on first access, so GBFS needs no protobuf."""
+        if name == "TransitFeedHandle":
+            return _extra.load_transit_handle()
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
