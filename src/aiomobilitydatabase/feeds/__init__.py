@@ -1,17 +1,14 @@
 """Typed async consumption of Mobility Database transit and GBFS feeds.
 
-Requires the ``feeds`` extra (``pip install aiomobilitydatabase[feeds]``) for
-the ``gtfs-realtime-bindings`` protobuf dependency.
+GBFS works with the base install. GTFS and GTFS-RT (``TransitFeedHandle``,
+``MobilityFeedsClient.get_transit_feed*``) need the ``feeds`` extra
+(``pip install aiomobilitydatabase[feeds]``) for protobuf; using them
+without it raises an ``ImportError`` naming the extra.
 """
 
-try:
-    from google.transit import gtfs_realtime_pb2 as _pb2_check  # noqa: F401
-except ImportError as err:
-    raise ImportError(
-        "aiomobilitydatabase.feeds requires the 'feeds' extra: "
-        "pip install aiomobilitydatabase[feeds]"
-    ) from err
+from typing import TYPE_CHECKING, Any
 
+from ._extra import load_transit_handle
 from .client import MobilityFeedsClient
 from .exceptions import (
     FeedParseError,
@@ -54,7 +51,17 @@ from .models import (
     VehicleType,
     WheelchairAccess,
 )
-from .transit import TransitFeedHandle
+
+if TYPE_CHECKING:
+    from .transit import TransitFeedHandle
+
+
+def __getattr__(name: str) -> Any:
+    """Load TransitFeedHandle on first access, so GBFS needs no protobuf."""
+    if name == "TransitFeedHandle":
+        return load_transit_handle()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "Agency",

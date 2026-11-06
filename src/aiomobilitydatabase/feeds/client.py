@@ -7,16 +7,19 @@ import shutil
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 import aiohttp
 
 from ..client import MobilityDatabaseClient
 from ..exceptions import MobilityDatabaseError
+from ._extra import load_transit_handle
 from .const import DEFAULT_TIMEOUT_SECONDS
 from .gbfs import GbfsFeedHandle
 from .models import StaticBuildProgress
-from .transit import TransitFeedHandle
+
+if TYPE_CHECKING:
+    from .transit import TransitFeedHandle
 
 
 class MobilityFeedsClient:
@@ -189,7 +192,7 @@ class MobilityFeedsClient:
         callback's own scheduling, so it cannot abort a build already in
         progress.
         """
-        return await TransitFeedHandle.create(self, feed_id, api_key, on_progress)
+        return await load_transit_handle().create(self, feed_id, api_key, on_progress)
 
     async def get_transit_feed_from_urls(
         self,
@@ -220,7 +223,7 @@ class MobilityFeedsClient:
         :meth:`purge_cache`). ``on_progress`` follows the same contract as
         :meth:`get_transit_feed`.
         """
-        return await TransitFeedHandle.create_from_urls(
+        return await load_transit_handle().create_from_urls(
             self,
             static_url,
             trip_updates_urls=trip_updates_urls,
