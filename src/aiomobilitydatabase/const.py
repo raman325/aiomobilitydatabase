@@ -1,6 +1,6 @@
 """Constants for aiomobilitydatabase."""
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 PROD_BASE_URL = "https://api.mobilitydatabase.org"
 QA_BASE_URL = "https://api-qa.mobilitydatabase.org"

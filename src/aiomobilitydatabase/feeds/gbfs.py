@@ -116,12 +116,15 @@ def _vehicle_types(value: Any) -> dict[str, int] | None:
 
     Entries without a usable type id, and counts that aren't parseable as
     an int (``int(None)`` used to raise), are dropped rather than
-    coerced; an absent count is the spec's 0. Anything that isn't a list
-    with at least one usable entry is None, i.e. "not published". A count
+    coerced; an absent count is the spec's 0. An explicitly empty list is
+    {}, i.e. zero of every type. Anything that isn't a list, or a non-empty
+    list with no usable entry, is None, i.e. "not published". A count
     of ``1e999`` parses as inf, which int() refuses, so it is dropped too.
     """
     if not isinstance(value, list):
         return None
+    if not value:
+        return {}
     types: dict[str, int] = {}
     for entry in value:
         if not isinstance(entry, Mapping):

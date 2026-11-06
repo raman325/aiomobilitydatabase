@@ -423,7 +423,8 @@ async def test_get_stations_total_over_malformed_envelopes(
         pytest.param([{"count": 4}], None, id="no-type-id"),
         pytest.param({"bike": 4}, None, id="object-not-a-list"),
         pytest.param("bike", None, id="string"),
-        pytest.param([], None, id="empty"),
+        pytest.param([], {}, id="empty-breakdown"),
+        pytest.param([{"count": 4}, "x", None], None, id="all-entries-unusable"),
         pytest.param(
             [{"vehicle_type_id": "bike", "count": 2}, "not-a-dict", None, 7],
             {"bike": 2},
@@ -438,8 +439,9 @@ async def test_vehicle_types_available_shapes(
     expected: dict[str, int] | None,
 ) -> None:
     """vehicle_types_available: int(entry.get("count", 0)) raised on a null
-    count and iterating an object yielded its keys. Unusable entries drop;
-    an empty result is None (the documented "not published" value).
+    count and iterating an object yielded its keys. Unusable entries drop.
+    An explicitly empty list is {} (zero of every type); a non-list, or a
+    non-empty list with no usable entry, is None ("not published").
     """
     _mock_catalog(mock_api)
     mock_api.get(
@@ -458,6 +460,23 @@ async def test_vehicle_types_available_shapes(
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     (station,) = await handle.get_stations()
     assert station.vehicle_types_available == expected
+
+
+async def test_vehicle_types_available_absent_is_none(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A status row without the field is "not published", not zero counts."""
+    _mock_catalog(mock_api)
+    mock_api.get(
+        "/gbfs/station_information.json", payload={"data": {"stations": [_STATION_ROW]}}
+    )
+    mock_api.get(
+        "/gbfs/station_status.json",
+        payload={"data": {"stations": [{"station_id": "real"}]}},
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    (station,) = await handle.get_stations()
+    assert station.vehicle_types_available is None
 
 
 async def test_station_coordinates_normalized_and_zone_filter_stays_total(
