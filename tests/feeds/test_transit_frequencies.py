@@ -96,7 +96,7 @@ async def test_start_time_matching_applies_to_upcoming_trips_overlay(
     """
     _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_MATCHED)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=2), now_utc=NOW
     )
     assert [t.trip_id for t in trips] == [
@@ -148,7 +148,7 @@ async def test_bare_cancellation_cancels_no_repetition(
         [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=2), now_utc=NOW
     )
     assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=2), now_utc=NOW
     )
     assert [t.trip_id for t in trips] == F1_SYNTHETIC_IDS

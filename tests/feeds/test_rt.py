@@ -388,12 +388,12 @@ def test_alerts_from_message() -> None:
     assert alert.cause == "CONSTRUCTION"
     assert alert.effect is AlertEffect.DETOUR
     assert alert.severity is None  # fixture sets no severity_level
-    assert alert.route_ids == ["R1"]
-    assert alert.stop_ids == ["S1"]
-    assert alert.trip_ids == []  # fixture informs a route and a stop only
-    assert alert.active_periods == [
-        (datetime.fromtimestamp(1_785_400_000, tz=UTC), None)
-    ]
+    assert alert.route_ids == ("R1",)
+    assert alert.stop_ids == ("S1",)
+    assert alert.trip_ids == ()  # fixture informs a route and a stop only
+    assert alert.active_periods == (
+        (datetime.fromtimestamp(1_785_400_000, tz=UTC), None),
+    )
 
 
 def test_alerts_trip_scoped_not_agency_wide() -> None:
@@ -406,9 +406,9 @@ def test_alerts_trip_scoped_not_agency_wide() -> None:
     msg.ParseFromString(ALERTS_TRIP_SCOPED)
     (alert,) = alerts_from_message(msg)
     assert alert.header == "T1 and T3 running late"
-    assert alert.route_ids == []
-    assert alert.stop_ids == []
-    assert alert.trip_ids == ["T1", "T3"]  # sorted, deduplicated
+    assert alert.route_ids == ()
+    assert alert.stop_ids == ()
+    assert alert.trip_ids == ("T1", "T3")  # sorted, deduplicated
     assert alert.effect is AlertEffect.SIGNIFICANT_DELAYS
 
 
@@ -781,7 +781,7 @@ def test_vehicle_unset_rich_fields_are_none() -> None:
     # NO_VALUE is the proto default: the producer said nothing at all, which
     # is not the same as an explicit UNKNOWN.
     assert vehicle.wheelchair_accessible is None
-    assert vehicle.carriages == []
+    assert vehicle.carriages == ()
 
 
 def test_alert_text_detail_and_images_are_surfaced() -> None:

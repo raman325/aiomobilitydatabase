@@ -1311,7 +1311,7 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         assert alert.effect is None or isinstance(alert.effect, AlertEffect)
         assert alert.severity is None or isinstance(alert.severity, AlertSeverity)
         # Informed-entity trip descriptors map to the EXACT trip_ids list.
-        assert alert.trip_ids == expected_trip_ids
+        assert alert.trip_ids == tuple(expected_trip_ids)
 
 
 _GARBAGE_NUMERICS = ["abc", "1.2.3", "NaN?", "--", "1e999x", " ", "12a"]
@@ -3001,7 +3001,7 @@ def test_generated_feeds_end_to_end_totality(
         # dropped coordinate-null check) would be caught here).
         zone = Circle(latitude=34.05, longitude=-118.25, radius_m=500_000.0)
         handle = TransitFeedHandle.__new__(TransitFeedHandle)
-        handle.stops = all_stops
+        handle._stops = all_stops
         returned = handle.stops_in(zone)
         assert all(
             s.latitude is not None
@@ -4388,7 +4388,7 @@ def _run_propagation_scenario(
                 )
                 trips = {}
                 for origin, destination in pairs:
-                    trips[(origin, destination)] = await handle.upcoming_trips(
+                    trips[(origin, destination)] = await handle.get_upcoming_trips(
                         origin,
                         destination,
                         lookahead=lookahead,
@@ -6772,11 +6772,11 @@ def test_alert_scope_lists_are_exact_and_unscoped_iff_all_empty(
     expected_routes = sorted({r for r, _, _ in informed if r})
     expected_stops = sorted({s for _, s, _ in informed if s})
     expected_trips = sorted({t for _, _, t in informed if t})
-    assert alert.route_ids == expected_routes
-    assert alert.stop_ids == expected_stops
-    assert alert.trip_ids == expected_trips
+    assert alert.route_ids == tuple(expected_routes)
+    assert alert.stop_ids == tuple(expected_stops)
+    assert alert.trip_ids == tuple(expected_trips)
     for scope in (alert.route_ids, alert.stop_ids, alert.trip_ids):
-        assert scope == sorted(set(scope))
+        assert scope == tuple(sorted(set(scope)))
         assert "" not in scope
     unscoped = not (alert.route_ids or alert.stop_ids or alert.trip_ids)
     assert unscoped is not any(value for triple in informed for value in triple)

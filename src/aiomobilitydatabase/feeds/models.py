@@ -2,10 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import IntEnum, StrEnum
+
+from ._frozen import FrozenDict
+
+
+def _freeze_mappings(model: object, *names: str) -> None:
+    """Store each named mapping field as a :class:`FrozenDict`.
+
+    Library-built models already hold one; this covers models a consumer
+    builds or ``dataclasses.replace``s with a plain ``dict`` (a test
+    fixture, say), which would otherwise be mutable and unhashable.
+    """
+    for name in names:
+        value = getattr(model, name)
+        if value is not None and not isinstance(value, FrozenDict):
+            object.__setattr__(model, name, FrozenDict(value))
 
 
 class WheelchairAccess(IntEnum):
@@ -253,7 +268,7 @@ class ArrivalsQuery:
     platforms, a direction pair). ``route_ids`` and ``headsigns`` narrow
     the rows; ``None`` or an empty list means no narrowing. ``headsigns``
     matches the trip-level headsign (the same values
-    :meth:`TransitFeedHandle.headsigns_serving` offers), so RT-added trips,
+    :meth:`TransitFeedHandle.get_headsigns_serving` offers), so RT-added trips,
     which announce no headsign, never pass a headsign filter. ``limit``
     caps the merged, filtered result for this query as a whole,
     nearest effective departure first; zero asks for an empty board.
@@ -265,10 +280,18 @@ class ArrivalsQuery:
     limit: int = 10
 
     def __post_init__(self) -> None:
-        """Reject inputs a slice or an id-iteration would silently misread."""
+        """Validate, then copy each id sequence into a tuple.
+
+        The copy is what makes the frozen query actually immutable: storing
+        the caller's list by reference would let a later ``append`` on that
+        list change a query already handed to the library.
+        """
         for name in ("stop_ids", "route_ids", "headsigns"):
-            if isinstance(getattr(self, name), str):
+            value = getattr(self, name)
+            if isinstance(value, str):
                 raise TypeError(f"{name} must be a sequence of ids, not a str")
+            if value is not None:
+                object.__setattr__(self, name, tuple(value))
         # A negative limit would slice rows off the END of the board.
         if self.limit < 0:
             raise ValueError(f"limit must be non-negative, got {self.limit}")
@@ -468,7 +491,7 @@ class VehiclePosition:
     trip_start_secs: int | None
     occupancy_status: OccupancyStatus | None
     occupancy_percentage: int | None
-    carriages: list[CarriageDetail]
+    carriages: tuple[CarriageDetail, ...]
     wheelchair_accessible: WheelchairAccess | None
     odometer: float | None
     timestamp: datetime | None
@@ -507,15 +530,15 @@ class ServiceAlert:
     effect: AlertEffect | None
     effect_detail: str | None
     severity: AlertSeverity | None
-    images: list[AlertImage]
+    images: tuple[AlertImage, ...]
     image_alternative_text: str | None
-    agency_ids: list[str]
-    route_ids: list[str]
-    route_types: list[int]
-    direction_ids: list[int]
-    stop_ids: list[str]
-    trip_ids: list[str]
-    active_periods: list[tuple[datetime | None, datetime | None]]
+    agency_ids: tuple[str, ...]
+    route_ids: tuple[str, ...]
+    route_types: tuple[int, ...]
+    direction_ids: tuple[int, ...]
+    stop_ids: tuple[str, ...]
+    trip_ids: tuple[str, ...]
+    active_periods: tuple[tuple[datetime | None, datetime | None], ...]
     url: str | None
 
     def is_active(self, at: datetime) -> bool:
@@ -533,7 +556,7 @@ class ServiceAlert:
 
 
 @dataclass(frozen=True)
-class Station:
+class GbfsStation:
     """A GBFS station: information + status merged.
 
     ``rental_uris`` passes through the station's deep-link table as
@@ -564,8 +587,12 @@ class Station:
     cross_street: str | None
     post_code: str | None
     region_id: str | None
-    vehicle_types_available: dict[str, int] | None
-    rental_uris: dict[str, str] | None
+    vehicle_types_available: Mapping[str, int] | None
+    rental_uris: Mapping[str, str] | None
+
+    def __post_init__(self) -> None:
+        """Freeze mapping fields given as plain dicts."""
+        _freeze_mappings(self, "vehicle_types_available", "rental_uris")
 
 
 @dataclass(frozen=True)
@@ -589,7 +616,11 @@ class GbfsVehicle:
     station_id: str | None
     home_station_id: str | None
     pricing_plan_id: str | None
-    rental_uris: dict[str, str] | None
+    rental_uris: Mapping[str, str] | None
+
+    def __post_init__(self) -> None:
+        """Freeze the mapping field when given as a plain dict."""
+        _freeze_mappings(self, "rental_uris")
 
 
 @dataclass(frozen=True)
@@ -616,7 +647,7 @@ class FeedInfo:
 
 
 @dataclass(frozen=True)
-class VehicleType:
+class GbfsVehicleType:
     """One vehicle type a GBFS system rents.
 
     Resolves the ``vehicle_type_id`` that stations and vehicles reference.
@@ -634,7 +665,7 @@ class VehicleType:
 
 
 @dataclass(frozen=True)
-class PricingPlan:
+class GbfsPricingPlan:
     """One pricing plan, resolving a vehicle's ``pricing_plan_id``.
 
     ``price`` is the base price in ``currency``; GBFS also allows per-km
@@ -651,7 +682,7 @@ class PricingPlan:
 
 
 @dataclass(frozen=True)
-class SystemRegion:
+class GbfsSystemRegion:
     """A named service region, resolving a station's ``region_id``."""
 
     id: str
@@ -665,7 +696,7 @@ class GbfsAlert:
     Distinct from :class:`ServiceAlert`, which is GTFS-RT: this one scopes
     to GBFS stations and regions rather than routes and trips, and its
     ``type`` is a raw string for the same reason as
-    :attr:`VehicleType.form_factor`.
+    :attr:`GbfsVehicleType.form_factor`.
     """
 
     id: str
@@ -673,14 +704,14 @@ class GbfsAlert:
     summary: str | None
     description: str | None
     url: str | None
-    station_ids: list[str]
-    region_ids: list[str]
+    station_ids: tuple[str, ...]
+    region_ids: tuple[str, ...]
     last_updated: datetime | None
-    active_periods: list[tuple[datetime | None, datetime | None]]
+    active_periods: tuple[tuple[datetime | None, datetime | None], ...]
 
 
 @dataclass(frozen=True)
-class SystemInfo:
+class GbfsSystemInfo:
     """GBFS system information."""
 
     system_id: str
@@ -688,7 +719,7 @@ class SystemInfo:
     short_name: str | None
     operator: str | None
     timezone: str | None
-    languages: list[str]
+    languages: tuple[str, ...]
     url: str | None
     purchase_url: str | None
     start_date: date | None

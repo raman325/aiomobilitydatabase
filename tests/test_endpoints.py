@@ -92,10 +92,10 @@ async def test_get_gtfs_rt_feeds_entity_types(
     feeds = await client.get_gtfs_rt_feeds(
         entity_types=[EntityType.VEHICLE_POSITIONS, EntityType.TRIP_UPDATES]
     )
-    assert feeds[0].entity_types == [
+    assert feeds[0].entity_types == (
         EntityType.VEHICLE_POSITIONS,
         EntityType.TRIP_UPDATES,
-    ]
+    )
     req = _last_request(mock_api, "/v1/gtfs_rt_feeds")
     assert req.query == {"entity_types": "vp,tu"}
 
@@ -153,7 +153,7 @@ async def test_get_gtfs_feed_gtfs_rt_feeds(
     _mock_token(mock_api)
     mock_api.get("/v1/gtfs_feeds/mdb-1210/gtfs_rt_feeds", payload=[GTFS_RT_FEED])
     feeds = await client.get_gtfs_feed_gtfs_rt_feeds("mdb-1210")
-    assert feeds[0].feed_references == ["mdb-1210"]
+    assert feeds[0].feed_references == ("mdb-1210",)
 
 
 async def test_get_gtfs_feed_availability(

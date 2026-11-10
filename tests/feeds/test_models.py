@@ -15,15 +15,15 @@ from aiomobilitydatabase.feeds.models import (
     ArrivalsQuery,
     BikesAllowed,
     CongestionLevel,
+    GbfsStation,
+    GbfsSystemInfo,
     GbfsVehicle,
     OccupancyStatus,
     PickupDropOffType,
     Route,
     ServiceAlert,
-    Station,
     Stop,
     StopArrival,
-    SystemInfo,
     VehiclePosition,
     VehicleStopStatus,
     WheelchairAccess,
@@ -146,7 +146,7 @@ def test_vehicle_and_station_construct() -> None:
         trip_start_secs=28800,
         occupancy_status=OccupancyStatus.MANY_SEATS_AVAILABLE,
         occupancy_percentage=40,
-        carriages=[],
+        carriages=(),
         wheelchair_accessible=WheelchairAccess.POSSIBLE,
         odometer=12345.6,
         timestamp=datetime(2026, 7, 31, 15, 0, tzinfo=UTC),
@@ -165,7 +165,7 @@ def test_vehicle_and_station_construct() -> None:
     assert vehicle.current_status is VehicleStopStatus.STOPPED_AT
     assert vehicle.congestion_level is CongestionLevel.RUNNING_SMOOTHLY
     assert vehicle.license_plate == "8ABC123"
-    station = Station(
+    station = GbfsStation(
         id="st1",
         name="Dock A",
         short_name="A",
@@ -205,13 +205,28 @@ def test_vehicle_and_station_construct() -> None:
         rental_uris=None,
     )
     assert gbfs_vehicle.id == "b1"
-    info = SystemInfo(
+    # Built with plain dict literals, the mapping fields are still frozen:
+    # read-only, and the model hashes. dataclasses.replace reruns the
+    # conversion, so a replaced model is frozen too.
+    assert station.rental_uris == {"web": "https://example.com/stations/st1"}
+    with pytest.raises(TypeError):
+        station.rental_uris["ios"] = "x"  # type: ignore[index]
+    hash(station)
+    restocked = dataclasses.replace(station, vehicle_types_available={"bike": 3})
+    with pytest.raises(TypeError):
+        restocked.vehicle_types_available["bike"] = 4  # type: ignore[index]
+    assert hash(restocked) != hash(station)
+    linked = dataclasses.replace(gbfs_vehicle, rental_uris={"web": "https://e.com"})
+    with pytest.raises(TypeError):
+        linked.rental_uris["web"] = "x"  # type: ignore[index]
+    hash(linked)
+    info = GbfsSystemInfo(
         system_id="sys",
         name="Test Bikes",
         short_name=None,
         operator=None,
         timezone="America/Los_Angeles",
-        languages=["en"],
+        languages=("en",),
         url=None,
         purchase_url=None,
         start_date=None,
@@ -235,19 +250,19 @@ def test_vehicle_and_station_construct() -> None:
         effect=AlertEffect.DETOUR,
         effect_detail=None,
         severity=None,
-        images=[],
+        images=(),
         image_alternative_text=None,
-        agency_ids=[],
-        route_ids=["R1"],
-        route_types=[],
-        direction_ids=[],
-        stop_ids=[],
-        trip_ids=["T1"],
-        active_periods=[(datetime(2026, 7, 1, tzinfo=UTC), None)],
+        agency_ids=(),
+        route_ids=("R1",),
+        route_types=(),
+        direction_ids=(),
+        stop_ids=(),
+        trip_ids=("T1",),
+        active_periods=((datetime(2026, 7, 1, tzinfo=UTC), None),),
         url=None,
     )
-    assert alert.route_ids == ["R1"]
-    assert alert.trip_ids == ["T1"]
+    assert alert.route_ids == ("R1",)
+    assert alert.trip_ids == ("T1",)
     route = _route("R1", short_name="10", long_name="Main Line")
     assert route.display_name == "10 Main Line"
     assert route.color == "FFD700"
@@ -286,7 +301,7 @@ def test_fixtures_are_valid() -> None:
 
 def test_arrivals_query_defaults() -> None:
     query = ArrivalsQuery(["S1", "S2"])
-    assert query.stop_ids == ["S1", "S2"]
+    assert query.stop_ids == ("S1", "S2")
     assert query.route_ids is None
     assert query.headsigns is None
     assert query.limit == 10

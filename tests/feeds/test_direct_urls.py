@@ -92,7 +92,7 @@ async def test_direct_transit_happy_path_with_etag(
     # no catalog dataset record at all.
     assert handle.static_feed_id.startswith("url-")
     assert handle.static_dataset is None
-    assert handle.rt_feeds == []
+    assert handle.rt_feeds == ()
     # Both the HEAD probe and the zip download carried the custom headers.
     for method in ("HEAD", "GET"):
         (request,) = _requests_for(mock_api, method, STATIC_PATH)
@@ -314,11 +314,11 @@ async def test_direct_rt_combined_url_deduplicated(
         service_alerts_urls=[combined_url],
     )
     assert len(handle.rt_feeds) == 1
-    assert handle.rt_feeds[0].entity_types == [
+    assert handle.rt_feeds[0].entity_types == (
         EntityType.TRIP_UPDATES,
         EntityType.VEHICLE_POSITIONS,
         EntityType.SERVICE_ALERTS,
-    ]
+    )
     [arrivals] = await handle.get_arrivals(
         [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=1), now_utc=NOW
     )

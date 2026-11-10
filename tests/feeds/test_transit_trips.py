@@ -1,4 +1,4 @@
-"""Tests for TransitFeedHandle.upcoming_trips: schedule + RT overlay."""
+"""Tests for TransitFeedHandle.get_upcoming_trips: schedule + RT overlay."""
 
 from datetime import UTC, date, datetime, timedelta
 
@@ -48,7 +48,7 @@ async def test_schedule_only_trips(
 ) -> None:
     _mock_catalog(mock_api, rt=False)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert [trip.trip_id for trip in trips] == ["T1"]
@@ -95,7 +95,7 @@ async def test_rt_origin_prediction_only(
     _mock_catalog(mock_api, rt=True)
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_DELAYED, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100", api_key="secret123")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     # The RT feed also carries an ADDED trip (ADDED-9): added trips never
@@ -119,7 +119,7 @@ async def test_rt_destination_prediction_only(
     _mock_catalog(mock_api, rt=True)
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_DEST_ARRIVAL, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert [trip.trip_id for trip in trips] == ["T1"]
@@ -140,7 +140,7 @@ async def test_rt_predictions_at_both_ends(
     _mock_catalog(mock_api, rt=True)
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_BOTH_ENDS, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert [trip.trip_id for trip in trips] == ["T1"]
@@ -163,7 +163,7 @@ async def test_rt_cancellation_drops_trip(
     handle = await feeds_client.get_transit_feed("mdb-100")
     # T1 is the only scheduled S1→S3 candidate in the window; canceling it
     # must drop the trip entirely (cancellation-wins, as in get_arrivals).
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert trips == []
@@ -180,12 +180,12 @@ async def test_skipped_origin_kills_only_that_boarding(
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_SKIP_S1, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
     assert (
-        await handle.upcoming_trips(
+        await handle.get_upcoming_trips(
             "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
         )
         == []
     )
-    later_boarding = await handle.upcoming_trips(
+    later_boarding = await handle.get_upcoming_trips(
         "S2", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert [trip.trip_id for trip in later_boarding] == ["T1"]
@@ -200,12 +200,12 @@ async def test_skipped_destination_kills_only_that_alighting(
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_SKIP_S3, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
     assert (
-        await handle.upcoming_trips(
+        await handle.get_upcoming_trips(
             "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
         )
         == []
     )
-    earlier_alighting = await handle.upcoming_trips(
+    earlier_alighting = await handle.get_upcoming_trips(
         "S1", "S2", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert [trip.trip_id for trip in earlier_alighting] == ["T1"]
@@ -222,7 +222,7 @@ async def test_skipped_intermediate_changes_nothing_for_the_ends(
     for _ in range(3):  # one queued RT response per merging call below
         mock_api.get("/rt/all", body=TRIP_UPDATES_T1_SKIP_S2, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert [trip.trip_id for trip in trips] == ["T1"]
@@ -233,7 +233,7 @@ async def test_skipped_intermediate_changes_nothing_for_the_ends(
     assert trip.predicted_departure == datetime(2026, 7, 30, 15, 5, 30, tzinfo=UTC)
     assert trip.predicted_arrival == datetime(2026, 7, 30, 15, 25, tzinfo=UTC)
     assert (
-        await handle.upcoming_trips(
+        await handle.get_upcoming_trips(
             "S1", "S2", lookahead=timedelta(hours=1), now_utc=NOW
         )
         == []
@@ -256,7 +256,7 @@ async def test_no_data_cuts_propagation_at_and_after_its_stop(
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_NO_DATA_CUT, content_type=PB)
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_NO_DATA_CUT, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert [trip.trip_id for trip in trips] == ["T1"]
@@ -287,7 +287,7 @@ async def test_trip_level_delay_fallback_covers_every_stop(
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_TRIP_DELAY, content_type=PB)
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_TRIP_DELAY, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW
     )
     assert [trip.trip_id for trip in trips] == ["T1"]
@@ -316,7 +316,7 @@ async def test_delayed_trip_survives_its_scheduled_origin_time(
     _mock_catalog(mock_api, rt=True)
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_DELAYED, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW_LATE
     )
     assert [trip.trip_id for trip in trips] == ["T1"]
@@ -329,7 +329,7 @@ async def test_zero_grace_drops_delayed_trip_at_origin_time(
     _mock_catalog(mock_api, rt=True)
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_DELAYED, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), grace=timedelta(0), now_utc=NOW_LATE
     )
     assert trips == []
@@ -340,7 +340,7 @@ async def test_past_schedule_only_trip_is_dropped(
 ) -> None:
     _mock_catalog(mock_api, rt=False)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "S1", "S3", lookahead=timedelta(hours=1), now_utc=NOW_LATE
     )
     assert trips == []
@@ -349,7 +349,7 @@ async def test_past_schedule_only_trip_is_dropped(
 async def test_services_on_answers_future_dates(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
-    """service_id on a row plus services_on(date) answers "does it run then".
+    """service_id on a row plus get_services_on(date) answers "does it run then".
 
     Neither half is useful alone: the id is opaque without a calendar
     query, and the calendar query returns opaque ids without rows naming
@@ -363,10 +363,12 @@ async def test_services_on_answers_future_dates(
 
     thursday = date(2026, 7, 30)
     saturday = date(2026, 8, 1)
-    assert weekday_service in await handle.services_on(thursday)
-    assert weekday_service not in await handle.services_on(saturday)
+    assert weekday_service in await handle.get_services_on(thursday)
+    assert weekday_service not in await handle.get_services_on(saturday)
     # The NIGHT calendar in the fixture runs on its own days.
-    assert await handle.services_on(thursday) != await handle.services_on(saturday)
+    assert await handle.get_services_on(thursday) != await handle.get_services_on(
+        saturday
+    )
 
 
 async def test_scheduled_departures_covers_a_multi_day_window(
@@ -381,7 +383,7 @@ async def test_scheduled_departures_covers_a_multi_day_window(
     _mock_catalog(mock_api, rt=False)
     handle = await feeds_client.get_transit_feed("mdb-100")
     start = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
-    rows = await handle.scheduled_departures(
+    rows = await handle.get_scheduled_departures(
         ["S1", "S2"], start=start, end=start + timedelta(days=7)
     )
     assert rows, "a week of a weekday service should not be empty"
@@ -413,8 +415,10 @@ async def test_scheduled_departures_filters_and_degenerate_windows(
     handle = await feeds_client.get_transit_feed("mdb-100")
     start = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
     end = start + timedelta(days=2)
-    everything = await handle.scheduled_departures(["S1", "S2"], start=start, end=end)
-    downtown = await handle.scheduled_departures(
+    everything = await handle.get_scheduled_departures(
+        ["S1", "S2"], start=start, end=end
+    )
+    downtown = await handle.get_scheduled_departures(
         ["S1", "S2"], start=start, end=end, headsigns=["Downtown"]
     )
     assert downtown, "the fixture has Downtown service"
@@ -423,5 +427,5 @@ async def test_scheduled_departures_filters_and_degenerate_windows(
 
     # A window that ends before it starts, and an empty stop list, are
     # questions with no answer rather than errors.
-    assert await handle.scheduled_departures(["S1"], start=end, end=start) == []
-    assert await handle.scheduled_departures([], start=start, end=end) == []
+    assert await handle.get_scheduled_departures(["S1"], start=end, end=start) == []
+    assert await handle.get_scheduled_departures([], start=start, end=end) == []

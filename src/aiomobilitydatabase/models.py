@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
@@ -80,7 +80,7 @@ class RequestMethod(StrEnum):
     GET = "GET"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Redirect(DataClassDictMixin):
     """A feed redirect to a replacement feed ID."""
 
@@ -88,7 +88,7 @@ class Redirect(DataClassDictMixin):
     comment: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class ExternalId(DataClassDictMixin):
     """An ID for the feed in an external or legacy database."""
 
@@ -96,7 +96,7 @@ class ExternalId(DataClassDictMixin):
     source: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class SourceInfo(DataClassDictMixin):
     """Information about the feed producer's source URL and license."""
 
@@ -109,10 +109,10 @@ class SourceInfo(DataClassDictMixin):
     license_id: str | None = None
     license_is_spdx: bool | None = None
     license_notes: str | None = None
-    license_tags: list[str] | None = None
+    license_tags: tuple[str, ...] | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class BoundingBox(DataClassDictMixin):
     """Geographic bounding box of a dataset."""
 
@@ -122,7 +122,7 @@ class BoundingBox(DataClassDictMixin):
     maximum_longitude: float | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Location(DataClassDictMixin):
     """Geographic location served by a feed."""
 
@@ -132,7 +132,7 @@ class Location(DataClassDictMixin):
     municipality: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class FeedRelatedLink(DataClassDictMixin):
     """A link related to a feed."""
 
@@ -142,11 +142,11 @@ class FeedRelatedLink(DataClassDictMixin):
     created_at: datetime | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class ValidationReportSummary(DataClassDictMixin):
     """Validation counts embedded in a latest-dataset summary."""
 
-    features: list[str] | None = None
+    features: tuple[str, ...] | None = None
     total_error: int | None = None
     total_warning: int | None = None
     total_info: int | None = None
@@ -155,7 +155,7 @@ class ValidationReportSummary(DataClassDictMixin):
     unique_info_count: int | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class LatestDataset(DataClassDictMixin):
     """Summary of the latest dataset for a GTFS feed."""
 
@@ -173,46 +173,46 @@ class LatestDataset(DataClassDictMixin):
     validation_report: ValidationReportSummary | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Feed(DataClassDictMixin):
     """Common feed fields shared by all feed types."""
 
     id: str | None = None
     data_type: DataType | None = None
     created_at: datetime | None = None
-    external_ids: list[ExternalId] | None = None
+    external_ids: tuple[ExternalId, ...] | None = None
     provider: str | None = None
     feed_contact_email: str | None = None
     source_info: SourceInfo | None = None
-    redirects: list[Redirect] | None = None
+    redirects: tuple[Redirect, ...] | None = None
     status: FeedStatus | None = None
     official: bool | None = None
     official_updated_at: datetime | None = None
     feed_name: str | None = None
     note: str | None = None
-    related_links: list[FeedRelatedLink] | None = None
+    related_links: tuple[FeedRelatedLink, ...] | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GtfsFeed(Feed):
     """A GTFS schedule feed."""
 
-    locations: list[Location] | None = None
+    locations: tuple[Location, ...] | None = None
     latest_dataset: LatestDataset | None = None
     bounding_box: BoundingBox | None = None
     visualization_dataset_id: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GtfsRtFeed(Feed):
     """A GTFS Realtime feed."""
 
-    entity_types: list[EntityType] | None = None
-    feed_references: list[str] | None = None
-    locations: list[Location] | None = None
+    entity_types: tuple[EntityType, ...] | None = None
+    feed_references: tuple[str, ...] | None = None
+    locations: tuple[Location, ...] | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GbfsEndpoint(DataClassDictMixin):
     """An endpoint available in a GBFS version."""
 
@@ -222,7 +222,7 @@ class GbfsEndpoint(DataClassDictMixin):
     is_feature: bool | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GbfsValidationReport(DataClassDictMixin):
     """A validation report for a GBFS feed version."""
 
@@ -232,7 +232,7 @@ class GbfsValidationReport(DataClassDictMixin):
     validator_version: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GbfsVersion(DataClassDictMixin):
     """A GBFS specification version supported by a feed."""
 
@@ -240,11 +240,11 @@ class GbfsVersion(DataClassDictMixin):
     created_at: datetime | None = None
     last_updated_at: datetime | None = None
     source: GbfsVersionSource | None = None
-    endpoints: list[GbfsEndpoint] | None = None
+    endpoints: tuple[GbfsEndpoint, ...] | None = None
     latest_validation_report: GbfsValidationReport | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GbfsFeed(Feed):
     """A GBFS feed.
 
@@ -253,15 +253,15 @@ class GbfsFeed(Feed):
     optional and unknown keys are ignored.
     """
 
-    locations: list[Location] | None = None
+    locations: tuple[Location, ...] | None = None
     system_id: str | None = None
     provider_url: str | None = None
-    versions: list[GbfsVersion] | None = None
+    versions: tuple[GbfsVersion, ...] | None = None
     bounding_box: BoundingBox | None = None
     bounding_box_generated_at: datetime | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class SearchFeedItemResult(DataClassDictMixin):
     """A single feed result from the search endpoint (union of feed types)."""
 
@@ -270,34 +270,34 @@ class SearchFeedItemResult(DataClassDictMixin):
     status: FeedStatus
     created_at: datetime | None = None
     official: bool | None = None
-    external_ids: list[ExternalId] | None = None
+    external_ids: tuple[ExternalId, ...] | None = None
     provider: str | None = None
     feed_name: str | None = None
     note: str | None = None
     feed_contact_email: str | None = None
     source_info: SourceInfo | None = None
-    redirects: list[Redirect] | None = None
-    locations: list[Location] | None = None
+    redirects: tuple[Redirect, ...] | None = None
+    locations: tuple[Location, ...] | None = None
     latest_dataset: LatestDataset | None = None
-    entity_types: list[EntityType] | None = None
-    versions: list[str] | None = None
-    feed_references: list[str] | None = None
+    entity_types: tuple[EntityType, ...] | None = None
+    versions: tuple[str, ...] | None = None
+    feed_references: tuple[str, ...] | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class SearchResults(DataClassDictMixin):
     """Response from the feed search endpoint."""
 
     total: int | None = None
-    results: list[SearchFeedItemResult] = field(default_factory=list)
+    results: tuple[SearchFeedItemResult, ...] = ()
 
 
-@dataclass
+@dataclass(frozen=True)
 class ValidationReport(DataClassDictMixin):
     """Full validation report for a GTFS dataset."""
 
     validated_at: datetime | None = None
-    features: list[str] | None = None
+    features: tuple[str, ...] | None = None
     validator_version: str | None = None
     total_error: int | None = None
     total_warning: int | None = None
@@ -309,7 +309,7 @@ class ValidationReport(DataClassDictMixin):
     url_html: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GtfsDataset(DataClassDictMixin):
     """A GTFS dataset for a feed."""
 
@@ -329,7 +329,7 @@ class GtfsDataset(DataClassDictMixin):
     unzipped_folder_size_mb: float | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GtfsFeedAvailabilityCheck(DataClassDictMixin):
     """A single availability check for a GTFS feed."""
 
@@ -341,7 +341,7 @@ class GtfsFeedAvailabilityCheck(DataClassDictMixin):
     error_type: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GtfsFeedAvailability(DataClassDictMixin):
     """Availability check history for a GTFS feed."""
 
@@ -349,10 +349,10 @@ class GtfsFeedAvailability(DataClassDictMixin):
     total: int
     offset: int
     limit: int
-    checks: list[GtfsFeedAvailabilityCheck] = field(default_factory=list)
+    checks: tuple[GtfsFeedAvailabilityCheck, ...] = ()
 
 
-@dataclass
+@dataclass(frozen=True)
 class LocationSearchResult(DataClassDictMixin):
     """A single location from the locations search endpoint."""
 
@@ -365,19 +365,19 @@ class LocationSearchResult(DataClassDictMixin):
     country_code: str | None = None
     subdivision_name: str | None = None
     subdivision_code: str | None = None
-    path_names: list[str] | None = None
+    path_names: tuple[str, ...] | None = None
     display_name: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class LocationSearchResults(DataClassDictMixin):
     """Response from the locations search endpoint."""
 
     total: int | None = None
-    results: list[LocationSearchResult] = field(default_factory=list)
+    results: tuple[LocationSearchResult, ...] = ()
 
 
-@dataclass
+@dataclass(frozen=True)
 class LicenseRule(DataClassDictMixin):
     """A rule (permission/condition/limitation) of a license."""
 
@@ -387,7 +387,7 @@ class LicenseRule(DataClassDictMixin):
     type: LicenseRuleType | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class License(DataClassDictMixin):
     """A license in the Mobility Database."""
 
@@ -399,17 +399,17 @@ class License(DataClassDictMixin):
     description: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    license_tags: list[str] | None = None
+    license_tags: tuple[str, ...] | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class LicenseWithRules(License):
     """A license including its rules."""
 
-    license_rules: list[LicenseRule] | None = None
+    license_rules: tuple[LicenseRule, ...] | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class MatchingLicense(DataClassDictMixin):
     """A license matched from a license URL."""
 
@@ -426,7 +426,7 @@ class MatchingLicense(DataClassDictMixin):
     regional_id: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Metadata(DataClassDictMixin):
     """Metadata about the API itself."""
 
@@ -434,7 +434,7 @@ class Metadata(DataClassDictMixin):
     commit_hash: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class AccessToken(DataClassDictMixin):
     """An access token response from the token endpoint."""
 

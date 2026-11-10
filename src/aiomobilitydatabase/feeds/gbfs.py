@@ -11,18 +11,19 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
+from ._frozen import FrozenDict
 from ._urls import _require_http_url  # deliberate friend access: shared URL guard
 from .const import GBFS_LANGUAGE_PREFERENCE
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
 from .models import (
     GbfsAlert,
+    GbfsPricingPlan,
+    GbfsStation,
+    GbfsSystemInfo,
+    GbfsSystemRegion,
     GbfsVehicle,
-    PricingPlan,
-    Station,
-    SystemInfo,
-    SystemRegion,
-    VehicleType,
+    GbfsVehicleType,
 )
 
 if TYPE_CHECKING:
@@ -78,7 +79,7 @@ def _version_key(version: str | None) -> tuple[int, ...]:
         return (0,)
 
 
-def _rental_uris(value: Any) -> dict[str, str] | None:
+def _rental_uris(value: Any) -> Mapping[str, str] | None:
     """Pass through a GBFS ``rental_uris`` object: platform key -> URI.
 
     Identical shape in 2.x and 3.x (``android``/``ios``/``web`` keys on
@@ -90,7 +91,7 @@ def _rental_uris(value: Any) -> dict[str, str] | None:
     if not isinstance(value, dict):
         return None
     uris = {str(key): uri for key, uri in value.items() if isinstance(uri, str)}
-    return uris or None
+    return FrozenDict(uris) if uris else None
 
 
 def _coordinate(value: Any) -> float | None:
@@ -111,7 +112,7 @@ def _coordinate(value: Any) -> float | None:
     return coordinate if math.isfinite(coordinate) else None
 
 
-def _vehicle_types(value: Any) -> dict[str, int] | None:
+def _vehicle_types(value: Any) -> Mapping[str, int] | None:
     """Normalize a station's ``vehicle_types_available`` to id -> count.
 
     Entries without a usable type id, and counts that aren't parseable as
@@ -124,7 +125,7 @@ def _vehicle_types(value: Any) -> dict[str, int] | None:
     if not isinstance(value, list):
         return None
     if not value:
-        return {}
+        return FrozenDict({})
     types: dict[str, int] = {}
     for entry in value:
         if not isinstance(entry, Mapping):
@@ -136,7 +137,7 @@ def _vehicle_types(value: Any) -> dict[str, int] | None:
             continue
         if type_id is not None:
             types[type_id] = count
-    return types or None
+    return FrozenDict(types) if types else None
 
 
 def _reported_at(value: Any) -> datetime | None:
@@ -424,7 +425,7 @@ class GbfsFeedHandle:
         self._doc_cache[name] = (time.monotonic(), ttl, document)
         return document
 
-    async def get_system_info(self) -> SystemInfo:
+    async def get_system_info(self) -> GbfsSystemInfo:
         """GBFS system information.
 
         A document without a usable ``system_id`` raises
@@ -437,13 +438,13 @@ class GbfsFeedHandle:
         )
         if system_id is None:
             raise FeedParseError("GBFS system_information document has no system_id")
-        return SystemInfo(
+        return GbfsSystemInfo(
             system_id=system_id,
             name=_localized(data.get("name")),
             short_name=_localized(data.get("short_name")),
             operator=_localized(data.get("operator")),
             timezone=_plain_text(data.get("timezone")),
-            languages=_languages(data),
+            languages=tuple(_languages(data)),
             url=_plain_text(data.get("url")),
             purchase_url=_plain_text(data.get("purchase_url")),
             start_date=_iso_date(data.get("start_date")),
@@ -467,10 +468,10 @@ class GbfsFeedHandle:
             return []
         return _rows(await self._document(name), key)
 
-    async def get_vehicle_types(self) -> list[VehicleType]:
+    async def get_vehicle_types(self) -> list[GbfsVehicleType]:
         """Vehicle types, resolving the ids stations and vehicles reference."""
         return [
-            VehicleType(
+            GbfsVehicleType(
                 id=type_id,
                 form_factor=_plain_text(row.get("form_factor")),
                 propulsion_type=_plain_text(row.get("propulsion_type")),
@@ -482,10 +483,10 @@ class GbfsFeedHandle:
             if (type_id := _record_id(row.get("vehicle_type_id"))) is not None
         ]
 
-    async def get_pricing_plans(self) -> list[PricingPlan]:
+    async def get_pricing_plans(self) -> list[GbfsPricingPlan]:
         """Pricing plans, resolving a vehicle's ``pricing_plan_id``."""
         return [
-            PricingPlan(
+            GbfsPricingPlan(
                 id=plan_id,
                 name=_localized(row.get("name")),
                 currency=_plain_text(row.get("currency")),
@@ -497,19 +498,19 @@ class GbfsFeedHandle:
             if (plan_id := _record_id(row.get("plan_id"))) is not None
         ]
 
-    async def get_regions(self) -> list[SystemRegion]:
+    async def get_regions(self) -> list[GbfsSystemRegion]:
         """Service regions, resolving a station's ``region_id``."""
         return [
-            SystemRegion(id=region_id, name=_localized(row.get("name")))
+            GbfsSystemRegion(id=region_id, name=_localized(row.get("name")))
             for row in await self._optional_rows("system_regions", "regions")
             if (region_id := _record_id(row.get("region_id"))) is not None
         ]
 
-    async def get_system_alerts(self) -> list[GbfsAlert]:
+    async def get_alerts(self) -> list[GbfsAlert]:
         """GBFS system alerts.
 
-        Named apart from the GTFS-RT ``get_alerts`` on the transit handle:
-        these scope to GBFS stations and regions, not routes and trips.
+        The same name as the transit handle's ``get_alerts``, scoped the
+        GBFS way: to stations and regions, not routes and trips.
         """
         return [
             GbfsAlert(
@@ -518,16 +519,16 @@ class GbfsFeedHandle:
                 summary=_localized(row.get("summary")),
                 description=_localized(row.get("description")),
                 url=_plain_text(row.get("url")),
-                station_ids=_id_list(row.get("station_ids")),
-                region_ids=_id_list(row.get("region_ids")),
+                station_ids=tuple(_id_list(row.get("station_ids"))),
+                region_ids=tuple(_id_list(row.get("region_ids"))),
                 last_updated=_reported_at(row.get("last_updated")),
-                active_periods=_alert_times(row.get("times")),
+                active_periods=tuple(_alert_times(row.get("times"))),
             )
             for row in await self._optional_rows("system_alerts", "alerts")
             if (alert_id := _record_id(row.get("alert_id"))) is not None
         ]
 
-    async def get_stations(self, zone: Circle | None = None) -> list[Station]:
+    async def get_stations(self, zone: Circle | None = None) -> list[GbfsStation]:
         """Stations with information and status merged by station_id.
 
         With ``zone``, only stations inside the circle are returned (stations
@@ -545,7 +546,7 @@ class GbfsFeedHandle:
         info_rows = _rows(await self._document("station_information"), "stations")
         status_rows = _rows(await self._document("station_status"), "stations")
         status_by_id = {_record_id(row.get("station_id")): row for row in status_rows}
-        stations: list[Station] = []
+        stations: list[GbfsStation] = []
         for info in info_rows:
             latitude = _coordinate(info.get("lat"))
             longitude = _coordinate(info.get("lon"))
@@ -560,7 +561,7 @@ class GbfsFeedHandle:
                 continue
             status: Mapping[str, Any] = status_by_id.get(station_id, {})
             stations.append(
-                Station(
+                GbfsStation(
                     id=station_id,
                     name=_localized(info.get("name")),
                     short_name=_localized(info.get("short_name")),
@@ -637,7 +638,7 @@ class GbfsFeedHandle:
                     # _record_id, matching _vehicle_types and
                     # get_vehicle_types: a producer using numeric type ids
                     # would otherwise yield int 7 here and "7" there, and
-                    # the VehicleType join would never match.
+                    # the GbfsVehicleType join would never match.
                     vehicle_type_id=_record_id(row.get("vehicle_type_id")),
                     current_range_m=_number(row.get("current_range_meters")),
                     current_fuel_percent=_number(row.get("current_fuel_percent")),

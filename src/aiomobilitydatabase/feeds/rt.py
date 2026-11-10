@@ -371,9 +371,11 @@ def _occupancy_percentage(holder: Any) -> int | None:
     return None if value < 0 else int(value)
 
 
-def _carriages(vehicle: gtfs_realtime_pb2.VehiclePosition) -> list[CarriageDetail]:
+def _carriages(
+    vehicle: gtfs_realtime_pb2.VehiclePosition,
+) -> tuple[CarriageDetail, ...]:
     """Per-carriage occupancy for a multi-carriage vehicle."""
-    return [
+    return tuple(
         CarriageDetail(
             id=carriage.id or None,
             label=carriage.label or None,
@@ -392,12 +394,14 @@ def _carriages(vehicle: gtfs_realtime_pb2.VehiclePosition) -> list[CarriageDetai
             else None,
         )
         for carriage in vehicle.multi_carriage_details
-    ]
+    )
 
 
-def _alert_images(image: gtfs_realtime_pb2.TranslatedImage) -> list[AlertImage]:
+def _alert_images(
+    image: gtfs_realtime_pb2.TranslatedImage,
+) -> tuple[AlertImage, ...]:
     """Every localized variant of an alert image that names a url."""
-    return [
+    return tuple(
         AlertImage(
             url=localized.url,
             media_type=localized.media_type or None,
@@ -405,7 +409,7 @@ def _alert_images(image: gtfs_realtime_pb2.TranslatedImage) -> list[AlertImage]:
         )
         for localized in image.localized_image
         if localized.url
-    ]
+    )
 
 
 def vehicles_from_message(
@@ -913,13 +917,13 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
                 ),
                 images=_alert_images(alert.image),
                 image_alternative_text=_first_translation(alert.image_alternative_text),
-                agency_ids=agency_ids,
-                route_ids=route_ids,
-                route_types=route_types,
-                direction_ids=direction_ids,
-                stop_ids=stop_ids,
-                trip_ids=trip_ids,
-                active_periods=[
+                agency_ids=tuple(agency_ids),
+                route_ids=tuple(route_ids),
+                route_types=tuple(route_types),
+                direction_ids=tuple(direction_ids),
+                stop_ids=tuple(stop_ids),
+                trip_ids=tuple(trip_ids),
+                active_periods=tuple(
                     (
                         _epoch_to_utc(period.start)
                         if period.HasField("start")
@@ -927,7 +931,7 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
                         _epoch_to_utc(period.end) if period.HasField("end") else None,
                     )
                     for period in alert.active_period
-                ],
+                ),
                 url=_first_translation(alert.url),
             )
         )

@@ -436,7 +436,7 @@ def _select_arrivals(
     return selected[: query.limit]
 
 
-def group_stations(stops: list[Stop]) -> list[StationGroup]:
+def group_stations(stops: Sequence[Stop]) -> list[StationGroup]:
     """Group boarding stops into logical stations, sorted by name.
 
     GTFS models stations as hierarchies: platforms (location_type 0, or
@@ -574,7 +574,7 @@ class TransitFeedHandle:
             assert static_feed is not None and static_feed.id is not None
             self._feed_key = static_feed.id
             self._headers = None
-        self.rt_feeds = rt_feeds
+        self._rt_feeds = tuple(rt_feeds)
         self._index = index
         self._api_key = api_key
         self._guard = _IndexGuard()
@@ -583,11 +583,11 @@ class TransitFeedHandle:
         # reused on a 304, i.e. when the producer itself states the bytes
         # are unchanged -- this is revalidation, not a TTL cache.
         self._rt_validators: dict[str, tuple[FeedValidators, Any]] = {}
-        self.stops: list[Stop] = index.stops()
-        self.routes: list[Route] = index.routes()
-        self.agencies: list[Agency] = index.agencies()
+        self._stops: tuple[Stop, ...] = tuple(index.stops())
+        self._routes: tuple[Route, ...] = tuple(index.routes())
+        self._agencies: tuple[Agency, ...] = tuple(index.agencies())
         # None when the dataset ships no feed_info.txt (an optional file).
-        self.feed_info: FeedInfo | None = index.feed_info()
+        self._feed_info: FeedInfo | None = index.feed_info()
 
     async def _index_read[T](
         self, fn: Callable[..., T], *args: object, **kwargs: object
@@ -623,6 +623,31 @@ class TransitFeedHandle:
         """
         return None if self._static_feed is None else self._static_feed.latest_dataset
 
+    @property
+    def rt_feeds(self) -> tuple[GtfsRtFeed, ...]:
+        """GTFS-RT sources this handle fetches (catalog records or synthesized)."""
+        return self._rt_feeds
+
+    @property
+    def stops(self) -> tuple[Stop, ...]:
+        """Every stop in the indexed dataset; replaced atomically on refresh."""
+        return self._stops
+
+    @property
+    def routes(self) -> tuple[Route, ...]:
+        """Every route in the indexed dataset; replaced atomically on refresh."""
+        return self._routes
+
+    @property
+    def agencies(self) -> tuple[Agency, ...]:
+        """Every agency in the indexed dataset; replaced atomically on refresh."""
+        return self._agencies
+
+    @property
+    def feed_info(self) -> FeedInfo | None:
+        """The dataset's feed_info.txt record, or None when it ships none."""
+        return self._feed_info
+
     @classmethod
     async def create(
         cls,
@@ -639,7 +664,7 @@ class TransitFeedHandle:
             rt_feeds = await catalog.get_gtfs_feed_gtfs_rt_feeds(feed_id)
         elif feed.data_type is DataType.GTFS_RT:
             rt_self = await catalog.get_gtfs_rt_feed(feed_id)
-            references = rt_self.feed_references or []
+            references = rt_self.feed_references or ()
             if not references:
                 raise StaticDataUnavailableError(
                     f"GTFS-RT feed {feed_id} has no feed_references to a static feed"
@@ -695,7 +720,7 @@ class TransitFeedHandle:
             GtfsRtFeed(
                 id=rt_url,
                 data_type=DataType.GTFS_RT,
-                entity_types=types,
+                entity_types=tuple(types),
                 source_info=SourceInfo(producer_url=rt_url, authentication_type=0),
             )
             for rt_url, types in url_types.items()
@@ -1354,7 +1379,7 @@ class TransitFeedHandle:
             )
             return [_select_arrivals(arrivals, query) for query in queries]
 
-    async def upcoming_trips(
+    async def get_upcoming_trips(
         self,
         origin_stop_id: str,
         destination_stop_id: str,
@@ -1659,7 +1684,7 @@ class TransitFeedHandle:
                 )
         return rows, touched
 
-    async def scheduled_departures(
+    async def get_scheduled_departures(
         self,
         stop_ids: Sequence[str],
         *,
@@ -1736,7 +1761,7 @@ class TransitFeedHandle:
         )
         return rows
 
-    async def services_on(self, service_date: date) -> set[str]:
+    async def get_services_on(self, service_date: date) -> set[str]:
         """Service ids running on a GTFS service date.
 
         Pairs with ``StopArrival.service_id``/``UpcomingTrip.service_id``:
@@ -1841,15 +1866,15 @@ class TransitFeedHandle:
         never leave ``static_dataset`` describing a dataset that is no
         longer the one being served.
         """
-        stops = await asyncio.to_thread(new_index.stops)
-        routes = await asyncio.to_thread(new_index.routes)
-        agencies = await asyncio.to_thread(new_index.agencies)
+        stops = tuple(await asyncio.to_thread(new_index.stops))
+        routes = tuple(await asyncio.to_thread(new_index.routes))
+        agencies = tuple(await asyncio.to_thread(new_index.agencies))
         feed_info = await asyncio.to_thread(new_index.feed_info)
         async with self._guard.writer():
             old_index = self._index
             if static_feed is not None:
                 self._static_feed = static_feed
-            self._index, self.stops, self.routes, self.agencies, self.feed_info = (
+            self._index, self._stops, self._routes, self._agencies, self._feed_info = (
                 new_index,
                 stops,
                 routes,
@@ -1877,12 +1902,12 @@ class TransitFeedHandle:
         """
         return group_stations(self.stops_in(zone))
 
-    async def routes_serving(self, stop_id: str) -> list[Route]:
+    async def get_routes_serving(self, stop_id: str) -> list[Route]:
         """Routes with scheduled service at the stop (route-filter picker)."""
         async with self._guard.reader():
             return await self._index_read(self._index.routes_serving, stop_id)
 
-    async def headsigns_serving(
+    async def get_headsigns_serving(
         self, stop_id: str, route_id: str | None = None
     ) -> list[str]:
         """Distinct headsigns at the stop (direction-filter picker options)."""
