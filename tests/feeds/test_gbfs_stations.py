@@ -605,7 +605,7 @@ async def test_system_alerts_scope_to_stations_and_regions(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
     handle = await _lookup_handle(mock_api, feeds_client)
-    [alert] = await handle.get_system_alerts()
+    [alert] = await handle.get_alerts()
     assert alert.id == "a1"
     assert alert.type == "SYSTEM_CLOSURE"
     assert alert.summary == "Closed for a storm"
@@ -637,7 +637,7 @@ async def test_unpublished_lookup_documents_are_empty_not_an_error(
     assert await handle.get_vehicle_types() == []
     assert await handle.get_pricing_plans() == []
     assert await handle.get_regions() == []
-    assert await handle.get_system_alerts() == []
+    assert await handle.get_alerts() == []
 
 
 @pytest.mark.parametrize(

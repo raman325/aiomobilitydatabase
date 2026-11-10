@@ -505,7 +505,7 @@ class GbfsFeedHandle:
             if (region_id := _record_id(row.get("region_id"))) is not None
         ]
 
-    async def get_system_alerts(self) -> list[GbfsAlert]:
+    async def get_alerts(self) -> list[GbfsAlert]:
         """GBFS system alerts.
 
         Named apart from the GTFS-RT ``get_alerts`` on the transit handle:
