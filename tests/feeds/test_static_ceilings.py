@@ -108,6 +108,25 @@ def test_unparseable_calendar_dates_are_never_active(tmp_path: Path) -> None:
     assert index.departures_ceiling(["S1"]) is None
 
 
+def test_realtime_index_helpers_accept_empty_input(tmp_path: Path) -> None:
+    index = _index(
+        tmp_path,
+        calendar="ALL,1,1,1,1,1,1,1,20260101,20261231\n",
+        stop_times=_TWO_STOPS,
+    )
+    at = datetime(2026, 7, 30, 7, tzinfo=UTC)
+    assert index.trips_ceiling([], frozenset(), 0) is None
+    assert index.instance_calls([]) == {}
+    assert index.rt_instances([], at) == []
+    # A trip with calls, addressed on a day its service runs and one it doesn't.
+    assert index.rt_instances(
+        [("T1", date(2026, 7, 30), None), ("T1", date(2027, 1, 1), None)], at
+    ) == [(("T1", date(2026, 7, 30)), ("T1", date(2026, 7, 30), None))]
+    assert index.trips_ceiling(["T1"], frozenset({date(2026, 3, 1)}), 600) == (
+        datetime(2026, 3, 1, 8, 20, tzinfo=UTC)
+    )
+
+
 def test_current_service_dates_edges(tmp_path: Path) -> None:
     index = _index(
         tmp_path,

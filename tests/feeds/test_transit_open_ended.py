@@ -55,6 +55,10 @@ def _mock_catalog(
 def _bundled_message() -> bytes:
     message = gtfs_realtime_pb2.FeedMessage()
     message.ParseFromString(TRIP_UPDATES_BASELINE)
+    # Served as a live feed: stamped at the tests' "now" (the fixture's own
+    # timestamp is an arbitrary parsing-test epoch, a day later), since a
+    # date-less update addresses the run current at the feed's time.
+    message.header.timestamp = int(_pdt(7, 30, 7, 45).timestamp())
     vehicles = gtfs_realtime_pb2.FeedMessage()
     vehicles.ParseFromString(VEHICLE_POSITIONS)
     message.entity.extend(vehicles.entity)
@@ -471,3 +475,59 @@ async def test_vehicles_match_their_own_run_only(
         ("T1", _pdt(7, 31, 8, 0, 30)): "FRIDAY",
         ("T2", _pdt(7, 31, 8, 30, 30)): None,  # not the current T2 run
     }
+
+
+async def test_a_dated_added_trip_keeps_its_vehicle(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """An RT-added trip naming its start_date still gets its vehicle."""
+    _mock_catalog(mock_api, rt=True)
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    message.header.timestamp = int(_pdt(7, 30, 7, 45).timestamp())
+    added = message.entity.add()
+    added.id = "added"
+    added.trip_update.trip.trip_id = "NEWT"
+    added.trip_update.trip.start_date = "20260730"
+    added.trip_update.trip.schedule_relationship = (
+        gtfs_realtime_pb2.TripDescriptor.ADDED
+    )
+    stu = added.trip_update.stop_time_update.add()
+    stu.stop_id = "S1"
+    stu.departure.time = int(_pdt(7, 30, 8, 15).timestamp())
+    message.entity.append(_vehicle("BUS9", "NEWT", start_date="20260730"))
+    for _ in range(2):
+        mock_api.get("/rt/all", body=message.SerializeToString(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [board] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"], route_ids=None, limit=None)],
+        start=_pdt(7, 30, 7, 45),
+        end=_pdt(7, 30, 9, 0),
+        with_vehicles=True,
+    )
+    [newt] = [row for row in board if row.trip_id == "NEWT"]
+    assert newt.vehicle is not None
+    assert newt.vehicle.vehicle_id == "BUS9"
+
+
+async def test_dateless_realtime_is_judged_at_the_feeds_time_not_the_boards(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A board for tomorrow morning must not move today's cancellation.
+
+    The feed is stamped Thursday 07:45 and cancels T1 without a date: it
+    means Thursday's run. Asked for Friday morning's board, Friday's T1
+    must still be there.
+    """
+    _mock_catalog(mock_api, rt=True)
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.ParseFromString(_feed_message(_trip_update("T1", canceled=True)))
+    message.header.timestamp = int(_pdt(7, 30, 7, 45).timestamp())
+    for _ in range(2):
+        mock_api.get("/rt/all", body=message.SerializeToString(), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    query = [ArrivalsQuery(["S1"], route_ids=["R1"], limit=1)]
+    [today] = await handle.get_arrivals(query, start=_pdt(7, 30, 7, 45))
+    [tomorrow] = await handle.get_arrivals(query, start=_pdt(7, 31, 7, 45))
+    assert _times(today) == [("T2", _pdt(7, 30, 8, 30, 30))]  # Thursday's T1 gone
+    assert _times(tomorrow) == [("T1", _pdt(7, 31, 8, 0, 30))]  # Friday's stays

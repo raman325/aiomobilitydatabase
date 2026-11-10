@@ -510,6 +510,10 @@ def _bundled_message(*, extra_vehicles: tuple[tuple[str, str], ...] = ()) -> byt
     """
     message = gtfs_realtime_pb2.FeedMessage()
     message.ParseFromString(TRIP_UPDATES_BASELINE)
+    # Served as a live feed: stamped at the tests' "now" (the fixture's own
+    # timestamp is an arbitrary parsing-test epoch, a day later), since a
+    # date-less update addresses the run current at the feed's time.
+    message.header.timestamp = int(NOW.timestamp())
     vehicles = gtfs_realtime_pb2.FeedMessage()
     vehicles.ParseFromString(VEHICLE_POSITIONS)
     message.entity.extend(vehicles.entity)

@@ -541,6 +541,7 @@ class AddedStopTime:
     arrival: datetime | None
     departure: datetime | None
     vehicle_id: str | None
+    start_date: date | None = None
 
 
 @dataclass(frozen=True)
@@ -620,6 +621,9 @@ class TripUpdates:
     trips: dict[TripUpdateKey, TripUpdateEntry] = field(default_factory=dict)
     canceled_trips: set[TripUpdateKey] = field(default_factory=set)
     added: list[AddedStopTime] = field(default_factory=list)
+    # When the producer built this snapshot (header.timestamp), the instant
+    # "the current service day" is judged at. None when absent or zero.
+    feed_time: datetime | None = None
 
 
 def resolve_trip_predictions(
@@ -744,6 +748,8 @@ def _trip_start_date(trip: gtfs_realtime_pb2.TripDescriptor) -> date | None:
 def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpdates:
     """Index TripUpdate entities by their (trip_id, start_date, start_secs) key."""
     updates = TripUpdates()
+    if message.header.HasField("timestamp") and message.header.timestamp:
+        updates.feed_time = _epoch_to_utc(message.header.timestamp)
     canceled = gtfs_realtime_pb2.TripDescriptor.CANCELED
     added = gtfs_realtime_pb2.TripDescriptor.ADDED
     for entity in message.entity:
@@ -787,6 +793,7 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
                         arrival=arrival,
                         departure=departure,
                         vehicle_id=vehicle_id,
+                        start_date=start_date,
                     )
                 )
             else:

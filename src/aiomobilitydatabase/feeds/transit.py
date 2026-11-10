@@ -267,6 +267,7 @@ def _match_vehicle(
     service_date: date | None,
     current_dates: Mapping[_RtIdentity, date],
     vehicles: _Vehicles,
+    scheduled: bool = True,
 ) -> VehiclePosition | None:
     """Return the vehicle serving a row, or None if it is not pinnable.
 
@@ -281,17 +282,21 @@ def _match_vehicle(
     template id, not its synthetic ``{trip_id}#{start_secs}`` id). A
     repetition is addressed by (template id, its start); a vehicle that
     names no start_time has not said which repetition it means, so it
-    serves whichever repetition asks -- the TripUpdates path's leniency.
-    ``service_date=None`` is an RT-added row with no schedule: only a
-    vehicle naming no day can match it.
+    serves whichever repetition of the current run asks. (This is more
+    lenient than TripUpdates, where an update without start_time matches
+    no repetition: a position is display-only, a prediction is not.)
+    ``scheduled=False`` is an RT-added row: it matches a vehicle naming
+    its ``service_date`` (the added trip's own start_date, possibly None)
+    or naming no day at all.
     """
     if vehicle_id and (vehicle := vehicles.by_vehicle_id.get(vehicle_id)) is not None:
         return vehicle
     if not plain_trip_id:
         return None
+    # An RT-added row has no schedule to judge "current" against: a vehicle
+    # naming no day may ride it, as may one naming the row's own day.
     is_current = (
-        service_date is None
-        or current_dates.get((plain_trip_id, start_secs)) == service_date
+        not scheduled or current_dates.get((plain_trip_id, start_secs)) == service_date
     )
     for secs in (start_secs, None) if start_secs is not None else (None,):
         if service_date is not None and (
@@ -362,7 +367,9 @@ def _apply_modification(
             # A replacement naming a stop nothing defines cannot be placed
             # on a map or named in a board.
             continue
-        if replacement.travel_time_to_stop is None:
+        if replacement.travel_time_to_stop is None or anchor_time is None:
+            # Untimed: no travel time, or an untimed reference call to
+            # measure it from. Placing it anyway would invent a time.
             continue
         when = anchor_time + timedelta(seconds=replacement.travel_time_to_stop)
         replacements.append(
@@ -386,7 +393,7 @@ def _apply_modification(
             stop_sequence=call.stop_sequence,
             stop_id=call.stop_id,
             arrival=call.arrival + delay if call.arrival else None,
-            departure=call.departure + delay,
+            departure=call.departure + delay if call.departure else None,
             pickup_type=call.pickup_type,
             drop_off_type=call.drop_off_type,
             timepoint_exact=call.timepoint_exact,
@@ -433,12 +440,29 @@ def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
 # span, then doubling. Two hours covers a daytime board in one pass.
 _INITIAL_HORIZON = timedelta(hours=2)
 
-# How far early a realtime prediction may run and still be caught by an
-# open-ended realtime query. A trip scheduled just past a horizon but
-# predicted early would sort INSIDE the board, so a horizon only settles
-# once the board's last row is at least this far inside it. Schedule-only
-# queries use no margin: without predictions, schedule order is final.
-_RT_EARLY_MARGIN = timedelta(hours=1)
+
+def _realtime_now(updates: TripUpdates, start: datetime) -> datetime:
+    """Return the instant realtime describes: the feed's time, else the present.
+
+    "The current service day" of a date-less update is judged at the
+    producer's header timestamp, not at the query's ``start`` -- a board
+    for tomorrow morning must not move today's cancellation onto
+    tomorrow's run. A feed without a timestamp (the spec requires one)
+    falls back to now, but never later than ``start``: realtime describes
+    the present, and a query about the past is answered as of its start.
+    """
+    if updates.feed_time is not None:
+        return updates.feed_time
+    return min(start, datetime.now(UTC))
+
+
+def _later(first: datetime | None, second: datetime | None) -> datetime | None:
+    """Return the later of two optional instants (None when both are None)."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return max(first, second)
 
 
 def _require_bound(end: datetime | None, limits: Sequence[int | None]) -> None:
@@ -1193,6 +1217,10 @@ class TransitFeedHandle:
             aggregate.trips.update(updates.trips)
             aggregate.canceled_trips |= updates.canceled_trips
             aggregate.added.extend(updates.added)
+            if updates.feed_time is not None and (
+                aggregate.feed_time is None or updates.feed_time > aggregate.feed_time
+            ):
+                aggregate.feed_time = updates.feed_time
         return aggregate
 
     async def _resolve_predictions(
@@ -1258,11 +1286,14 @@ class TransitFeedHandle:
         pass reading only the new slice, only for boards still filling,
         with route/headsign filters applied in SQL, and never past the last
         instant any departure matching that query can occur (none: one
-        pass). A limited board is final once it is full with its last row
-        at least ``_RT_EARLY_MARGIN`` inside the horizon, so a trip
-        scheduled just beyond it but running early can't be missed; the
-        answer is the same as reading the whole window at once. Realtime is
-        fetched once, before the first slice. Open-ended queries need a
+        pass). Detours widen that bound by how late a detoured trip can
+        reach. A limited board is final once it is full with its last row
+        inside the horizon by at least how early the feed runs anything --
+        its earliest prediction against schedule, and its most negative
+        detour travel time or delay -- so no row beyond the horizon can
+        sort ahead of it. The answer is exactly that of reading the whole
+        window at once, for any feed. Realtime is fetched once, before the
+        first slice. Open-ended queries need a
         limit: ``end=None`` with any ``limit=None`` query raises
         ``ValueError``. ``end < start`` returns empty boards.
 
@@ -1307,7 +1338,9 @@ class TransitFeedHandle:
         a dated prediction or cancellation affects only the instance whose
         service day it names — an early-posted "trip X canceled tomorrow"
         never cancels today's departure — while a date-less one affects
-        only the currently-active (earliest in-window) instance.
+        only the trip's current run, judged at the feed's own timestamp
+        (see :meth:`StaticIndex.current_service_dates`), so a board for
+        tomorrow morning never moves today's update onto tomorrow's run.
 
         ``with_vehicles`` attaches each row's live
         :class:`VehiclePosition` when one can be pinned down -- off by
@@ -1354,8 +1387,19 @@ class TransitFeedHandle:
             # Per query, the last instant a matching departure can occur
             # (None: never) bounds how far any scan reads. With none at all,
             # one pass still lets RT-added rows through.
+            current_at = _realtime_now(updates, start) - grace
+            margin = await self._early_margin(updates, modifications, current_at)
+            # A detour can put rows where and when the schedule has none
+            # (a pop-up stop, a long diversion), so its trips' reach widens
+            # every query's ceiling.
+            detours = await self._detour_ceiling(modifications)
             ceilings = [
-                await self._index_read(self._index.departures_ceiling, *_filters(q))
+                _later(
+                    await self._index_read(
+                        self._index.departures_ceiling, *_filters(q)
+                    ),
+                    detours,
+                )
                 for q in queries
             ]
             ceiling = max((c for c in ceilings if c is not None), default=None)
@@ -1386,6 +1430,7 @@ class TransitFeedHandle:
                     start=start,
                     end=horizon,
                     grace=grace,
+                    current_at=current_at,
                     updates=updates,
                     modifications=modifications,
                     rt_stops=rt_stops,
@@ -1402,13 +1447,91 @@ class TransitFeedHandle:
                             [[_effective_departure(row, start) for row in board]],
                             [queries[i].limit],
                             horizon,
-                            _RT_EARLY_MARGIN,
+                            margin,
                         )
                     ):
                         boards[i] = board
                 if all(board is not None for board in boards):
                     break
             return [board or [] for board in boards]
+
+    async def _early_margin(
+        self,
+        updates: TripUpdates,
+        modifications: Sequence[TripModifications],
+        current_at: datetime,
+    ) -> timedelta:
+        """How far ahead of its schedule any realtime row can appear.
+
+        A row the scan has not read yet is scheduled after the horizon; it
+        can only sort earlier if realtime moves it earlier. That happens to
+        exactly the runs the feed addresses (by their predictions) and to
+        detoured runs (by negative travel times or propagated delays), so
+        the largest such shift is computed from the feed itself. A board
+        settled with its last row this far inside the horizon is final --
+        the same answer as reading the whole window, for any feed. Caller
+        holds the reader guard.
+        """
+        early = 0.0
+        for trip_modifications in modifications:
+            for modification in trip_modifications.modifications:
+                early = max(early, -modification.propagated_delay_seconds)
+                for replacement in modification.replacements:
+                    if replacement.travel_time_to_stop is not None:
+                        early = max(early, -replacement.travel_time_to_stop)
+        instances = dict(
+            await self._index_read(
+                self._index.rt_instances, list(updates.trips), current_at
+            )
+        )
+        if instances:
+            resolved = await self._resolve_predictions(updates, instances)
+            calls = await self._index_read(self._index.instance_calls, list(instances))
+            for instance, trip_rt in resolved.items():
+                for call in calls[instance]:
+                    prediction = trip_rt.predictions.get(call.stop_sequence)
+                    if prediction is None:
+                        continue
+                    for explicit, scheduled in (
+                        (prediction.departure, call.departure),
+                        (prediction.arrival, call.arrival),
+                    ):
+                        predicted = _predicted_time(
+                            explicit, scheduled, prediction.delay_seconds
+                        )
+                        if predicted is not None and scheduled is not None:
+                            early = max(early, (scheduled - predicted).total_seconds())
+        return timedelta(seconds=early)
+
+    async def _detour_ceiling(
+        self, modifications: Sequence[TripModifications]
+    ) -> datetime | None:
+        """Latest instant any detoured trip's rebuilt calls can reach."""
+        latest: datetime | None = None
+        for trip_modifications in modifications:
+            extra = max(
+                (
+                    max(
+                        modification.propagated_delay_seconds,
+                        *(
+                            replacement.travel_time_to_stop or 0
+                            for replacement in modification.replacements
+                        ),
+                    )
+                    for modification in trip_modifications.modifications
+                ),
+                default=0,
+            )
+            latest = _later(
+                latest,
+                await self._index_read(
+                    self._index.trips_ceiling,
+                    sorted(trip_modifications.trip_ids),
+                    trip_modifications.service_dates,
+                    extra,
+                ),
+            )
+        return latest
 
     async def _current_runs(
         self,
@@ -1451,6 +1574,7 @@ class TransitFeedHandle:
         start: datetime,
         end: datetime,
         grace: timedelta,
+        current_at: datetime,
         updates: TripUpdates,
         modifications: Sequence[TripModifications],
         rt_stops: Mapping[str, Stop],
@@ -1503,7 +1627,7 @@ class TransitFeedHandle:
             [(dep.trip_id, dep.source_trip_id, dep.start_secs) for dep in scheduled],
             updates,
             vehicles,
-            start - grace,
+            current_at,
         )
         resolved = await self._resolve_predictions(
             updates,
@@ -1607,9 +1731,10 @@ class TransitFeedHandle:
                         row.vehicle_id,
                         row.trip_id,
                         None,
-                        service_date=None,
+                        service_date=row.start_date,
                         current_dates={},
                         vehicles=vehicles,
+                        scheduled=False,
                     ),
                     headsign=None,
                     scheduled_arrival=None,
@@ -1702,7 +1827,8 @@ class TransitFeedHandle:
         ``TripDescriptor.start_date`` service-day matching also follows
         :meth:`get_arrivals` exactly: a dated update or cancellation
         affects only its named service day's instance, a date-less one
-        only the earliest in-window instance (see :func:`_rt_key_for_row`).
+        only the trip's current run as of the feed's timestamp (see
+        :func:`_rt_key_for_row`).
 
         ``with_vehicles`` attaches the live :class:`VehiclePosition` running
         each journey, exactly as :meth:`get_arrivals` does; ``vehicle_id``
@@ -1725,6 +1851,8 @@ class TransitFeedHandle:
             vehicles = _vehicle_index(
                 await self._vehicles_from(vehicle_messages, stops_by_id, routes_by_id)
             )
+            current_at = _realtime_now(updates, start) - grace
+            margin = await self._early_margin(updates, (), current_at)
             results: list[list[UpcomingTrip]] = []
             for query in queries:
                 rows: list[UpcomingTrip] = []
@@ -1767,6 +1895,7 @@ class TransitFeedHandle:
                             start=start,
                             end=horizon,
                             grace=grace,
+                            current_at=current_at,
                             updates=updates,
                             stops_by_id=stops_by_id,
                             routes_by_id=routes_by_id,
@@ -1777,7 +1906,7 @@ class TransitFeedHandle:
                         [[_effective_trip_departure(row) for row in rows]],
                         [query.limit],
                         horizon,
-                        _RT_EARLY_MARGIN,
+                        margin,
                     ):
                         break
                 results.append(rows)
@@ -1790,6 +1919,7 @@ class TransitFeedHandle:
         start: datetime,
         end: datetime,
         grace: timedelta,
+        current_at: datetime,
         updates: TripUpdates,
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
@@ -1812,7 +1942,7 @@ class TransitFeedHandle:
             ],
             updates,
             vehicles,
-            start - grace,
+            current_at,
         )
         resolved = await self._resolve_predictions(
             updates,
@@ -2050,7 +2180,12 @@ class TransitFeedHandle:
             touched.add((instance.trip_id, instance.service_date))
             route = routes_by_id.get(instance.route_id)
             for call in calls:
-                if call.stop_id not in wanted_stops or call.departure > horizon:
+                # An untimed call is never a row, as in the schedule itself.
+                if (
+                    call.stop_id not in wanted_stops
+                    or call.departure is None
+                    or call.departure > horizon
+                ):
                     continue
                 rows.append(
                     StopArrival(

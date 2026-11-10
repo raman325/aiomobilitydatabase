@@ -240,17 +240,20 @@ Notes on direct mode:
   as soon as it is settled, bounded or not. A board stops scanning once
   nothing more can match: past the last day any service that serves its stops,
   routes and headsigns runs — so a filter matching nothing, a seasonal
-  route, or a calendar running "forever" all end promptly. Realtime is
-  fetched once, and a realtime board only settles once its last row sits
-  an hour inside the horizon: a trip scheduled just beyond it but running
-  early can't be missed. An open-ended query with no limit raises
-  `ValueError`. `end` bounds scheduled times; a delayed trip predicted past
-  it, and RT-added trips, still show.
+  route, or a calendar running "forever" all end promptly; a detour widens
+  that by how late a detoured trip can reach. Realtime is fetched once, and
+  a realtime board only settles once its last row sits inside the horizon
+  by at least how early the feed runs anything (its earliest prediction
+  against schedule, its most negative detour shift), so the answer is
+  exactly that of reading the whole window. An open-ended query with no
+  limit raises `ValueError`. `end` bounds scheduled times; a delayed trip
+  predicted past it, and RT-added trips, still show.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
   or vehicle with no `start_date` applies only to the trip's run that is
-  under way or still to come today (including last night's past-midnight
-  run) — never to tomorrow's, however wide the window. A dated one applies
-  to exactly its day.
+  under way or still to come on the feed's own day (including last night's
+  past-midnight run), judged at the feed's header timestamp — never to
+  tomorrow's, however wide the window or late the board's `start`. A dated
+  one applies to exactly its day, including an RT-added trip's vehicle.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic
   `{trip_id}#{start_secs}` ids, so every schedule query — arrivals,

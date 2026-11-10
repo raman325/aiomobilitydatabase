@@ -331,7 +331,8 @@ class TripCall:
     stop_sequence: int
     stop_id: str
     arrival: datetime | None
-    departure: datetime
+    # None for an untimed call (GTFS allows untimed intermediate stops).
+    departure: datetime | None
     pickup_type: PickupDropOffType | None
     drop_off_type: PickupDropOffType | None
     timepoint_exact: bool | None
@@ -879,12 +880,24 @@ class StaticIndex:
             if not template:
                 continue  # dangling reference: nothing to repeat
             first_arrival, first_departure = template[0][1], template[0][2]
-            anchor = first_arrival if first_arrival is not None else first_departure
-            if anchor is None:
+            if first_arrival is None and first_departure is None:
                 raise ValueError(
                     f"frequency trip {trip_id!r} has no first-stop time "
                     "to anchor repetition offsets"
                 )
+            # Anchor on the template's EARLIEST time. For a valid template
+            # (times never decrease along the trip) that is the first
+            # stop's arrival, as before. For an invalid one -- a first stop
+            # arriving after it departs, a later call timed before an
+            # earlier one -- anchoring on the first arrival would shift
+            # some calls before the repetition's own service day starts,
+            # which every day-window scan assumes cannot happen.
+            anchor = min(
+                secs
+                for _stop_id, arrival, departure, *_rest in template
+                for secs in (arrival, departure)
+                if secs is not None
+            )
             conn.execute("DELETE FROM stop_times WHERE trip_id = ?", (trip_id,))
             starts: set[int] = set()
             for start_secs, end_secs, headway_secs in trip_spans:
@@ -1243,7 +1256,11 @@ class StaticIndex:
                                     if row[13] is not None
                                     else None
                                 ),
-                                departure=day_start_utc + timedelta(seconds=row[14]),
+                                departure=(
+                                    day_start_utc + timedelta(seconds=row[14])
+                                    if row[14] is not None
+                                    else None
+                                ),
                                 pickup_type=_enum_or_none(PickupDropOffType, row[15]),
                                 drop_off_type=_enum_or_none(PickupDropOffType, row[16]),
                                 timepoint_exact=_timepoint_exact(row[17]),
@@ -1391,12 +1408,20 @@ class StaticIndex:
         self._last_dates = last
         return last
 
-    def _ceiling_from(self, rows: Iterable[tuple[str, int]]) -> datetime | None:
-        """Latest instant across (service id, latest stop-time secs) rows."""
+    def _ceiling_from(
+        self, rows: Iterable[tuple[str, int]], *, last_date_cap: date | None = None
+    ) -> datetime | None:
+        """Latest instant across (service id, latest stop-time secs) rows.
+
+        ``last_date_cap`` bounds every service's last date further (a
+        modification naming its service dates applies to no later day).
+        """
         last_dates = self._service_last_dates()
         best: datetime | None = None
         for service_id, max_secs in rows:
             last = last_dates.get(service_id)
+            if last is not None and last_date_cap is not None:
+                last = min(last, last_date_cap)
             if last is None or max_secs is None:
                 continue
             try:
@@ -1422,6 +1447,12 @@ class StaticIndex:
         open-ended query over these filters has nothing to scan for. Far
         tighter than the feed's own end: a filter matching nothing ends at
         once, and a seasonal route ends with its season.
+
+        An upper bound, not an exact last departure: calendar removals and
+        a date range that never falls on one of its weekdays are ignored.
+        The one costly case is a filter matched only by a placeholder
+        service running to a far year with almost no active days, which
+        scans day by day to its end -- rare enough to accept.
         """
         if not stop_ids:
             return None
@@ -1462,6 +1493,135 @@ class StaticIndex:
             (origin_stop_id, destination_stop_id),
         )
         return self._ceiling_from(rows)
+
+    def trips_ceiling(
+        self,
+        source_trip_ids: Sequence[str],
+        service_dates: frozenset[date],
+        extra_secs: int,
+    ) -> datetime | None:
+        """Latest instant any run of these trips can reach, plus ``extra_secs``.
+
+        Bounds the rows a trip modification (detour) can produce: replacement
+        stops are timed from a call of the trip itself, so no rebuilt call
+        lands later than the trip's latest scheduled time on its last
+        runnable day plus the modification's largest travel time and delay
+        (``extra_secs``). ``service_dates``, when given, restricts the runs
+        to those days. ``source_trip_ids`` are producer-facing ids (a
+        frequency template covers every repetition). None: no such run.
+        """
+        if not source_trip_ids:
+            return None
+        rows = self._conn.execute(
+            "SELECT t.service_id, MAX(MAX(COALESCE(st.arrival_secs, -1), "
+            "COALESCE(st.departure_secs, -1))) "
+            "FROM trips t JOIN stop_times st ON st.trip_id = t.id "
+            f"WHERE t.source_trip_id IN ({','.join('?' * len(source_trip_ids))}) "
+            "GROUP BY t.service_id",
+            list(source_trip_ids),
+        ).fetchall()
+        return self._ceiling_from(
+            [
+                (service_id, secs + max(0, extra_secs))
+                for service_id, secs in rows
+                if secs is not None and secs >= 0
+            ],
+            last_date_cap=max(service_dates) if service_dates else None,
+        )
+
+    def rt_instances[K: tuple[str, date | None, int | None]](
+        self, keys: Iterable[K], at: datetime
+    ) -> list[tuple[tuple[str, date], K]]:
+        """Resolve TripUpdate keys to the concrete runs they address.
+
+        Each key is ``(source trip id, start_date or None, start_secs or
+        None)``. Its trip resolves the way the merge matches rows: a plain
+        trip only by a key without start_secs, a frequency repetition only
+        by its own start. A dated key addresses that day's run if the
+        trip's service runs that day; a date-less key its current run as of
+        ``at`` (:meth:`current_service_dates`). Returns ``((concrete trip
+        id, service date), key)`` pairs.
+        """
+        keys = list(keys)
+        if not keys:
+            return []
+        sources = sorted({source for source, _day, _secs in keys})
+        # Only trips with calls: a frequency template keeps its trips row
+        # after its calls move to the materialized repetitions, and a run
+        # with no calls is not a run any row could come from.
+        trips = self._conn.execute(
+            "SELECT id, source_trip_id, start_secs, service_id FROM trips t "
+            f"WHERE source_trip_id IN ({','.join('?' * len(sources))}) "
+            "AND EXISTS (SELECT 1 FROM stop_times st WHERE st.trip_id = t.id)",
+            sources,
+        ).fetchall()
+        by_identity = {(source, secs): trip_id for trip_id, source, secs, _ in trips}
+        service_of = {trip_id: service for trip_id, _, _, service in trips}
+        dateless = [
+            trip_id
+            for source, day, secs in keys
+            if day is None and (trip_id := by_identity.get((source, secs)))
+        ]
+        current = self.current_service_dates(dateless, at)
+        active: dict[date, set[str]] = {}
+        found: list[tuple[tuple[str, date], K]] = []
+        for key in keys:
+            source, day, secs = key
+            trip_id = by_identity.get((source, secs))
+            if trip_id is None:
+                continue
+            if day is None:
+                if trip_id in current:
+                    found.append(((trip_id, current[trip_id]), key))
+                continue
+            if day not in active:
+                active[day] = self.active_service_ids(day)
+            if service_of[trip_id] in active[day]:
+                found.append(((trip_id, day), key))
+        return found
+
+    def instance_calls(
+        self, instances: Sequence[tuple[str, date]]
+    ) -> dict[tuple[str, date], list[TripCall]]:
+        """Each (concrete trip, service day) run's timed calls, as instants.
+
+        Calls without a departure time are left out: callers compare these
+        against predicted times, and an untimed call has nothing to compare.
+        """
+        if not instances:
+            return {}
+        trip_ids = sorted({trip_id for trip_id, _ in instances})
+        rows = self._conn.execute(
+            "SELECT trip_id, stop_sequence, stop_id, arrival_secs, departure_secs, "
+            "pickup_type, drop_off_type, timepoint, stop_headsign FROM stop_times "
+            f"WHERE trip_id IN ({','.join('?' * len(trip_ids))}) "
+            "AND departure_secs IS NOT NULL ORDER BY trip_id, stop_sequence",
+            trip_ids,
+        ).fetchall()
+        by_trip: dict[str, list[Any]] = {}
+        for row in rows:
+            by_trip.setdefault(row[0], []).append(row)
+        calls: dict[tuple[str, date], list[TripCall]] = {}
+        for trip_id, service_date in instances:
+            day_start = self._service_day_start(service_date).astimezone(UTC)
+            calls[(trip_id, service_date)] = [
+                TripCall(
+                    stop_sequence=row[1],
+                    stop_id=row[2],
+                    arrival=(
+                        day_start + timedelta(seconds=row[3])
+                        if row[3] is not None
+                        else None
+                    ),
+                    departure=day_start + timedelta(seconds=row[4]),
+                    pickup_type=_enum_or_none(PickupDropOffType, row[5]),
+                    drop_off_type=_enum_or_none(PickupDropOffType, row[6]),
+                    timepoint_exact=_timepoint_exact(row[7]),
+                    stop_headsign=row[8],
+                )
+                for row in by_trip.get(trip_id, [])
+            ]
+        return calls
 
     def current_service_dates(
         self, trip_ids: Sequence[str], at: datetime

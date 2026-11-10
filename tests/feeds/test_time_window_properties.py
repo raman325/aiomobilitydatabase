@@ -1,15 +1,30 @@
-"""Property tests for the start/end/limit window and open-ended scanning.
+"""Property tests for the start/end/limit window and incremental scanning.
 
-The central law: an open-ended query (``end=None``, ``limit=k``) returns
-exactly the first ``k`` rows of the same query bounded at the feed's scan
-ceiling. Expanding horizons are an optimization; this law says they never
-change an answer. It is checked for every dated query, schedule-only and
-realtime, including realtime predictions running up to the early margin.
+The central laws: a dated query's answer does not depend on how it was
+scanned. An open-ended query (``end=None``, ``limit=k``) returns exactly the
+first ``k`` rows of the same query bounded beyond the end of service; a
+bounded query with ``limit=k`` returns exactly the first ``k`` rows of the
+unlimited one; a larger limit only appends; a batch equals its queries run
+alone. Expanding horizons, per-query freezing, SQL pushdown and ceilings are
+optimizations these laws say never change an answer.
+
+They are checked over generated feeds in several timezones, with and
+without frequency-based trips, under generated realtime: delays and
+explicit times running arbitrarily early or late, cancellations, RT-added
+trips, detours (to pop-up stops, with negative travel times and propagated
+delays) and vehicles -- each dated or date-less, with or without a feed
+timestamp. Which run a date-less update addresses is checked separately
+against an oracle built from the raw feed files.
 """
 
 import asyncio
+import csv
+import io
+import zipfile
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from google.transit import gtfs_realtime_pb2
 from hypothesis import HealthCheck, event, given, reject, settings
@@ -25,7 +40,6 @@ from aiomobilitydatabase.feeds.models import (
 )
 from aiomobilitydatabase.feeds.static_index import StaticIndex
 from aiomobilitydatabase.feeds.transit import (
-    _RT_EARLY_MARGIN,
     TransitFeedHandle,
     _DirectUrls,
     _horizon_settles,
@@ -37,34 +51,371 @@ from tests.feeds.test_properties import _index_from_zip_bytes, _random_gtfs_zip
 _SETTINGS = settings(
     max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow]
 )
+_RT_SETTINGS = settings(
+    max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow]
+)
 
-# The generated calendars run 2026-01-01 .. 2027-12-31, with stop times up
-# to 47:59:59, so nothing is scheduled after this instant. Bounded queries
-# ending here are the reference an open-ended query must match.
-_BEYOND_SERVICE = datetime(2028, 1, 3, tzinfo=UTC)
+# The generated calendars run 2026-01-01 .. 2027-12-31 with stop times up to
+# 47:59:59 in UTC-11..UTC+11, detours add at most a few hours, so nothing is
+# scheduled after this instant: bounded queries ending here are the
+# reference an open-ended query must match.
+_BEYOND_SERVICE = datetime(2028, 1, 5, tzinfo=UTC)
 
 _STARTS = st.datetimes(
     min_value=datetime(2025, 12, 1),
     max_value=datetime(2028, 1, 15),
     timezones=st.just(UTC),
 )
+_HOUR = 3600
+_TIMEZONES = st.sampled_from(["UTC", "America/New_York", "Australia/Sydney"])
+
+
+# -- feeds ----------------------------------------------------------------------
+
+
+def _restamp(zip_bytes: bytes, timezone: str, *, frequencies: bool) -> bytes:
+    """Move a generated feed into ``timezone``, maybe repeating its anchor."""
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as source:
+        files = {name: source.read(name).decode() for name in source.namelist()}
+    files["agency.txt"] = files["agency.txt"].replace(",UTC\n", f",{timezone}\n")
+    if frequencies:
+        anchor_trip = files["trips.txt"].splitlines()[1].split(",")[2]
+        files["frequencies.txt"] = (
+            "trip_id,start_time,end_time,headway_secs\n"
+            f"{anchor_trip},06:00:00,09:00:00,3600\n"
+        )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as target:
+        for name, content in files.items():
+            target.writestr(name, content)
+    return buf.getvalue()
+
+
+@st.composite
+def _feed_variant(draw: st.DrawFn) -> bytes:
+    """A generated feed in a drawn timezone, maybe with frequencies.
+
+    New York and Sydney put DST transitions (in opposite seasons) inside
+    the generated calendars; the frequency rule repeats the anchor trip so
+    repetitions are matched by start_time.
+    """
+    return _restamp(
+        draw(_random_gtfs_zip()), draw(_TIMEZONES), frequencies=draw(st.booleans())
+    )
+
+
+def _build(zip_bytes: bytes) -> StaticIndex:
+    try:
+        return _index_from_zip_bytes(zip_bytes)
+    except FeedParseError:
+        reject()  # a generated feed too malformed to index has no answers
+
+
+def _anchor(index: StaticIndex) -> tuple[str, list[str]]:
+    """The first stored call's producer trip id and the first two stops.
+
+    ``_random_gtfs_zip`` guarantees the first trip's first two stop_times
+    rows reference real ids, which is where non-empty answers come from.
+    """
+    rows = index._conn.execute(
+        "SELECT t.source_trip_id, st.stop_id FROM stop_times st "
+        "JOIN trips t ON t.id = st.trip_id ORDER BY st.rowid LIMIT 2"
+    ).fetchall()
+    if not rows:
+        reject()
+    return rows[0][0], [stop_id for _, stop_id in rows]
+
+
+def _stop_choices(index: StaticIndex, draw_ids: Sequence[int]) -> list[str]:
+    # POPUP: a stop only realtime detours define, served by no schedule.
+    stop_ids = [*sorted({stop.id for stop in index.stops()}), "NOT-A-STOP", "POPUP"]
+    return sorted({stop_ids[i % len(stop_ids)] for i in draw_ids})
+
+
+async def _uncapped[T](
+    handle: TransitFeedHandle, until: datetime, call: Callable[[], Awaitable[T]]
+) -> T:
+    """Run ``call`` with every per-query ceiling lifted to ``until``.
+
+    The reference a scan optimization is checked against must not share
+    the optimization: with ceilings lifted, an unlimited query reads its
+    whole window, so a ceiling that wrongly cut rows (a detour reaching
+    past the schedule) shows up as a difference.
+    """
+    index = handle._index
+    saved = (index.departures_ceiling, index.journeys_ceiling)
+    index.departures_ceiling = lambda *_a, **_k: until  # type: ignore[method-assign]
+    index.journeys_ceiling = lambda *_a, **_k: until  # type: ignore[method-assign]
+    try:
+        return await call()
+    finally:
+        index.departures_ceiling, index.journeys_ceiling = saved
+
+
+def _trip_ids(index: StaticIndex) -> list[str]:
+    """Producer-facing trip ids, the anchor's first."""
+    anchor = _anchor(index)[0]
+    rows = index._conn.execute("SELECT DISTINCT source_trip_id FROM trips")
+    return [anchor, *sorted(row[0] for row in rows if row[0] != anchor)]
+
+
+# -- realtime -------------------------------------------------------------------
+
+_DATE = st.one_of(
+    st.none(),
+    # The run the example starts near, or the next two days' runs -- which
+    # lie beyond the first horizons, where an early prediction matters.
+    st.sampled_from(["RUN_DAY", "RUN_DAY+1", "RUN_DAY+2"]),
+    st.dates(min_value=date(2025, 12, 28), max_value=date(2028, 1, 3)),
+)
+_START_TIME = st.sampled_from([None, None, "06:00:00", "07:00:00"])
+_SHIFT = st.integers(-6 * _HOUR, 6 * _HOUR)
+_ENTITY = st.one_of(
+    st.tuples(st.just("trip_delay"), st.integers(0, 5), _SHIFT, _DATE, _START_TIME),
+    st.tuples(
+        st.just("stop_delay"), st.integers(0, 5), st.integers(0, 3), _SHIFT, _DATE
+    ),
+    st.tuples(
+        st.just("stop_time"),
+        st.integers(0, 5),
+        st.integers(0, 3),
+        st.integers(-6 * _HOUR, 30 * _HOUR),
+        _DATE,
+    ),
+    st.tuples(st.just("cancel"), st.integers(0, 5), _DATE, _START_TIME),
+    st.tuples(
+        st.just("added"),
+        st.integers(0, 4),
+        st.integers(-_HOUR, 30 * _HOUR),
+        _DATE,
+        st.booleans(),
+    ),
+    st.tuples(
+        st.just("detour"),
+        st.integers(0, 5),
+        st.integers(0, 3),
+        st.lists(
+            st.tuples(st.integers(0, 4), st.integers(-30 * 60, 2 * _HOUR)),
+            min_size=1,
+            max_size=2,
+        ),
+        st.integers(-_HOUR, _HOUR),
+        _DATE,
+    ),
+    st.tuples(st.just("vehicle"), st.integers(0, 5), _DATE, _START_TIME),
+)
+# (entities, whether the feed carries a header timestamp -- mostly yes, as
+# the spec requires; sometimes not, to exercise the fallback)
+_REALTIME = st.tuples(
+    st.lists(_ENTITY, min_size=2, max_size=8),
+    st.sampled_from([True, True, True, False]),
+)
+
+# Most realtime examples start shortly before the anchor's run on some
+# day, so date-less updates have a current run and dated ones a match;
+# otherwise most starts fall nowhere near a run and realtime binds nothing.
+_NEAR = st.tuples(
+    st.dates(min_value=date(2026, 1, 1), max_value=date(2027, 12, 31)),
+    st.integers(0, 150),
+)
+# Weights are drawn explicitly: st.one_of collapses identical branches, and
+# Hypothesis favours small integers and early list elements, so the cases
+# that matter come first.
+_NEAR_RUN = st.sampled_from([True, True, True, False]).flatmap(
+    lambda near: _NEAR if near else st.none()
+)
+
+# The entity a near-run example leads with: shapes that independent
+# sampling would almost never line up on the anchor's own runs.
+_RUN_DAYS = st.sampled_from([None, "RUN_DAY", "RUN_DAY+1"])
+_EARLY_TOMORROW = st.tuples(
+    # Tomorrow's run predicted at the anchor stop to depart between start
+    # and the first horizon -- hours early, in a slice not yet read, yet it
+    # must lead the board. (Predicted before start, every mode drops it.)
+    st.just("early_tomorrow"),
+    st.integers(0, 2 * _HOUR),
+)
+_DETOUR = st.tuples(
+    # A detour of the anchor's run through a stop no schedule serves.
+    st.just("detour"),
+    st.integers(-30 * 60, 3 * _HOUR),
+    st.integers(-_HOUR, _HOUR),
+    _RUN_DAYS,
+)
+_LEAD = st.sampled_from(["early", "detour", "early", "detour", "shift"]).flatmap(
+    lambda kind: {
+        "shift": st.tuples(st.just("shift"), _SHIFT, _RUN_DAYS),
+        "early": _EARLY_TOMORROW,
+        "detour": _DETOUR,
+    }[kind]
+)
+
+
+def _with_lead(
+    index: StaticIndex,
+    entities: list[tuple[Any, ...]],
+    lead: tuple[Any, ...] | None,
+) -> tuple[list[tuple[Any, ...]], list[str]]:
+    """Prepend the lead entity; return the stops it needs queried."""
+    if lead is None:
+        return entities, []
+    anchor_stop = _anchor(index)[1][0]
+    sequence = index._conn.execute(
+        "SELECT stop_sequence FROM stop_times ORDER BY rowid LIMIT 1"
+    ).fetchone()[0]
+    if lead[0] == "shift":
+        spec: tuple[Any, ...] = ("trip_delay", 0, lead[1], lead[2], None)
+        stops = [anchor_stop]
+    elif lead[0] == "early_tomorrow":
+        spec = ("stop_time", 0, sequence, lead[1], "RUN_DAY+1")
+        stops = [anchor_stop]
+    else:
+        _, travel, delay, run_day = lead
+        spec = ("detour", 0, sequence, [(0, travel)], delay, run_day)
+        stops = [anchor_stop, "POPUP"]
+    return [spec, *entities], stops
+
+
+def _near_run_start(
+    index: StaticIndex, start: datetime, near: tuple[date, int] | None
+) -> tuple[datetime, date | None]:
+    """``start``, or an instant ``minutes`` before the anchor departs on a day."""
+    if near is None:
+        return start, None
+    day, minutes = near
+    secs = index._conn.execute(
+        "SELECT departure_secs FROM stop_times ORDER BY rowid LIMIT 1"
+    ).fetchone()[0]
+    if secs is None:
+        return start, None
+    anchor = index._service_day_start(day).astimezone(UTC)
+    return anchor + timedelta(seconds=secs, minutes=-minutes), day
+
+
+def _rt_message(  # noqa: PLR0912, PLR0915 -- a branch per generated entity kind
+    index: StaticIndex,
+    realtime: tuple[list[tuple[Any, ...]], bool],
+    start: datetime,
+    run_day: date | None,
+) -> gtfs_realtime_pb2.FeedMessage:
+    """Build one FeedMessage from generated entity specs."""
+    entities, stamped = realtime
+    trip_ids = _trip_ids(index)
+    stop_ids = sorted({stop.id for stop in index.stops()}) or ["S"]
+
+    def trip(i: int) -> str:
+        return trip_ids[i % len(trip_ids)]
+
+    def day(choice: date | str | None) -> str | None:
+        if isinstance(choice, str):
+            offset = int(choice.removeprefix("RUN_DAY") or 0)
+            choice = run_day + timedelta(days=offset) if run_day else None
+        return choice.strftime("%Y%m%d") if isinstance(choice, date) else None
+
+    def at(offset: int) -> int:
+        return int((start + timedelta(seconds=offset)).timestamp())
+
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    if stamped:  # a live feed, stamped at the query's start
+        message.header.timestamp = int(start.timestamp())
+    # Detours may route through POPUP, a stop only this feed defines (an
+    # undefined replacement stop is unplaceable and skipped).
+    popup = message.entity.add()
+    popup.id = "popup-stop"
+    popup.stop.stop_id = "POPUP"
+    popup.stop.stop_lat = 34.0
+    popup.stop.stop_lon = -118.0
+    for n, spec in enumerate(entities):
+        entity = message.entity.add()
+        entity.id = f"e{n}"
+        kind = spec[0]
+        if kind == "vehicle":
+            _, i, date_choice, start_time = spec
+            vehicle = entity.vehicle
+            vehicle.vehicle.id = f"V{n}"
+            vehicle.trip.trip_id = trip(i)
+            if (start_date := day(date_choice)) is not None:
+                vehicle.trip.start_date = start_date
+            if start_time is not None:
+                vehicle.trip.start_time = start_time
+            vehicle.position.latitude = 34.0
+            vehicle.position.longitude = -118.0
+        elif kind == "detour":
+            _, i, sequence, replacements, delay, date_choice = spec
+            mods = entity.trip_modifications
+            mods.selected_trips.add().trip_ids.append(trip(i))
+            if (service_date := day(date_choice)) is not None:
+                mods.service_dates.append(service_date)
+            mod = mods.modifications.add()
+            mod.start_stop_selector.stop_sequence = sequence
+            mod.end_stop_selector.stop_sequence = sequence
+            mod.propagated_modification_delay = delay
+            for stop_pick, travel in replacements:
+                stop = mod.replacement_stops.add()
+                stop.stop_id = (
+                    "POPUP" if stop_pick == 0 else stop_ids[stop_pick % len(stop_ids)]
+                )
+                stop.travel_time_to_stop = travel
+        elif kind == "added":
+            _, stop_pick, offset, date_choice, with_vehicle = spec
+            update = entity.trip_update
+            update.trip.trip_id = f"ADD{n}"
+            update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.ADDED
+            if (start_date := day(date_choice)) is not None:
+                update.trip.start_date = start_date
+            stu = update.stop_time_update.add()
+            stu.stop_id = stop_ids[stop_pick % len(stop_ids)]
+            stu.departure.time = at(offset)
+            if with_vehicle:
+                update.vehicle.id = f"AV{n}"
+                position = message.entity.add()
+                position.id = f"e{n}-vp"
+                position.vehicle.vehicle.id = f"AV{n}"
+                position.vehicle.trip.trip_id = f"ADD{n}"
+                if start_date is not None:
+                    position.vehicle.trip.start_date = start_date
+                position.vehicle.position.latitude = 34.0
+                position.vehicle.position.longitude = -118.0
+        else:
+            update = entity.trip_update
+            update.trip.trip_id = trip(spec[1])
+            start_time = None
+            if kind == "trip_delay":
+                _, _, delay, date_choice, start_time = spec
+                update.delay = delay
+            elif kind == "stop_delay":
+                _, _, sequence, delay, date_choice = spec
+                stu = update.stop_time_update.add()
+                stu.stop_sequence = sequence
+                stu.departure.delay = delay
+            elif kind == "stop_time":
+                _, _, sequence, offset, date_choice = spec
+                stu = update.stop_time_update.add()
+                stu.stop_sequence = sequence
+                stu.departure.time = at(offset)
+            else:  # cancel
+                _, _, date_choice, start_time = spec
+                update.trip.schedule_relationship = (
+                    gtfs_realtime_pb2.TripDescriptor.CANCELED
+                )
+            if (start_date := day(date_choice)) is not None:
+                update.trip.start_date = start_date
+            if start_time is not None:
+                update.trip.start_time = start_time
+    return message
 
 
 def _run[T](
-    zip_bytes: bytes,
-    body: Callable[[TransitFeedHandle, StaticIndex], Awaitable[T]],
+    index: StaticIndex,
+    body: Callable[[TransitFeedHandle], Awaitable[T]],
     message: gtfs_realtime_pb2.FeedMessage | None = None,
 ) -> T:
-    """Run ``body`` against a handle over the generated feed, no network.
+    """Run ``body`` against a handle over ``index``, with no network.
 
-    With ``message``, every realtime fetch returns it; otherwise the handle
-    has no realtime sources at all.
+    With ``message``, every realtime fetch (TripUpdates and vehicles alike)
+    returns it; otherwise the handle has no realtime sources.
     """
-
-    try:
-        index = _index_from_zip_bytes(zip_bytes)
-    except FeedParseError:
-        reject()  # a generated feed too malformed to index has no answers
 
     async def scenario() -> T:
         async with MobilityFeedsClient() as client:
@@ -74,9 +425,7 @@ def _run[T](
                 [],
                 index,
                 None,
-                direct=_DirectUrls(
-                    static_url="https://example.com/g.zip", headers=None
-                ),
+                direct=_DirectUrls(static_url="https://e.com/g.zip", headers=None),
             )
             if message is not None:
 
@@ -84,12 +433,12 @@ def _run[T](
                     return [message]
 
                 handle._fetch_entity_messages = fetch  # type: ignore[method-assign]
-            try:
-                return await body(handle, index)
-            finally:
-                handle.close()
+            return await body(handle)
 
-    return asyncio.run(scenario())
+    try:
+        return asyncio.run(scenario())
+    finally:
+        index.close()
 
 
 def _arrival_key(row: StopArrival) -> tuple[object, ...]:
@@ -99,31 +448,25 @@ def _arrival_key(row: StopArrival) -> tuple[object, ...]:
         row.scheduled_departure,
         row.predicted_departure,
         row.predicted_arrival,
+        row.realtime,
+        row.vehicle.vehicle_id if row.vehicle else None,
     )
 
 
 def _trip_key(row: UpcomingTrip) -> tuple[object, ...]:
-    return (row.trip_id, row.scheduled_departure, row.predicted_departure)
+    return (
+        row.trip_id,
+        row.scheduled_departure,
+        row.predicted_departure,
+        row.vehicle.vehicle_id if row.vehicle else None,
+    )
 
 
-def _anchor(index: StaticIndex) -> tuple[str, list[str]]:
-    """The generated feed's anchor trip and its first stops (always real ids).
-
-    ``_random_gtfs_zip`` guarantees the first trip's first two stop_times
-    rows reference real ids, which is where non-empty answers come from.
-    """
-    rows = index._conn.execute(
-        "SELECT trip_id, stop_id FROM stop_times ORDER BY rowid LIMIT 2"
-    ).fetchall()
-    return rows[0][0], [stop_id for _, stop_id in rows]
+def _keys(boards: Sequence[Sequence[StopArrival]]) -> list[list[tuple[object, ...]]]:
+    return [[_arrival_key(row) for row in board] for board in boards]
 
 
-def _stop_choices(index: StaticIndex, draw_ids: Sequence[int]) -> list[str]:
-    stop_ids = [*sorted({stop.id for stop in index.stops()}), "NOT-A-STOP"]
-    return sorted({stop_ids[i % len(stop_ids)] for i in draw_ids})
-
-
-# -- the helpers themselves ---------------------------------------------------
+# -- the helpers themselves -----------------------------------------------------
 
 
 @given(
@@ -157,10 +500,8 @@ def test_horizons_stop_at_the_end_or_the_ceiling_whichever_is_first() -> None:
         start + timedelta(hours=2),
         start + timedelta(hours=4),
     ]
-    # Past the ceiling nothing is scheduled: stop there.
     far = start + timedelta(days=900)
     assert list(_horizons(start, far, ceiling))[-1] == (ceiling, True)
-    # No departure can ever occur: one pass at start (RT-added rows only).
     assert list(_horizons(start, week, None)) == [(start, True)]
     assert list(_horizons(start, None, None)) == [(start, True)]
 
@@ -170,300 +511,196 @@ def test_horizon_settles_rules() -> None:
     early = horizon - timedelta(hours=2)
     late = horizon - timedelta(minutes=30)
     margin = timedelta(hours=1)
-    # Full and well inside the horizon: settled.
     assert _horizon_settles([[early]], [1], horizon, margin)
-    # Full, but an early-running trip from beyond the horizon could still
-    # sort ahead of the last row.
     assert not _horizon_settles([[late]], [1], horizon, margin)
     assert _horizon_settles([[late]], [1], horizon, timedelta(0))
-    # Room left on the board.
     assert not _horizon_settles([[early]], [2], horizon, margin)
-    # Unlimited never settles before the ceiling.
     assert not _horizon_settles([[early]], [None], horizon, margin)
-    # Zero limit is trivially full.
     assert _horizon_settles([[]], [0], horizon, margin)
-    # Every board must settle.
     assert not _horizon_settles([[early], []], [1, 1], horizon, margin)
 
 
-# Realtime update shapes: (kind, delay seconds, stop_sequence, start_date).
-# Delays stay within the early-running margin on the early side, which is
-# the guarantee the open-ended scan makes; dates span the generated feeds.
-_RT_UPDATES = st.tuples(
-    st.sampled_from(["trip_delay", "stop_delay", "cancel"]),
-    st.integers(-int(_RT_EARLY_MARGIN.total_seconds()), 7200),
-    st.one_of(st.none(), st.integers(0, 3)),
-    st.one_of(
-        st.none(),
-        st.just("RUN_DAY"),  # the day of the run the example starts near
-        st.dates(min_value=date(2025, 12, 28), max_value=date(2028, 1, 3)).map(
-            lambda day: day.strftime("%Y%m%d")
-        ),
-    ),
-)
-
-# Half the realtime examples start shortly before the anchor trip departs on
-# some day, so date-less updates have a current run to bind to and dated
-# ones a matching day; otherwise most starts fall nowhere near a run.
-_NEAR_RUN = st.one_of(
-    st.none(),
-    st.tuples(
-        st.dates(min_value=date(2026, 1, 1), max_value=date(2027, 12, 31)),
-        st.integers(0, 150),
-    ),
-)
-
-
-def _near_run_start(
-    index: StaticIndex, start: datetime, near: tuple[date, int] | None
-) -> tuple[datetime, date | None]:
-    """``start``, or an instant ``minutes`` before the anchor's departure."""
-    if near is None:
-        return start, None
-    day, minutes = near
-    secs = index._conn.execute(
-        "SELECT departure_secs FROM stop_times ORDER BY rowid LIMIT 1"
-    ).fetchone()[0]
-    if secs is None:
-        return start, None
-    midnight = datetime.combine(day, time(), tzinfo=UTC)  # generated feeds are UTC
-    return midnight + timedelta(seconds=secs, minutes=-minutes), day
-
-
-def _rt_message(
-    trip_ids: list[str],
-    updates: list[tuple[str, int, int | None, str | None]],
-    run_day: date | None = None,
-) -> gtfs_realtime_pb2.FeedMessage:
-    message = gtfs_realtime_pb2.FeedMessage()
-    message.header.gtfs_realtime_version = "2.0"
-    for i, (kind, delay, stop_sequence, date_choice) in enumerate(updates):
-        entity = message.entity.add()
-        entity.id = f"u{i}"
-        trip = entity.trip_update.trip
-        trip.trip_id = trip_ids[i % len(trip_ids)]
-        start_date = (
-            (run_day.strftime("%Y%m%d") if run_day else None)
-            if date_choice == "RUN_DAY"
-            else date_choice
-        )
-        if start_date is not None:
-            trip.start_date = start_date
-        if kind == "cancel":
-            trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.CANCELED
-        elif kind == "trip_delay" or stop_sequence is None:
-            entity.trip_update.delay = delay
-        else:
-            update = entity.trip_update.stop_time_update.add()
-            update.stop_sequence = stop_sequence
-            update.departure.delay = delay
-    return message
-
-
-# -- open-ended equals bounded-at-the-ceiling ---------------------------------
+# -- scan independence ----------------------------------------------------------
 
 
 @_SETTINGS
 @given(
-    zip_bytes=_random_gtfs_zip(),
+    zip_bytes=_feed_variant(),
     start=_STARTS,
     stop_picks=st.lists(st.integers(0, 10), min_size=1, max_size=3),
     limit=st.integers(0, 5),
     use_anchor=st.booleans(),
+    hours=st.integers(1, 96),
 )
-def test_open_ended_scheduled_departures_equal_bounded_truncated(
-    zip_bytes: bytes,
-    start: datetime,
-    stop_picks: list[int],
-    limit: int,
-    use_anchor: bool,
-) -> None:
-    async def body(handle: TransitFeedHandle, index: StaticIndex) -> None:
-        stops = _stop_choices(index, stop_picks)
-        if use_anchor:
-            stops = sorted({*stops, _anchor(index)[1][0]})
-        [open_ended] = await handle.get_scheduled_departures(
-            [ArrivalsQuery(stops, limit=limit)], start=start
-        )
-        ceiling = max(_BEYOND_SERVICE, start)
-        [bounded] = await handle.get_scheduled_departures(
-            [ArrivalsQuery(stops, limit=None)], start=start, end=ceiling
-        )
-        event(f"scheduled rows: {min(len(open_ended), 3)}")
-        assert [_arrival_key(r) for r in open_ended] == [
-            _arrival_key(r) for r in bounded[:limit]
-        ]
-        # Limit prefix: a larger limit only appends.
-        [wider] = await handle.get_scheduled_departures(
-            [ArrivalsQuery(stops, limit=limit + 2)], start=start
-        )
-        assert [_arrival_key(r) for r in wider[:limit]] == [
-            _arrival_key(r) for r in open_ended
-        ]
-        # Start bound.
-        assert all(
-            r.scheduled_departure is not None and r.scheduled_departure >= start
-            for r in open_ended
-        )
-
-    _run(zip_bytes, body)
-
-
-@_SETTINGS
-@given(
-    zip_bytes=_random_gtfs_zip(),
-    start=_STARTS,
-    stop_picks=st.lists(st.integers(0, 10), min_size=1, max_size=3),
-    limit=st.integers(1, 5),
-    updates=st.lists(_RT_UPDATES, min_size=1, max_size=6),
-    use_anchor=st.booleans(),
-    near=_NEAR_RUN,
-    lead=st.tuples(
-        st.integers(-int(_RT_EARLY_MARGIN.total_seconds()), 7200),
-        st.sampled_from([None, "RUN_DAY"]),
-    ),
-)
-def test_open_ended_arrivals_equal_bounded_truncated_with_realtime(
+def test_scheduled_departures_do_not_depend_on_how_they_were_scanned(
     *,
     zip_bytes: bytes,
     start: datetime,
     stop_picks: list[int],
     limit: int,
-    updates: list[tuple[str, int, int | None, str | None]],
+    use_anchor: bool,
+    hours: int,
+) -> None:
+    index = _build(zip_bytes)
+    stops = _stop_choices(index, stop_picks)
+    if use_anchor:
+        stops = sorted({*stops, _anchor(index)[1][0]})
+
+    async def body(handle: TransitFeedHandle) -> None:
+        async def board(limit: int | None, end: datetime | None) -> list[StopArrival]:
+            [rows] = await handle.get_scheduled_departures(
+                [ArrivalsQuery(stops, limit=limit)], start=start, end=end
+            )
+            return rows
+
+        reference = max(_BEYOND_SERVICE, start)
+        whole = await _uncapped(handle, reference, lambda: board(None, reference))
+        open_ended = await board(limit, None)
+        assert _keys([open_ended]) == _keys([whole[:limit]])
+        assert _keys([(await board(limit + 2, None))[:limit]]) == _keys([open_ended])
+        end = start + timedelta(hours=hours)
+        all_rows = await _uncapped(handle, end, lambda: board(None, end))
+        assert _keys([await board(None, end)]) == _keys([all_rows])
+        assert _keys([await board(limit, end)]) == _keys([all_rows[:limit]])
+        assert all(
+            row.scheduled_departure is not None
+            and start <= row.scheduled_departure <= end
+            for row in all_rows
+        )
+        event(f"scheduled rows: {min(len(open_ended), 3)}")
+
+    _run(index, body)
+
+
+@_RT_SETTINGS
+@given(
+    zip_bytes=_feed_variant(),
+    start=_STARTS,
+    stop_picks=st.lists(st.integers(0, 10), min_size=1, max_size=3),
+    limit=st.integers(1, 5),
+    realtime=_REALTIME,
+    use_anchor=st.booleans(),
+    near=_NEAR_RUN,
+    lead=_LEAD,
+    hours=st.integers(1, 96),
+)
+def test_arrivals_do_not_depend_on_how_they_were_scanned(
+    *,
+    zip_bytes: bytes,
+    start: datetime,
+    stop_picks: list[int],
+    limit: int,
+    realtime: tuple[list[tuple[Any, ...]], bool],
     use_anchor: bool,
     near: tuple[date, int] | None,
-    lead: tuple[int, str | None],
+    lead: tuple[Any, ...],
+    hours: int,
 ) -> None:
-    """Holds under realtime: delays and early running up to the margin, at
-    trip or stop level, and cancellations, each dated or date-less."""
-    if near is not None:
-        # Starting near the anchor's run: query its stop, and lead with a
-        # delay for that run (dated to its day, or date-less = current).
-        use_anchor = True
-        updates = [("trip_delay", lead[0], None, lead[1]), *updates]
-    trip_ids = _trip_ids(zip_bytes)
-    message = gtfs_realtime_pb2.FeedMessage()
+    """Open-ended = whole window; bounded+limit = bounded, truncated; larger
+    limits only append -- under any generated realtime, vehicles included.
 
-    async def body(handle: TransitFeedHandle, index: StaticIndex) -> None:
-        nonlocal start
-        start, run_day = _near_run_start(index, start, near)
-        message.CopyFrom(_rt_message(trip_ids, updates, run_day))
-        stops = _stop_choices(index, stop_picks)
-        if use_anchor:
-            stops = sorted({*stops, _anchor(index)[1][0]})
-        [open_ended] = await handle.get_arrivals(
-            [ArrivalsQuery(stops, limit=limit)], start=start
-        )
-        ceiling = max(_BEYOND_SERVICE, start)
-        [bounded] = await handle.get_arrivals(
-            [ArrivalsQuery(stops, limit=None)], start=start, end=ceiling
-        )
-        event(f"realtime rows: {min(len(open_ended), 3)}")
+    "Whole window" is read with every ceiling lifted, so it shares none of
+    the scan's optimizations: a ceiling or margin that dropped a row (a
+    detour past the schedule, a run predicted hours early) shows up.
+    """
+    index = _build(zip_bytes)
+    start, run_day = _near_run_start(index, start, near)
+    entities, stamped = realtime
+    entities, lead_stops = _with_lead(index, entities, lead if near else None)
+    message = _rt_message(index, (entities, stamped), start, run_day)
+    stops = sorted({*_stop_choices(index, stop_picks), *lead_stops})
+    if use_anchor:
+        stops = sorted({*stops, _anchor(index)[1][0]})
+
+    async def body(handle: TransitFeedHandle) -> None:
+        async def board(limit: int | None, end: datetime | None) -> list[StopArrival]:
+            [rows] = await handle.get_arrivals(
+                [ArrivalsQuery(stops, limit=limit)],
+                start=start,
+                end=end,
+                with_vehicles=True,
+            )
+            return rows
+
+        reference = max(_BEYOND_SERVICE, start)
+        whole = await _uncapped(handle, reference, lambda: board(None, reference))
+        open_ended = await board(limit, None)
+        assert _keys([open_ended]) == _keys([whole[:limit]])
+        assert _keys([(await board(limit + 2, None))[:limit]]) == _keys([open_ended])
+        end = start + timedelta(hours=hours)
+        window = await _uncapped(handle, end, lambda: board(None, end))
+        assert _keys([await board(limit, end)]) == _keys([window[:limit]])
+        assert _keys([await board(None, end)]) == _keys([window])
+        event(f"rows: {min(len(open_ended), 3)}")
+        event(f"popup rows: {any(r.stop_id == 'POPUP' for r in whole)}")
+        event(f"lead: {lead[0] if near else None}")
         event(f"predicted: {any(r.predicted_departure for r in open_ended)}")
-        event(f"bounded shorter than unlimited: {len(bounded) < len(open_ended)}")
-        assert [_arrival_key(r) for r in open_ended] == [
-            _arrival_key(r) for r in bounded[:limit]
-        ]
+        event(f"vehicle: {any(r.vehicle for r in open_ended)}")
+        event(f"detour in feed: {any(e[0] == 'detour' for e in entities)}")
 
-    _run(zip_bytes, body, message)
+    _run(index, body, message)
 
 
-@_SETTINGS
+@_RT_SETTINGS
 @given(
-    zip_bytes=_random_gtfs_zip(),
+    zip_bytes=_feed_variant(),
     start=_STARTS,
     pair_picks=st.tuples(st.integers(0, 10), st.integers(0, 10)),
     limit=st.integers(0, 4),
     use_anchor=st.booleans(),
+    realtime=_REALTIME,
+    near=_NEAR_RUN,
+    hours=st.integers(1, 96),
 )
-def test_open_ended_upcoming_trips_equal_bounded_truncated(
+def test_upcoming_trips_do_not_depend_on_how_they_were_scanned(
+    *,
     zip_bytes: bytes,
     start: datetime,
     pair_picks: tuple[int, int],
     limit: int,
     use_anchor: bool,
-) -> None:
-    async def body(handle: TransitFeedHandle, index: StaticIndex) -> None:
-        stop_ids = sorted({stop.id for stop in index.stops()})
-        origin = stop_ids[pair_picks[0] % len(stop_ids)]
-        destination = stop_ids[pair_picks[1] % len(stop_ids)]
-        anchor_stops = _anchor(index)[1]
-        if use_anchor and len(anchor_stops) == 2:
-            origin, destination = anchor_stops
-        [open_ended] = await handle.get_upcoming_trips(
-            [TripQuery(origin, destination, limit=limit)], start=start
-        )
-        ceiling = max(_BEYOND_SERVICE, start)
-        [bounded] = await handle.get_upcoming_trips(
-            [TripQuery(origin, destination, limit=None)], start=start, end=ceiling
-        )
-        event(f"trip rows: {min(len(open_ended), 3)}")
-        assert [_trip_key(r) for r in open_ended] == [
-            _trip_key(r) for r in bounded[:limit]
-        ]
-
-    _run(zip_bytes, body)
-
-
-@_SETTINGS
-@given(
-    zip_bytes=_random_gtfs_zip(),
-    start=_STARTS,
-    query_picks=st.lists(
-        st.tuples(
-            st.lists(st.integers(0, 10), min_size=1, max_size=2), st.integers(0, 4)
-        ),
-        min_size=1,
-        max_size=3,
-    ),
-    hours=st.integers(1, 72),
-)
-def test_a_batch_equals_its_queries_run_alone(
-    zip_bytes: bytes,
-    start: datetime,
-    query_picks: list[tuple[list[int], int]],
+    realtime: tuple[list[tuple[Any, ...]], bool],
+    near: tuple[date, int] | None,
     hours: int,
 ) -> None:
-    end = start + timedelta(hours=hours)
+    index = _build(zip_bytes)
+    start, run_day = _near_run_start(index, start, near)
+    message = _rt_message(index, realtime, start, run_day)
+    stop_ids = sorted({stop.id for stop in index.stops()})
+    origin = stop_ids[pair_picks[0] % len(stop_ids)]
+    destination = stop_ids[pair_picks[1] % len(stop_ids)]
+    anchor_stops = _anchor(index)[1]
+    if use_anchor and len(anchor_stops) == 2:
+        origin, destination = anchor_stops
 
-    async def body(handle: TransitFeedHandle, index: StaticIndex) -> None:
-        queries = [
-            ArrivalsQuery(_stop_choices(index, picks), limit=limit)
-            for picks, limit in query_picks
-        ]
-        for method in (handle.get_arrivals, handle.get_scheduled_departures):
-            batch = await method(queries, start=start, end=end)
-            alone = [(await method([q], start=start, end=end))[0] for q in queries]
-            assert [[_arrival_key(r) for r in b] for b in batch] == [
-                [_arrival_key(r) for r in a] for a in alone
-            ]
-            for board in batch:
-                assert all(
-                    r.scheduled_departure is None
-                    or start - timedelta(hours=1) <= r.scheduled_departure <= end
-                    for r in board
-                )
+    async def body(handle: TransitFeedHandle) -> None:
+        async def trips(limit: int | None, end: datetime | None) -> list[UpcomingTrip]:
+            [rows] = await handle.get_upcoming_trips(
+                [TripQuery(origin, destination, limit=limit)],
+                start=start,
+                end=end,
+                with_vehicles=True,
+            )
+            return rows
 
-    _run(zip_bytes, body)
+        def keys(rows: list[UpcomingTrip]) -> list[tuple[object, ...]]:
+            return [_trip_key(row) for row in rows]
 
+        reference = max(_BEYOND_SERVICE, start)
+        whole = await _uncapped(handle, reference, lambda: trips(None, reference))
+        open_ended = await trips(limit, None)
+        assert keys(open_ended) == keys(whole[:limit])
+        end = start + timedelta(hours=hours)
+        window = await _uncapped(handle, end, lambda: trips(None, end))
+        assert keys(await trips(limit, end)) == keys(window[:limit])
+        event(f"trip rows: {min(len(open_ended), 3)}")
 
-def _trip_ids(zip_bytes: bytes) -> list[str]:
-    try:
-        index = _index_from_zip_bytes(zip_bytes)
-    except FeedParseError:
-        reject()
-    try:
-        anchor_trip = _anchor(index)[0]
-        rows = index._conn.execute("SELECT DISTINCT source_trip_id FROM trips")
-        others = sorted(row[0] for row in rows if row[0] != anchor_trip)
-        return [anchor_trip, *others]
-    finally:
-        index.close()
+    _run(index, body, message)
 
 
-@_SETTINGS
+@_RT_SETTINGS
 @given(
-    zip_bytes=_random_gtfs_zip(),
+    zip_bytes=_feed_variant(),
     start=_STARTS,
     query_picks=st.lists(
         st.tuples(
@@ -474,83 +711,111 @@ def _trip_ids(zip_bytes: bytes) -> list[str]:
         min_size=2,
         max_size=4,
     ),
-    updates=st.lists(_RT_UPDATES, max_size=4),
+    realtime=_REALTIME,
+    near=_NEAR_RUN,
+    lead=_LEAD,
+    hours=st.one_of(st.none(), st.integers(1, 72)),
 )
-def test_an_open_ended_batch_equals_its_queries_run_alone(
+def test_a_batch_equals_its_queries_run_alone(
+    *,
     zip_bytes: bytes,
     start: datetime,
     query_picks: list[tuple[list[int], int, bool]],
-    updates: list[tuple[str, int, int | None, str | None]],
+    realtime: tuple[list[tuple[Any, ...]], bool],
+    near: tuple[date, int] | None,
+    lead: tuple[Any, ...],
+    hours: int | None,
 ) -> None:
     """Batching survives queries settling at different horizons.
 
-    Later passes read only the stops (and filters) of boards still filling
-    and freeze the boards already settled; that must never change a board.
+    Later passes read only the stops and filters of boards still filling
+    and freeze settled boards; detours widen every query's ceiling. None of
+    that may change a board.
     """
-    message = _rt_message(_trip_ids(zip_bytes), updates)
+    index = _build(zip_bytes)
+    start, run_day = _near_run_start(index, start, near)
+    entities, stamped = realtime
+    entities, lead_stops = _with_lead(index, entities, lead if near else None)
+    message = _rt_message(index, (entities, stamped), start, run_day)
+    queries = [
+        ArrivalsQuery(
+            sorted({*_stop_choices(index, picks), *lead_stops})
+            if anchored
+            else _stop_choices(index, picks),
+            limit=limit,
+        )
+        for picks, limit, anchored in query_picks
+    ]
+    end = None if hours is None else start + timedelta(hours=hours)
 
-    async def body(handle: TransitFeedHandle, index: StaticIndex) -> None:
-        anchor_stop = _anchor(index)[1][0]
-        queries = [
-            ArrivalsQuery(
-                sorted({*_stop_choices(index, picks), anchor_stop})
-                if anchored
-                else _stop_choices(index, picks),
-                limit=limit,
-            )
-            for picks, limit, anchored in query_picks
-        ]
+    async def body(handle: TransitFeedHandle) -> None:
         for method in (handle.get_arrivals, handle.get_scheduled_departures):
-            batch = await method(queries, start=start)
-            alone = [(await method([q], start=start))[0] for q in queries]
-            assert [[_arrival_key(r) for r in b] for b in batch] == [
-                [_arrival_key(r) for r in a] for a in alone
-            ]
+            batch = await method(queries, start=start, end=end)
+            alone = [(await method([q], start=start, end=end))[0] for q in queries]
+            assert _keys(batch) == _keys(alone)
         event(f"distinct board sizes: {len({len(b) for b in batch})}")
 
-    _run(zip_bytes, body, message)
+    _run(index, body, message)
+
+
+# -- which run a date-less update addresses -------------------------------------
+
+
+def _secs(cell: str) -> int | None:
+    """An independent GTFS time parser: H:MM:SS, hours past 24 allowed."""
+    parts = cell.strip().split(":")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    hours, minutes, seconds = (int(part) for part in parts)
+    return hours * 3600 + minutes * 60 + seconds
 
 
 @_SETTINGS
-@given(zip_bytes=_random_gtfs_zip(), at=_STARTS)
+@given(zip_bytes=_random_gtfs_zip(), at=_STARTS, timezone=_TIMEZONES)
 def test_current_service_dates_match_their_definition(
-    zip_bytes: bytes, at: datetime
+    zip_bytes: bytes, at: datetime, timezone: str
 ) -> None:
-    """The run a date-less update addresses, against a brute-force oracle.
+    """The run a date-less update addresses, from the raw files.
 
-    Definition: the earliest service day D, no later than ``at``'s local
-    date, on which the trip's service runs and whose last stop time (over
-    the whole trip) is at or after ``at``. Never a later day.
+    Definition: the earliest service day D, among the three days before
+    ``at``'s local date and that date itself, on which the trip's service
+    runs and whose run's last stop time is at or after ``at``. Computed
+    from the zip's own CSV with an independent time parser and anchor;
+    only service activity (tested elsewhere) comes from the index.
     """
+    restamped = _restamp(zip_bytes, timezone, frequencies=False)
+    index = _build(restamped)
     try:
-        index = _index_from_zip_bytes(zip_bytes)
-    except FeedParseError:
-        reject()
-    try:
-        trips = index._conn.execute(
-            "SELECT t.id, t.service_id, MAX(MAX(COALESCE(st.arrival_secs, -1),"
-            " COALESCE(st.departure_secs, -1))) FROM trips t"
-            " JOIN stop_times st ON st.trip_id = t.id GROUP BY t.id"
-        ).fetchall()
-        got = index.current_service_dates([trip_id for trip_id, _, _ in trips], at)
-        tz = index._tz
+        with zipfile.ZipFile(io.BytesIO(restamped)) as source:
+            trips_csv = source.read("trips.txt").decode()
+            stop_times_csv = source.read("stop_times.txt").decode()
+        service_of = {
+            row["trip_id"]: row["service_id"]
+            for row in csv.DictReader(io.StringIO(trips_csv))
+        }
+        ends: dict[str, int] = {}
+        for row in csv.DictReader(io.StringIO(stop_times_csv)):
+            for cell in (row["arrival_time"], row["departure_time"]):
+                secs = _secs(cell)
+                if secs is not None and row["trip_id"] in service_of:
+                    ends[row["trip_id"]] = max(ends.get(row["trip_id"], -1), secs)
+        got = index.current_service_dates(sorted(service_of), at)
+        tz = ZoneInfo(timezone)
         local_today = at.astimezone(tz).date()
-        for trip_id, service_id, end_secs in trips:
+        for trip_id, service_id in service_of.items():
             expected = None
-            if end_secs is not None and end_secs >= 0:
-                for back in range(end_secs // 86_400 + 1, -1, -1):
+            if trip_id in ends:
+                for back in (3, 2, 1, 0):
                     day = local_today - timedelta(days=back)
                     anchor = (
                         datetime.combine(day, time(12), tzinfo=tz) - timedelta(hours=12)
                     ).astimezone(UTC)
                     if service_id in index.active_service_ids(day) and (
-                        anchor + timedelta(seconds=end_secs) >= at
+                        anchor + timedelta(seconds=ends[trip_id]) >= at
                     ):
                         expected = day
                         break
             assert got.get(trip_id) == expected, trip_id
-            if expected is not None:
-                assert expected <= local_today
         event(f"has a current run: {bool(got)}")
     finally:
         index.close()
