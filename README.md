@@ -240,13 +240,13 @@ Notes on direct mode:
   as soon as it is settled, bounded or not. A board stops scanning once
   nothing more can match: past the last day any service that serves its stops,
   routes and headsigns runs — so a filter matching nothing, a seasonal
-  route, or a calendar running "forever" all end promptly; a detour widens
-  that by how late a detoured trip can reach. Realtime is fetched once, and
-  a realtime board only settles once its last row sits inside the horizon
-  by at least how early the feed runs anything (its earliest prediction
-  against schedule, its most negative detour shift), so the answer is
-  exactly that of reading the whole window. An open-ended query with no
-  limit raises `ValueError`. `end` bounds scheduled times; a delayed trip
+  route, or a calendar running "forever" all end promptly. Realtime is
+  fetched once, and the runs it can move — the ones a TripUpdate addresses
+  and the ones a detour rebuilds (on the `service_dates` it must name) —
+  are read whole before the scan begins; every other row sorts at its
+  scheduled time, so a board is final as soon as it is full inside the
+  slice read so far, and the answer is exactly that of reading the whole
+  window. An open-ended query with no limit raises `ValueError`. `end` bounds scheduled times; a delayed trip
   predicted past it, and RT-added trips, still show.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
   or vehicle with no `start_date` applies only to the trip's run that is
@@ -516,9 +516,11 @@ The suite combines example-based, property-based, and conformance testing:
     directly, without a hand-built oracle;
   - open-ended equals bounded: for every dated query, `end=None, limit=k`
     returns exactly the first `k` rows of the same query bounded beyond the
-    end of service — including with realtime delays, early running up to
-    the margin, dated and date-less cancellations, and batches whose
-    queries settle at different horizons;
+    end of service, read as a plain scan of the whole window — including
+    with realtime delays, runs predicted hours early, garbage times,
+    detours with several (or empty) modifications, dated and date-less
+    cancellations, feed timestamps behind, ahead of or far from the query,
+    and batches whose queries settle at different horizons;
   - the cache as a round trip: a built index and the same index reopened from
     disk answer every query identically, including the stored timezone, and
     `purge_cache` removes exactly the named feed and nothing else for any

@@ -1187,89 +1187,100 @@ class StaticIndex:
             )
         )
 
-    def trip_instance_calls(
-        self,
-        trip_ids: list[str],
-        now_utc: datetime,
-        lookahead: timedelta,
-        grace: timedelta = timedelta(0),
+    def instance_trip_calls(
+        self, instances: Iterable[tuple[str, date]]
     ) -> list[TripInstanceCalls]:
-        """Complete call sequences for the named trips, per service day.
+        """Complete call sequences of specific (concrete trip, service day) runs.
 
         Keyed on CONCRETE trip ids, so a frequency repetition resolves to
-        its own instance. Unlike ``upcoming_departures`` this filters by
-        trip rather than by stop and does not window the calls themselves:
-        a modification's reference stop may sit outside the query window
-        while the stops it affects sit inside it.
+        its own run. A run whose trip's service doesn't operate that day
+        doesn't exist and yields nothing. Unlike ``upcoming_departures``
+        this filters by trip rather than by stop and does not window the
+        calls: a modification's reference stop may be anywhere on the trip.
         """
-        if not trip_ids:
-            return []
-        marks = ",".join("?" * len(trip_ids))
-        instances: list[TripInstanceCalls] = []
-        for (
-            service_date,
-            day_start_utc,
-            active,
-            _window_lo,
-            _window_hi,
-        ) in self._service_day_windows(now_utc, lookahead, grace):
-            service_marks = ",".join("?" * len(active))
-            rows = self._conn.execute(
-                "SELECT t.id, t.source_trip_id, t.start_secs, t.route_id, "
-                "t.service_id, t.headsign, t.wheelchair_accessible, "
-                "t.bikes_allowed, t.direction_id, t.short_name, t.block_id, "
-                "st.stop_sequence, st.stop_id, st.arrival_secs, "
-                "st.departure_secs, st.pickup_type, st.drop_off_type, "
-                "st.timepoint, st.stop_headsign "
-                "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
-                f"WHERE t.id IN ({marks}) "
-                f"AND t.service_id IN ({service_marks}) "
-                "ORDER BY t.id, st.stop_sequence",
-                [*trip_ids, *sorted(active)],
-            ).fetchall()
-            by_trip: dict[str, list[Any]] = {}
-            for row in rows:
-                by_trip.setdefault(row[0], []).append(row)
-            for trip_id, trip_rows in by_trip.items():
-                head = trip_rows[0]
-                instances.append(
-                    TripInstanceCalls(
-                        trip_id=trip_id,
-                        source_trip_id=head[1],
-                        start_secs=head[2],
-                        service_date=service_date,
-                        day_start_utc=day_start_utc,
-                        route_id=head[3],
-                        service_id=head[4],
-                        headsign=head[5],
-                        wheelchair_accessible=_enum_or_none(WheelchairAccess, head[6]),
-                        bikes_allowed=_enum_or_none(BikesAllowed, head[7]),
-                        direction_id=head[8],
-                        trip_short_name=head[9],
-                        block_id=head[10],
-                        calls=[
-                            TripCall(
-                                stop_sequence=row[11],
-                                stop_id=row[12],
-                                arrival=(
-                                    day_start_utc + timedelta(seconds=row[13])
-                                    if row[13] is not None
-                                    else None
-                                ),
-                                departure=(
-                                    day_start_utc + timedelta(seconds=row[14])
-                                    if row[14] is not None
-                                    else None
-                                ),
-                                pickup_type=_enum_or_none(PickupDropOffType, row[15]),
-                                drop_off_type=_enum_or_none(PickupDropOffType, row[16]),
-                                timepoint_exact=_timepoint_exact(row[17]),
-                                stop_headsign=row[18],
-                            )
-                            for row in trip_rows
-                        ],
+        by_day: dict[date, set[str]] = {}
+        for trip_id, service_date in instances:
+            by_day.setdefault(service_date, set()).add(trip_id)
+        found: list[TripInstanceCalls] = []
+        for service_date in sorted(by_day):
+            active = self.active_service_ids(service_date)
+            if active:
+                found.extend(
+                    self._instance_calls_on(
+                        service_date,
+                        self._service_day_start(service_date).astimezone(UTC),
+                        sorted(by_day[service_date]),
+                        active,
                     )
                 )
+        return found
+
+    def _instance_calls_on(
+        self,
+        service_date: date,
+        day_start_utc: datetime,
+        trip_ids: list[str],
+        active: set[str],
+    ) -> list[TripInstanceCalls]:
+        marks = ",".join("?" * len(trip_ids))
+        instances: list[TripInstanceCalls] = []
+        service_marks = ",".join("?" * len(active))
+        rows = self._conn.execute(
+            "SELECT t.id, t.source_trip_id, t.start_secs, t.route_id, "
+            "t.service_id, t.headsign, t.wheelchair_accessible, "
+            "t.bikes_allowed, t.direction_id, t.short_name, t.block_id, "
+            "st.stop_sequence, st.stop_id, st.arrival_secs, "
+            "st.departure_secs, st.pickup_type, st.drop_off_type, "
+            "st.timepoint, st.stop_headsign "
+            "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
+            f"WHERE t.id IN ({marks}) "
+            f"AND t.service_id IN ({service_marks}) "
+            "ORDER BY t.id, st.stop_sequence",
+            [*trip_ids, *sorted(active)],
+        ).fetchall()
+        by_trip: dict[str, list[Any]] = {}
+        for row in rows:
+            by_trip.setdefault(row[0], []).append(row)
+        for trip_id, trip_rows in by_trip.items():
+            head = trip_rows[0]
+            instances.append(
+                TripInstanceCalls(
+                    trip_id=trip_id,
+                    source_trip_id=head[1],
+                    start_secs=head[2],
+                    service_date=service_date,
+                    day_start_utc=day_start_utc,
+                    route_id=head[3],
+                    service_id=head[4],
+                    headsign=head[5],
+                    wheelchair_accessible=_enum_or_none(WheelchairAccess, head[6]),
+                    bikes_allowed=_enum_or_none(BikesAllowed, head[7]),
+                    direction_id=head[8],
+                    trip_short_name=head[9],
+                    block_id=head[10],
+                    calls=[
+                        TripCall(
+                            stop_sequence=row[11],
+                            stop_id=row[12],
+                            arrival=(
+                                day_start_utc + timedelta(seconds=row[13])
+                                if row[13] is not None
+                                else None
+                            ),
+                            departure=(
+                                day_start_utc + timedelta(seconds=row[14])
+                                if row[14] is not None
+                                else None
+                            ),
+                            pickup_type=_enum_or_none(PickupDropOffType, row[15]),
+                            drop_off_type=_enum_or_none(PickupDropOffType, row[16]),
+                            timepoint_exact=_timepoint_exact(row[17]),
+                            stop_headsign=row[18],
+                        )
+                        for row in trip_rows
+                    ],
+                )
+            )
         return instances
 
     def concrete_trip_ids(self, source_trip_ids: list[str]) -> dict[str, list[str]]:
@@ -1408,20 +1419,12 @@ class StaticIndex:
         self._last_dates = last
         return last
 
-    def _ceiling_from(
-        self, rows: Iterable[tuple[str, int]], *, last_date_cap: date | None = None
-    ) -> datetime | None:
-        """Latest instant across (service id, latest stop-time secs) rows.
-
-        ``last_date_cap`` bounds every service's last date further (a
-        modification naming its service dates applies to no later day).
-        """
+    def _ceiling_from(self, rows: Iterable[tuple[str, int]]) -> datetime | None:
+        """Latest instant across (service id, latest stop-time secs) rows."""
         last_dates = self._service_last_dates()
         best: datetime | None = None
         for service_id, max_secs in rows:
             last = last_dates.get(service_id)
-            if last is not None and last_date_cap is not None:
-                last = min(last, last_date_cap)
             if last is None or max_secs is None:
                 continue
             try:
@@ -1494,41 +1497,6 @@ class StaticIndex:
         )
         return self._ceiling_from(rows)
 
-    def trips_ceiling(
-        self,
-        source_trip_ids: Sequence[str],
-        service_dates: frozenset[date],
-        extra_secs: int,
-    ) -> datetime | None:
-        """Latest instant any run of these trips can reach, plus ``extra_secs``.
-
-        Bounds the rows a trip modification (detour) can produce: replacement
-        stops are timed from a call of the trip itself, so no rebuilt call
-        lands later than the trip's latest scheduled time on its last
-        runnable day plus the modification's largest travel time and delay
-        (``extra_secs``). ``service_dates``, when given, restricts the runs
-        to those days. ``source_trip_ids`` are producer-facing ids (a
-        frequency template covers every repetition). None: no such run.
-        """
-        if not source_trip_ids:
-            return None
-        rows = self._conn.execute(
-            "SELECT t.service_id, MAX(MAX(COALESCE(st.arrival_secs, -1), "
-            "COALESCE(st.departure_secs, -1))) "
-            "FROM trips t JOIN stop_times st ON st.trip_id = t.id "
-            f"WHERE t.source_trip_id IN ({','.join('?' * len(source_trip_ids))}) "
-            "GROUP BY t.service_id",
-            list(source_trip_ids),
-        ).fetchall()
-        return self._ceiling_from(
-            [
-                (service_id, secs + max(0, extra_secs))
-                for service_id, secs in rows
-                if secs is not None and secs >= 0
-            ],
-            last_date_cap=max(service_dates) if service_dates else None,
-        )
-
     def rt_instances[K: tuple[str, date | None, int | None]](
         self, keys: Iterable[K], at: datetime
     ) -> list[tuple[tuple[str, date], K]]:
@@ -1580,49 +1548,6 @@ class StaticIndex:
                 found.append(((trip_id, day), key))
         return found
 
-    def instance_calls(
-        self, instances: Sequence[tuple[str, date]]
-    ) -> dict[tuple[str, date], list[TripCall]]:
-        """Each (concrete trip, service day) run's timed calls, as instants.
-
-        Calls without a departure time are left out: callers compare these
-        against predicted times, and an untimed call has nothing to compare.
-        """
-        if not instances:
-            return {}
-        trip_ids = sorted({trip_id for trip_id, _ in instances})
-        rows = self._conn.execute(
-            "SELECT trip_id, stop_sequence, stop_id, arrival_secs, departure_secs, "
-            "pickup_type, drop_off_type, timepoint, stop_headsign FROM stop_times "
-            f"WHERE trip_id IN ({','.join('?' * len(trip_ids))}) "
-            "AND departure_secs IS NOT NULL ORDER BY trip_id, stop_sequence",
-            trip_ids,
-        ).fetchall()
-        by_trip: dict[str, list[Any]] = {}
-        for row in rows:
-            by_trip.setdefault(row[0], []).append(row)
-        calls: dict[tuple[str, date], list[TripCall]] = {}
-        for trip_id, service_date in instances:
-            day_start = self._service_day_start(service_date).astimezone(UTC)
-            calls[(trip_id, service_date)] = [
-                TripCall(
-                    stop_sequence=row[1],
-                    stop_id=row[2],
-                    arrival=(
-                        day_start + timedelta(seconds=row[3])
-                        if row[3] is not None
-                        else None
-                    ),
-                    departure=day_start + timedelta(seconds=row[4]),
-                    pickup_type=_enum_or_none(PickupDropOffType, row[5]),
-                    drop_off_type=_enum_or_none(PickupDropOffType, row[6]),
-                    timepoint_exact=_timepoint_exact(row[7]),
-                    stop_headsign=row[8],
-                )
-                for row in by_trip.get(trip_id, [])
-            ]
-        return calls
-
     def current_service_dates(
         self, trip_ids: Sequence[str], at: datetime
     ) -> dict[str, date]:
@@ -1638,8 +1563,11 @@ class StaticIndex:
         later day's run is never "current", so a date-less update can't
         leak onto tomorrow. Callers pass ``at = start - grace`` so a run
         still finishing late keeps its updates.
+
+        An ``at`` past the last instant any service day can be dated (a
+        garbage but representable feed timestamp) has no current run.
         """
-        if not trip_ids:
+        if not trip_ids or at >= _LATEST_INSTANT:
             return {}
         marks = ",".join("?" * len(trip_ids))
         trips = self._conn.execute(
@@ -1763,80 +1691,18 @@ class StaticIndex:
             window_lo,
             window_hi,
         ) in self._service_day_windows(now_utc, lookahead, grace):
-            stop_marks = ",".join("?" * len(stop_ids))
-            service_marks = ",".join("?" * len(active))
-            sql = (
-                "SELECT st.trip_id, t.route_id, t.service_id, t.headsign, st.stop_id, "
-                "st.stop_sequence, "
-                "st.arrival_secs, st.departure_secs, t.source_trip_id, t.start_secs, "
-                "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
-                "st.pickup_type, st.drop_off_type, st.timepoint, st.stop_headsign, "
-                "t.short_name, t.block_id "
-                "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
-                f"WHERE st.stop_id IN ({stop_marks}) "
-                f"AND t.service_id IN ({service_marks}) "
-                "AND st.departure_secs >= ? AND st.departure_secs <= ?"
-            )
-            params: list[object] = [*stop_ids, *sorted(active), window_lo, window_hi]
-            if route_ids:
-                route_marks = ",".join("?" * len(route_ids))
-                sql += f" AND t.route_id IN ({route_marks})"
-                params.extend(route_ids)
-            if headsigns:
-                headsign_marks = ",".join("?" * len(headsigns))
-                sql += f" AND t.headsign IN ({headsign_marks})"
-                params.extend(headsigns)
-            for (
-                trip_id,
-                route_id,
-                service_id,
-                headsign,
-                stop_id,
-                stop_sequence,
-                arr_secs,
-                dep_secs,
-                source_trip_id,
-                start_secs,
-                wheelchair,
-                bikes,
-                direction_id,
-                pickup_type,
-                drop_off_type,
-                timepoint,
-                stop_headsign,
-                trip_short_name,
-                block_id,
-            ) in self._conn.execute(sql, params):
-                results.append(
-                    ScheduledDeparture(
-                        trip_id=trip_id,
-                        route_id=route_id,
-                        service_id=service_id,
-                        headsign=headsign,
-                        stop_id=stop_id,
-                        stop_sequence=stop_sequence,
-                        arrival=(
-                            day_start_utc + timedelta(seconds=arr_secs)
-                            if arr_secs is not None
-                            else None
-                        ),
-                        departure=day_start_utc + timedelta(seconds=dep_secs),
-                        source_trip_id=source_trip_id,
-                        start_secs=start_secs,
-                        service_date=service_date,
-                        wheelchair_accessible=_enum_or_none(
-                            WheelchairAccess, wheelchair
-                        ),
-                        bikes_allowed=_enum_or_none(BikesAllowed, bikes),
-                        direction_id=direction_id,
-                        pickup_type=_enum_or_none(PickupDropOffType, pickup_type),
-                        drop_off_type=_enum_or_none(PickupDropOffType, drop_off_type),
-                        timepoint_exact=_timepoint_exact(timepoint),
-                        stop_headsign=stop_headsign,
-                        trip_short_name=trip_short_name,
-                        block_id=block_id,
-                    )
+            results.extend(
+                self._departures_on(
+                    service_date,
+                    day_start_utc,
+                    active,
+                    stop_ids=stop_ids,
+                    route_ids=route_ids,
+                    headsigns=headsigns,
+                    window_sql="AND st.departure_secs >= ? AND st.departure_secs <= ?",
+                    window_params=[window_lo, window_hi],
                 )
+            )
         # Total sort key: departure alone ties frequently (same-minute
         # departures across trips/stops); trip_id/stop_id break ties so
         # repeated identical queries never flap between orderings, even if
@@ -1855,6 +1721,135 @@ class StaticIndex:
                 limited.append(dep)
                 per_stop_counts[dep.stop_id] = count + 1
         return limited
+
+    def _departures_on(
+        self,
+        service_date: date,
+        day_start_utc: datetime,
+        active: set[str],
+        *,
+        stop_ids: Sequence[str],
+        route_ids: Sequence[str] | None,
+        headsigns: Sequence[str] | None,
+        window_sql: str,
+        window_params: Sequence[object],
+    ) -> list[ScheduledDeparture]:
+        """One service day's timed departures at ``stop_ids`` (see callers)."""
+        rows: list[ScheduledDeparture] = []
+        stop_marks = ",".join("?" * len(stop_ids))
+        service_marks = ",".join("?" * len(active))
+        sql = (
+            "SELECT st.trip_id, t.route_id, t.service_id, t.headsign, st.stop_id, "
+            "st.stop_sequence, "
+            "st.arrival_secs, st.departure_secs, t.source_trip_id, t.start_secs, "
+            "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
+            "st.pickup_type, st.drop_off_type, st.timepoint, st.stop_headsign, "
+            "t.short_name, t.block_id "
+            "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
+            f"WHERE st.stop_id IN ({stop_marks}) "
+            f"AND t.service_id IN ({service_marks}) "
+            "AND st.departure_secs IS NOT NULL "
+            f"{window_sql}"
+        )
+        params: list[object] = [*stop_ids, *sorted(active), *window_params]
+        if route_ids:
+            route_marks = ",".join("?" * len(route_ids))
+            sql += f" AND t.route_id IN ({route_marks})"
+            params.extend(route_ids)
+        if headsigns:
+            headsign_marks = ",".join("?" * len(headsigns))
+            sql += f" AND t.headsign IN ({headsign_marks})"
+            params.extend(headsigns)
+        for (
+            trip_id,
+            route_id,
+            service_id,
+            headsign,
+            stop_id,
+            stop_sequence,
+            arr_secs,
+            dep_secs,
+            source_trip_id,
+            start_secs,
+            wheelchair,
+            bikes,
+            direction_id,
+            pickup_type,
+            drop_off_type,
+            timepoint,
+            stop_headsign,
+            trip_short_name,
+            block_id,
+        ) in self._conn.execute(sql, params):
+            rows.append(
+                ScheduledDeparture(
+                    trip_id=trip_id,
+                    route_id=route_id,
+                    service_id=service_id,
+                    headsign=headsign,
+                    stop_id=stop_id,
+                    stop_sequence=stop_sequence,
+                    arrival=(
+                        day_start_utc + timedelta(seconds=arr_secs)
+                        if arr_secs is not None
+                        else None
+                    ),
+                    departure=day_start_utc + timedelta(seconds=dep_secs),
+                    source_trip_id=source_trip_id,
+                    start_secs=start_secs,
+                    service_date=service_date,
+                    wheelchair_accessible=_enum_or_none(WheelchairAccess, wheelchair),
+                    bikes_allowed=_enum_or_none(BikesAllowed, bikes),
+                    direction_id=direction_id,
+                    pickup_type=_enum_or_none(PickupDropOffType, pickup_type),
+                    drop_off_type=_enum_or_none(PickupDropOffType, drop_off_type),
+                    timepoint_exact=_timepoint_exact(timepoint),
+                    stop_headsign=stop_headsign,
+                    trip_short_name=trip_short_name,
+                    block_id=block_id,
+                )
+            )
+        return rows
+
+    def instance_departures(
+        self,
+        instances: Iterable[tuple[str, date]],
+        stop_ids: Sequence[str],
+        route_ids: Sequence[str] | None = None,
+        headsigns: Sequence[str] | None = None,
+    ) -> list[ScheduledDeparture]:
+        """Every timed departure of specific runs at ``stop_ids``, any time.
+
+        The runs are (concrete trip, service day) pairs, as
+        :meth:`rt_instances` resolves them; a run whose service doesn't
+        operate that day yields nothing. Rows are exactly the ones
+        :meth:`upcoming_departures` builds for these runs, with no window.
+        """
+        by_day: dict[date, set[str]] = {}
+        for trip_id, service_date in instances:
+            by_day.setdefault(service_date, set()).add(trip_id)
+        if not stop_ids:
+            return []
+        rows: list[ScheduledDeparture] = []
+        for service_date in sorted(by_day):
+            active = self.active_service_ids(service_date)
+            if not active:
+                continue
+            trip_ids = sorted(by_day[service_date])
+            rows.extend(
+                self._departures_on(
+                    service_date,
+                    self._service_day_start(service_date).astimezone(UTC),
+                    active,
+                    stop_ids=stop_ids,
+                    route_ids=route_ids,
+                    headsigns=headsigns,
+                    window_sql=f"AND st.trip_id IN ({','.join('?' * len(trip_ids))})",
+                    window_params=trip_ids,
+                )
+            )
+        rows.sort(key=lambda dep: (dep.departure, dep.trip_id, dep.stop_id))
+        return rows
 
     # Shared origin->destination candidate predicate: right direction, both
     # ends timed, service active. Kept as one fragment so the row query and
@@ -1903,6 +1898,149 @@ class StaticIndex:
             extremes.append((row[0], row[1]))
         return extremes[0], extremes[1]
 
+    def _trips_on(
+        self,
+        service_date: date,
+        day_start_utc: datetime,
+        active: set[str],
+        *,
+        origin_stop_id: str,
+        destination_stop_id: str,
+        window_sql: str,
+        window_params: Sequence[object],
+    ) -> list[ScheduledTrip]:
+        """One service day's origin->destination journeys (see callers)."""
+        found: list[ScheduledTrip] = []
+        service_marks = ",".join("?" * len(active))
+        candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
+        # The IS NOT NULL clauses (in the shared candidate predicate)
+        # guarantee ScheduledTrip's non-optional datetimes: a stop_time
+        # without a departure at the origin (or an arrival at the
+        # destination) can never produce a row. The bare d.* columns are
+        # well-defined under GROUP BY because the query has exactly one
+        # min/max aggregate: SQLite documents that they then come from
+        # the row MIN(d.arrival_secs) selected, i.e. the destination
+        # call actually ridden to.
+        sql = (
+            "SELECT o.trip_id, t.route_id, t.service_id, t.headsign, "
+            "o.departure_secs, MIN(d.arrival_secs), "
+            "t.source_trip_id, t.start_secs, "
+            "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
+            "o.pickup_type, o.drop_off_type, o.timepoint, o.stop_headsign, "
+            "d.pickup_type, d.drop_off_type, d.timepoint, d.stop_headsign, "
+            "o.stop_sequence, d.stop_sequence, t.short_name, t.block_id "
+            f"{candidates} "
+            f"{window_sql} "
+            "GROUP BY o.trip_id, o.stop_sequence"
+        )
+        params: list[object] = [
+            origin_stop_id,
+            destination_stop_id,
+            *sorted(active),
+            *window_params,
+        ]
+        rows = self._conn.execute(sql, params).fetchall()
+        if not rows:
+            return []
+        first_key, last_key = self._pair_day_extremes(
+            origin_stop_id, destination_stop_id, active
+        )
+        for (
+            trip_id,
+            route_id,
+            service_id,
+            headsign,
+            dep_secs,
+            arr_secs,
+            source_trip_id,
+            start_secs,
+            wheelchair,
+            bikes,
+            direction_id,
+            o_pickup,
+            o_drop_off,
+            o_timepoint,
+            o_stop_headsign,
+            d_pickup,
+            d_drop_off,
+            d_timepoint,
+            d_stop_headsign,
+            o_sequence,
+            d_sequence,
+            trip_short_name,
+            block_id,
+        ) in rows:
+            found.append(
+                ScheduledTrip(
+                    trip_id=trip_id,
+                    route_id=route_id,
+                    service_id=service_id,
+                    headsign=headsign,
+                    origin_stop_id=origin_stop_id,
+                    destination_stop_id=destination_stop_id,
+                    departure=day_start_utc + timedelta(seconds=dep_secs),
+                    arrival=day_start_utc + timedelta(seconds=arr_secs),
+                    source_trip_id=source_trip_id,
+                    start_secs=start_secs,
+                    service_date=service_date,
+                    origin_stop_sequence=o_sequence,
+                    destination_stop_sequence=d_sequence,
+                    wheelchair_accessible=_enum_or_none(WheelchairAccess, wheelchair),
+                    bikes_allowed=_enum_or_none(BikesAllowed, bikes),
+                    direction_id=direction_id,
+                    origin_pickup_type=_enum_or_none(PickupDropOffType, o_pickup),
+                    origin_drop_off_type=_enum_or_none(PickupDropOffType, o_drop_off),
+                    origin_timepoint_exact=_timepoint_exact(o_timepoint),
+                    origin_stop_headsign=o_stop_headsign,
+                    destination_pickup_type=_enum_or_none(PickupDropOffType, d_pickup),
+                    destination_drop_off_type=_enum_or_none(
+                        PickupDropOffType, d_drop_off
+                    ),
+                    destination_timepoint_exact=_timepoint_exact(d_timepoint),
+                    destination_stop_headsign=d_stop_headsign,
+                    is_first=(trip_id, o_sequence) == first_key,
+                    is_last=(trip_id, o_sequence) == last_key,
+                    trip_short_name=trip_short_name,
+                    block_id=block_id,
+                )
+            )
+        return found
+
+    def instance_trips(
+        self,
+        instances: Iterable[tuple[str, date]],
+        origin_stop_id: str,
+        destination_stop_id: str,
+    ) -> list[ScheduledTrip]:
+        """Every origin->destination journey of specific runs, any time.
+
+        The runs are (concrete trip, service day) pairs; rows are exactly
+        the ones :meth:`upcoming_trips` builds for them (first/last of day
+        included), with no window.
+        """
+        by_day: dict[date, set[str]] = {}
+        for trip_id, service_date in instances:
+            by_day.setdefault(service_date, set()).add(trip_id)
+        rows: list[ScheduledTrip] = []
+        for service_date in sorted(by_day):
+            active = self.active_service_ids(service_date)
+            if not active:
+                continue
+            trip_ids = sorted(by_day[service_date])
+            rows.extend(
+                self._trips_on(
+                    service_date,
+                    self._service_day_start(service_date).astimezone(UTC),
+                    active,
+                    origin_stop_id=origin_stop_id,
+                    destination_stop_id=destination_stop_id,
+                    window_sql=f"AND o.trip_id IN ({','.join('?' * len(trip_ids))})",
+                    window_params=trip_ids,
+                )
+            )
+        rows.sort(key=lambda trip: (trip.departure, trip.trip_id, trip.arrival))
+        return rows
+
     def upcoming_trips(
         self,
         origin_stop_id: str,
@@ -1944,106 +2082,17 @@ class StaticIndex:
             window_lo,
             window_hi,
         ) in self._service_day_windows(now_utc, lookahead, grace):
-            service_marks = ",".join("?" * len(active))
-            candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
-            # The IS NOT NULL clauses (in the shared candidate predicate)
-            # guarantee ScheduledTrip's non-optional datetimes: a stop_time
-            # without a departure at the origin (or an arrival at the
-            # destination) can never produce a row. The bare d.* columns are
-            # well-defined under GROUP BY because the query has exactly one
-            # min/max aggregate: SQLite documents that they then come from
-            # the row MIN(d.arrival_secs) selected, i.e. the destination
-            # call actually ridden to.
-            sql = (
-                "SELECT o.trip_id, t.route_id, t.service_id, t.headsign, "
-                "o.departure_secs, MIN(d.arrival_secs), "
-                "t.source_trip_id, t.start_secs, "
-                "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
-                "o.pickup_type, o.drop_off_type, o.timepoint, o.stop_headsign, "
-                "d.pickup_type, d.drop_off_type, d.timepoint, d.stop_headsign, "
-                "o.stop_sequence, d.stop_sequence, t.short_name, t.block_id "
-                f"{candidates} "
-                "AND o.departure_secs >= ? AND o.departure_secs <= ? "
-                "GROUP BY o.trip_id, o.stop_sequence"
-            )
-            params: list[object] = [
-                origin_stop_id,
-                destination_stop_id,
-                *sorted(active),
-                window_lo,
-                window_hi,
-            ]
-            rows = self._conn.execute(sql, params).fetchall()
-            if not rows:
-                continue
-            first_key, last_key = self._pair_day_extremes(
-                origin_stop_id, destination_stop_id, active
-            )
-            for (
-                trip_id,
-                route_id,
-                service_id,
-                headsign,
-                dep_secs,
-                arr_secs,
-                source_trip_id,
-                start_secs,
-                wheelchair,
-                bikes,
-                direction_id,
-                o_pickup,
-                o_drop_off,
-                o_timepoint,
-                o_stop_headsign,
-                d_pickup,
-                d_drop_off,
-                d_timepoint,
-                d_stop_headsign,
-                o_sequence,
-                d_sequence,
-                trip_short_name,
-                block_id,
-            ) in rows:
-                results.append(
-                    ScheduledTrip(
-                        trip_id=trip_id,
-                        route_id=route_id,
-                        service_id=service_id,
-                        headsign=headsign,
-                        origin_stop_id=origin_stop_id,
-                        destination_stop_id=destination_stop_id,
-                        departure=day_start_utc + timedelta(seconds=dep_secs),
-                        arrival=day_start_utc + timedelta(seconds=arr_secs),
-                        source_trip_id=source_trip_id,
-                        start_secs=start_secs,
-                        service_date=service_date,
-                        origin_stop_sequence=o_sequence,
-                        destination_stop_sequence=d_sequence,
-                        wheelchair_accessible=_enum_or_none(
-                            WheelchairAccess, wheelchair
-                        ),
-                        bikes_allowed=_enum_or_none(BikesAllowed, bikes),
-                        direction_id=direction_id,
-                        origin_pickup_type=_enum_or_none(PickupDropOffType, o_pickup),
-                        origin_drop_off_type=_enum_or_none(
-                            PickupDropOffType, o_drop_off
-                        ),
-                        origin_timepoint_exact=_timepoint_exact(o_timepoint),
-                        origin_stop_headsign=o_stop_headsign,
-                        destination_pickup_type=_enum_or_none(
-                            PickupDropOffType, d_pickup
-                        ),
-                        destination_drop_off_type=_enum_or_none(
-                            PickupDropOffType, d_drop_off
-                        ),
-                        destination_timepoint_exact=_timepoint_exact(d_timepoint),
-                        destination_stop_headsign=d_stop_headsign,
-                        is_first=(trip_id, o_sequence) == first_key,
-                        is_last=(trip_id, o_sequence) == last_key,
-                        trip_short_name=trip_short_name,
-                        block_id=block_id,
-                    )
+            results.extend(
+                self._trips_on(
+                    service_date,
+                    day_start_utc,
+                    active,
+                    origin_stop_id=origin_stop_id,
+                    destination_stop_id=destination_stop_id,
+                    window_sql="AND o.departure_secs >= ? AND o.departure_secs <= ?",
+                    window_params=[window_lo, window_hi],
                 )
+            )
         # Total sort key, matching upcoming_departures's rationale: arrival
         # is the third component because a degenerate loop trip can depart
         # the origin twice at the identical instant.

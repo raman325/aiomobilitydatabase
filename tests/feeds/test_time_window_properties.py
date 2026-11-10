@@ -41,8 +41,9 @@ from aiomobilitydatabase.feeds.models import (
 from aiomobilitydatabase.feeds.static_index import StaticIndex
 from aiomobilitydatabase.feeds.transit import (
     TransitFeedHandle,
+    _board_settles,
     _DirectUrls,
-    _horizon_settles,
+    _effective_trip_departure,
     _horizons,
 )
 
@@ -135,21 +136,29 @@ def _stop_choices(index: StaticIndex, draw_ids: Sequence[int]) -> list[str]:
 async def _uncapped[T](
     handle: TransitFeedHandle, until: datetime, call: Callable[[], Awaitable[T]]
 ) -> T:
-    """Run ``call`` with every per-query ceiling lifted to ``until``.
+    """Run ``call`` as a plain read of its whole window.
 
     The reference a scan optimization is checked against must not share
-    the optimization: with ceilings lifted, an unlimited query reads its
-    whole window, so a ceiling that wrongly cut rows (a detour reaching
-    past the schedule) shows up as a difference.
+    the optimization: every per-query ceiling is lifted to ``until``, so an
+    unlimited query reads its whole window, and the up-front read of the
+    runs realtime addresses is switched off, so those rows come from the
+    window scan like any other. A ceiling that wrongly cut rows, or an
+    up-front read that added or lost any, shows up as a difference.
     """
     index = handle._index
     saved = (index.departures_ceiling, index.journeys_ceiling)
     index.departures_ceiling = lambda *_a, **_k: until  # type: ignore[method-assign]
     index.journeys_ceiling = lambda *_a, **_k: until  # type: ignore[method-assign]
+
+    async def nothing_up_front(*_a: object) -> list[object]:
+        return []
+
+    handle._addressed_runs = nothing_up_front  # type: ignore[method-assign]
     try:
         return await call()
     finally:
         index.departures_ceiling, index.journeys_ceiling = saved
+        del handle._addressed_runs
 
 
 def _trip_ids(index: StaticIndex) -> list[str]:
@@ -179,7 +188,8 @@ _ENTITY = st.one_of(
         st.just("stop_time"),
         st.integers(0, 5),
         st.integers(0, 3),
-        st.integers(-6 * _HOUR, 30 * _HOUR),
+        # GARBAGE_TIME: an explicit time of epoch 1 -- valid, absurdly early.
+        st.one_of(st.integers(-6 * _HOUR, 30 * _HOUR), st.just("GARBAGE_TIME")),
         _DATE,
     ),
     st.tuples(st.just("cancel"), st.integers(0, 5), _DATE, _START_TIME),
@@ -193,22 +203,32 @@ _ENTITY = st.one_of(
     st.tuples(
         st.just("detour"),
         st.integers(0, 5),
-        st.integers(0, 3),
+        # One or more modifications on the trip: (selected stop sequence,
+        # replacements -- possibly none, which the spec allows -- delay).
         st.lists(
-            st.tuples(st.integers(0, 4), st.integers(-30 * 60, 2 * _HOUR)),
+            st.tuples(
+                st.integers(0, 3),
+                st.lists(
+                    st.tuples(st.integers(0, 4), st.integers(-30 * 60, 2 * _HOUR)),
+                    max_size=2,
+                ),
+                st.integers(-_HOUR, 2 * _HOUR),
+            ),
             min_size=1,
-            max_size=2,
+            max_size=3,
         ),
-        st.integers(-_HOUR, _HOUR),
         _DATE,
+        _START_TIME,
     ),
     st.tuples(st.just("vehicle"), st.integers(0, 5), _DATE, _START_TIME),
 )
-# (entities, whether the feed carries a header timestamp -- mostly yes, as
-# the spec requires; sometimes not, to exercise the fallback)
+# (entities, the feed's header timestamp: mostly the query's start, as a
+# live feed is; sometimes hours behind or ahead of it (a board for later,
+# a stale feed), absurd (year 9999), or absent -- the spec requires one,
+# so that exercises the fallback)
 _REALTIME = st.tuples(
     st.lists(_ENTITY, min_size=2, max_size=8),
-    st.sampled_from([True, True, True, False]),
+    st.sampled_from(["start", "start", "start", "behind", "ahead", "garbage", None]),
 )
 
 # Most realtime examples start shortly before the anchor's run on some
@@ -242,6 +262,15 @@ _DETOUR = st.tuples(
     st.integers(-_HOUR, _HOUR),
     _RUN_DAYS,
 )
+# Trips ignore detours, so their lead is an early or shifted run; usually
+# one (a lead is what makes the early-tomorrow case reachable at all).
+_TRIP_LEAD = st.sampled_from(["early", "early", "shift", "none"]).flatmap(
+    lambda kind: {
+        "shift": st.tuples(st.just("shift"), _SHIFT, _RUN_DAYS),
+        "early": _EARLY_TOMORROW,
+        "none": st.none(),
+    }[kind]
+)
 _LEAD = st.sampled_from(["early", "detour", "early", "detour", "shift"]).flatmap(
     lambda kind: {
         "shift": st.tuples(st.just("shift"), _SHIFT, _RUN_DAYS),
@@ -271,7 +300,7 @@ def _with_lead(
         stops = [anchor_stop]
     else:
         _, travel, delay, run_day = lead
-        spec = ("detour", 0, sequence, [(0, travel)], delay, run_day)
+        spec = ("detour", 0, [(sequence, [(0, travel)], delay)], run_day, None)
         stops = [anchor_stop, "POPUP"]
     return [spec, *entities], stops
 
@@ -294,7 +323,7 @@ def _near_run_start(
 
 def _rt_message(  # noqa: PLR0912, PLR0915 -- a branch per generated entity kind
     index: StaticIndex,
-    realtime: tuple[list[tuple[Any, ...]], bool],
+    realtime: tuple[list[tuple[Any, ...]], str | None],
     start: datetime,
     run_day: date | None,
 ) -> gtfs_realtime_pb2.FeedMessage:
@@ -317,8 +346,13 @@ def _rt_message(  # noqa: PLR0912, PLR0915 -- a branch per generated entity kind
 
     message = gtfs_realtime_pb2.FeedMessage()
     message.header.gtfs_realtime_version = "2.0"
-    if stamped:  # a live feed, stamped at the query's start
-        message.header.timestamp = int(start.timestamp())
+    if stamped is not None:
+        message.header.timestamp = {
+            "start": int(start.timestamp()),
+            "behind": int(start.timestamp()) - 3 * _HOUR,
+            "ahead": int(start.timestamp()) + _HOUR,
+            "garbage": 253_402_290_000,  # 9999-12-31T23:00Z: representable
+        }[stamped]
     # Detours may route through POPUP, a stop only this feed defines (an
     # undefined replacement stop is unplaceable and skipped).
     popup = message.entity.add()
@@ -342,21 +376,26 @@ def _rt_message(  # noqa: PLR0912, PLR0915 -- a branch per generated entity kind
             vehicle.position.latitude = 34.0
             vehicle.position.longitude = -118.0
         elif kind == "detour":
-            _, i, sequence, replacements, delay, date_choice = spec
+            _, i, modifications, date_choice, start_time = spec
             mods = entity.trip_modifications
             mods.selected_trips.add().trip_ids.append(trip(i))
             if (service_date := day(date_choice)) is not None:
                 mods.service_dates.append(service_date)
-            mod = mods.modifications.add()
-            mod.start_stop_selector.stop_sequence = sequence
-            mod.end_stop_selector.stop_sequence = sequence
-            mod.propagated_modification_delay = delay
-            for stop_pick, travel in replacements:
-                stop = mod.replacement_stops.add()
-                stop.stop_id = (
-                    "POPUP" if stop_pick == 0 else stop_ids[stop_pick % len(stop_ids)]
-                )
-                stop.travel_time_to_stop = travel
+            if start_time is not None:
+                mods.start_times.append(start_time)
+            for sequence, replacements, delay in modifications:
+                mod = mods.modifications.add()
+                mod.start_stop_selector.stop_sequence = sequence
+                mod.end_stop_selector.stop_sequence = sequence
+                mod.propagated_modification_delay = delay
+                for stop_pick, travel in replacements:
+                    stop = mod.replacement_stops.add()
+                    stop.stop_id = (
+                        "POPUP"
+                        if stop_pick == 0
+                        else stop_ids[stop_pick % len(stop_ids)]
+                    )
+                    stop.travel_time_to_stop = travel
         elif kind == "added":
             _, stop_pick, offset, date_choice, with_vehicle = spec
             update = entity.trip_update
@@ -393,7 +432,7 @@ def _rt_message(  # noqa: PLR0912, PLR0915 -- a branch per generated entity kind
                 _, _, sequence, offset, date_choice = spec
                 stu = update.stop_time_update.add()
                 stu.stop_sequence = sequence
-                stu.departure.time = at(offset)
+                stu.departure.time = 1 if offset == "GARBAGE_TIME" else at(offset)
             else:  # cancel
                 _, _, date_choice, start_time = spec
                 update.trip.schedule_relationship = (
@@ -506,18 +545,18 @@ def test_horizons_stop_at_the_end_or_the_ceiling_whichever_is_first() -> None:
     assert list(_horizons(start, None, None)) == [(start, True)]
 
 
-def test_horizon_settles_rules() -> None:
+def test_board_settles_rules() -> None:
     horizon = datetime(2026, 7, 30, 12, tzinfo=UTC)
-    early = horizon - timedelta(hours=2)
-    late = horizon - timedelta(minutes=30)
-    margin = timedelta(hours=1)
-    assert _horizon_settles([[early]], [1], horizon, margin)
-    assert not _horizon_settles([[late]], [1], horizon, margin)
-    assert _horizon_settles([[late]], [1], horizon, timedelta(0))
-    assert not _horizon_settles([[early]], [2], horizon, margin)
-    assert not _horizon_settles([[early]], [None], horizon, margin)
-    assert _horizon_settles([[]], [0], horizon, margin)
-    assert not _horizon_settles([[early], []], [1, 1], horizon, margin)
+    inside = horizon - timedelta(hours=2)
+    # Full with its last row inside (or at) the horizon: final.
+    assert _board_settles([inside], 1, horizon)
+    assert _board_settles([horizon], 1, horizon)
+    assert _board_settles([], 0, horizon)
+    # Room left, unlimited, or a delayed last row past the horizon: an
+    # unread row at its scheduled time could still sort ahead.
+    assert not _board_settles([inside], 2, horizon)
+    assert not _board_settles([inside], None, horizon)
+    assert not _board_settles([horizon + timedelta(seconds=1)], 1, horizon)
 
 
 # -- scan independence ----------------------------------------------------------
@@ -590,7 +629,7 @@ def test_arrivals_do_not_depend_on_how_they_were_scanned(
     start: datetime,
     stop_picks: list[int],
     limit: int,
-    realtime: tuple[list[tuple[Any, ...]], bool],
+    realtime: tuple[list[tuple[Any, ...]], str | None],
     use_anchor: bool,
     near: tuple[date, int] | None,
     lead: tuple[Any, ...],
@@ -641,15 +680,16 @@ def test_arrivals_do_not_depend_on_how_they_were_scanned(
     _run(index, body, message)
 
 
-@_RT_SETTINGS
+@settings(_RT_SETTINGS, max_examples=400)
 @given(
     zip_bytes=_feed_variant(),
     start=_STARTS,
     pair_picks=st.tuples(st.integers(0, 10), st.integers(0, 10)),
     limit=st.integers(0, 4),
-    use_anchor=st.booleans(),
+    use_anchor=st.sampled_from([True, True, True, False]),
     realtime=_REALTIME,
     near=_NEAR_RUN,
+    lead=_TRIP_LEAD,
     hours=st.integers(1, 96),
 )
 def test_upcoming_trips_do_not_depend_on_how_they_were_scanned(
@@ -659,13 +699,20 @@ def test_upcoming_trips_do_not_depend_on_how_they_were_scanned(
     pair_picks: tuple[int, int],
     limit: int,
     use_anchor: bool,
-    realtime: tuple[list[tuple[Any, ...]], bool],
+    realtime: tuple[list[tuple[Any, ...]], str | None],
     near: tuple[date, int] | None,
+    lead: tuple[Any, ...] | None,
     hours: int,
 ) -> None:
     index = _build(zip_bytes)
     start, run_day = _near_run_start(index, start, near)
-    message = _rt_message(index, realtime, start, run_day)
+    if lead is not None and lead[0] == "early_tomorrow" and near is not None:
+        # Predict tomorrow's run to leave just before today's, which the
+        # start sits ``near[1]`` minutes ahead of: the early run must lead
+        # a board whose first horizon already holds today's.
+        lead = ("early_tomorrow", lead[1] % max(1, near[1] * 60))
+    entities, _ = _with_lead(index, realtime[0], lead)
+    message = _rt_message(index, (entities, realtime[1]), start, run_day)
     stop_ids = sorted({stop.id for stop in index.stops()})
     origin = stop_ids[pair_picks[0] % len(stop_ids)]
     destination = stop_ids[pair_picks[1] % len(stop_ids)]
@@ -694,6 +741,14 @@ def test_upcoming_trips_do_not_depend_on_how_they_were_scanned(
         window = await _uncapped(handle, end, lambda: trips(None, end))
         assert keys(await trips(limit, end)) == keys(window[:limit])
         event(f"trip rows: {min(len(open_ended), 3)}")
+        leading = whole[:1]
+        event(
+            "a run beyond the first horizon leads, predicted early"
+            if leading
+            and leading[0].scheduled_departure > start + timedelta(hours=2)
+            and _effective_trip_departure(leading[0]) < leading[0].scheduled_departure
+            else "no early lead"
+        )
 
     _run(index, body, message)
 
@@ -721,7 +776,7 @@ def test_a_batch_equals_its_queries_run_alone(
     zip_bytes: bytes,
     start: datetime,
     query_picks: list[tuple[list[int], int, bool]],
-    realtime: tuple[list[tuple[Any, ...]], bool],
+    realtime: tuple[list[tuple[Any, ...]], str | None],
     near: tuple[date, int] | None,
     lead: tuple[Any, ...],
     hours: int | None,

@@ -863,4 +863,24 @@ def test_trip_modifications_without_selected_trips_is_skipped() -> None:
     modification.start_stop_selector.stop_sequence = 1
     modification.end_stop_selector.stop_sequence = 1
     entity.trip_modifications.selected_trips.add()  # no trip_ids
+    entity.trip_modifications.service_dates.append("20260730")
+    assert trip_modifications_from_message(message) == []
+
+
+@pytest.mark.parametrize("dates", [(), ("not-a-date",)])
+def test_trip_modifications_without_a_usable_service_date_are_skipped(
+    dates: tuple[str, ...],
+) -> None:
+    """service_dates is required; naming none (or only garbage) names no run,
+    rather than every day the trip runs.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "undated"
+    modification = entity.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    entity.trip_modifications.selected_trips.add().trip_ids.append("T1")
+    entity.trip_modifications.service_dates.extend(dates)
     assert trip_modifications_from_message(message) == []

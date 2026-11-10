@@ -236,7 +236,7 @@ class TripModifications:
     """Modifications applying to a set of trip instances."""
 
     trip_ids: list[str]
-    service_dates: frozenset[date]
+    service_dates: frozenset[date]  # never empty: the spec requires them
     start_secs: frozenset[int]
     modifications: list[Modification]
 
@@ -282,6 +282,8 @@ def trip_modifications_from_message(
 
     service_dates parse leniently: a malformed date degrades to "not this
     day" rather than failing the message, like every other RT descriptor.
+    The spec requires service_dates, so an entity naming no usable date
+    modifies no run at all -- it is never read as "every day".
     """
     found: list[TripModifications] = []
     for entity in message.entity:
@@ -325,6 +327,8 @@ def trip_modifications_from_message(
             for raw in modifications.service_dates
             if (parsed_date := _lenient_service_date(raw)) is not None
         )
+        if not dates:
+            continue
         starts = frozenset(
             secs
             for raw in modifications.start_times

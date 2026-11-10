@@ -757,6 +757,23 @@ async def test_detour_ignores_a_service_date_it_does_not_name(
     assert ("T1", "S3") not in calls
 
 
+async def test_a_detour_naming_no_service_date_modifies_nothing(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """service_dates is required: without one, a detour names no run --
+    it is never read as "every day".
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=_detour_message(service_dates=()), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2", "S3"])], start=NOW, end=NOW + timedelta(hours=2)
+    )
+    calls = {(a.trip_id, a.stop_id) for a in arrivals}
+    assert ("T1", "S2") in calls
+    assert ("T1", "S3") not in calls
+
+
 async def test_propagated_delay_shifts_stops_after_the_detour(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:

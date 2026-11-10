@@ -24,10 +24,11 @@ def _index(
     stop_times: str,
     trips: str = "R1,ALL,T1,Downtown\nR1,ALL,T2,Uptown\n",
     calendar_dates: str = "",
+    timezone: str = "UTC",
 ) -> StaticIndex:
     files = {
         "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
-        "A,A,https://a.example,UTC\n",
+        f"A,A,https://a.example,{timezone}\n",
         "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,One,1,1\nS2,Two,1,1\n",
         "routes.txt": "route_id,route_short_name,route_type\nR1,1,3\n",
         "trips.txt": "route_id,service_id,trip_id,trip_headsign\n" + trips,
@@ -115,16 +116,37 @@ def test_realtime_index_helpers_accept_empty_input(tmp_path: Path) -> None:
         stop_times=_TWO_STOPS,
     )
     at = datetime(2026, 7, 30, 7, tzinfo=UTC)
-    assert index.trips_ceiling([], frozenset(), 0) is None
-    assert index.instance_calls([]) == {}
     assert index.rt_instances([], at) == []
+    assert index.instance_departures([], ["S1"]) == []
+    assert index.instance_departures([("T1", date(2026, 7, 30))], []) == []
+    assert index.instance_trips([], "S1", "S2") == []
+    assert index.instance_trip_calls([]) == []
     # A trip with calls, addressed on a day its service runs and one it doesn't.
     assert index.rt_instances(
         [("T1", date(2026, 7, 30), None), ("T1", date(2027, 1, 1), None)], at
     ) == [(("T1", date(2026, 7, 30)), ("T1", date(2026, 7, 30), None))]
-    assert index.trips_ceiling(["T1"], frozenset({date(2026, 3, 1)}), 600) == (
-        datetime(2026, 3, 1, 8, 20, tzinfo=UTC)
+    # A run on a day its service doesn't operate doesn't exist.
+    gone = [("T1", date(2027, 1, 1))]
+    assert index.instance_departures(gone, ["S1"]) == []
+    assert index.instance_trips(gone, "S1", "S2") == []
+    assert index.instance_trip_calls(gone) == []
+    [run] = index.instance_trip_calls([("T1", date(2026, 7, 30))])
+    assert [call.stop_id for call in run.calls] == ["S1", "S2"]
+
+
+def test_a_garbage_feed_time_has_no_current_run(tmp_path: Path) -> None:
+    """A representable but absurd feed timestamp (year 9999) east of UTC
+    would overflow local-date arithmetic; it simply means no current run.
+    """
+    index = _index(
+        tmp_path,
+        calendar="ALL,1,1,1,1,1,1,1,20260101,99991231\n",
+        stop_times=_TWO_STOPS,
+        timezone="Australia/Sydney",
     )
+    at = datetime(9999, 12, 31, 23, tzinfo=UTC)
+    assert index.current_service_dates(["T1"], at) == {}
+    assert index.rt_instances([("T1", None, None)], at) == []
 
 
 def test_current_service_dates_edges(tmp_path: Path) -> None:

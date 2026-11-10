@@ -193,7 +193,7 @@ async def test_an_empty_window_returns_empty_boards(
 async def test_an_early_running_trip_beyond_the_first_horizon_is_caught(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
-    """The early-running margin keeps the open-ended board exact.
+    """A run realtime moves is read whole, so the open-ended board is exact.
 
     The first horizon is start + 2h = 08:10:30, which holds only T1
     (08:00:30). T2 is scheduled at 08:30:30, outside that horizon, but
@@ -531,3 +531,181 @@ async def test_dateless_realtime_is_judged_at_the_feeds_time_not_the_boards(
     [tomorrow] = await handle.get_arrivals(query, start=_pdt(7, 31, 7, 45))
     assert _times(today) == [("T2", _pdt(7, 30, 8, 30, 30))]  # Thursday's T1 gone
     assert _times(tomorrow) == [("T1", _pdt(7, 31, 8, 0, 30))]  # Friday's stays
+
+
+def _update(*entities: tuple[str, str | None, int | None, int | None]) -> bytes:
+    """TripUpdates: (trip_id, start_date, trip delay, S1 departure epoch)."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    for n, (trip_id, start_date, delay, departure) in enumerate(entities):
+        entity = message.entity.add()
+        entity.id = f"e{n}"
+        entity.trip_update.trip.trip_id = trip_id
+        if start_date is not None:
+            entity.trip_update.trip.start_date = start_date
+        if delay is not None:
+            entity.trip_update.delay = delay
+        if departure is not None:
+            stu = entity.trip_update.stop_time_update.add()
+            stu.stop_sequence = 1
+            stu.departure.time = departure
+    return message.SerializeToString()
+
+
+async def test_tomorrows_run_predicted_early_leads_an_open_ended_journey_board(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Tomorrow's T1 is predicted to leave S1 at 07:50:30 today, ahead of
+    today's 08:00:30 -- which already sits inside the first horizon. The
+    run realtime addresses is read whole up front, so the board can't
+    settle on today's run before ever reading tomorrow's.
+    """
+    _mock_catalog(mock_api, rt=True)
+    early = int(_pdt(7, 30, 7, 50, 30).timestamp())
+    mock_api.get(
+        "/rt/all", body=_update(("T1", "20260731", None, early)), content_type=PB
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [trips] = await handle.get_upcoming_trips(
+        [TripQuery("S1", "S2", limit=1)], start=_pdt(7, 30, 6, 10, 30)
+    )
+    assert [(row.trip_id, row.scheduled_departure) for row in trips] == [
+        ("T1", _pdt(7, 31, 8, 0, 30))
+    ]
+
+
+async def test_a_bounded_window_holds_addressed_runs_to_their_schedule(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """The window closes at ``end`` for SCHEDULED departures, realtime or
+    not: T2 (08:30:30) predicted 40 minutes early is still outside a window
+    ending 08:15, and so is tomorrow's T1 predicted into it.
+    """
+    _mock_catalog(mock_api, rt=True)
+    early = int(_pdt(7, 30, 7, 50, 30).timestamp())
+    body = _update(("T2", None, -40 * 60, None), ("T1", "20260731", None, early))
+    for _ in range(2):  # one fetch per call: no caching headers
+        mock_api.get("/rt/all", body=body, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    start, end = _pdt(7, 30, 7, 0), _pdt(7, 30, 8, 15)
+    [board] = await handle.get_arrivals([ArrivalsQuery(["S1"])], start=start, end=end)
+    assert [(row.trip_id, row.scheduled_departure) for row in board] == [
+        ("T1", _pdt(7, 30, 8, 0, 30))
+    ]
+    [trips] = await handle.get_upcoming_trips(
+        [TripQuery("S1", "S2")], start=start, end=end
+    )
+    assert [(row.trip_id, row.scheduled_departure) for row in trips] == [
+        ("T1", _pdt(7, 30, 8, 0, 30))
+    ]
+
+
+async def test_a_delayed_row_past_the_horizon_does_not_settle_the_board(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """T1 runs three hours late (11:00:30). The first horizon (08:10:30)
+    holds only it, but T2 at 08:30:30 -- read in the next slice -- leaves
+    first, so the board can't stop at a last row beyond its horizon.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=_update(("T1", None, 3 * 3600, None)), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [board] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"], limit=1)], start=_pdt(7, 30, 6, 10, 30)
+    )
+    assert [row.trip_id for row in board] == ["T2"]
+
+
+async def test_one_slice_settles_a_board_whatever_realtime_says_elsewhere(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Cost, not just correctness: a garbage explicit time (epoch 1) on one
+    trip and a large early shift on another used to stop every board from
+    settling. Neither is a row this board can show, so one slice does.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all",
+        body=_update(("T4", None, None, 1), ("T3", None, -6 * 3600, None)),
+        content_type=PB,
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    index = handle._index
+    reads: list[object] = []
+    scan = index.upcoming_departures
+
+    def counting(*args: object, **kwargs: object) -> object:
+        reads.append(args)
+        return scan(*args, **kwargs)  # type: ignore[arg-type]
+
+    index.upcoming_departures = counting  # type: ignore[method-assign]
+    [board] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"], limit=1)], start=_pdt(7, 30, 7, 0)
+    )
+    assert [row.trip_id for row in board] == ["T1"]
+    assert len(reads) == 1
+
+
+def _detour(*, replacements: bool, popup: bool = False) -> bytes:
+    """T1 on 2026-07-30: its S2 call replaced (by POPUP or by nothing), +10min."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "mod"
+    modifications = entity.trip_modifications
+    modifications.selected_trips.add().trip_ids.append("T1")
+    modifications.service_dates.append("20260730")
+    modification = modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    modification.propagated_modification_delay = 600
+    if replacements:
+        replacement = modification.replacement_stops.add()
+        replacement.stop_id = "POPUP" if popup else "S2"
+        replacement.travel_time_to_stop = 60
+    if popup:
+        stop = message.entity.add()
+        stop.id = "popup"
+        stop.stop.stop_id = "POPUP"
+        stop.stop.stop_lat = 34.0
+        stop.stop.stop_lon = -118.0
+    return message.SerializeToString()
+
+
+async def test_a_detour_with_no_replacement_stops_skips_and_delays(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """The spec allows an empty replacement list: the span is skipped and
+    the rest of the trip shifts by the propagated delay -- no crash.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get("/rt/all", body=_detour(replacements=False), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [board] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1", "S2"], limit=None)],
+        start=_pdt(7, 30, 7, 0),
+        end=_pdt(7, 30, 12, 0),
+    )
+    t1 = [
+        (row.stop_id, row.scheduled_departure) for row in board if row.trip_id == "T1"
+    ]
+    assert t1 == [("S2", _pdt(7, 30, 8, 20, 30))]
+
+
+async def test_a_stop_only_a_detour_serves_has_an_open_ended_board(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """No schedule serves POPUP, so its scheduled ceiling is "never"; the
+    detoured run is read whole up front, so the board still shows it.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all", body=_detour(replacements=True, popup=True), content_type=PB
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [board] = await handle.get_arrivals(
+        [ArrivalsQuery(["POPUP"], limit=1)], start=_pdt(7, 30, 6, 0)
+    )
+    assert [(row.trip_id, row.scheduled_departure) for row in board] == [
+        ("T1", _pdt(7, 30, 8, 1))
+    ]
