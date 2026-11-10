@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+import aiohttp
 import pytest
 from google.transit import gtfs_realtime_pb2
 
@@ -432,3 +433,82 @@ async def test_gbfs_unsolicited_304_is_a_connection_error(
     with pytest.raises(SourceConnectionError) as err:
         await handle.get_system_info()
     assert err.value.status == 304
+
+
+async def test_a_cookie_set_since_changes_the_request_vary_cookie_names(
+    mock_api: MockApi,
+) -> None:
+    """RFC 9111 section 4.1 end to end: the producer sets a cookie and
+    answers ``Vary: Cookie``. The next request carries that cookie, so the
+    stored copy -- drawn without it -- is not its answer; the copy drawn
+    with it is, while the cookie stays.
+    """
+    _mock_transit(mock_api)
+    headers = {"Cache-Control": "max-age=600", "Vary": "Cookie"}
+    mock_api.get(
+        RT,
+        body=_t1_delayed(60, timestamp=100),
+        content_type=PB,
+        headers={**headers, "Set-Cookie": "region=west"},
+    )
+    mock_api.get(
+        RT, body=_t1_delayed(120, timestamp=200), content_type=PB, headers=headers
+    )
+    # Loopback is an IP host: only an unsafe jar keeps its cookies.
+    async with (
+        aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as session,
+        MobilityFeedsClient(
+            "test-refresh-token", session, base_url=mock_api.url()
+        ) as client,
+    ):
+        handle = await client.get_transit_feed("mdb-100")
+        assert await _t1_delay(handle) == 60
+        assert await _t1_delay(handle) == 120  # asked: now with the cookie
+        assert await _t1_delay(handle) == 120  # the same request: fresh
+    hits = _rt_hits(mock_api)
+    assert len(hits) == 2
+    assert "Cookie" not in hits[0]
+    assert hits[1]["Cookie"] == "region=west"
+
+
+async def test_gbfs_a_changed_session_header_that_vary_names_asks_again(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A session's default headers can change between calls; a stored
+    document answers only the header values its Vary names.
+    """
+    _mock_gbfs(mock_api)
+    vary = {"Cache-Control": "max-age=600", "Vary": "X-Region"}
+    mock_api.get(INFO, payload=_info(ttl=600, name="East Bikes"), headers=vary)
+    mock_api.get(INFO, payload=_info(ttl=600, name="West Bikes"), headers=vary)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    session = feeds_client._get_session()
+    session.headers["X-Region"] = "east"
+    assert (await handle.get_system_info()).name == "East Bikes"
+    assert (await handle.get_system_info()).name == "East Bikes"
+    session.headers["X-Region"] = "west"
+    assert (await handle.get_system_info()).name == "West Bikes"
+    assert [hit.get("X-Region") for hit in _info_hits(mock_api)] == ["east", "west"]
+
+
+async def test_a_redirected_response_with_vary_is_never_reused_unasked(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """The final hop of a redirect carried headers no later request can be
+    checked against in advance: under a Vary, each call asks.
+    """
+    _mock_transit(mock_api)
+    moved = mock_api.url("/rt/moved")
+    vary = {"Cache-Control": "max-age=600", "Vary": "Accept"}
+    for timestamp in (100, 200):
+        mock_api.get(RT, status=302, headers={"Location": moved})
+        mock_api.get(
+            "/rt/moved",
+            body=_t1_delayed(timestamp - 40, timestamp=timestamp),
+            content_type=PB,
+            headers=vary,
+        )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    assert await _t1_delay(handle) == 60
+    assert await _t1_delay(handle) == 160
+    assert len([r for r in mock_api.requests if r.path == "/rt/moved"]) == 2

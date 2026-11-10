@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -3679,7 +3680,11 @@ def _gbfs_handle(documents: dict[str, object]) -> GbfsFeedHandle:
     """
     handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
     handle._endpoints = {name: f"https://gbfs.invalid/{name}" for name in documents}
-    handle._client = None  # type: ignore[assignment]  # never reached: all cached
+    # Never fetches (all cached); only asked what a request would carry.
+    session = SimpleNamespace(
+        headers={}, cookie_jar=SimpleNamespace(filter_cookies=lambda _url: {})
+    )
+    handle._client = SimpleNamespace(_get_session=lambda: session)  # type: ignore[assignment]
     handle._headers = None
     handle._docs = FreshnessCache()
     for name, data in documents.items():

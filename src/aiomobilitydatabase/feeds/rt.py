@@ -13,7 +13,13 @@ from typing import Any
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
-from ._freshness import Response, Validators, header_fields
+from ._freshness import (
+    Response,
+    Validators,
+    header_fields,
+    request_fields,
+    sent_fields,
+)
 from ._urls import _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
@@ -97,6 +103,44 @@ def _vocab_or_none[StrEnumT: StrEnum](
         return None
 
 
+def _feed_request(
+    auth_type: int | None,
+    api_key_name: str | None,
+    api_key: str | None,
+    headers: Mapping[str, str] | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return the query parameters and headers of a GTFS-RT request.
+
+    See :func:`fetch_feed_message` for how auth and custom headers combine.
+    """
+    params: dict[str, str] = {}
+    req_headers: dict[str, str] = dict(headers) if headers else {}
+    if api_key is not None and api_key_name:
+        if auth_type == _AUTH_TYPE_QUERY_PARAM:
+            params[api_key_name] = api_key
+        elif auth_type == _AUTH_TYPE_HEADER:
+            req_headers[api_key_name] = api_key
+    return params, req_headers
+
+
+def feed_request_fields(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    auth_type: int | None = None,
+    api_key_name: str | None = None,
+    api_key: str | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Return the controlled header fields :func:`fetch_feed_message` sends now.
+
+    Unconditional: what a stored response's Vary is matched against (see
+    :func:`~._freshness.request_fields`).
+    """
+    _params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
+    return request_fields(session, url, req_headers)
+
+
 async def fetch_feed_message(
     session: aiohttp.ClientSession,
     url: str,
@@ -127,15 +171,10 @@ async def fetch_feed_message(
     derives freshness and validators from them (RFC 9111).
     """
     _require_http_url(url, "GTFS-RT producer URL")
-    params: dict[str, str] = {}
-    req_headers: dict[str, str] = dict(headers) if headers else {}
-    if api_key is not None and api_key_name:
-        if auth_type == _AUTH_TYPE_QUERY_PARAM:
-            params[api_key_name] = api_key
-        elif auth_type == _AUTH_TYPE_HEADER:
-            req_headers[api_key_name] = api_key
+    params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
     if validators is not None:
         req_headers.update(validators.request_headers())
+    controlled = request_fields(session, url, req_headers)
     requested_at = datetime.now(UTC)
     try:
         async with session.get(
@@ -165,12 +204,14 @@ async def fetch_feed_message(
                     fields=fields,
                     requested_at=requested_at,
                     received_at=received_at,
+                    request_fields=sent_fields(controlled, resp),
                 )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
                     f"Producer error {resp.status}: {url}", status=resp.status
                 )
             raw = await resp.read()
+            sent = sent_fields(controlled, resp)
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
     message = gtfs_realtime_pb2.FeedMessage()
@@ -183,6 +224,7 @@ async def fetch_feed_message(
         fields=fields,
         requested_at=requested_at,
         received_at=received_at,
+        request_fields=sent,
     )
 
 

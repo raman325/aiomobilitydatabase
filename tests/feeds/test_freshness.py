@@ -54,7 +54,18 @@ SUN = _http(T0 - timedelta(days=4))
         ({"Cache-Control": 'max-age="30"'}, Freshness(lifetime=30.0)),
         ({"Cache-Control": "max-age=0"}, Freshness(lifetime=0.0)),
         ({"Cache-Control": "no-cache, max-age=30"}, Freshness(lifetime=0.0)),
-        ({"Cache-Control": 'no-cache="Set-Cookie"'}, Freshness(lifetime=0.0)),
+        # A qualified no-cache only bars passing its fields on (RFC 9111
+        # 5.2.2.4); this cache never passes stored fields on at all.
+        ({"Cache-Control": 'no-cache="Set-Cookie"'}, Freshness(lifetime=None)),
+        (
+            {"Cache-Control": 'max-age=600, no-cache="Set-Cookie, ETag"'},
+            Freshness(lifetime=600.0),
+        ),
+        ({"Cache-Control": "max-age=600, no-cache=Set-Cookie"}, Freshness(600.0)),
+        (
+            {"Cache-Control": 'max-age=600, no-cache="Set-Cookie", no-cache'},
+            Freshness(lifetime=0.0),
+        ),
         (
             {"Cache-Control": "no-store, max-age=30"},
             Freshness(lifetime=None, storable=False),
@@ -216,11 +227,31 @@ def test_freshness_of_reads_dates_as_the_cache_pins_them() -> None:
     ) == Freshness(59.5)
 
 
-def test_a_leap_second_is_the_second_before_it() -> None:
-    """RFC 9110 allows 23:59:60; datetime can't hold it, so 23:59:59."""
+def test_a_leap_second_counts_as_the_second_before_it() -> None:
+    """RFC 9110 allows 23:59:60; datetime can't hold it, so arithmetic
+    counts it as 23:59:59 (the POSIX convention).
+    """
     assert freshness_module._http_date("Sat, 31 Dec 2016 23:59:60 GMT") == datetime(
         2016, 12, 31, 23, 59, 59, tzinfo=UTC
     )
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "Sat, 31 Dec 2016 23:59:60 GMT",
+        "Saturday, 31-Dec-16 23:59:60 GMT",
+        "Sat Dec 31 23:59:60 2016",
+    ],
+)
+def test_a_leap_second_keeps_its_identity(form: str) -> None:
+    """Canonical text keeps :60 apart from :59 in every form, so two dates
+    are the same second exactly when their texts are equal.
+    """
+    canonical = freshness_module._canonical_date(form, T0)
+    assert canonical == "Sat, 31 Dec 2016 23:59:60 GMT"
+    assert not freshness_module._same_instant(form, "Sat, 31 Dec 2016 23:59:59 GMT")
+    assert freshness_module._same_instant(form, "Sat, 31 Dec 2016 23:59:60 GMT")
 
 
 def _day_name(when: datetime) -> str:
@@ -864,9 +895,10 @@ async def test_merged_dates_keep_the_meaning_they_arrived_with() -> None:
     assert stale._entries["u"].lifetime == 0.0
 
 
-async def test_a_304_without_age_drops_the_stored_age() -> None:
-    """RFC 9111 section 5.1: no Age on the 304 means the origin validated it
-    just now; the 200's Age (a trip through a cache) no longer applies.
+async def test_a_304_without_age_keeps_the_stored_age() -> None:
+    """RFC 9111 section 3.2: a 304 replaces only the fields it carries, and
+    section 5.1: a missing Age does not mean the origin was contacted. The
+    200's Age stays, so the renewal is 30 - 20 seconds, not 30.
     """
     clock = _Clock()
     cache: FreshnessCache[str] = FreshnessCache(clock)
@@ -874,14 +906,172 @@ async def test_a_304_without_age_drops_the_stored_age() -> None:
         [
             _raw("a", {"Cache-Control": "max-age=30", "Age": "20", "ETag": '"1"'}),
             _raw(None, {"ETag": '"1"'}),
+            _raw(None, {"ETag": '"1"'}),
         ]
     )
     await cache.get("u", producer)
     clock.now = 10.0  # 30 - 20: stale
     await cache.get("u", producer)
-    clock.now = 35.0  # renewed for the full 30s, not 10
+    clock.now = 19.9  # renewed for 10s
     assert await cache.get("u", producer) == "a"
     assert len(producer.seen) == 2
+    clock.now = 25.0  # past the 10s renewal: asks again
+    assert await cache.get("u", producer) == "a"
+    assert len(producer.seen) == 3
+
+
+async def test_a_304s_content_length_never_replaces_the_stored_one() -> None:
+    """RFC 9111 section 3.2: Content-Length describes the 304 itself."""
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    producer = _Producer(
+        [
+            _raw(
+                "a",
+                {"Content-Length": "512", "ETag": '"1"', "Cache-Control": "no-cache"},
+            ),
+            _raw(None, {"Content-Length": "0", "ETag": '"1"', "Age": "3"}),
+        ]
+    )
+    await cache.get("u", producer)
+    await cache.get("u", producer)
+    fields = cache._entries["u"].fields
+    assert fields["content-length"] == ("512",)
+    assert fields["age"] == ("3",)
+
+
+def _sent(value: str | None, headers: dict[str, str], **sent: tuple[str, ...]):  # type: ignore[no-untyped-def]
+    """A response drawn by a request carrying these controlled fields."""
+    return Response(value, header_fields(headers), T0, T0, dict(sent))
+
+
+VARY_COOKIE = {"Cache-Control": "max-age=600", "Vary": "Cookie", "ETag": '"1"'}
+
+
+async def test_a_stored_response_answers_only_requests_its_vary_matches() -> None:
+    """RFC 9111 section 4.1: a cookie set since the response was drawn
+    changes the request it would stand in for -- so the cache asks, and a
+    selecting 304 makes it the answer for the new request too.
+    """
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    west = {"cookie": ("region=west",)}
+    producer = _Producer(
+        [_sent("a", VARY_COOKIE), _sent(None, {"ETag": '"1"'}, cookie=("region=west",))]
+    )
+    assert await cache.get("u", producer, request_fields={}) == "a"
+    assert await cache.get("u", producer, request_fields={}) == "a"
+    assert len(producer.seen) == 1  # same request: fresh
+    assert await cache.get("u", producer, request_fields=west) == "a"
+    assert producer.seen[1] == V1  # asked, with its validators
+    assert await cache.get("u", producer, request_fields=west) == "a"
+    assert len(producer.seen) == 2  # the 304 made it west's answer
+    # Back to no cookie: that is no longer the request it answers.
+    producer.queue.append(_sent("b", VARY_COOKIE))
+    assert await cache.get("u", producer, request_fields={}) == "b"
+
+
+@pytest.mark.parametrize(
+    ("vary", "sent", "upcoming", "reused"),
+    [
+        # Fields Vary doesn't nominate never matter.
+        ("Accept", {"cookie": ("a=1",)}, {"cookie": ("a=2",)}, True),
+        # Names are case-insensitive; list members are compared as a list.
+        ("ACCEPT", {"accept": ("a, b",)}, {"accept": ("a", "b")}, True),
+        ("Accept", {"accept": ("a,b",)}, {"accept": ("b,a",)}, False),
+        # Absent from both matches; absent from one doesn't.
+        ("X-Region", {}, {}, True),
+        ("X-Region", {}, {"x-region": ("west",)}, False),
+        # A field only one request carries counts only if nominated.
+        ("Accept", {"accept": ("a",)}, {"accept": ("a",), "x-region": ("w",)}, True),
+    ],
+)
+async def test_vary_matching(
+    vary: str,
+    sent: dict[str, tuple[str, ...]],
+    upcoming: dict[str, tuple[str, ...]],
+    reused: bool,
+) -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    headers = {"Cache-Control": "max-age=600", "Vary": vary}
+    producer = _Producer(
+        [Response("a", header_fields(headers), T0, T0, sent), _raw("b", {})]
+    )
+    await cache.get("u", producer, request_fields=sent)
+    assert await cache.get("u", producer, request_fields=upcoming) == (
+        "a" if reused else "b"
+    )
+
+
+async def test_vary_counts_every_field_line() -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    fields = {"cache-control": ("max-age=600",), "vary": ("Accept", "X-Region")}
+    producer = _Producer(
+        [Response("a", fields, T0, T0, {"x-region": ("east",)}), _raw("b", {})]
+    )
+    await cache.get("u", producer, request_fields={"x-region": ("east",)})
+    assert await cache.get("u", producer, request_fields={"x-region": ("west",)}) == "b"
+
+
+async def test_vary_star_on_its_own_field_line_is_never_stored() -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    fields = {"cache-control": ("max-age=600",), "vary": ("Accept", "*")}
+    producer = _Producer([Response("a", fields, T0, T0)])
+    assert await cache.get("u", producer) == "a"
+    assert "u" not in cache._entries
+
+
+async def test_an_unknown_request_confirms_no_vary() -> None:
+    """A redirected request's fields are unknown: with a Vary, the stored
+    response can't be shown to match, so the cache asks; without one, it
+    is reused as usual.
+    """
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    redirected = Response("a", header_fields(VARY_COOKIE), T0, T0, None)
+    producer = _Producer([redirected, _raw("b", {"Cache-Control": "max-age=600"})])
+    await cache.get("u", producer)
+    assert await cache.get("u", producer) == "b"
+    plain = Response("c", header_fields({"Cache-Control": "max-age=600"}), T0, T0, None)
+    other: FreshnessCache[str] = FreshnessCache(_Clock())
+    await other.get("u", _Producer([plain]))
+    assert await other.get("u", _Producer([])) == "c"
+
+
+async def test_a_request_with_other_fields_never_joins_one_in_flight() -> None:
+    """It may draw another answer, so it runs its own request."""
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    gate = asyncio.Event()
+    producer = _Producer(
+        [_sent("east", VARY_COOKIE), _sent("west", VARY_COOKIE)], gate=gate
+    )
+    first = asyncio.ensure_future(cache.get("u", producer, request_fields={}))
+    same = asyncio.ensure_future(cache.get("u", producer, request_fields={}))
+    other = asyncio.ensure_future(
+        cache.get("u", producer, request_fields={"cookie": ("region=west",)})
+    )
+    await asyncio.sleep(0)
+    gate.set()
+    assert await asyncio.gather(first, same, other) == ["east", "east", "west"]
+    assert len(producer.seen) == 2
+
+
+async def test_an_older_copy_loses_even_when_it_cannot_be_stored() -> None:
+    """A stale edge copy marked Vary: * (or no-store) is still older than
+    the stored copy: the stored copy answers, and stays.
+    """
+    cache: FreshnessCache[int] = FreshnessCache(
+        _Clock(), timestamp=lambda v: datetime.fromtimestamp(v, UTC)
+    )
+    now = int(T0.timestamp())
+    producer = _Producer(  # type: ignore[arg-type]
+        [
+            _raw(now, {"Cache-Control": "max-age=0"}),
+            _raw(now - 60, {"Cache-Control": "max-age=600", "Vary": "*"}),
+            _raw(now - 60, {"Cache-Control": "no-store"}),
+        ]
+    )
+    assert await cache.get("u", producer) == now  # type: ignore[arg-type]
+    assert await cache.get("u", producer) == now  # type: ignore[arg-type]
+    assert await cache.get("u", producer) == now  # type: ignore[arg-type]
+    assert cache._entries["u"].value == now
 
 
 async def test_a_vary_star_response_is_never_reused() -> None:
@@ -919,6 +1109,37 @@ async def test_an_imf_last_modified_is_echoed_exactly() -> None:
         None,
         Validators(None, leap),
         Validators(None, "Sat, 31 Dec 2016 23:59:59 GMT"),
+    ]
+
+
+async def test_a_leap_second_last_modified_is_its_own_second() -> None:
+    """An RFC 850 leap second is echoed as :60, and a 304 whose weak tag
+    matches but whose Last-Modified is the second before selects nothing.
+    """
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    weak = 'W/"x"'
+    producer = _Producer(
+        [
+            _raw(
+                "a",
+                {
+                    "ETag": weak,
+                    "Last-Modified": "Saturday, 31-Dec-16 23:59:60 GMT",
+                    "Cache-Control": "max-age=0",
+                },
+            ),
+            _raw(
+                None, {"ETag": weak, "Last-Modified": "Sat, 31 Dec 2016 23:59:59 GMT"}
+            ),
+            _raw("b", {"Cache-Control": "max-age=0"}),
+        ]
+    )
+    await cache.get("u", producer)
+    assert await cache.get("u", producer) == "b"  # re-asked unconditionally
+    assert producer.seen == [
+        None,
+        Validators(weak, "Sat, 31 Dec 2016 23:59:60 GMT"),
+        None,
     ]
 
 
@@ -1259,7 +1480,7 @@ async def test_a_finished_request_is_never_joined() -> None:
     producer = _Producer([_r("a", None, 0.0)], gate=asyncio.Event())
     waiter = asyncio.ensure_future(cache.get("u", producer))
     await asyncio.sleep(0)
-    task = cache._in_flight["u"]
+    task, _fields = cache._in_flight["u"]
     observed: list[tuple[bool, bool]] = []
     producer.gate.set()  # type: ignore[union-attr]
     # Runs right after the request's own step, before any done-callback.
@@ -1279,7 +1500,7 @@ async def test_a_request_cancelled_before_it_runs_leaves_no_trace() -> None:
     waiter = asyncio.ensure_future(cache.get("u", producer))
     await asyncio.sleep(0)  # get() has scheduled the request, not run it
     assert not producer.seen
-    cache._in_flight["u"].cancel()
+    cache._in_flight["u"][0].cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
     await asyncio.sleep(0)
@@ -1383,7 +1604,16 @@ def _model_selects(
 
 
 _STYLES_304 = st.sampled_from(
-    ["full", "redated", "validator_only", "weakened", "strengthened", "bare", "another"]
+    [
+        "full",
+        "ageless",
+        "redated",
+        "validator_only",
+        "weakened",
+        "strengthened",
+        "bare",
+        "another",
+    ]
 )
 
 
@@ -1397,8 +1627,11 @@ class FreshnessMachine(RuleBasedStateMachine):
     monotonic one; documents are stamped against it (a few seconds behind,
     slightly ahead, years ahead); responses carry Date (current, stale or
     none) and sometimes Age; ETags are strong or weak; and a 304 repeats
-    the headers, carries only its ETag, carries nothing, or names another
-    representation -- the last two select nothing and must be re-asked.
+    the headers (with or without the Age), carries only its ETag, carries
+    nothing, or names another representation -- the last two select
+    nothing and must be re-asked. A producer may answer ``Vary: X-Region``
+    while the client's region changes: a stored copy answers only the
+    region it was drawn (or last revalidated) for.
     """
 
     def __init__(self) -> None:
@@ -1418,9 +1651,12 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.date_style = "imf"
         self.date_mode = "now"
         self.age: int | None = None
+        self.vary_offered = False
         self.style_304 = "full"
         self.fail_next = False
         self.stale_next = False
+        # Client state: the region every request carries.
+        self.region = "east"
         # What the producer saw and served during one call:
         # (validators sent, headers served, document or None for a 304).
         self.log: list[tuple[Validators | None, dict[str, str], _Doc | None]] = []
@@ -1431,6 +1667,8 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.stored_lm: str | None = None
         self.stored_date: int | None = None
         self.stored_age: int | None = None
+        self.stored_vary: str | None = None
+        self.stored_region = "east"
         self.stored_received = 0
         self.stored_at = 0.0
         self.stored_lifetime: float | None = None
@@ -1468,7 +1706,12 @@ class FreshnessMachine(RuleBasedStateMachine):
             )
         if self.age is not None:
             headers["Age"] = str(self.age)
+        if self.vary_offered:
+            headers["Vary"] = "X-Region"
         return headers
+
+    def _request_fields(self) -> dict[str, tuple[str, ...]]:
+        return {"x-region": (self.region,)}
 
     async def _fetch(self, *, validators: Validators | None) -> Response[_Doc]:
         await asyncio.sleep(0)  # let a burst pile up on the in-flight task
@@ -1500,12 +1743,21 @@ class FreshnessMachine(RuleBasedStateMachine):
                 "redated": {**self._headers(None), "Last-Modified": redated},
                 "bare": {},
             }[style]
+            if self.style_304 == "ageless":
+                headers.pop("Age", None)
             self.log.append((validators, headers, None))
-            return Response(None, header_fields(headers), now, now)
+            return Response(
+                None, header_fields(headers), now, now, self._request_fields()
+            )
         if unchanged:
             assert etag is not None
             headers = {
                 "full": self._headers(etag, lm),
+                # The full headers less the Age: the stored Age must stay
+                # (RFC 9111 section 3.2 removes nothing a 304 lacks).
+                "ageless": {
+                    k: v for k, v in self._headers(etag, lm).items() if k != "Age"
+                },
                 "validator_only": {"ETag": etag},
                 # A CDN weakening the tag (as compression does): selects by
                 # weak comparison.
@@ -1526,14 +1778,18 @@ class FreshnessMachine(RuleBasedStateMachine):
                 "another": {"ETag": '"another"', "Cache-Control": "max-age=600"},
             }[self.style_304]
             self.log.append((validators, headers, None))
-            return Response(None, header_fields(headers), now, now)
+            return Response(
+                None, header_fields(headers), now, now, self._request_fields()
+            )
         headers = self._headers(etag, lm)
         self.log.append((validators, headers, doc))
-        return Response(doc, header_fields(headers), now, now)
+        return Response(doc, header_fields(headers), now, now, self._request_fields())
 
     def _expect_fresh(self) -> bool:
         if self.stored is None:
             return False
+        if self.stored_vary is not None and self.stored_region != self.region:
+            return False  # drawn for another region: Vary doesn't match
         age = self.clock.now - self.stored_at
         if self.stored_lifetime is not None:
             return age < self.stored_lifetime
@@ -1542,7 +1798,12 @@ class FreshnessMachine(RuleBasedStateMachine):
     async def _call(self, count: int) -> list[_Doc | BaseException]:
         return await asyncio.gather(
             *(
-                self.cache.get("u", self._fetch, min_interval=self.min_interval)
+                self.cache.get(
+                    "u",
+                    self._fetch,
+                    request_fields=self._request_fields(),
+                    min_interval=self.min_interval,
+                )
                 for _ in range(count)
             ),
             return_exceptions=True,
@@ -1626,6 +1887,16 @@ class FreshnessMachine(RuleBasedStateMachine):
         """Date current, 20s stale, or missing; maybe an Age."""
         self.date_mode, self.age = date_mode, age
 
+    @rule(vary=st.booleans())
+    def set_vary(self, vary: bool) -> None:
+        """The producer answers ``Vary: X-Region`` (or stops)."""
+        self.vary_offered = vary
+
+    @rule(region=st.sampled_from(["east", "west"]))
+    def set_region(self, region: str) -> None:
+        """The client's requests carry another region from now on."""
+        self.region = region
+
     @rule(interval=st.sampled_from([0.0, 10.0]))
     def set_min_interval(self, interval: float) -> None:
         self.min_interval = interval
@@ -1650,6 +1921,31 @@ class FreshnessMachine(RuleBasedStateMachine):
         # Just past it: the exact instant is float-rounding territory, and
         # the examples pin the boundary itself.
         self.clock.now = self.stored_at + self.stored_lifetime + 0.001
+        self.call(count=1)
+        self.call(count=1)
+
+    @precondition(lambda self: self.stored is not None and bool(self.stored_lifetime))
+    @rule()
+    def probe_the_lifetime_edge(self) -> None:
+        """Call just before the modelled lifetime ends, then just after: a
+        renewal of the wrong length (a stored Age dropped or kept wrongly,
+        a field merged that shouldn't be) shows on one side or the other.
+        """
+        assert self.stored_lifetime is not None
+        expiry = self.stored_at + self.stored_lifetime
+        self.clock.now = max(self.clock.now, expiry - 0.5)
+        self.call(count=1)
+        self.clock.now = max(self.clock.now, expiry + 0.5)
+        self.call(count=1)
+
+    @precondition(lambda self: self.stored is not None and self.vary_offered)
+    @rule(style=_STYLES_304)
+    def move_region_then_call_twice(self, style: str) -> None:
+        """A new region misses the stored copy; a selecting 304 makes it the
+        new region's answer, so the very next call is fresh.
+        """
+        self.style_304 = style
+        self.region = "west" if self.region == "east" else "east"
         self.call(count=1)
         self.call(count=1)
 
@@ -1728,9 +2024,13 @@ class FreshnessMachine(RuleBasedStateMachine):
                 self.stored_etag = headers["ETag"]
             if "Last-Modified" in headers:
                 self.stored_lm = _canonical(headers["Last-Modified"])
-            # A 304 without Age was validated by the origin just now: the
-            # stored Age (an older trip through a cache) goes.
-            self.stored_age = age if "Age" in headers else None
+            # A field the 304 lacks stays -- the stored Age included.
+            if "Age" in headers:
+                self.stored_age = age
+            if "Vary" in headers:
+                self.stored_vary = headers["Vary"]
+            # It now answers the request that drew it.
+            self.stored_region = self.region
             self.stored_date = date
             storable, lifetime = _model_lifetime(
                 self.stored_cc, self.stored_date, self.stored_age, received
@@ -1740,21 +2040,24 @@ class FreshnessMachine(RuleBasedStateMachine):
             else:
                 self.stored = None
             return answer
+        if self.stored is not None:
+            # The newest thing we know of is the stored copy, as of its stamp
+            # -- but no later than the second it actually reached us. An
+            # older copy loses even when it couldn't be stored.
+            known = min(self.stored.timestamp, self.stored_received)
+            if served.timestamp < known:
+                event("stale edge rejected")
+                self.stored_at, self.stored_lifetime = self.clock.now, 0.0
+                return self.stored
         storable, lifetime = _model_lifetime(
             headers.get("Cache-Control"), date, age, received
         )
         if not storable:
             self.stored = None
             return served
-        if self.stored is not None:
-            # The newest thing we know of is the stored copy, as of its stamp
-            # -- but no later than the second it actually reached us.
-            known = min(self.stored.timestamp, self.stored_received)
-            if served.timestamp < known:
-                event("stale edge rejected")
-                self.stored_at, self.stored_lifetime = self.clock.now, 0.0
-                return self.stored
         self.stored = served
+        self.stored_vary = headers.get("Vary")
+        self.stored_region = self.region
         self.stored_cc = headers.get("Cache-Control")
         self.stored_etag = headers.get("ETag")
         self.stored_lm = _canonical(headers.get("Last-Modified"))

@@ -271,9 +271,15 @@ Notes on direct mode:
   `*` or a list, and a `Last-Modified` that isn't an HTTP-date, validate
   nothing — such a producer gets unconditional requests. A counting `304`
   updates only the headers it carries — one with just its `ETag` after
-  `no-cache` is still `no-cache`; one without `Date` is dated on arrival —
-  and freshness is recomputed from the merged headers. `no-cache` revalidates
-  every time, `no-store` is never stored, invalid freshness (including a
+  `no-cache` is still `no-cache`; one without `Date` is dated on arrival;
+  one without `Age` keeps the stored `Age` — and freshness is recomputed
+  from the merged headers. A stored copy answers only requests matching
+  the request headers its `Vary` names: a cookie the producer set since,
+  or a changed session default header, means asking again (a `304` then
+  makes it the answer for the new request); `Vary: *` is never stored.
+  A bare `no-cache` revalidates every time (one naming fields only bars
+  passing those fields on, which this cache never does), `no-store` is
+  never stored, invalid freshness (including a
   malformed `Cache-Control`) counts as stale, and a response declaring
   nothing is revalidated on every call — no heuristic lifetimes. A GBFS
   document's `ttl` counts from its own `last_updated`, and the shorter of
@@ -286,12 +292,12 @@ Notes on direct mode:
   copy is kept but asked about again on the next call. A stored timestamp
   later than when we received it (a producer clock running ahead) counts
   as that receipt time, so a far-future stamp can't pin the cache and a
-  slightly fast clock doesn't switch the rule off; `no-store` responses
-  are passed through without comparison. `rt_min_interval=` on
+  slightly fast clock doesn't switch the rule off — even an older copy that
+  couldn't be stored (`no-store`) loses to the stored one. `rt_min_interval=` on
   `get_transit_feed*` is an opt-in request budget for producers that
   declare no freshness at all: it reuses a realtime parse younger than the
   interval, and never extends `no-cache`, `max-age=0`, an expired
-  lifetime, a rejected older copy or `no-store`.
+  lifetime, a rejected older copy, `no-store` or a `Vary` mismatch.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
   or vehicle with no `start_date` applies to one run, judged at the feed's
   header timestamp alone (never a query setting): the run scheduled to be

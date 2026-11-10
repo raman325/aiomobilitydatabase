@@ -66,6 +66,7 @@ from .rt import (
     TripUpdateKey,
     TripUpdates,
     alerts_from_message,
+    feed_request_fields,
     feed_timestamp,
     fetch_feed_message,
     resolve_trip_predictions,
@@ -1432,6 +1433,14 @@ class TransitFeedHandle:
                     api_key=self._api_key,
                     headers=self._headers,
                     timeout_seconds=self._client.timeout_seconds,
+                ),
+                request_fields=feed_request_fields(
+                    session,
+                    url,
+                    auth_type=source.authentication_type,
+                    api_key_name=source.api_key_parameter_name,
+                    api_key=self._api_key,
+                    headers=self._headers,
                 ),
                 min_interval=self._rt_min_interval,
             )

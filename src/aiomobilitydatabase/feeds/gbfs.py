@@ -11,7 +11,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 import aiohttp
 
-from ._freshness import FreshnessCache, Response, Validators, header_fields
+from ._freshness import (
+    FreshnessCache,
+    Response,
+    Validators,
+    header_fields,
+    request_fields,
+    sent_fields,
+)
 from ._frozen import FrozenDict
 from ._urls import _require_http_url  # deliberate friend access: shared URL guard
 from .const import GBFS_LANGUAGE_PREFERENCE
@@ -445,6 +452,7 @@ class GbfsFeedHandle:
         request_headers = dict(headers) if headers else {}
         if validators is not None:
             request_headers.update(validators.request_headers())
+        controlled = request_fields(session, url, request_headers)
         requested_at = datetime.now(UTC)
         try:
             async with session.get(
@@ -466,6 +474,7 @@ class GbfsFeedHandle:
                         fields=fields,
                         requested_at=requested_at,
                         received_at=received_at,
+                        request_fields=sent_fields(controlled, resp),
                     )
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
@@ -475,6 +484,7 @@ class GbfsFeedHandle:
                     document = await resp.json(content_type=None)
                 except ValueError as err:
                     raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
+                sent = sent_fields(controlled, resp)
         except (TimeoutError, aiohttp.ClientError) as err:
             raise SourceConnectionError(f"Error fetching {url}: {err}") from err
         if not isinstance(document, dict) or "data" not in document:
@@ -484,6 +494,7 @@ class GbfsFeedHandle:
             fields=fields,
             requested_at=requested_at,
             received_at=received_at,
+            request_fields=sent,
         )
 
     async def _document(self, name: str) -> dict[str, Any]:
@@ -498,6 +509,11 @@ class GbfsFeedHandle:
                 url,
                 self._headers,
                 f"GBFS {name} endpoint URL",
+            ),
+            request_fields=request_fields(
+                self._client._get_session(),  # deliberate friend access
+                url,
+                self._headers or {},
             ),
         )
 
