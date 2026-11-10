@@ -253,7 +253,7 @@ class ArrivalsQuery:
     platforms, a direction pair). ``route_ids`` and ``headsigns`` narrow
     the rows; ``None`` or an empty list means no narrowing. ``headsigns``
     matches the trip-level headsign (the same values
-    :meth:`TransitFeedHandle.headsigns_serving` offers), so RT-added trips,
+    :meth:`TransitFeedHandle.get_headsigns_serving` offers), so RT-added trips,
     which announce no headsign, never pass a headsign filter. ``limit``
     caps the merged, filtered result for this query as a whole,
     nearest effective departure first; zero asks for an empty board.

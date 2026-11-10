@@ -522,7 +522,7 @@ async def test_handle_answers_from_canonical_feed(
     assert city2.headsign is None  # CITY trips publish no headsign
     # Plain-trip answer: AB1 (BEATTY_AIRPORT 8:00 -> BULLFROG 8:10 local).
     # AB2 serves both stops in reverse order and must not appear.
-    trips = await handle.upcoming_trips(
+    trips = await handle.get_upcoming_trips(
         "BEATTY_AIRPORT",
         "BULLFROG",
         lookahead=timedelta(hours=1),

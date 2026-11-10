@@ -1354,7 +1354,7 @@ class TransitFeedHandle:
             )
             return [_select_arrivals(arrivals, query) for query in queries]
 
-    async def upcoming_trips(
+    async def get_upcoming_trips(
         self,
         origin_stop_id: str,
         destination_stop_id: str,
@@ -1659,7 +1659,7 @@ class TransitFeedHandle:
                 )
         return rows, touched
 
-    async def scheduled_departures(
+    async def get_scheduled_departures(
         self,
         stop_ids: Sequence[str],
         *,
@@ -1736,7 +1736,7 @@ class TransitFeedHandle:
         )
         return rows
 
-    async def services_on(self, service_date: date) -> set[str]:
+    async def get_services_on(self, service_date: date) -> set[str]:
         """Service ids running on a GTFS service date.
 
         Pairs with ``StopArrival.service_id``/``UpcomingTrip.service_id``:
@@ -1877,12 +1877,12 @@ class TransitFeedHandle:
         """
         return group_stations(self.stops_in(zone))
 
-    async def routes_serving(self, stop_id: str) -> list[Route]:
+    async def get_routes_serving(self, stop_id: str) -> list[Route]:
         """Routes with scheduled service at the stop (route-filter picker)."""
         async with self._guard.reader():
             return await self._index_read(self._index.routes_serving, stop_id)
 
-    async def headsigns_serving(
+    async def get_headsigns_serving(
         self, stop_id: str, route_id: str | None = None
     ) -> list[str]:
         """Distinct headsigns at the stop (direction-filter picker options)."""

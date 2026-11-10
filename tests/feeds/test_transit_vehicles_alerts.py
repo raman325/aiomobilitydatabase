@@ -236,10 +236,10 @@ async def test_routes_serving_stop(
 ) -> None:
     _mock_catalog(mock_api)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    routes = await handle.routes_serving("S1")
+    routes = await handle.get_routes_serving("S1")
     # T1/T2/T4 (R1) and T3 (R2) stop at S1
     assert {route.id for route in routes} == {"R1", "R2"}
-    routes_s2 = await handle.routes_serving("S2")
+    routes_s2 = await handle.get_routes_serving("S2")
     assert {route.id for route in routes_s2} == {"R1"}  # only T1 continues to S2
 
 
@@ -249,13 +249,17 @@ async def test_headsigns_serving_stop(
     _mock_catalog(mock_api)
     handle = await feeds_client.get_transit_feed("mdb-100")
     # S1 sees R1 trips (headsigns Downtown, Holiday) and R2's T3 (Owl Loop).
-    assert await handle.headsigns_serving("S1") == ["Downtown", "Holiday", "Owl Loop"]
+    assert await handle.get_headsigns_serving("S1") == [
+        "Downtown",
+        "Holiday",
+        "Owl Loop",
+    ]
     # Narrowed to R1: only its two headsigns.
-    assert await handle.headsigns_serving("S1", route_id="R1") == [
+    assert await handle.get_headsigns_serving("S1", route_id="R1") == [
         "Downtown",
         "Holiday",
     ]
-    assert await handle.headsigns_serving("S2") == ["Downtown"]
+    assert await handle.get_headsigns_serving("S2") == ["Downtown"]
 
 
 async def test_routes_and_headsigns_serving_parent_station(
@@ -267,8 +271,8 @@ async def test_routes_and_headsigns_serving_parent_station(
     # stop_times rows, per GTFS station-grouping semantics ST1 itself never
     # appears in stop_times. Both queries key strictly off stop_times.stop_id,
     # so a parent station always resolves to [], never its children's routes.
-    assert await handle.routes_serving("ST1") == []
-    assert await handle.headsigns_serving("ST1") == []
+    assert await handle.get_routes_serving("ST1") == []
+    assert await handle.get_headsigns_serving("ST1") == []
 
 
 async def test_close_releases_the_static_index_connection(
@@ -278,7 +282,7 @@ async def test_close_releases_the_static_index_connection(
     handle = await feeds_client.get_transit_feed("mdb-100")
     handle.close()
     with pytest.raises(sqlite3.ProgrammingError):
-        await handle.routes_serving("S1")
+        await handle.get_routes_serving("S1")
 
 
 def test_service_alert_is_active() -> None:
@@ -367,8 +371,8 @@ async def test_in_flight_query_blocks_index_swap(
     [
         pytest.param(
             "upcoming_trips",
-            lambda handle: handle.upcoming_trips("S1", "S2", now_utc=NOW),
-            id="upcoming_trips",
+            lambda handle: handle.get_upcoming_trips("S1", "S2", now_utc=NOW),
+            id="get_upcoming_trips",
         ),
         pytest.param(
             "routes_for_trips",
@@ -377,13 +381,13 @@ async def test_in_flight_query_blocks_index_swap(
         ),
         pytest.param(
             "routes_serving",
-            lambda handle: handle.routes_serving("S1"),
-            id="routes_serving",
+            lambda handle: handle.get_routes_serving("S1"),
+            id="get_routes_serving",
         ),
         pytest.param(
             "headsigns_serving",
-            lambda handle: handle.headsigns_serving("S1"),
-            id="headsigns_serving",
+            lambda handle: handle.get_headsigns_serving("S1"),
+            id="get_headsigns_serving",
         ),
     ],
 )

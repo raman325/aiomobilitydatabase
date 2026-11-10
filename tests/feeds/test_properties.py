@@ -4388,7 +4388,7 @@ def _run_propagation_scenario(
                 )
                 trips = {}
                 for origin, destination in pairs:
-                    trips[(origin, destination)] = await handle.upcoming_trips(
+                    trips[(origin, destination)] = await handle.get_upcoming_trips(
                         origin,
                         destination,
                         lookahead=lookahead,
