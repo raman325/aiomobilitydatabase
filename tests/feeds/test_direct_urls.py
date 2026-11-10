@@ -314,11 +314,11 @@ async def test_direct_rt_combined_url_deduplicated(
         service_alerts_urls=[combined_url],
     )
     assert len(handle.rt_feeds) == 1
-    assert handle.rt_feeds[0].entity_types == [
+    assert handle.rt_feeds[0].entity_types == (
         EntityType.TRIP_UPDATES,
         EntityType.VEHICLE_POSITIONS,
         EntityType.SERVICE_ALERTS,
-    ]
+    )
     [arrivals] = await handle.get_arrivals(
         [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=1), now_utc=NOW
     )

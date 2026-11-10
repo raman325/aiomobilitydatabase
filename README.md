@@ -247,6 +247,13 @@ Notes on direct mode:
   `TripDescriptor` uses to address one run. That is what lets two buses out
   on the same headway-based trip be told apart — without it, concurrent
   repetitions of one template trip are indistinguishable.
+- **Everything the library hands out is immutable**: every model (catalog
+  and feeds) is a frozen dataclass whose collections are tuples or
+  read-only mappings, and a handle's `stops`/`routes`/`agencies`/`rt_feeds`
+  are tuples. Shared state can't be changed from outside, and models are
+  hashable except `GbfsStation`/`GbfsVehicle`, whose mapping fields aren't.
+  Query results (`get_arrivals()` and friends) are fresh lists the caller
+  owns.
 - **The full descriptive surface is exposed, typed by shape**: closed GTFS
   vocabularies are enums (`WheelchairAccess`, `BikesAllowed`,
   `PickupDropOffType`, `StopLocationType`, alert cause/effect/severity,

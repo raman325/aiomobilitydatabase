@@ -59,7 +59,7 @@ def test_source_info() -> None:
     assert info.producer_url == "https://ladotbus.com/gtfs"
     assert info.authentication_type == 2
     assert info.is_producer_url_unstable is None
-    assert info.license_tags == ["family:ODC"]
+    assert info.license_tags == ("family:ODC",)
 
 
 def test_location_and_bounding_box() -> None:
@@ -104,8 +104,8 @@ def test_gtfs_feed() -> None:
 def test_gtfs_rt_feed() -> None:
     feed = GtfsRtFeed.from_dict(GTFS_RT_FEED)
     assert feed.data_type is DataType.GTFS_RT
-    assert feed.entity_types == [EntityType.VEHICLE_POSITIONS, EntityType.TRIP_UPDATES]
-    assert feed.feed_references == ["mdb-1210"]
+    assert feed.entity_types == (EntityType.VEHICLE_POSITIONS, EntityType.TRIP_UPDATES)
+    assert feed.feed_references == ("mdb-1210",)
     assert feed.redirects is None
 
 
@@ -155,7 +155,7 @@ def test_location_search() -> None:
     result = results.results[0]
     assert result.location_id == 175905
     assert result.location_type is LocationType.MUNICIPALITY
-    assert result.path_names == ["Canada", "Quebec", "Montréal"]
+    assert result.path_names == ("Canada", "Quebec", "Montréal")
 
 
 def test_licenses() -> None:

@@ -12,6 +12,7 @@ import re
 import pytest
 
 from aiomobilitydatabase import feeds
+from aiomobilitydatabase import models as catalog_models
 from aiomobilitydatabase.feeds import ArrivalsQuery, GbfsFeedHandle, MobilityFeedsClient
 from aiomobilitydatabase.feeds import models as feed_models
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle
@@ -109,9 +110,11 @@ _MUTABLE_CONTAINER = re.compile(r"\b(list|dict|set)\[")
 
 
 @pytest.mark.parametrize(
-    "model", _public_models(feed_models), ids=lambda model: model.__name__
+    "model",
+    [*_public_models(catalog_models), *_public_models(feed_models)],
+    ids=lambda model: f"{model.__module__.rsplit('.', 2)[-2]}.{model.__name__}",
 )
-def test_feed_models_are_deeply_immutable(model: type) -> None:
+def test_public_models_are_deeply_immutable(model: type) -> None:
     params = model.__dataclass_params__  # type: ignore[attr-defined]
     assert params.frozen, f"{model.__name__} must be frozen"
     for field in dataclasses.fields(model):

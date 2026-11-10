@@ -664,7 +664,7 @@ class TransitFeedHandle:
             rt_feeds = await catalog.get_gtfs_feed_gtfs_rt_feeds(feed_id)
         elif feed.data_type is DataType.GTFS_RT:
             rt_self = await catalog.get_gtfs_rt_feed(feed_id)
-            references = rt_self.feed_references or []
+            references = rt_self.feed_references or ()
             if not references:
                 raise StaticDataUnavailableError(
                     f"GTFS-RT feed {feed_id} has no feed_references to a static feed"
@@ -720,7 +720,7 @@ class TransitFeedHandle:
             GtfsRtFeed(
                 id=rt_url,
                 data_type=DataType.GTFS_RT,
-                entity_types=types,
+                entity_types=tuple(types),
                 source_info=SourceInfo(producer_url=rt_url, authentication_type=0),
             )
             for rt_url, types in url_types.items()
