@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -23,6 +24,9 @@ from typing import Protocol
 # represent, or larger than this, as this value.
 _DELTA_SECONDS_MAX = 2_147_483_648
 _DELTA_SECONDS_DIGITS = len(str(_DELTA_SECONDS_MAX))
+# RFC 9110 section 5.6.2 token, and section 8.8.3 entity-tag.
+_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_ENTITY_TAG = re.compile(r'(W/)?"[\x21\x23-\x7e\x80-\xff]*"')
 
 
 # A response's header fields: lower-cased name -> values, in the order
@@ -50,8 +54,11 @@ class Validators:
 
     @classmethod
     def from_fields(cls, fields: Fields) -> Validators | None:
-        """Read the validators in a set of header fields; None when neither."""
-        etag = _first(fields, "etag")
+        """Read the validators in a set of header fields; None when neither.
+
+        An ETag that isn't one entity-tag (``*``, a list) validates nothing.
+        """
+        etag = _etag(fields)
         last_modified = _first(fields, "last-modified")
         if not etag and not last_modified:
             return None
@@ -97,6 +104,15 @@ def _first(fields: Fields, name: str) -> str | None:
     return values[0] if values else None
 
 
+def _etag(fields: Fields) -> str | None:
+    """Return the ETag if it is exactly one entity-tag; None otherwise."""
+    value = _first(fields, "etag")
+    if value is None:
+        return None
+    value = value.strip()
+    return value if _ENTITY_TAG.fullmatch(value) else None
+
+
 def _http_date(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -129,11 +145,11 @@ def _split_field(value: str) -> list[str] | None:
     """Split one Cache-Control field on commas outside quoted strings.
 
     A comma inside a quoted value (``community="a, max-age=3600"``) belongs
-    to that value; splitting on it would invent directives. A quoted
-    string may only BE an argument -- open right after ``=`` and close
-    before the next comma -- so a stray quote anywhere else (``foo"bar``)
-    or one still open at the end of the field makes the field malformed:
-    None.
+    to that value; splitting on it would invent directives. A quote may
+    only open an argument (right after ``=``), once per part, so a stray
+    quote anywhere else (``foo"bar``) or one still open at the end of the
+    field makes the field malformed: None. Text glued after a closing
+    quote is left for :func:`_directive`'s grammar to reject.
     """
     parts: list[str] = []
     current: list[str] = []
@@ -156,8 +172,6 @@ def _split_field(value: str) -> list[str] | None:
             if closed or not "".join(current).rstrip().endswith("="):
                 return None
             quoted = True
-        elif closed and not char.isspace():
-            return None  # text after a closing quote, before the comma
         current.append(char)
     if quoted:
         return None
@@ -165,28 +179,55 @@ def _split_field(value: str) -> list[str] | None:
     return parts
 
 
+def _directive(part: str) -> tuple[str, str | None] | None:
+    """Parse one ``token [ "=" ( token / quoted-string ) ]`` directive.
+
+    None when it doesn't fit that grammar (RFC 9111 section 5.2): a name
+    or argument holding whitespace or separators -- ``no-cache no-store``,
+    a missing comma -- is not a directive.
+    """
+    name, sep, arg = part.partition("=")
+    if not _TOKEN.fullmatch(name):
+        return None
+    if not sep:
+        return name.lower(), None
+    # _split_field already rejected unbalanced quotes, so a leading quote
+    # here opens a complete quoted-string.
+    quoted = arg.startswith('"') and arg.endswith('"')
+    if not (quoted or _TOKEN.fullmatch(arg)):
+        return None
+    return name.lower(), arg
+
+
 def _directives(values: Sequence[str]) -> tuple[dict[str, list[str | None]], bool]:
     """Parse Cache-Control fields into directives; also report malformation.
 
     Each field is split on its own, so one field's dangling quote can't
-    swallow the next field. A malformed field is still split on every
-    comma -- a ``no-store`` or ``no-cache`` in it must not hide -- and
-    reported, so the caller can treat its freshness as invalid.
+    swallow the next field. A field that breaks the grammar -- a stray
+    quote, a missing comma -- is malformed, and reported so the caller can
+    treat its freshness as invalid; it is still scanned for directive
+    names split on commas, whitespace AND quotes, so a ``no-store`` or
+    ``no-cache`` in it never hides (not even glued to a quoted string).
     """
     directives: dict[str, list[str | None]] = {}
     malformed = False
     for value in values:
         parts = _split_field(value)
-        if parts is None:
+        parsed = [] if parts is None else [_directive(p.strip()) for p in parts]
+        if parts is None or any(
+            directive is None and part.strip()
+            for directive, part in zip(parsed, parts, strict=True)
+        ):
             malformed = True
-            # Quotes mean nothing in a malformed field: drop them, so a
-            # ``no-store"`` still reads as no-store.
-            parts = value.replace('"', "").split(",")
-        for part in parts:
-            name, sep, arg = part.strip().partition("=")
-            name = name.strip().lower()
-            if name:
-                directives.setdefault(name, []).append(arg if sep else None)
+            for word in re.split(r'[,\s"]+', value):
+                name, sep, arg = word.partition("=")
+                if name:
+                    directives.setdefault(name.lower(), []).append(arg if sep else None)
+            continue
+        for directive in parsed:
+            if directive is not None:
+                name, arg = directive
+                directives.setdefault(name, []).append(arg)
     return directives, malformed
 
 
@@ -248,14 +289,27 @@ def freshness_of(
 
 
 def _entity_tag(fields: Fields) -> tuple[bool, str] | None:
-    """Return the ETag as (weak, opaque tag); None when there is none."""
-    value = _first(fields, "etag")
-    if not value:
+    """Return the ETag as (weak, opaque tag); None when there is no valid one."""
+    value = _etag(fields)
+    if value is None:
         return None
-    value = value.strip()
     if value.startswith("W/"):
         return True, value[2:]
     return False, value
+
+
+def _same_instant(new: str, stored: str | None) -> bool:
+    """Whether two Last-Modified values name the same instant.
+
+    Compared as dates when both parse (an RFC 850 date equals its IMF-fixdate
+    form), as text otherwise.
+    """
+    if stored is None:
+        return False
+    new_date, stored_date = _http_date(new), _http_date(stored)
+    if new_date is not None and stored_date is not None:
+        return new_date == stored_date
+    return new == stored
 
 
 def _selects(stored: Fields, new: Fields) -> bool:
@@ -263,22 +317,24 @@ def _selects(stored: Fields, new: Fields) -> bool:
 
     A 304 carrying a strong ETag selects only a stored response with that
     same strong ETag. One carrying only weak validators (a weak ETag,
-    Last-Modified) selects one they correspond to. One carrying no
-    validator selects only a stored response that has none either. A 304
-    that selects nothing MUST NOT update anything: it may describe some
-    other representation entirely.
+    Last-Modified) selects one they ALL correspond to -- a matching weak
+    tag with a different Last-Modified is another edge's copy. One
+    carrying no validator selects only a stored response that has none
+    either. A 304 that selects nothing MUST NOT update anything: it may
+    describe some other representation entirely.
     """
     new_tag, stored_tag = _entity_tag(new), _entity_tag(stored)
     if new_tag is not None and not new_tag[0]:
         return stored_tag is not None and stored_tag == new_tag
     new_modified = _first(new, "last-modified")
-    if new_tag is not None or new_modified:
-        return (
-            new_tag is not None
-            and stored_tag is not None
-            and stored_tag[1] == new_tag[1]
-        ) or (bool(new_modified) and new_modified == _first(stored, "last-modified"))
-    return stored_tag is None and not _first(stored, "last-modified")
+    stored_modified = _first(stored, "last-modified")
+    if new_tag is None and not new_modified:
+        return stored_tag is None and not stored_modified
+    tag_matches = new_tag is None or (
+        stored_tag is not None and stored_tag[1] == new_tag[1]
+    )
+    modified_matches = not new_modified or _same_instant(new_modified, stored_modified)
+    return tag_matches and modified_matches
 
 
 def _dated(fields: Fields, received_at: datetime) -> Fields:
@@ -338,7 +394,8 @@ class FreshnessCache[T]:
     the cache asks again unconditionally. A selecting 304's header fields
     replace the stored fields of the same name and the rest stay (a 304
     carrying only its ETag after ``no-cache`` is still ``no-cache``; one
-    without Date is dated at receipt), and freshness and validators are
+    without Date is dated at receipt; a stored Age stays when a 304 brings
+    none, which only shortens the renewal), and freshness and validators are
     recomputed from the merged set. Concurrent ``get`` calls for one key
     share one fetch.
 

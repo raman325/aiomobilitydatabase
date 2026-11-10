@@ -108,6 +108,15 @@ def test_repeated_cache_control_fields_merge() -> None:
     assert _fresh(TwoFields()) == Freshness(lifetime=0.0)
 
 
+@pytest.mark.parametrize("etag", ["*", '"a", "b"', "bare", 'W/"x" junk'])
+def test_an_etag_that_isnt_one_entity_tag_validates_nothing(etag: str) -> None:
+    """``*`` or a list would change what If-None-Match means."""
+    assert Validators.from_headers({"ETag": etag}) is None
+    assert Validators.from_headers({"ETag": etag, "Last-Modified": "Mon"}) == (
+        Validators(etag=None, last_modified="Mon")
+    )
+
+
 def test_validators_from_headers_and_back() -> None:
     assert Validators.from_headers({}) is None
     validators = Validators.from_headers({"etag": '"v1"', "Last-Modified": "Thu"})
@@ -163,6 +172,8 @@ _PREFIX = st.lists(
             "\\",
             'foo"bar',
             'ext="a"b',
+            "max-age=60 public",
+            "ext=a;b",
         ]
     )
 )
@@ -206,6 +217,31 @@ def test_a_quote_that_isnt_an_argument_cannot_hide_no_store(header: str) -> None
     makes the field malformed, and no-store in it is still seen.
     """
     assert _fresh({"Cache-Control": header}) == Freshness(None, storable=False)
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        # A missing comma: not a directive list, and never a hidden no-store.
+        ("max-age=600, no-cache no-store", Freshness(None, storable=False)),
+        ("no-store no-cache", Freshness(None, storable=False)),
+        ("max-age=600, public no-cache", Freshness(0.0)),
+        ('foo="x"no-store', Freshness(None, storable=False)),
+        ("max-age=60 no-store", Freshness(None, storable=False)),
+        # Grammar alone: no BWS around "=", no text glued to a quoted string.
+        ("max-age = 60", Freshness(0.0)),
+        ('max-age=60, ext="a"b', Freshness(0.0)),
+        ("max-age=60, ext=a;b", Freshness(0.0)),
+        # Empty list elements are fine (RFC 9110 section 5.6.1).
+        ("max-age=60,, public", Freshness(60.0)),
+    ],
+)
+def test_cache_control_follows_its_grammar(header: str, expected: Freshness) -> None:
+    """RFC 9111 section 5.2: ``token [ "=" ( token / quoted-string ) ]``.
+    A field breaking it is stale now, and still scanned for no-store and
+    no-cache split on commas and whitespace.
+    """
+    assert _fresh({"Cache-Control": header}) == expected
 
 
 def test_an_unterminated_quote_makes_the_field_invalid() -> None:
@@ -455,6 +491,86 @@ async def test_a_304_that_selects_nothing_updates_nothing(
     await cache.get("u", producer)
     assert await cache.get("u", producer) == "b"
     assert producer.seen == [None, Validators('"1"', "Mon"), None]
+
+
+@pytest.mark.parametrize(
+    ("stored", "not_modified"),
+    [
+        # A strong 304 tag never selects a weak stored one.
+        pytest.param({"ETag": 'W/"1"'}, {"ETag": '"1"'}, id="strong-vs-weak-stored"),
+        # Weak validators must ALL correspond: another edge's copy.
+        pytest.param(
+            {"ETag": 'W/"1"', "Last-Modified": _http(T0)},
+            {"ETag": 'W/"1"', "Last-Modified": _http(T0 + timedelta(days=1))},
+            id="weak-tag-matches-last-modified-doesnt",
+        ),
+        # A Last-Modified the stored response never had corresponds to
+        # nothing stored.
+        pytest.param(
+            {"ETag": 'W/"1"'},
+            {"ETag": 'W/"1"', "Last-Modified": _http(T0)},
+            id="last-modified-the-stored-copy-lacks",
+        ),
+    ],
+)
+async def test_a_304_must_match_every_validator_it_carries(
+    stored: dict[str, str], not_modified: dict[str, str]
+) -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    producer = _Producer(
+        [
+            _raw("a", {**stored, "Cache-Control": "max-age=0"}),
+            _raw(None, {**not_modified, "Cache-Control": "max-age=600"}),
+            _raw("b", {"Cache-Control": "max-age=0"}),
+        ]
+    )
+    await cache.get("u", producer)
+    assert await cache.get("u", producer) == "b"
+    assert producer.seen[2] is None  # re-asked unconditionally
+
+
+async def test_last_modified_is_compared_as_an_instant() -> None:
+    """The same instant in RFC 850 form still selects the stored response."""
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    rfc850 = "Thursday, 30-Jul-26 12:00:00 GMT"
+    producer = _Producer(
+        [
+            _raw("a", {"Last-Modified": _http(T0), "Cache-Control": "max-age=0"}),
+            _raw(None, {"Last-Modified": rfc850, "Cache-Control": "max-age=60"}),
+        ]
+    )
+    await cache.get("u", producer)
+    await cache.get("u", producer)
+    clock.now = 59.0
+    assert await cache.get("u", producer) == "a"
+    assert len(producer.seen) == 2
+
+
+async def test_a_retry_counts_freshness_from_its_own_request() -> None:
+    """The non-selecting 304 took 5s; the retry's max-age=10 starts at the
+    retry, not at the first request.
+    """
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    first = {"ETag": '"1"', "Cache-Control": "max-age=0"}
+    queue = [
+        _raw("a", first),
+        _raw(None, {}),
+        _raw("b", {"Cache-Control": "max-age=10"}),
+    ]
+
+    async def fetch(*, validators: Validators | None) -> Response[str]:
+        item = queue.pop(0)
+        if item.value is None:
+            clock.now += 5
+        return item
+
+    await cache.get("u", fetch)
+    assert await cache.get("u", fetch) == "b"  # at 0: 304 (to 5s), retry at 5
+    clock.now = 14.0
+    assert await cache.get("u", fetch) == "b"  # still fresh: 5 + 10 > 14
+    assert not queue
 
 
 @pytest.mark.parametrize("tags", [('W/"1"', 'W/"1"'), ('"1"', 'W/"1"')])
@@ -814,7 +930,9 @@ def _model_selects(stored_etag: str | None, sent: dict[str, str]) -> bool:
     return stored_etag is not None and stored_etag.removeprefix("W/") == new[2:]
 
 
-_STYLES_304 = st.sampled_from(["full", "validator_only", "weakened", "bare", "another"])
+_STYLES_304 = st.sampled_from(
+    ["full", "validator_only", "weakened", "strengthened", "bare", "another"]
+)
 
 
 class FreshnessMachine(RuleBasedStateMachine):
@@ -909,6 +1027,12 @@ class FreshnessMachine(RuleBasedStateMachine):
                 "weakened": {
                     **self._headers(etag),
                     "ETag": f"W/{etag.removeprefix('W/')}",
+                },
+                # The opposite: a strong tag for a weak stored one -- selects
+                # nothing (a strong validator must match strongly).
+                "strengthened": {
+                    **self._headers(etag),
+                    "ETag": etag.removeprefix("W/"),
                 },
                 "bare": {},
                 "another": {"ETag": '"another"', "Cache-Control": "max-age=600"},
