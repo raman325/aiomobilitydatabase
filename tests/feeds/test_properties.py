@@ -3001,7 +3001,7 @@ def test_generated_feeds_end_to_end_totality(
         # dropped coordinate-null check) would be caught here).
         zone = Circle(latitude=34.05, longitude=-118.25, radius_m=500_000.0)
         handle = TransitFeedHandle.__new__(TransitFeedHandle)
-        handle.stops = all_stops
+        handle._stops = all_stops
         returned = handle.stops_in(zone)
         assert all(
             s.latitude is not None

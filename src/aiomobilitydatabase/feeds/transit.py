@@ -574,7 +574,7 @@ class TransitFeedHandle:
             assert static_feed is not None and static_feed.id is not None
             self._feed_key = static_feed.id
             self._headers = None
-        self.rt_feeds = rt_feeds
+        self._rt_feeds = rt_feeds
         self._index = index
         self._api_key = api_key
         self._guard = _IndexGuard()
@@ -583,11 +583,11 @@ class TransitFeedHandle:
         # reused on a 304, i.e. when the producer itself states the bytes
         # are unchanged -- this is revalidation, not a TTL cache.
         self._rt_validators: dict[str, tuple[FeedValidators, Any]] = {}
-        self.stops: list[Stop] = index.stops()
-        self.routes: list[Route] = index.routes()
-        self.agencies: list[Agency] = index.agencies()
+        self._stops: list[Stop] = index.stops()
+        self._routes: list[Route] = index.routes()
+        self._agencies: list[Agency] = index.agencies()
         # None when the dataset ships no feed_info.txt (an optional file).
-        self.feed_info: FeedInfo | None = index.feed_info()
+        self._feed_info: FeedInfo | None = index.feed_info()
 
     async def _index_read[T](
         self, fn: Callable[..., T], *args: object, **kwargs: object
@@ -622,6 +622,31 @@ class TransitFeedHandle:
         available", not as "no data".
         """
         return None if self._static_feed is None else self._static_feed.latest_dataset
+
+    @property
+    def rt_feeds(self) -> list[GtfsRtFeed]:
+        """GTFS-RT sources this handle fetches (catalog records or synthesized)."""
+        return self._rt_feeds
+
+    @property
+    def stops(self) -> list[Stop]:
+        """Every stop in the indexed dataset; replaced atomically on refresh."""
+        return self._stops
+
+    @property
+    def routes(self) -> list[Route]:
+        """Every route in the indexed dataset; replaced atomically on refresh."""
+        return self._routes
+
+    @property
+    def agencies(self) -> list[Agency]:
+        """Every agency in the indexed dataset; replaced atomically on refresh."""
+        return self._agencies
+
+    @property
+    def feed_info(self) -> FeedInfo | None:
+        """The dataset's feed_info.txt record, or None when it ships none."""
+        return self._feed_info
 
     @classmethod
     async def create(
@@ -1849,7 +1874,7 @@ class TransitFeedHandle:
             old_index = self._index
             if static_feed is not None:
                 self._static_feed = static_feed
-            self._index, self.stops, self.routes, self.agencies, self.feed_info = (
+            self._index, self._stops, self._routes, self._agencies, self._feed_info = (
                 new_index,
                 stops,
                 routes,
