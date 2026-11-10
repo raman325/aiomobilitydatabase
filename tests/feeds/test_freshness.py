@@ -3,12 +3,12 @@
 import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from email.utils import format_datetime
+from email.utils import format_datetime, parsedate_to_datetime
 
 import pytest
 from hypothesis import event, given, settings
 from hypothesis import strategies as st
-from hypothesis.stateful import RuleBasedStateMachine, rule
+from hypothesis.stateful import RuleBasedStateMachine, precondition, rule
 
 from aiomobilitydatabase.feeds._freshness import (
     Freshness,
@@ -153,7 +153,17 @@ def test_older_responses_are_never_fresher(max_age: int, ages: tuple[int, int]) 
 
 _PREFIX = st.lists(
     st.sampled_from(
-        ["max-age=60", "public", "private", 'ext="x', 'ext="a, b"', '"', "\\"]
+        [
+            "max-age=60",
+            "public",
+            "private",
+            'ext="x',
+            'ext="a, b"',
+            '"',
+            "\\",
+            'foo"bar',
+            'ext="a"b',
+        ]
     )
 )
 
@@ -181,6 +191,21 @@ def test_no_store_and_no_cache_always_win(prefix: list[str], directive: str) -> 
     assert _fresh({"Cache-Control": same_field}) == expected
     two_fields = [("Cache-Control", ", ".join(prefix)), ("Cache-Control", directive)]
     assert _fresh(_Fields(two_fields)) == expected
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        'max-age=60, foo"bar, no-store"',
+        'max-age=60, private", no-store, x"',
+        'max-age=60, ext="a"b, no-store',
+    ],
+)
+def test_a_quote_that_isnt_an_argument_cannot_hide_no_store(header: str) -> None:
+    """A quoted string may only be a directive's argument; a stray quote
+    makes the field malformed, and no-store in it is still seen.
+    """
+    assert _fresh({"Cache-Control": header}) == Freshness(None, storable=False)
 
 
 def test_an_unterminated_quote_makes_the_field_invalid() -> None:
@@ -333,7 +358,7 @@ async def test_freshness_counts_from_the_request_not_the_receipt() -> None:
 async def test_expired_entries_revalidate_and_304_extends() -> None:
     clock = _Clock()
     cache: FreshnessCache[str] = FreshnessCache(clock)
-    producer = _Producer([_r("a", V1, 10.0), _r(None, None, 10.0)])
+    producer = _Producer([_r("a", V1, 10.0), _r(None, V1, 10.0)])
     await cache.get("u", producer)
     clock.now = 10.0
     assert await cache.get("u", producer) == "a"
@@ -369,7 +394,7 @@ async def test_no_store_on_a_304_drops_the_entry() -> None:
     producer = _Producer(
         [
             _r("a", V1, 0.0),
-            _r(None, None, None, storable=False),
+            _r(None, V1, None, storable=False),
             _r("b", None, 0.0),
         ]
     )
@@ -379,15 +404,17 @@ async def test_no_store_on_a_304_drops_the_entry() -> None:
     assert producer.seen == [None, V1, None]  # nothing left to revalidate
 
 
-async def test_a_304_rotates_only_the_validators_it_carries() -> None:
+async def test_a_selecting_304_rotates_only_the_validators_it_carries() -> None:
     both = Validators(etag='"1"', last_modified="Mon")
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
     producer = _Producer(
         [
             _r("a", both, 0.0),
+            # Same strong ETag (selects), new Last-Modified: rotates it.
+            _r(None, Validators(etag='"1"', last_modified="Tue"), 0.0),
+            # Only a Last-Modified, matching what is now stored: selects.
             _r(None, Validators(etag=None, last_modified="Tue"), 0.0),
-            _r(None, None, 0.0),
-            _r(None, None, 0.0),
+            _r(None, V1, 0.0),
         ]
     )
     for _ in range(4):
@@ -400,29 +427,111 @@ async def test_a_304_rotates_only_the_validators_it_carries() -> None:
     ]
 
 
-async def test_an_unvalidated_entry_takes_a_304s_validators() -> None:
+@pytest.mark.parametrize(
+    "not_modified",
+    [
+        pytest.param({}, id="no-validator"),
+        pytest.param({"ETag": '"2"'}, id="another-strong-etag"),
+        pytest.param({"ETag": 'W/"2"'}, id="a-non-matching-weak-etag"),
+        pytest.param({"Last-Modified": "Sun"}, id="a-non-matching-last-modified"),
+    ],
+)
+async def test_a_304_that_selects_nothing_updates_nothing(
+    not_modified: dict[str, str],
+) -> None:
+    """RFC 9111 section 4.3.4: such a 304 MUST NOT update the stored
+    response -- it may describe another representation. The cache asks
+    again unconditionally instead of renewing ``a`` for ten minutes.
+    """
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
-    producer = _Producer([_r("a", None, 0.0)])
+    stored = {"ETag": '"1"', "Last-Modified": "Mon", "Cache-Control": "max-age=0"}
+    producer = _Producer(
+        [
+            _raw("a", stored),
+            _raw(None, {**not_modified, "Cache-Control": "max-age=600"}),
+            _raw("b", {"Cache-Control": "max-age=0"}),
+        ]
+    )
     await cache.get("u", producer)
-    cache._entries["u"].fields = {}
-    producer.queue += [_r(None, V1, 0.0), _r(None, None, 0.0)]
-    await cache.get("u", producer)  # an unsolicited-looking 304 still lands
-    await cache.get("u", producer)
-    assert producer.seen[-1] == V1
+    assert await cache.get("u", producer) == "b"
+    assert producer.seen == [None, Validators('"1"', "Mon"), None]
 
 
-async def test_a_bare_304_keeps_the_stored_freshness_headers() -> None:
+@pytest.mark.parametrize("tags", [('W/"1"', 'W/"1"'), ('"1"', 'W/"1"')])
+async def test_a_weak_etag_selects_by_weak_comparison(tags: tuple[str, str]) -> None:
+    stored_tag, new_tag = tags
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer(
+        [
+            _raw("a", {"ETag": stored_tag, "Cache-Control": "max-age=0"}),
+            _raw(None, {"ETag": new_tag, "Cache-Control": "max-age=60"}),
+        ]
+    )
+    await cache.get("u", producer)
+    await cache.get("u", producer)
+    clock.now = 59.0
+    assert await cache.get("u", producer) == "a"
+    assert len(producer.seen) == 2
+
+
+async def test_a_304_without_date_is_dated_at_receipt() -> None:
+    """RFC 9110 section 6.6.1: a 304 with no Date takes its receipt time as
+    Date, so the stored response's old Date can't age the renewal to 0.
+    """
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    later = T0 + timedelta(seconds=120)
+    first = {"Date": _http(T0), "Cache-Control": "max-age=60", "ETag": '"1"'}
+    producer = _Producer(
+        [
+            _raw("a", first),
+            Response(None, header_fields({"ETag": '"1"'}), later, later),
+        ]
+    )
+    await cache.get("u", producer)
+    clock.now = 120.0
+    await cache.get("u", producer)
+    clock.now = 179.0
+    await cache.get("u", producer)
+    assert len(producer.seen) == 2  # renewed for 60s from the 304
+
+
+async def test_an_eagerly_finished_request_is_never_joined() -> None:
+    """Under an eager task factory a request that never suspends finishes
+    inside ensure_future; it must not be left for the next caller to join.
+    """
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)
+    try:
+        cache: FreshnessCache[str] = FreshnessCache(_Clock())
+        calls: list[Validators | None] = []
+
+        async def instant(*, validators: Validators | None) -> Response[str]:
+            calls.append(validators)
+            return _r("a", None, 0.0)
+
+        assert await cache.get("u", instant) == "a"
+        assert not cache._in_flight
+        assert await cache.get("u", instant) == "a"
+        assert len(calls) == 2
+    finally:
+        loop.set_task_factory(None)
+
+
+async def test_a_304_carrying_only_its_etag_keeps_the_stored_freshness() -> None:
     """RFC 9111 section 4.3.4: a 304 updates the stored fields it carries
-    and leaves the rest. A bare 304 after no-cache is still no-cache, so a
-    caller's min_interval (only for "declared nothing") can't extend it.
+    and leaves the rest. One carrying only its ETag after no-cache is still
+    no-cache, so a caller's min_interval (only for "declared nothing")
+    can't extend it.
     """
     clock = _Clock()
     cache: FreshnessCache[str] = FreshnessCache(clock)
     producer = _Producer(
         [
             _raw("a", {"Cache-Control": "no-cache", "ETag": '"1"'}),
-            _raw(None, {}),
-            _raw(None, {}),
+            _raw(None, {"ETag": '"1"'}),
+            _raw(None, {"ETag": '"1"'}),
         ]
     )
     await cache.get("u", producer, min_interval=30.0)
@@ -438,7 +547,7 @@ async def test_a_304s_own_fields_replace_the_stored_ones() -> None:
     producer = _Producer(
         [
             _raw("a", {"Cache-Control": "max-age=10", "ETag": '"1"'}),
-            _raw(None, {"Cache-Control": "max-age=60"}),
+            _raw(None, {"Cache-Control": "max-age=60", "ETag": '"1"'}),
         ]
     )
     await cache.get("u", producer)
@@ -458,18 +567,20 @@ async def test_the_lifetime_hook_runs_on_a_304_against_the_stored_value() -> Non
         return body if header is None else min(body, header)
 
     cache: FreshnessCache[str] = FreshnessCache(clock, lifetime=lifetime)
-    producer = _Producer([_r("ttl=60", V1, 600.0), _r(None, None, 600.0)])
+    producer = _Producer([_r("ttl=60", V1, 600.0), _r(None, V1, 600.0)])
     await cache.get("u", producer)
     clock.now = 61.0
     await cache.get("u", producer)  # 304, max-age=600 again
     clock.now = 125.0
-    producer.queue.append(_r(None, None, 600.0))
+    producer.queue.append(_r(None, V1, 600.0))
     await cache.get("u", producer)
     assert len(producer.seen) == 3  # the 304 renewed 60s, not 600s
 
 
-async def test_a_bare_304_keeps_the_shorter_stored_lifetime_under_the_hook() -> None:
-    """Stored max-age=10 with a body allowing 300: a bare 304 keeps 10."""
+async def test_a_304_without_cache_control_keeps_the_stored_lifetime() -> None:
+    """Stored max-age=10 with a body allowing 300: a 304 carrying only its
+    ETag keeps 10, under the hook too.
+    """
     clock = _Clock()
 
     def lifetime(value: str, header: float | None, _requested: datetime) -> float:
@@ -480,8 +591,8 @@ async def test_a_bare_304_keeps_the_shorter_stored_lifetime_under_the_hook() -> 
     producer = _Producer(
         [
             _raw("ttl=300", {"Cache-Control": "max-age=10", "ETag": '"1"'}),
-            _raw(None, {}),
-            _raw(None, {}),
+            _raw(None, {"ETag": '"1"'}),
+            _raw(None, {"ETag": '"1"'}),
         ]
     )
     await cache.get("u", producer)
@@ -655,7 +766,7 @@ async def test_a_request_cancelled_before_it_runs_leaves_no_trace() -> None:
 async def test_a_304_with_nothing_stored_is_a_bug_not_a_value() -> None:
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
     producer = _Producer([_r(None, None, 0.0)])
-    with pytest.raises(RuntimeError, match="nothing stored"):
+    with pytest.raises(RuntimeError, match="unconditional"):
         await cache.get("u", producer)
 
 
@@ -672,27 +783,52 @@ def _doc_time(doc: _Doc) -> datetime:
     return datetime.fromtimestamp(doc.timestamp, UTC)
 
 
-def _model_freshness(cache_control: str | None) -> tuple[bool, float | None]:
-    """The four header shapes the fake producer sends: (storable, lifetime)."""
+def _model_lifetime(
+    cache_control: str | None, date: int | None, age: int | None, received: float
+) -> tuple[bool, float | None]:
+    """(storable, lifetime) for the header shapes the fake producer sends.
+
+    Requests are instantaneous here, so the lifetime is max-age less the
+    initial age: the larger of Date's apparent age and Age. Date is whole
+    seconds; a missing one is the (whole-second) receipt time.
+    """
     if cache_control is None:
         return True, None
     if cache_control == "no-store":
         return False, None
     if cache_control == "no-cache":
         return True, 0.0
-    return True, float(cache_control.removeprefix("max-age="))
+    max_age = float(cache_control.removeprefix("max-age="))
+    dated = date if date is not None else int(received)
+    initial = max(0.0, received - dated, float(age or 0))
+    return True, max(0.0, max_age - initial)
+
+
+def _model_selects(stored_etag: str | None, sent: dict[str, str]) -> bool:
+    """RFC 9111 section 4.3.4, restated for ETags only (no Last-Modified)."""
+    new = sent.get("ETag")
+    if new is None:
+        return stored_etag is None
+    if not new.startswith("W/"):
+        return new == stored_etag
+    return stored_etag is not None and stored_etag.removeprefix("W/") == new[2:]
+
+
+_STYLES_304 = st.sampled_from(["full", "validator_only", "weakened", "bare", "another"])
 
 
 class FreshnessMachine(RuleBasedStateMachine):
     """Random clocks, publishes, failures, stale edges, calls and bursts.
 
-    The fake producer records exactly what it served and checks the
-    validators each request carries; a reference model applies the cache's
-    documented rules to that record, and every call is checked against it:
-    how many requests were made, what was sent, and what came back. The
-    wall clock moves with the monotonic one, and documents are stamped
-    against it -- a few seconds behind, slightly ahead (an un-synced
-    producer clock), or years ahead (a clock bug).
+    The fake producer records exactly what it served, header by header; a
+    reference model applies the cache's documented rules to that record,
+    and every call is checked against it: which requests were made with
+    which validators, and what came back. The wall clock moves with the
+    monotonic one; documents are stamped against it (a few seconds behind,
+    slightly ahead, years ahead); responses carry Date (current, stale or
+    none) and sometimes Age; ETags are strong or weak; and a 304 repeats
+    the headers, carries only its ETag, carries nothing, or names another
+    representation -- the last two select nothing and must be re-asked.
     """
 
     def __init__(self) -> None:
@@ -707,15 +843,21 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.published = _Doc(1, self._wall() - 1000)
         self.cache_control: str | None = None
         self.validators_offered = True
-        self.bare_304 = False
+        self.weak = False
+        self.date_mode = "now"
+        self.age: int | None = None
+        self.style_304 = "full"
         self.fail_next = False
         self.stale_next = False
-        self.requests = 0
-        self.served: list[_Doc | None] = []  # None = answered 304
+        # What the producer saw and served during one call:
+        # (validators sent, headers served, document or None for a 304).
+        self.log: list[tuple[Validators | None, dict[str, str], _Doc | None]] = []
         # Model of the cache.
         self.stored: _Doc | None = None
         self.stored_cc: str | None = None
         self.stored_etag: str | None = None
+        self.stored_date: int | None = None
+        self.stored_age: int | None = None
         self.stored_received = 0
         self.stored_at = 0.0
         self.stored_lifetime: float | None = None
@@ -724,37 +866,57 @@ class FreshnessMachine(RuleBasedStateMachine):
     def _wall(self) -> int:
         return int(T0.timestamp() + self.clock.now)
 
-    async def _fetch(self, *, validators: Validators | None) -> Response[_Doc]:
-        self.requests += 1
-        # What the cache must send: the validators of what it stores.
-        expected = (
-            Validators(etag=self.stored_etag, last_modified=None)
-            if self.stored is not None and self.stored_etag is not None
-            else None
-        )
-        assert validators == expected
-        await asyncio.sleep(0)  # let a burst pile up on the in-flight task
-        if self.fail_next:
-            self.fail_next = False
-            raise ConnectionError("producer down")
-        doc = self.published
-        if self.stale_next:
-            self.stale_next = False
-            doc = _Doc(doc.version, doc.timestamp - 50)  # an older edge copy
-        etag = f'"{doc.version}.{doc.timestamp}"' if self.validators_offered else None
+    def _received(self) -> float:
+        return T0.timestamp() + self.clock.now
+
+    def _etag(self, doc: _Doc) -> str | None:
+        if not self.validators_offered:
+            return None
+        tag = f'"{doc.version}.{doc.timestamp}"'
+        return f"W/{tag}" if self.weak else tag
+
+    def _headers(self, etag: str | None) -> dict[str, str]:
         headers: dict[str, str] = {}
         if self.cache_control is not None:
             headers["Cache-Control"] = self.cache_control
         if etag is not None:
             headers["ETag"] = etag
+        if self.date_mode != "none":
+            date = self._wall() - (20 if self.date_mode == "stale" else 0)
+            headers["Date"] = _http(datetime.fromtimestamp(date, UTC))
+        if self.age is not None:
+            headers["Age"] = str(self.age)
+        return headers
+
+    async def _fetch(self, *, validators: Validators | None) -> Response[_Doc]:
+        await asyncio.sleep(0)  # let a burst pile up on the in-flight task
+        if self.fail_next:
+            self.fail_next = False
+            self.log.append((validators, {}, None))
+            raise ConnectionError("producer down")
+        doc = self.published
+        if self.stale_next:
+            self.stale_next = False
+            doc = _Doc(doc.version, doc.timestamp - 50)  # an older edge copy
+        etag = self._etag(doc)
         now = T0 + timedelta(seconds=self.clock.now)
-        if validators is not None and validators.etag == etag:
-            self.served.append(None)
-            return Response(
-                None, header_fields({} if self.bare_304 else headers), now, now
-            )
-        self.served.append(doc)
-        self._served_cc, self._served_etag = self.cache_control, etag
+        if validators is not None and etag is not None and validators.etag == etag:
+            headers = {
+                "full": self._headers(etag),
+                "validator_only": {"ETag": etag},
+                # A CDN weakening the tag (as compression does): selects by
+                # weak comparison.
+                "weakened": {
+                    **self._headers(etag),
+                    "ETag": f"W/{etag.removeprefix('W/')}",
+                },
+                "bare": {},
+                "another": {"ETag": '"another"', "Cache-Control": "max-age=600"},
+            }[self.style_304]
+            self.log.append((validators, headers, None))
+            return Response(None, header_fields(headers), now, now)
+        headers = self._headers(etag)
+        self.log.append((validators, headers, doc))
         return Response(doc, header_fields(headers), now, now)
 
     def _expect_fresh(self) -> bool:
@@ -790,22 +952,21 @@ class FreshnessMachine(RuleBasedStateMachine):
             [None, "no-store", "no-cache", "max-age=0", "max-age=5", "max-age=30"]
         ),
         validators=st.booleans(),
+        weak=st.booleans(),
     )
-    def publish(self, cache_control: str | None, validators: bool) -> None:
+    def publish(self, cache_control: str | None, validators: bool, weak: bool) -> None:
         self.version += 1
         self.published = _Doc(self.version, self._wall() - 5)
         self.cache_control = cache_control
-        self.validators_offered = validators
+        self.validators_offered, self.weak = validators, weak
 
     @rule()
     def publish_cacheable(self) -> None:
-        """Publish the common real-world shape: fresh for 30s, with an ETag.
-
-        Weighted in on purpose: the store -> expire -> 304 -> fresh again
-        path needs a cacheable, validated response, which ``publish`` only
-        draws now and then.
+        """The common real-world shape: fresh for 30s, a strong ETag, full
+        304s. Weighted in so store -> expire -> 304 -> fresh again happens.
         """
-        self.publish(cache_control="max-age=30", validators=True)
+        self.publish(cache_control="max-age=30", validators=True, weak=False)
+        self.style_304, self.date_mode = "full", "now"
 
     @rule(ahead=st.sampled_from([2, 10**8]))
     def publish_from_a_fast_clock(self, ahead: int) -> None:
@@ -819,18 +980,17 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.version += 1
         self.published = _Doc(self.version, self._wall())
 
-    @rule(cache_control=st.sampled_from(["max-age=30", "no-cache", "max-age=5"]))
-    def publish_validated_then_bare_304s(self, cache_control: str) -> None:
-        """Validated, with freshness, and every later 304 bare: the stored
-        headers must keep governing (RFC 9111 section 4.3.4).
-        """
-        self.publish(cache_control=cache_control, validators=True)
-        self.bare_304 = True
+    @rule(style=_STYLES_304)
+    def set_304_style(self, style: str) -> None:
+        self.style_304 = style
 
-    @rule(bare=st.booleans())
-    def set_304_style(self, bare: bool) -> None:
-        """Whether a 304 repeats the freshness headers or carries none."""
-        self.bare_304 = bare
+    @rule(
+        date_mode=st.sampled_from(["now", "stale", "none"]),
+        age=st.sampled_from([None, None, 5]),
+    )
+    def set_message_age(self, date_mode: str, age: int | None) -> None:
+        """Date current, 20s stale, or missing; maybe an Age."""
+        self.date_mode, self.age = date_mode, age
 
     @rule(interval=st.sampled_from([0.0, 10.0]))
     def set_min_interval(self, interval: float) -> None:
@@ -844,66 +1004,118 @@ class FreshnessMachine(RuleBasedStateMachine):
     def serve_stale_edge_next(self) -> None:
         self.stale_next = True
 
+    @precondition(lambda self: self.stored is not None and bool(self.stored_lifetime))
+    @rule(style=_STYLES_304)
+    def lapse_then_call_twice(self, style: str) -> None:
+        """Let a declared lifetime lapse, revalidate, and call straight
+        again: a selecting 304 must renew it -- with its own Date, Age and
+        Cache-Control merged over the stored ones -- for the next call.
+        """
+        assert self.stored_lifetime is not None
+        self.style_304 = style
+        # Just past it: the exact instant is float-rounding territory, and
+        # the examples pin the boundary itself.
+        self.clock.now = self.stored_at + self.stored_lifetime + 0.001
+        self.call(count=1)
+        self.call(count=1)
+
+    @rule()
+    def call_twice(self) -> None:
+        """Back to back: a 304 that renewed freshness must answer the next."""
+        self.call(count=1)
+        self.call(count=1)
+
     @rule(count=st.integers(1, 4))
     def call(self, count: int) -> None:
         expect_fresh = self._expect_fresh()
         will_fail = self.fail_next and not expect_fresh
-        before_requests, before_served = self.requests, len(self.served)
+        sent = (
+            Validators(etag=self.stored_etag, last_modified=None)
+            if self.stored is not None and self.stored_etag is not None
+            else None
+        )
+        self.log = []
         results = asyncio.run(self._call(count))
-        # Sharing: a burst costs at most one request; freshness: none at all.
-        assert self.requests - before_requests == (0 if expect_fresh else 1)
+        if expect_fresh:
+            assert self.log == []  # freshness: no request at all
+            event(
+                f"fresh hit after {self.last_kind}"
+                + (" (declared lifetime)" if self.stored_lifetime else "")
+            )
+            assert all(r == self.stored for r in results)
+            return
+        # Sharing: a burst costs one request (two when a 304 is re-asked),
+        # carrying exactly the stored validators.
+        assert self.log and self.log[0][0] == sent
         if will_fail:
+            assert len(self.log) == 1
             assert all(isinstance(r, ConnectionError) for r in results)
             return
         assert all(r == results[0] for r in results)
-        returned = results[0]
-        if expect_fresh:
-            event(f"fresh hit after {self.last_kind}")
-            assert returned == self.stored
-            return
-        assert len(self.served) == before_served + 1
-        self.last_kind = "304" if self.served[-1] is None else "200"
-        if self.served[-1] is None:
-            self.last_kind += " (bare)" if self.bare_304 else " (headers)"
+        _, headers, served = self.log[0]
+        if served is None and not _model_selects(self.stored_etag, headers):
+            # A 304 that identifies nothing: asked again, unconditionally.
+            event(f"304 ({self.style_304}) selects nothing: re-asked")
+            assert len(self.log) == 2
+            assert self.log[1][0] is None and self.log[1][2] is not None
+            _, headers, served = self.log[1]
+        else:
+            assert len(self.log) == 1
+        self.last_kind = "200" if served is not None else f"304 ({self.style_304})"
         event(f"request answered {self.last_kind}")
-        assert returned == self._absorb(self.served[-1])
+        assert results[0] == self._absorb(headers, served)
 
-    def _absorb(self, served: _Doc | None) -> _Doc:
+    def _absorb(self, headers: dict[str, str], served: _Doc | None) -> _Doc:
         """Apply the cache rules to what the producer served; return the answer."""
+        received = self._received()
+        date = (
+            int(parsedate_to_datetime(headers["Date"]).timestamp())
+            if "Date" in headers
+            else int(received)  # dated at receipt
+        )
+        age = int(headers["Age"]) if "Age" in headers else None
         if served is None:
-            # A 304 confirms the stored copy. Its own headers replace the
-            # stored ones of the same name; a bare 304 changes nothing.
+            # A selecting 304: its fields replace the stored ones of the same
+            # name; Date always (it is dated at receipt if it had none).
             assert self.stored is not None
             answer = self.stored
-            if not self.bare_304:
-                self.stored_cc = self.cache_control
-            storable, lifetime = _model_freshness(self.stored_cc)
+            if "Cache-Control" in headers:
+                self.stored_cc = headers["Cache-Control"]
+            if "ETag" in headers:
+                self.stored_etag = headers["ETag"]
+            if "Age" in headers:
+                self.stored_age = age
+            self.stored_date = date
+            storable, lifetime = _model_lifetime(
+                self.stored_cc, self.stored_date, self.stored_age, received
+            )
             if storable:
                 self.stored_at, self.stored_lifetime = self.clock.now, lifetime
             else:
                 self.stored = None
             return answer
-        storable, lifetime = _model_freshness(self._served_cc)
+        storable, lifetime = _model_lifetime(
+            headers.get("Cache-Control"), date, age, received
+        )
         if not storable:
             self.stored = None
             return served
         if self.stored is not None:
             # The newest thing we know of is the stored copy, as of its stamp
-            # -- but no later than when it actually reached us.
+            # -- but no later than the second it actually reached us.
             known = min(self.stored.timestamp, self.stored_received)
             if served.timestamp < known:
                 event("stale edge rejected")
                 self.stored_at, self.stored_lifetime = self.clock.now, 0.0
                 return self.stored
-        self.stored, self.stored_cc, self.stored_etag = (
-            served,
-            self._served_cc,
-            self._served_etag,
-        )
+        self.stored = served
+        self.stored_cc = headers.get("Cache-Control")
+        self.stored_etag = headers.get("ETag")
+        self.stored_date, self.stored_age = date, age
         self.stored_received = self._wall()
         self.stored_at, self.stored_lifetime = self.clock.now, lifetime
         return served
 
 
-FreshnessMachine.TestCase.settings = settings(max_examples=200, deadline=None)
+FreshnessMachine.TestCase.settings = settings(max_examples=600, deadline=None)
 TestFreshnessMachine = FreshnessMachine.TestCase

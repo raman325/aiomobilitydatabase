@@ -86,7 +86,9 @@ async def test_realtime_within_max_age_costs_no_request_then_revalidates(
         content_type=PB,
         headers={"Cache-Control": "max-age=30", "ETag": '"v1"'},
     )
-    mock_api.get(RT, status=304, headers={"Cache-Control": "max-age=30"})
+    mock_api.get(
+        RT, status=304, headers={"Cache-Control": "max-age=30", "ETag": '"v1"'}
+    )
     handle = await feeds_client.get_transit_feed("mdb-100")
     clock = _Clock()
     handle._rt_cache._clock = clock
@@ -114,7 +116,7 @@ async def test_no_cache_revalidates_every_call(
         content_type=PB,
         headers={"Cache-Control": "no-cache, max-age=300", "ETag": '"v1"'},
     )
-    mock_api.get(RT, status=304, headers={"Cache-Control": "no-cache"})
+    mock_api.get(RT, status=304, headers={"Cache-Control": "no-cache", "ETag": '"v1"'})
     handle = await feeds_client.get_transit_feed("mdb-100")
     assert await _t1_delay(handle) == 60
     assert await _t1_delay(handle) == 60
@@ -182,10 +184,10 @@ async def test_rt_min_interval_never_extends_a_declared_lifetime(
     assert await _t1_delay(handle) == 120
 
 
-async def test_a_bare_304_after_no_cache_is_still_no_cache(
+async def test_a_304_without_cache_control_after_no_cache_is_still_no_cache(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
-    """The 304 carries no Cache-Control, so the stored no-cache stands
+    """The 304 carries only its ETag, so the stored no-cache stands
     (RFC 9111 section 4.3.4) and rt_min_interval can't stretch it.
     """
     _mock_transit(mock_api)
@@ -195,8 +197,8 @@ async def test_a_bare_304_after_no_cache_is_still_no_cache(
         content_type=PB,
         headers={"Cache-Control": "no-cache", "ETag": '"v1"'},
     )
-    mock_api.get(RT, status=304)
-    mock_api.get(RT, status=304)
+    mock_api.get(RT, status=304, headers={"ETag": '"v1"'})
+    mock_api.get(RT, status=304, headers={"ETag": '"v1"'})
     handle = await feeds_client.get_transit_feed(
         "mdb-100", rt_min_interval=timedelta(seconds=30)
     )
@@ -209,6 +211,41 @@ async def test_a_bare_304_after_no_cache_is_still_no_cache(
     hits = _rt_hits(mock_api)
     assert len(hits) == 3
     assert all(hit.get("If-None-Match") == '"v1"' for hit in hits[1:])
+
+
+@pytest.mark.parametrize(
+    "not_modified",
+    [
+        pytest.param({}, id="no-validator"),
+        pytest.param({"ETag": '"v2"'}, id="another-strong-etag"),
+    ],
+)
+async def test_a_304_that_selects_nothing_is_asked_again_unconditionally(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient, not_modified: dict[str, str]
+) -> None:
+    """RFC 9111 section 4.3.4: a 304 whose validator doesn't identify the
+    stored response (none, or another representation's strong ETag) MUST
+    NOT update it -- here it would have renewed v1 for ten minutes. The
+    cache asks again without validators and takes the current message.
+    """
+    _mock_transit(mock_api)
+    mock_api.get(
+        RT,
+        body=_t1_delayed(60, timestamp=100),
+        content_type=PB,
+        headers={"Cache-Control": "max-age=0", "ETag": '"v1"'},
+    )
+    mock_api.get(
+        RT, status=304, headers={**not_modified, "Cache-Control": "max-age=600"}
+    )
+    mock_api.get(RT, body=_t1_delayed(120, timestamp=200), content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    assert await _t1_delay(handle) == 60
+    assert await _t1_delay(handle) == 120
+    hits = _rt_hits(mock_api)
+    assert len(hits) == 3
+    assert hits[1].get("If-None-Match") == '"v1"'
+    assert "If-None-Match" not in hits[2]
 
 
 async def test_negative_rt_min_interval_is_rejected_before_any_request(
@@ -287,7 +324,7 @@ async def test_gbfs_revalidates_with_its_etag(
 ) -> None:
     _mock_gbfs(mock_api)
     mock_api.get(INFO, payload=_info(ttl=0), headers={"ETag": '"g1"'})
-    mock_api.get(INFO, status=304)
+    mock_api.get(INFO, status=304, headers={"ETag": '"g1"'})
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     assert (await handle.get_system_info()).name == "Test Bikes"
     assert (await handle.get_system_info()).name == "Test Bikes"
@@ -341,18 +378,18 @@ async def test_gbfs_a_304_never_outlives_the_document_ttl(
     assert hits[2].get("If-None-Match") == '"g1"'
 
 
-async def test_gbfs_a_bare_304_keeps_the_stored_max_age(
+async def test_gbfs_a_304_without_cache_control_keeps_the_stored_max_age(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
-    """max-age=10 under a 300s ttl: a 304 with no headers keeps 10s."""
+    """max-age=10 under a 300s ttl: a 304 carrying only its ETag keeps 10s."""
     _mock_gbfs(mock_api)
     mock_api.get(
         INFO,
         payload=_info(ttl=300),
         headers={"Cache-Control": "max-age=10", "ETag": '"g1"'},
     )
-    mock_api.get(INFO, status=304)
-    mock_api.get(INFO, status=304)
+    mock_api.get(INFO, status=304, headers={"ETag": '"g1"'})
+    mock_api.get(INFO, status=304, headers={"ETag": '"g1"'})
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     clock = _Clock()
     handle._docs._clock = clock

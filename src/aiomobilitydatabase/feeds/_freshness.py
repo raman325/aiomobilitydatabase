@@ -16,7 +16,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
+from email.utils import format_datetime, parsedate_to_datetime
 from typing import Protocol
 
 # RFC 9111 section 1.2.2: a cache treats any delta-seconds value it cannot
@@ -129,23 +129,35 @@ def _split_field(value: str) -> list[str] | None:
     """Split one Cache-Control field on commas outside quoted strings.
 
     A comma inside a quoted value (``community="a, max-age=3600"``) belongs
-    to that value; splitting on it would invent directives. None when a
-    quote is still open at the end of the field: the field is malformed.
+    to that value; splitting on it would invent directives. A quoted
+    string may only BE an argument -- open right after ``=`` and close
+    before the next comma -- so a stray quote anywhere else (``foo"bar``)
+    or one still open at the end of the field makes the field malformed:
+    None.
     """
     parts: list[str] = []
     current: list[str] = []
-    quoted = escaped = False
+    quoted = escaped = closed = False
     for char in value:
-        if escaped:
-            escaped = False
-        elif char == "\\" and quoted:
-            escaped = True
-        elif char == '"':
-            quoted = not quoted
-        elif char == "," and not quoted:
-            parts.append("".join(current))
-            current = []
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted, closed = False, True
+            current.append(char)
             continue
+        if char == ",":
+            parts.append("".join(current))
+            current, closed = [], False
+            continue
+        if char == '"':
+            if closed or not "".join(current).rstrip().endswith("="):
+                return None
+            quoted = True
+        elif closed and not char.isspace():
+            return None  # text after a closing quote, before the comma
         current.append(char)
     if quoted:
         return None
@@ -167,7 +179,9 @@ def _directives(values: Sequence[str]) -> tuple[dict[str, list[str | None]], boo
         parts = _split_field(value)
         if parts is None:
             malformed = True
-            parts = value.split(",")
+            # Quotes mean nothing in a malformed field: drop them, so a
+            # ``no-store"`` still reads as no-store.
+            parts = value.replace('"', "").split(",")
         for part in parts:
             name, sep, arg = part.strip().partition("=")
             name = name.strip().lower()
@@ -233,6 +247,52 @@ def freshness_of(
     return Freshness(lifetime=max(0.0, lifetime - initial_age + response_delay))
 
 
+def _entity_tag(fields: Fields) -> tuple[bool, str] | None:
+    """Return the ETag as (weak, opaque tag); None when there is none."""
+    value = _first(fields, "etag")
+    if not value:
+        return None
+    value = value.strip()
+    if value.startswith("W/"):
+        return True, value[2:]
+    return False, value
+
+
+def _selects(stored: Fields, new: Fields) -> bool:
+    """Whether a 304 identifies the stored response (RFC 9111 section 4.3.4).
+
+    A 304 carrying a strong ETag selects only a stored response with that
+    same strong ETag. One carrying only weak validators (a weak ETag,
+    Last-Modified) selects one they correspond to. One carrying no
+    validator selects only a stored response that has none either. A 304
+    that selects nothing MUST NOT update anything: it may describe some
+    other representation entirely.
+    """
+    new_tag, stored_tag = _entity_tag(new), _entity_tag(stored)
+    if new_tag is not None and not new_tag[0]:
+        return stored_tag is not None and stored_tag == new_tag
+    new_modified = _first(new, "last-modified")
+    if new_tag is not None or new_modified:
+        return (
+            new_tag is not None
+            and stored_tag is not None
+            and stored_tag[1] == new_tag[1]
+        ) or (bool(new_modified) and new_modified == _first(stored, "last-modified"))
+    return stored_tag is None and not _first(stored, "last-modified")
+
+
+def _dated(fields: Fields, received_at: datetime) -> Fields:
+    """Give a response with no Date its receipt time as Date.
+
+    RFC 9110 section 6.6.1: a recipient caching a message without Date
+    MUST record when it was received as its Date -- so a 304 lacking one
+    replaces the stored Date instead of leaving the old one to age it.
+    """
+    if _first(fields, "date") is not None:
+        return fields
+    return {**fields, "date": (format_datetime(received_at, usegmt=True),)}
+
+
 @dataclass(frozen=True)
 class Response[T]:
     """One fetch's outcome, as a :class:`FreshnessCache` consumes it.
@@ -272,9 +332,13 @@ class FreshnessCache[T]:
 
     ``get`` answers from the stored parse while it is fresh and otherwise
     fetches, passing the stored validators so the producer can answer
-    ``304``. A 304's header fields replace the stored fields of the same
-    name and the rest stay (RFC 9111 section 4.3.4) -- a bare 304 after
-    ``no-cache`` is still ``no-cache`` -- and freshness and validators are
+    ``304``. A 304 updates the stored response only if its validator
+    identifies it (RFC 9111 section 4.3.4); one that doesn't -- a
+    different strong ETag, or no validator at all -- updates nothing, and
+    the cache asks again unconditionally. A selecting 304's header fields
+    replace the stored fields of the same name and the rest stay (a 304
+    carrying only its ETag after ``no-cache`` is still ``no-cache``; one
+    without Date is dated at receipt), and freshness and validators are
     recomputed from the merged set. Concurrent ``get`` calls for one key
     share one fetch.
 
@@ -289,10 +353,12 @@ class FreshnessCache[T]:
     kept and marked stale (the next call asks again). A stored timestamp
     later than the stored copy's own receipt (a producer clock running
     ahead, or a clock bug) counts as that receipt time, to the second: a
-    far-future stamp
-    can't pin the cache, and a slightly fast clock doesn't switch the rule
-    off. ``no-store`` responses are never stored, so there is nothing to
-    compare them against.
+    far-future stamp can't pin the cache, and a slightly fast clock doesn't
+    switch the rule off. The price of the clamp: under a fast producer
+    clock, an edge copy stamped between the stored copy's receipt and its
+    (future) stamp is accepted, as is one stamped within the receipt
+    second when stamps carry fractions (GBFS 3.0). ``no-store`` responses
+    are never stored, so there is nothing to compare them against.
     """
 
     def __init__(
@@ -330,7 +396,10 @@ class FreshnessCache[T]:
         task = self._in_flight.get(key)
         if task is None:
             task = asyncio.ensure_future(self._refresh(key, fetch))
-            self._in_flight[key] = task
+            # An eager task factory can run the whole request inside
+            # ensure_future; a finished one must never be joined.
+            if not task.done():
+                self._in_flight[key] = task
             task.add_done_callback(lambda done: self._finished(key, done))
         # Shielded: a caller cancelling its own wait must not cancel the
         # request every other waiter is sharing.
@@ -378,32 +447,43 @@ class FreshnessCache[T]:
 
     async def _revalidate(self, key: str, fetch: Fetch[T]) -> T:
         entry = self._entries.get(key)
+        validators = Validators.from_fields(entry.fields) if entry else None
         requested = self._clock()
-        response = await fetch(
-            validators=Validators.from_fields(entry.fields) if entry else None
-        )
+        response = await fetch(validators=validators)
+        if (
+            response.value is None
+            and entry is not None
+            and validators is not None
+            and not _selects(entry.fields, response.fields)
+        ):
+            # A 304 that doesn't identify the stored response can't update
+            # it (RFC 9111 section 4.3.4): ask again, unconditionally.
+            validators = None
+            requested = self._clock()
+            response = await fetch(validators=None)
+        fields = _dated(response.fields, response.received_at)
         if response.value is None:
-            if entry is None:
-                # The fetch was unconditional, so the caller's fetch must
-                # have rejected a 304 already; reaching here is a bug.
-                raise RuntimeError(f"304 for {key} with nothing stored")
-            fields = {**entry.fields, **response.fields}
+            if entry is None or validators is None:
+                # A 304 answers only a conditional request; the caller's
+                # fetch must have rejected this one already.
+                raise RuntimeError(f"304 to an unconditional request for {key}")
+            merged = {**entry.fields, **fields}
             freshness = freshness_of(
-                fields,
+                merged,
                 requested_at=response.requested_at,
                 received_at=response.received_at,
             )
             if not freshness.storable:
                 self._entries.pop(key, None)
                 return entry.value
-            entry.fields = fields
+            entry.fields = merged
             entry.stored_at = requested
             entry.lifetime = self._lifetime_of(
                 entry.value, freshness, response.requested_at
             )
             return entry.value
         freshness = freshness_of(
-            response.fields,
+            fields,
             requested_at=response.requested_at,
             received_at=response.received_at,
         )
@@ -416,7 +496,7 @@ class FreshnessCache[T]:
             return entry.value
         self._entries[key] = _Entry(
             value=response.value,
-            fields=response.fields,
+            fields=fields,
             stored_at=requested,
             lifetime=self._lifetime_of(
                 response.value, freshness, response.requested_at

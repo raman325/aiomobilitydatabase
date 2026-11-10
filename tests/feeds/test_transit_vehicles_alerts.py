@@ -624,7 +624,7 @@ async def test_rt_revalidates_with_etag_and_reuses_the_parse_on_304(
     mock_api.get(
         "/rt/all", body=VEHICLE_POSITIONS, content_type=PB, headers={"ETag": '"v1"'}
     )
-    mock_api.get("/rt/all", status=304)
+    mock_api.get("/rt/all", status=304, headers={"ETag": '"v1"'})
     handle = await feeds_client.get_transit_feed("mdb-100")
 
     first = await handle.get_vehicles()
@@ -649,7 +649,7 @@ async def test_rt_revalidates_with_last_modified_when_no_etag(
         content_type=PB,
         headers={"Last-Modified": stamp},
     )
-    mock_api.get("/rt/all", status=304)
+    mock_api.get("/rt/all", status=304, headers={"Last-Modified": stamp})
     handle = await feeds_client.get_transit_feed("mdb-100")
     await handle.get_vehicles()
     assert await handle.get_vehicles()

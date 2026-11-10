@@ -264,9 +264,12 @@ Notes on direct mode:
   response's declared lifetime (`Cache-Control: max-age`, or
   `Expires`/`Date`, less its `Age`) the stored parse is reused with no
   request; afterwards the request is conditional (`ETag`/`Last-Modified`),
-  so an unchanged feed costs a `304`. A `304` updates only the headers it
-  carries — a bare `304` after `no-cache` is still `no-cache` — and
-  freshness is recomputed from the merged headers. `no-cache` revalidates
+  so an unchanged feed costs a `304`. A `304` counts only if its validator
+  identifies the stored copy; one naming another `ETag`, or none at all,
+  changes nothing and is asked again unconditionally. A counting `304`
+  updates only the headers it carries — one with just its `ETag` after
+  `no-cache` is still `no-cache`; one without `Date` is dated on arrival —
+  and freshness is recomputed from the merged headers. `no-cache` revalidates
   every time, `no-store` is never stored, invalid freshness (including a
   malformed `Cache-Control`) counts as stale, and a response declaring
   nothing is revalidated on every call — no heuristic lifetimes. A GBFS
