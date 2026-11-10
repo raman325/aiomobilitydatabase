@@ -222,13 +222,13 @@ def test_detour_index_helpers_accept_empty_input(tmp_path: Path) -> None:
 
 def test_a_stop_time_no_date_can_carry_is_still_under_way(tmp_path: Path) -> None:
     """A garbage stop time (300000:00:00, decades past its day) on service
-    that only runs in year 9999: the first run's last call falls past the
-    end of datetime, so that run is still under way -- found, not an
-    OverflowError.
+    that runs only on 9999-01-01: that run's last call falls past the end
+    of datetime, so it is still under way -- found, not an OverflowError.
+    (Running daily, every run since would be under way too: ambiguous.)
     """
     index = _index(
         tmp_path,
-        calendar="ALL,1,1,1,1,1,1,1,99990101,99991231\n",
+        calendar="ALL,1,1,1,1,1,1,1,99990101,99990101\n",
         stop_times="T1,08:00:00,08:00:00,S1,1\nT1,300000:00:00,300000:00:00,S2,2\n",
     )
     at = datetime(9999, 11, 1, tzinfo=UTC)

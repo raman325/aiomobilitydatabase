@@ -203,7 +203,8 @@ def _rt_key_for_row(
     whole trip and the feed's own time (see ``_realtime_now``), never from
     which runs happen to fall in the window -- so a long or open-ended
     window can't move a date-less update onto tomorrow's run. An
-    identity with no current run takes no date-less update at all. When a
+    identity with no current run -- including one with two runs under
+    way at once, which collide -- takes no date-less update at all. When a
     dated and a date-less key both exist for one row, the dated key wins
     (it is strictly more specific). A garbage start_date parses to None
     (see ``rt._trip_start_date``), so it behaves exactly like an absent one.

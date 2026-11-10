@@ -266,7 +266,10 @@ Notes on direct mode:
   when a spring-forward day starts the evening before its date); else the
   run that ended within `grace`, so a late-running run keeps its updates;
   else the run still to come today — never tomorrow's, however wide the
-  window or late the board's `start`. A dated
+  window or late the board's `start`. When two runs are under way at once
+  (a trip longer than a day, running on consecutive days), they collide
+  and the update applies to neither: the spec requires `start_date`
+  wherever runs can collide. A dated
   one applies to exactly its day, including an RT-added trip's vehicle.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic

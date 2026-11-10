@@ -998,6 +998,29 @@ _NEAR_DAY_START = st.tuples(
 )
 
 
+def _expected_current(
+    under_way: list[date], ended: list[date], to_come: list[date]
+) -> date | None:
+    """The definition's choice among a trip's runs, by class.
+
+    Under way first -- none when two or more are, as they collide; else
+    the latest that ended within grace; else the earliest still to come.
+    """
+    if len(under_way) > 1:
+        event("runs under way collide: none current")
+        return None
+    if under_way:
+        event("current: under way")
+        return under_way[0]
+    if ended:
+        event("current: ended within grace")
+        return max(ended)
+    if to_come:
+        event("current: still to come")
+        return min(to_come)
+    return None
+
+
 @settings(_SETTINGS, max_examples=300)
 @given(
     zip_bytes=_random_gtfs_zip(),
@@ -1019,11 +1042,12 @@ def test_current_service_dates_match_their_definition(
     day whose start (local noon minus 12 elapsed hours) is at or before
     ``now``, found by trying every date around ``now``. Among the runs up
     to today on which the trip's service runs (every day back to the
-    trip's own length plus the grace is tried), the current one is the
-    earliest scheduled to be under way at ``now``; else the latest that
-    ended within ``grace``; else the earliest still to come. Computed from
-    the zip's own CSV with an independent time parser and anchor; only
-    service activity (tested elsewhere) comes from the index.
+    trip's own length plus the grace is tried), the current one is the run
+    scheduled to be under way at ``now`` -- none when two or more are, as
+    they collide; else the latest that ended within ``grace``; else the
+    earliest still to come. Computed from the zip's own CSV with an
+    independent time parser and anchor; only service activity (tested
+    elsewhere) comes from the index.
     """
     grace = timedelta(minutes=grace_minutes)
     restamped = _restamp(zip_bytes, timezone, frequencies=False)
@@ -1079,15 +1103,7 @@ def test_current_service_dates_match_their_definition(
                 under_way = [day for day, first, last in runs if first <= now <= last]
                 ended = [day for day, _, last in runs if now - grace <= last < now]
                 to_come = [day for day, first, _ in runs if first > now]
-                if under_way:
-                    expected = min(under_way)
-                    event("current: under way")
-                elif ended:
-                    expected = max(ended)
-                    event("current: ended within grace")
-                elif to_come:
-                    expected = min(to_come)
-                    event("current: still to come")
+                expected = _expected_current(under_way, ended, to_come)
                 if under_way and ended:
                     event("an ended run in grace loses to one under way")
             assert got.get(trip_id) == expected, trip_id

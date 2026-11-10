@@ -967,6 +967,117 @@ def test_a_run_under_way_beats_one_that_ended_within_grace() -> None:
     _run(index, body, _dateless_message(now))
 
 
+# A daily trip running 26 hours: 08:00 at A to 10:00 the next morning at B.
+# From 08:00 to 10:00 two runs are under way at once -- they collide.
+_LONG_DAILY = "T,08:00:00,08:00:00,A,1\nT,34:00:00,34:00:00,B,2\n"
+
+
+def _cancellation(
+    at: datetime, start_date: str | None = None
+) -> gtfs_realtime_pb2.FeedMessage:
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    message.header.timestamp = int(at.timestamp())
+    entity = message.entity.add()
+    entity.id = "cancel"
+    entity.trip_update.trip.trip_id = "T"
+    entity.trip_update.trip.schedule_relationship = (
+        gtfs_realtime_pb2.TripDescriptor.CANCELED
+    )
+    if start_date is not None:
+        entity.trip_update.trip.start_date = start_date
+    return message
+
+
+def test_two_runs_under_way_collide_and_take_no_dateless_update() -> None:
+    """At 09:00 yesterday's run (due at B at 10:00) and today's (left A at
+    08:00) are both under way: a date-less delay or vehicle could mean
+    either, so it applies to neither -- both rows stay schedule-only.
+    """
+    index = _index_from_zip_bytes(_feed(_LONG_DAILY))
+    now = datetime(2026, 6, 10, 9, tzinfo=UTC)
+    assert index.current_service_dates(["T"], now, timedelta(hours=1)) == {}
+    assert index.rt_instances([("T", None, None)], now, timedelta(hours=1)) == []
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=2)], start=now, with_vehicles=True
+        )
+        assert _times(board) == [
+            datetime(2026, 6, 10, 10, tzinfo=UTC),  # yesterday's run
+            datetime(2026, 6, 11, 10, tzinfo=UTC),  # today's run
+        ]
+        assert all(row.predicted_departure is None for row in board)
+        assert all(row.vehicle is None for row in board)
+
+    _run(index, body, _dateless_message(now))
+
+
+def test_a_dated_update_still_reaches_one_of_two_colliding_runs() -> None:
+    """start_date is how a producer disambiguates colliding runs: a dated
+    delay reaches exactly the run it names.
+    """
+    index = _index_from_zip_bytes(_feed(_LONG_DAILY))
+    now = datetime(2026, 6, 10, 9, tzinfo=UTC)
+    message = _dateless_message(now)
+    message.entity[0].trip_update.trip.start_date = "20260609"
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals([ArrivalsQuery(["B"], limit=2)], start=now)
+        assert [row.predicted_departure for row in board] == [
+            datetime(2026, 6, 10, 10, 5, tzinfo=UTC),  # the named run, late
+            None,
+        ]
+
+    _run(index, body, message)
+
+
+def test_a_dateless_cancellation_of_colliding_runs_cancels_neither() -> None:
+    """Conservative for cancellations too: with no way to tell which run
+    is cancelled, both stay on the board; a dated one removes its run.
+    """
+    now = datetime(2026, 6, 10, 9, tzinfo=UTC)
+    both = [
+        datetime(2026, 6, 10, 10, tzinfo=UTC),
+        datetime(2026, 6, 11, 10, tzinfo=UTC),
+    ]
+    for message, expected in (
+        (_cancellation(now), both),
+        (_cancellation(now, "20260609"), both[1:]),
+    ):
+
+        async def body(
+            handle: TransitFeedHandle, expected: list[datetime] = expected
+        ) -> None:
+            [board] = await handle.get_arrivals(
+                [ArrivalsQuery(["B"], limit=None)],
+                start=now,
+                end=now + timedelta(days=1, hours=2),
+            )
+            assert _times(board) == expected
+
+        _run(_index_from_zip_bytes(_feed(_LONG_DAILY)), body, message)
+
+
+def test_one_run_under_way_again_takes_the_dateless_update() -> None:
+    """At 10:30 yesterday's run has reached B; only today's is under way,
+    so it is current and takes the date-less delay.
+    """
+    index = _index_from_zip_bytes(_feed(_LONG_DAILY))
+    now = datetime(2026, 6, 10, 10, 30, tzinfo=UTC)
+    assert index.current_service_dates(["T"], now, timedelta(hours=1)) == {
+        "T": date(2026, 6, 10)
+    }
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals([ArrivalsQuery(["B"], limit=1)], start=now)
+        [row] = board
+        assert row.scheduled_departure == datetime(2026, 6, 11, 10, tzinfo=UTC)
+        assert row.predicted_departure == datetime(2026, 6, 11, 10, 5, tzinfo=UTC)
+
+    _run(index, body, _dateless_message(now))
+
+
 def test_a_forever_calendar_west_of_utc_caps_the_ceiling() -> None:
     """UTC-12, a calendar to 9999-12-31: that day's start can't be dated
     (its noon is past datetime's end), so the ceiling is the latest instant

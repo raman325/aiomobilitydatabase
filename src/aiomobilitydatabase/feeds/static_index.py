@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import itertools
 import sqlite3
 import zipfile
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -472,8 +473,7 @@ class ScheduledTrip:
 
 def _days(first: date, last: date, *, backward: bool = False) -> Iterator[date]:
     """Yield the dates from ``first`` through ``last``, lazily; or last to first."""
-    count = (last - first).days + 1
-    for offset in range(max(count, 0)):
+    for offset in range(max((last - first).days + 1, 0)):
         yield (
             last - timedelta(days=offset)
             if backward
@@ -1779,12 +1779,20 @@ class StaticIndex:
         date from 23:00 local (see :meth:`_service_day_of`) -- on which the
         trip's service runs, that is, in order of preference:
 
-        1. the earliest run scheduled to be under way at ``now`` (its first
-           stop time at or before ``now``, its last at or after);
+        1. the run scheduled to be under way at ``now`` (its first stop time
+           at or before ``now``, its last at or after);
         2. else the latest run that ended within ``grace`` before ``now`` (a
            run finishing late keeps its updates: at 00:45 the run that ended
            at 00:30 beats tonight's 23:00 one);
-        3. else the earliest run still to come.
+        3. else the earliest run still to come (at 00:30, last night's
+           25:30 run, not tonight's).
+
+        Two runs under way at once -- a trip longer than a day, running on
+        consecutive days -- collide: which one the update means is
+        unknowable, so the trip has no current run and the update applies
+        to neither, rather than to a guessed one (the spec requires
+        ``start_date`` wherever runs can collide). Rules 2 and 3 never
+        collide this way: they pick the run nearest ``now``.
 
         Stop times span the whole trip, not just the stops a query asked
         about. A later day's run is never "current", so a date-less update
@@ -1827,8 +1835,12 @@ class StaticIndex:
                 active = active_by_day[day] = self.active_service_ids(day)
             return service_id in active
 
-        def first_running(service_id: str, days: Iterable[date]) -> date | None:
-            return next((day for day in days if runs(service_id, day)), None)
+        def running(service_id: str, days: Iterable[date], most: int) -> list[date]:
+            # At most ``most`` days, so a garbage-length trip or a huge grace
+            # never walks every day back.
+            return list(
+                itertools.islice((day for day in days if runs(service_id, day)), most)
+            )
 
         current: dict[str, date] = {}
         for trip_id, service_id, start_secs, end_secs in trips:
@@ -1847,15 +1859,23 @@ class StaticIndex:
             )
             started_to = today if upcoming is None else upcoming - timedelta(days=1)
             ended_to = today if ongoing is None else ongoing - timedelta(days=1)
-            day = None
-            if ongoing is not None:
-                day = first_running(service_id, _days(ongoing, started_to))
-            if day is None:
-                day = first_running(service_id, _days(counted, ended_to, backward=True))
-            if day is None and upcoming is not None:
-                day = first_running(service_id, _days(upcoming, today))
-            if day is not None:
-                current[trip_id] = day
+            if ongoing is not None and (
+                under_way := running(service_id, _days(ongoing, started_to), 2)
+            ):
+                # Two under way collide: neither is current, and the update
+                # must not fall through to a run that isn't under way.
+                if len(under_way) == 1:
+                    current[trip_id] = under_way[0]
+                continue
+            nearest = running(
+                service_id, _days(counted, ended_to, backward=True), 1
+            ) or (
+                running(service_id, _days(upcoming, today), 1)
+                if upcoming is not None
+                else []
+            )
+            if nearest:
+                current[trip_id] = nearest[0]
         return current
 
     def _service_day_of(self, at: datetime) -> date:
