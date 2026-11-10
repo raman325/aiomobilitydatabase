@@ -16,6 +16,7 @@ from aiomobilitydatabase.feeds._freshness import (
     Response,
     Validators,
     freshness_from_headers,
+    header_fields,
 )
 
 T0 = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
@@ -84,8 +85,19 @@ def test_freshness_examples(headers: dict[str, str], expected: Freshness) -> Non
     assert _fresh(headers) == expected
 
 
-def test_response_delay_counts_against_freshness() -> None:
-    assert _fresh({"Cache-Control": "max-age=30"}, delay=4.0) == Freshness(26.0)
+def test_response_delay_is_counted_once() -> None:
+    """max-age=30 with headers 4s after the request: RFC 9111 has it fresh
+    until receipt + 30 - 4, which is request + 30 -- the lifetime is
+    counted from the request, so the delay must not come off twice.
+    """
+    assert _fresh({"Cache-Control": "max-age=30"}, delay=4.0) == Freshness(30.0)
+    assert _fresh({"Cache-Control": "max-age=30", "Age": "12"}, delay=4.0) == (
+        Freshness(18.0)
+    )
+    # No Date: the receipt time stands in for it (RFC 9110), and the initial
+    # age still applies -- 4s short of Expires, never past it.
+    expires = {"Expires": _http(T0 + timedelta(seconds=45))}
+    assert _fresh(expires, delay=4.0) == Freshness(41.0)
 
 
 def test_repeated_cache_control_fields_merge() -> None:
@@ -121,7 +133,10 @@ def test_lifetime_is_max_age_minus_age_clamped(
         {"Cache-Control": f"max-age={max_age}", "Age": str(age)}, delay=delay
     )
     assert freshness.storable
-    assert freshness.lifetime == pytest.approx(max(0.0, max_age - (age + delay)))
+    # Fresh until receipt + max_age - (age + delay); counted from the
+    # request, which was ``delay`` earlier.
+    expected = max_age - (age + delay) + delay
+    assert freshness.lifetime == pytest.approx(max(0.0, expected), abs=1e-6)
 
 
 @given(
@@ -136,10 +151,42 @@ def test_older_responses_are_never_fresher(max_age: int, ages: tuple[int, int]) 
     assert fresh_old.lifetime <= fresh_young.lifetime
 
 
-@given(directives=st.lists(st.sampled_from(["max-age=60", "public", "private"])))
-def test_no_store_always_wins(directives: list[str]) -> None:
-    header = ", ".join([*directives, "no-store"])
-    assert _fresh({"Cache-Control": header}) == Freshness(None, storable=False)
+_PREFIX = st.lists(
+    st.sampled_from(
+        ["max-age=60", "public", "private", 'ext="x', 'ext="a, b"', '"', "\\"]
+    )
+)
+
+
+class _Fields(dict[str, str]):
+    """Headers whose items() repeat a name, like aiohttp's multidict."""
+
+    def __init__(self, pairs: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self.pairs = pairs
+
+    def items(self):  # type: ignore[override]
+        return self.pairs
+
+
+@given(prefix=_PREFIX, directive=st.sampled_from(["no-store", "no-cache"]))
+def test_no_store_and_no_cache_always_win(prefix: list[str], directive: str) -> None:
+    """Whatever comes first -- an unterminated quote included -- a later
+    no-store or no-cache, in the same field or the next, is never hidden.
+    """
+    expected = (
+        Freshness(None, storable=False) if directive == "no-store" else Freshness(0.0)
+    )
+    same_field = ", ".join([*prefix, directive])
+    assert _fresh({"Cache-Control": same_field}) == expected
+    two_fields = [("Cache-Control", ", ".join(prefix)), ("Cache-Control", directive)]
+    assert _fresh(_Fields(two_fields)) == expected
+
+
+def test_an_unterminated_quote_makes_the_field_invalid() -> None:
+    assert _fresh({"Cache-Control": 'max-age=60, ext="x'}) == Freshness(0.0)
+    two_fields = [("Cache-Control", 'max-age=60, ext="x'), ("Cache-Control", "a")]
+    assert _fresh(_Fields(two_fields)) == Freshness(0.0)
 
 
 _HEADER_TEXT = st.one_of(
@@ -189,14 +236,6 @@ def test_repeated_date_fields_use_the_first() -> None:
     assert _fresh(TwoExpires()) == Freshness(lifetime=30.0)
 
 
-def test_validators_merge_on_a_304() -> None:
-    stored = Validators(etag='"1"', last_modified="Mon")
-    assert stored.updated_by(None) == stored
-    assert stored.updated_by(Validators(etag=None, last_modified="Tue")) == Validators(
-        etag='"1"', last_modified="Tue"
-    )
-
-
 # -- FreshnessCache: examples ----------------------------------------------------
 
 
@@ -208,6 +247,21 @@ class _Clock:
         return self.now
 
 
+def _headers(
+    validators: Validators | None, lifetime: float | None, *, storable: bool = True
+) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if not storable:
+        headers["Cache-Control"] = "no-store"
+    elif lifetime is not None:
+        headers["Cache-Control"] = f"max-age={int(lifetime)}"
+    if validators is not None and validators.etag:
+        headers["ETag"] = validators.etag
+    if validators is not None and validators.last_modified:
+        headers["Last-Modified"] = validators.last_modified
+    return headers
+
+
 def _r[T](
     value: T | None,
     validators: Validators | None,
@@ -215,7 +269,13 @@ def _r[T](
     *,
     storable: bool = True,
 ) -> Response[T]:
-    return Response(value, validators, Freshness(lifetime, storable), T0)
+    """A response whose headers declare exactly this; zero response delay."""
+    fields = header_fields(_headers(validators, lifetime, storable=storable))
+    return Response(value, fields, T0, T0)
+
+
+def _raw[T](value: T | None, headers: dict[str, str]) -> Response[T]:
+    return Response(value, header_fields(headers), T0, T0)
 
 
 @dataclass
@@ -344,18 +404,56 @@ async def test_an_unvalidated_entry_takes_a_304s_validators() -> None:
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
     producer = _Producer([_r("a", None, 0.0)])
     await cache.get("u", producer)
-    cache._entries["u"].validators = None
+    cache._entries["u"].fields = {}
     producer.queue += [_r(None, V1, 0.0), _r(None, None, 0.0)]
     await cache.get("u", producer)  # an unsolicited-looking 304 still lands
     await cache.get("u", producer)
     assert producer.seen[-1] == V1
 
 
+async def test_a_bare_304_keeps_the_stored_freshness_headers() -> None:
+    """RFC 9111 section 4.3.4: a 304 updates the stored fields it carries
+    and leaves the rest. A bare 304 after no-cache is still no-cache, so a
+    caller's min_interval (only for "declared nothing") can't extend it.
+    """
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer(
+        [
+            _raw("a", {"Cache-Control": "no-cache", "ETag": '"1"'}),
+            _raw(None, {}),
+            _raw(None, {}),
+        ]
+    )
+    await cache.get("u", producer, min_interval=30.0)
+    await cache.get("u", producer, min_interval=30.0)
+    clock.now = 1.0
+    await cache.get("u", producer, min_interval=30.0)
+    assert producer.seen == [None, V1, V1]
+
+
+async def test_a_304s_own_fields_replace_the_stored_ones() -> None:
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer(
+        [
+            _raw("a", {"Cache-Control": "max-age=10", "ETag": '"1"'}),
+            _raw(None, {"Cache-Control": "max-age=60"}),
+        ]
+    )
+    await cache.get("u", producer)
+    clock.now = 10.0
+    await cache.get("u", producer)
+    clock.now = 69.0
+    assert await cache.get("u", producer) == "a"
+    assert len(producer.seen) == 2  # the 304's max-age=60 replaced 10
+
+
 async def test_the_lifetime_hook_runs_on_a_304_against_the_stored_value() -> None:
     """A long HTTP lifetime on a 304 can't outlast the body's own limit."""
     clock = _Clock()
 
-    def lifetime(value: str, header: float | None, _received: datetime) -> float:
+    def lifetime(value: str, header: float | None, _requested: datetime) -> float:
         body = float(value.removeprefix("ttl="))
         return body if header is None else min(body, header)
 
@@ -370,13 +468,39 @@ async def test_the_lifetime_hook_runs_on_a_304_against_the_stored_value() -> Non
     assert len(producer.seen) == 3  # the 304 renewed 60s, not 600s
 
 
-async def test_a_non_finite_hook_lifetime_is_stale() -> None:
-    cache: FreshnessCache[str] = FreshnessCache(
-        _Clock(), lifetime=lambda *_: float("nan")
+async def test_a_bare_304_keeps_the_shorter_stored_lifetime_under_the_hook() -> None:
+    """Stored max-age=10 with a body allowing 300: a bare 304 keeps 10."""
+    clock = _Clock()
+
+    def lifetime(value: str, header: float | None, _requested: datetime) -> float:
+        body = float(value.removeprefix("ttl="))
+        return body if header is None else min(body, header)
+
+    cache: FreshnessCache[str] = FreshnessCache(clock, lifetime=lifetime)
+    producer = _Producer(
+        [
+            _raw("ttl=300", {"Cache-Control": "max-age=10", "ETag": '"1"'}),
+            _raw(None, {}),
+            _raw(None, {}),
+        ]
     )
+    await cache.get("u", producer)
+    clock.now = 10.0
+    await cache.get("u", producer)
+    clock.now = 20.0
+    await cache.get("u", producer)
+    assert len(producer.seen) == 3
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+async def test_a_non_finite_hook_lifetime_is_stale(bad: float) -> None:
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock, lifetime=lambda *_: bad)
     producer = _Producer([_r("a", None, None), _r("b", None, None)])
     await cache.get("u", producer)
+    clock.now = 1e9
     assert await cache.get("u", producer) == "b"
+    assert cache._entries["u"].lifetime == 0.0
 
 
 def _dated(value: int) -> datetime:
@@ -402,20 +526,36 @@ async def test_older_responses_never_replace_newer_ones() -> None:
 
 
 async def test_a_future_dated_copy_cannot_pin_the_cache() -> None:
-    """A producer clock bug stamps one snapshot in the future, then recovers.
+    """A producer clock bug stamps one snapshot years ahead, then recovers.
 
-    A timestamp later than its own receipt is no observation, so it never
-    blocks the corrected (earlier-stamped) snapshots that follow.
+    A stamp later than its own receipt counts as the receipt time, so any
+    snapshot stamped after we received the bad one replaces it; a CDN copy
+    stamped before that receipt is still an older copy.
     """
-    future = int(T0.timestamp()) + 10 * 365 * 86_400
+    now = int(T0.timestamp())
+    future = now + 10 * 365 * 86_400
     cache: FreshnessCache[int] = FreshnessCache(_Clock(), timestamp=_dated)
-    queue = [_r(future, None, 0.0), _r(int(T0.timestamp()) - 5, None, 0.0)]
+    queue = [_r(future, None, 0.0), _r(now - 5, None, 0.0), _r(now + 5, None, 0.0)]
 
     async def fetch(*, validators: Validators | None) -> Response[int]:
         return queue.pop(0)
 
     assert await cache.get("u", fetch) == future
-    assert await cache.get("u", fetch) == int(T0.timestamp()) - 5
+    assert await cache.get("u", fetch) == future  # older than the receipt
+    assert await cache.get("u", fetch) == now + 5
+
+
+async def test_a_slightly_fast_producer_clock_keeps_the_rule() -> None:
+    """Stamped 2s after we received it (no NTP), then a 60s-older edge copy."""
+    now = int(T0.timestamp())
+    cache: FreshnessCache[int] = FreshnessCache(_Clock(), timestamp=_dated)
+    queue = [_r(now + 2, None, 0.0), _r(now - 58, None, 0.0)]
+
+    async def fetch(*, validators: Validators | None) -> Response[int]:
+        return queue.pop(0)
+
+    assert await cache.get("u", fetch) == now + 2
+    assert await cache.get("u", fetch) == now + 2
 
 
 async def test_concurrent_callers_share_one_request_and_its_error() -> None:
@@ -459,6 +599,59 @@ async def test_an_abandoned_failure_is_not_reported_as_unretrieved() -> None:
     assert not cache._in_flight
 
 
+async def test_the_receipt_clamp_works_in_whole_seconds() -> None:
+    """Stamps are whole seconds: one stamped in the second the stored copy
+    arrived (half a second in) is not older than that copy.
+    """
+    now = int(T0.timestamp())
+    arrived = T0 + timedelta(milliseconds=500)
+    cache: FreshnessCache[int] = FreshnessCache(_Clock(), timestamp=_dated)
+    queue = [Response(now + 2, {}, arrived, arrived), _r(now, None, 0.0)]
+
+    async def fetch(*, validators: Validators | None) -> Response[int]:
+        return queue.pop(0)
+
+    assert await cache.get("u", fetch) == now + 2
+    assert await cache.get("u", fetch) == now
+
+
+async def test_a_finished_request_is_never_joined() -> None:
+    """When the shared request answers, it has already left the in-flight
+    table: a caller arriving in that same loop step makes its own request
+    instead of reusing a no-cache (or failed) answer.
+    """
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    producer = _Producer([_r("a", None, 0.0)], gate=asyncio.Event())
+    waiter = asyncio.ensure_future(cache.get("u", producer))
+    await asyncio.sleep(0)
+    task = cache._in_flight["u"]
+    observed: list[tuple[bool, bool]] = []
+    producer.gate.set()  # type: ignore[union-attr]
+    # Runs right after the request's own step, before any done-callback.
+    asyncio.get_running_loop().call_soon(
+        lambda: observed.append((task.done(), "u" in cache._in_flight))
+    )
+    assert await waiter == "a"
+    assert observed == [(True, False)]
+
+
+async def test_a_request_cancelled_before_it_runs_leaves_no_trace() -> None:
+    """Loop shutdown can cancel the shared request before its first step;
+    the next call must make a fresh request, not await a dead one.
+    """
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    producer = _Producer([_r("a", None, 30.0)])
+    waiter = asyncio.ensure_future(cache.get("u", producer))
+    await asyncio.sleep(0)  # get() has scheduled the request, not run it
+    assert not producer.seen
+    cache._in_flight["u"].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.sleep(0)
+    assert not cache._in_flight
+    assert await cache.get("u", producer) == "a"
+
+
 async def test_a_304_with_nothing_stored_is_a_bug_not_a_value() -> None:
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
     producer = _Producer([_r(None, None, 0.0)])
@@ -479,15 +672,27 @@ def _doc_time(doc: _Doc) -> datetime:
     return datetime.fromtimestamp(doc.timestamp, UTC)
 
 
+def _model_freshness(cache_control: str | None) -> tuple[bool, float | None]:
+    """The four header shapes the fake producer sends: (storable, lifetime)."""
+    if cache_control is None:
+        return True, None
+    if cache_control == "no-store":
+        return False, None
+    if cache_control == "no-cache":
+        return True, 0.0
+    return True, float(cache_control.removeprefix("max-age="))
+
+
 class FreshnessMachine(RuleBasedStateMachine):
     """Random clocks, publishes, failures, stale edges, calls and bursts.
 
-    The fake producer records exactly what it served; a reference model
-    applies the cache's documented rules to that record, and every call is
-    checked against it: how many requests were made, and what came back.
-    Every response is "received" at T0 (wall clock); document timestamps
-    count up from T0 - 1000s, so they are real observations -- except a
-    future-dated publish, which must never pin the cache.
+    The fake producer records exactly what it served and checks the
+    validators each request carries; a reference model applies the cache's
+    documented rules to that record, and every call is checked against it:
+    how many requests were made, what was sent, and what came back. The
+    wall clock moves with the monotonic one, and documents are stamped
+    against it -- a few seconds behind, slightly ahead (an un-synced
+    producer clock), or years ahead (a clock bug).
     """
 
     def __init__(self) -> None:
@@ -499,22 +704,35 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.min_interval = 0.0
         # Producer state.
         self.version = 1
-        self.published = _Doc(1, int(T0.timestamp()) - 1000)
-        self.lifetime: float | None = None
-        self.storable = True
+        self.published = _Doc(1, self._wall() - 1000)
+        self.cache_control: str | None = None
         self.validators_offered = True
+        self.bare_304 = False
         self.fail_next = False
         self.stale_next = False
         self.requests = 0
         self.served: list[_Doc | None] = []  # None = answered 304
         # Model of the cache.
         self.stored: _Doc | None = None
+        self.stored_cc: str | None = None
+        self.stored_etag: str | None = None
+        self.stored_received = 0
         self.stored_at = 0.0
         self.stored_lifetime: float | None = None
         self.last_kind = "none"
 
+    def _wall(self) -> int:
+        return int(T0.timestamp() + self.clock.now)
+
     async def _fetch(self, *, validators: Validators | None) -> Response[_Doc]:
         self.requests += 1
+        # What the cache must send: the validators of what it stores.
+        expected = (
+            Validators(etag=self.stored_etag, last_modified=None)
+            if self.stored is not None and self.stored_etag is not None
+            else None
+        )
+        assert validators == expected
         await asyncio.sleep(0)  # let a burst pile up on the in-flight task
         if self.fail_next:
             self.fail_next = False
@@ -523,14 +741,21 @@ class FreshnessMachine(RuleBasedStateMachine):
         if self.stale_next:
             self.stale_next = False
             doc = _Doc(doc.version, doc.timestamp - 50)  # an older edge copy
-        etag = Validators(etag=f'"{doc.version}.{doc.timestamp}"', last_modified=None)
-        offered = etag if self.validators_offered else None
-        freshness = Freshness(self.lifetime, self.storable)
-        if validators is not None and validators == offered:
+        etag = f'"{doc.version}.{doc.timestamp}"' if self.validators_offered else None
+        headers: dict[str, str] = {}
+        if self.cache_control is not None:
+            headers["Cache-Control"] = self.cache_control
+        if etag is not None:
+            headers["ETag"] = etag
+        now = T0 + timedelta(seconds=self.clock.now)
+        if validators is not None and validators.etag == etag:
             self.served.append(None)
-            return Response(None, None, freshness, T0)
+            return Response(
+                None, header_fields({} if self.bare_304 else headers), now, now
+            )
         self.served.append(doc)
-        return Response(doc, offered, freshness, T0)
+        self._served_cc, self._served_etag = self.cache_control, etag
+        return Response(doc, header_fields(headers), now, now)
 
     def _expect_fresh(self) -> bool:
         if self.stored is None:
@@ -561,14 +786,15 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.clock.now += seconds
 
     @rule(
-        lifetime=st.sampled_from([None, 0.0, 5.0, 30.0]),
-        storable=st.booleans(),
+        cache_control=st.sampled_from(
+            [None, "no-store", "no-cache", "max-age=0", "max-age=5", "max-age=30"]
+        ),
         validators=st.booleans(),
     )
-    def publish(self, lifetime: float | None, storable: bool, validators: bool) -> None:
+    def publish(self, cache_control: str | None, validators: bool) -> None:
         self.version += 1
-        self.published = _Doc(self.version, self.published.timestamp + 10)
-        self.lifetime, self.storable = lifetime, storable
+        self.published = _Doc(self.version, self._wall() - 5)
+        self.cache_control = cache_control
         self.validators_offered = validators
 
     @rule()
@@ -579,23 +805,32 @@ class FreshnessMachine(RuleBasedStateMachine):
         path needs a cacheable, validated response, which ``publish`` only
         draws now and then.
         """
-        self.publish(lifetime=30.0, storable=True, validators=True)
+        self.publish(cache_control="max-age=30", validators=True)
 
-    @rule()
-    def publish_future_dated(self) -> None:
-        """A producer clock bug: one snapshot stamped years ahead.
-
-        The next publish returns to real time; the cache must take it.
-        """
+    @rule(ahead=st.sampled_from([2, 10**8]))
+    def publish_from_a_fast_clock(self, ahead: int) -> None:
+        """A producer clock a little (no NTP) or years (a bug) ahead."""
         self.version += 1
-        self.published = _Doc(self.version, int(T0.timestamp()) + 10**8)
-        self.lifetime, self.storable = 0.0, True
+        self.published = _Doc(self.version, self._wall() + ahead)
 
     @rule()
     def publish_corrected(self) -> None:
+        """Back on real time after a fast clock."""
         self.version += 1
-        self.published = _Doc(self.version, int(T0.timestamp()) - 500 + self.version)
-        self.lifetime, self.storable = 0.0, True
+        self.published = _Doc(self.version, self._wall())
+
+    @rule(cache_control=st.sampled_from(["max-age=30", "no-cache", "max-age=5"]))
+    def publish_validated_then_bare_304s(self, cache_control: str) -> None:
+        """Validated, with freshness, and every later 304 bare: the stored
+        headers must keep governing (RFC 9111 section 4.3.4).
+        """
+        self.publish(cache_control=cache_control, validators=True)
+        self.bare_304 = True
+
+    @rule(bare=st.booleans())
+    def set_304_style(self, bare: bool) -> None:
+        """Whether a 304 repeats the freshness headers or carries none."""
+        self.bare_304 = bare
 
     @rule(interval=st.sampled_from([0.0, 10.0]))
     def set_min_interval(self, interval: float) -> None:
@@ -628,38 +863,46 @@ class FreshnessMachine(RuleBasedStateMachine):
             return
         assert len(self.served) == before_served + 1
         self.last_kind = "304" if self.served[-1] is None else "200"
+        if self.served[-1] is None:
+            self.last_kind += " (bare)" if self.bare_304 else " (headers)"
         event(f"request answered {self.last_kind}")
         assert returned == self._absorb(self.served[-1])
 
     def _absorb(self, served: _Doc | None) -> _Doc:
         """Apply the cache rules to what the producer served; return the answer."""
-        if served is None:  # 304: the stored copy is confirmed
+        if served is None:
+            # A 304 confirms the stored copy. Its own headers replace the
+            # stored ones of the same name; a bare 304 changes nothing.
             assert self.stored is not None
             answer = self.stored
-            if self.storable:
-                self.stored_lifetime = self.lifetime
-                self.stored_at = self._requested
+            if not self.bare_304:
+                self.stored_cc = self.cache_control
+            storable, lifetime = _model_freshness(self.stored_cc)
+            if storable:
+                self.stored_at, self.stored_lifetime = self.clock.now, lifetime
             else:
                 self.stored = None
             return answer
-        if not self.storable:
+        storable, lifetime = _model_freshness(self._served_cc)
+        if not storable:
             self.stored = None
             return served
-        if self.stored is not None and served.timestamp < self.stored.timestamp <= int(
-            T0.timestamp()
-        ):
-            # Never older (only against a real observation): keep, stale.
-            event("stale edge rejected")
-            self.stored_at, self.stored_lifetime = self._requested, 0.0
-            return self.stored
-        self.stored = served
-        self.stored_at, self.stored_lifetime = self._requested, self.lifetime
+        if self.stored is not None:
+            # The newest thing we know of is the stored copy, as of its stamp
+            # -- but no later than when it actually reached us.
+            known = min(self.stored.timestamp, self.stored_received)
+            if served.timestamp < known:
+                event("stale edge rejected")
+                self.stored_at, self.stored_lifetime = self.clock.now, 0.0
+                return self.stored
+        self.stored, self.stored_cc, self.stored_etag = (
+            served,
+            self._served_cc,
+            self._served_etag,
+        )
+        self.stored_received = self._wall()
+        self.stored_at, self.stored_lifetime = self.clock.now, lifetime
         return served
-
-    @property
-    def _requested(self) -> float:
-        # Requests are instantaneous on the fake clock: request = receipt.
-        return self.clock.now
 
 
 FreshnessMachine.TestCase.settings = settings(max_examples=200, deadline=None)

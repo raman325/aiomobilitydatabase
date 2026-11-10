@@ -182,6 +182,35 @@ async def test_rt_min_interval_never_extends_a_declared_lifetime(
     assert await _t1_delay(handle) == 120
 
 
+async def test_a_bare_304_after_no_cache_is_still_no_cache(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """The 304 carries no Cache-Control, so the stored no-cache stands
+    (RFC 9111 section 4.3.4) and rt_min_interval can't stretch it.
+    """
+    _mock_transit(mock_api)
+    mock_api.get(
+        RT,
+        body=_t1_delayed(60, timestamp=100),
+        content_type=PB,
+        headers={"Cache-Control": "no-cache", "ETag": '"v1"'},
+    )
+    mock_api.get(RT, status=304)
+    mock_api.get(RT, status=304)
+    handle = await feeds_client.get_transit_feed(
+        "mdb-100", rt_min_interval=timedelta(seconds=30)
+    )
+    clock = _Clock()
+    handle._rt_cache._clock = clock
+    assert await _t1_delay(handle) == 60
+    assert await _t1_delay(handle) == 60
+    clock.now += 1
+    assert await _t1_delay(handle) == 60
+    hits = _rt_hits(mock_api)
+    assert len(hits) == 3
+    assert all(hit.get("If-None-Match") == '"v1"' for hit in hits[1:])
+
+
 async def test_negative_rt_min_interval_is_rejected_before_any_request(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
@@ -310,6 +339,29 @@ async def test_gbfs_a_304_never_outlives_the_document_ttl(
     hits = _info_hits(mock_api)
     assert len(hits) == 3
     assert hits[2].get("If-None-Match") == '"g1"'
+
+
+async def test_gbfs_a_bare_304_keeps_the_stored_max_age(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """max-age=10 under a 300s ttl: a 304 with no headers keeps 10s."""
+    _mock_gbfs(mock_api)
+    mock_api.get(
+        INFO,
+        payload=_info(ttl=300),
+        headers={"Cache-Control": "max-age=10", "ETag": '"g1"'},
+    )
+    mock_api.get(INFO, status=304)
+    mock_api.get(INFO, status=304)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    clock = _Clock()
+    handle._docs._clock = clock
+    await handle.get_system_info()
+    clock.now += 10
+    await handle.get_system_info()
+    clock.now += 11
+    await handle.get_system_info()
+    assert len(_info_hits(mock_api)) == 3
 
 
 async def test_gbfs_the_shorter_declared_lifetime_wins(

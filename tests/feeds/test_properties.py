@@ -3685,7 +3685,7 @@ def _gbfs_handle(documents: dict[str, object]) -> GbfsFeedHandle:
     for name, data in documents.items():
         handle._docs._entries[handle._endpoints[name]] = _Entry(
             value={"data": data},
-            validators=None,
+            fields={},
             stored_at=0.0,
             lifetime=float("inf"),
             received_at=datetime.now(UTC),

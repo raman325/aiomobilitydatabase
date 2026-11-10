@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import aiohttp
 
-from ._freshness import FreshnessCache, Response, Validators, freshness_from_headers
+from ._freshness import FreshnessCache, Response, Validators, header_fields
 from ._frozen import FrozenDict
 from ._urls import _require_http_url  # deliberate friend access: shared URL guard
 from .const import GBFS_LANGUAGE_PREFERENCE
@@ -277,20 +277,22 @@ def _ttl_seconds(value: Any) -> float | None:
 
 
 def _document_lifetime(
-    document: Mapping[str, Any], header_lifetime: float | None, received_at: datetime
+    document: Mapping[str, Any], header_lifetime: float | None, requested_at: datetime
 ) -> float | None:
-    """Remaining freshness of a GBFS document, in seconds, at ``received_at``.
+    """How long a GBFS document stays fresh, in seconds from ``requested_at``.
 
     The document's ``ttl`` counts from its own ``last_updated`` (GBFS: the
     data will be updated again ``ttl`` seconds after it last was), so a
-    document already ``n`` seconds old has ``ttl - n`` left; a missing or
-    unparseable ``last_updated`` counts from receipt, and the result never
-    exceeds ``ttl`` (a ``last_updated`` in the future is clock skew, not
-    extra freshness). A ``ttl`` that is present but unusable declares 0,
-    just as an invalid ``max-age`` would. When the HTTP headers declare a
-    lifetime too, the shorter one wins; neither declaring anything is None.
-    Runs on every response, a 304's included (with the stored document),
-    so a CDN's long ``max-age`` can never outlast the document's own ttl.
+    document already ``n`` seconds old when requested has ``ttl - n`` left;
+    a missing or unparseable ``last_updated`` counts from the request, and
+    the result never exceeds ``ttl`` (a ``last_updated`` in the future is
+    clock skew, not extra freshness). A ``ttl`` that is present but
+    unusable declares 0, just as an invalid ``max-age`` would. When the
+    HTTP headers declare a lifetime too (``header_lifetime``, also counted
+    from the request), the shorter one wins; neither declaring anything is
+    None. Runs on every response, a 304's included (with the stored
+    document and the stored headers merged with the 304's), so a CDN's
+    long ``max-age`` can never outlast the document's own ttl.
     """
     declared = [header_lifetime] if header_lifetime is not None else []
     if "ttl" in document:
@@ -298,8 +300,8 @@ def _document_lifetime(
         if ttl is None:
             declared.append(0.0)
         else:
-            updated = _reported_at(document.get("last_updated")) or received_at
-            elapsed = max(0.0, (received_at - updated).total_seconds())
+            updated = _reported_at(document.get("last_updated")) or requested_at
+            elapsed = max(0.0, (requested_at - updated).total_seconds())
             declared.append(max(0.0, ttl - elapsed))
     return min(declared, default=None)
 
@@ -451,9 +453,7 @@ class GbfsFeedHandle:
                 timeout=aiohttp.ClientTimeout(total=client.timeout_seconds),
             ) as resp:
                 received_at = datetime.now(UTC)
-                freshness = freshness_from_headers(
-                    resp.headers, requested_at=requested_at, received_at=received_at
-                )
+                fields = header_fields(resp.headers)
                 if resp.status == HTTPStatus.NOT_MODIFIED:
                     if validators is None:
                         raise SourceConnectionError(
@@ -463,15 +463,14 @@ class GbfsFeedHandle:
                         )
                     return Response(
                         value=None,
-                        validators=Validators.from_headers(resp.headers),
-                        freshness=freshness,
+                        fields=fields,
+                        requested_at=requested_at,
                         received_at=received_at,
                     )
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
                         f"GBFS endpoint error {resp.status}: {url}", status=resp.status
                     )
-                fresh = Validators.from_headers(resp.headers)
                 try:
                     document = await resp.json(content_type=None)
                 except ValueError as err:
@@ -482,8 +481,8 @@ class GbfsFeedHandle:
             raise FeedParseError(f"GBFS document missing data envelope: {url}")
         return Response(
             value=document,
-            validators=fresh,
-            freshness=freshness,
+            fields=fields,
+            requested_at=requested_at,
             received_at=received_at,
         )
 

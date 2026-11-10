@@ -264,19 +264,24 @@ Notes on direct mode:
   response's declared lifetime (`Cache-Control: max-age`, or
   `Expires`/`Date`, less its `Age`) the stored parse is reused with no
   request; afterwards the request is conditional (`ETag`/`Last-Modified`),
-  so an unchanged feed costs a `304`. `no-cache` revalidates every time,
-  `no-store` is never stored, invalid freshness counts as stale, and a
-  response declaring nothing is revalidated on every call — no heuristic
-  lifetimes. A GBFS document's `ttl` counts from its own `last_updated`,
-  and the shorter of `ttl` and the HTTP lifetime wins — on a `304` too,
-  so a renewal never outlives the document; an unusable `ttl` means the
-  document isn't reused. Concurrent calls share one in-flight request per
+  so an unchanged feed costs a `304`. A `304` updates only the headers it
+  carries — a bare `304` after `no-cache` is still `no-cache` — and
+  freshness is recomputed from the merged headers. `no-cache` revalidates
+  every time, `no-store` is never stored, invalid freshness (including a
+  malformed `Cache-Control`) counts as stale, and a response declaring
+  nothing is revalidated on every call — no heuristic lifetimes. A GBFS
+  document's `ttl` counts from its own `last_updated`, and the shorter of
+  `ttl` and the HTTP lifetime wins — on a `304` too, so a renewal never
+  outlives the document; an unusable `ttl` means the document isn't
+  reused. Concurrent calls share one in-flight request per
   URL (a cancelled caller cancels neither it nor the other waiters). A
   response older than the stored copy (a CDN edge behind, by GTFS-RT
   header timestamp or GBFS `last_updated`) never replaces it; the stored
   copy is kept but asked about again on the next call. A stored timestamp
-  later than when we received it isn't trusted for this, and `no-store`
-  responses are passed through without comparison. `rt_min_interval=` on
+  later than when we received it (a producer clock running ahead) counts
+  as that receipt time, so a far-future stamp can't pin the cache and a
+  slightly fast clock doesn't switch the rule off; `no-store` responses
+  are passed through without comparison. `rt_min_interval=` on
   `get_transit_feed*` is an opt-in request budget for producers that
   declare no freshness at all: it reuses a realtime parse younger than the
   interval, and never extends `no-cache`, `max-age=0`, an expired

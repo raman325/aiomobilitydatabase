@@ -13,7 +13,7 @@ from typing import Any
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
-from ._freshness import Response, Validators, freshness_from_headers
+from ._freshness import Response, Validators, header_fields
 from ._urls import _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
@@ -122,9 +122,9 @@ async def fetch_feed_message(
     runs in a thread (CPU-bound for large feeds).
 
     With ``validators`` the request is conditional, and a ``304`` comes
-    back as a :class:`Response` with no value. The response's freshness
-    (RFC 9111, see :func:`freshness_from_headers`) rides along, with None
-    meaning the producer declared none.
+    back as a :class:`Response` with no value. The response's header
+    fields and request/receipt instants ride along: the freshness cache
+    derives freshness and validators from them (RFC 9111).
     """
     _require_http_url(url, "GTFS-RT producer URL")
     params: dict[str, str] = {}
@@ -149,9 +149,7 @@ async def fetch_feed_message(
                 raise SourceAuthenticationError(
                     f"Producer rejected credentials ({resp.status}): {url}"
                 )
-            freshness = freshness_from_headers(
-                resp.headers, requested_at=requested_at, received_at=received_at
-            )
+            fields = header_fields(resp.headers)
             # 304 is the producer confirming the bytes are unchanged, so
             # reusing the previous parse is not a staleness risk.
             if resp.status == HTTPStatus.NOT_MODIFIED:
@@ -164,15 +162,14 @@ async def fetch_feed_message(
                     )
                 return Response(
                     value=None,
-                    validators=Validators.from_headers(resp.headers),
-                    freshness=freshness,
+                    fields=fields,
+                    requested_at=requested_at,
                     received_at=received_at,
                 )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
                     f"Producer error {resp.status}: {url}", status=resp.status
                 )
-            fresh = Validators.from_headers(resp.headers)
             raw = await resp.read()
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
@@ -183,8 +180,8 @@ async def fetch_feed_message(
         raise FeedParseError(f"Undecodable GTFS-RT protobuf from {url}") from err
     return Response(
         value=message,
-        validators=fresh,
-        freshness=freshness,
+        fields=fields,
+        requested_at=requested_at,
         received_at=received_at,
     )
 
