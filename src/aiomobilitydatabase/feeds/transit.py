@@ -532,6 +532,33 @@ def _pushdown(
     return stops, routes, headsigns
 
 
+# A scheduled row's identity: one stop_times row of one run. Rows read up
+# front and rows read by the scan are the same row only when all of it
+# matches -- an (invalid) feed repeating a stop_sequence within a trip
+# keeps both rows, whichever path reads them.
+_RowKey = tuple[str, date, int, str, datetime]
+
+
+def _departure_key(dep: ScheduledDeparture) -> _RowKey:
+    return (
+        dep.trip_id,
+        dep.service_date,
+        dep.stop_sequence,
+        dep.stop_id,
+        dep.departure,
+    )
+
+
+def _journey_key(trip: ScheduledTrip) -> _RowKey:
+    return (
+        trip.trip_id,
+        trip.service_date,
+        trip.origin_stop_sequence,
+        trip.destination_stop_id,
+        trip.departure,
+    )
+
+
 def _board_settles(
     times: Sequence[datetime], limit: int | None, horizon: datetime
 ) -> bool:
@@ -1429,9 +1456,8 @@ class TransitFeedHandle:
             ceiling = max((c for c in ceilings if c is not None), default=None)
             memo = _PredictionMemo()
             boards: list[list[StopArrival] | None] = [None] * len(queries)
-            scheduled: dict[tuple[str, date, int], ScheduledDeparture] = {
-                (dep.trip_id, dep.service_date, dep.stop_sequence): dep
-                for dep in addressed
+            scheduled: dict[_RowKey, ScheduledDeparture] = {
+                _departure_key(dep): dep for dep in addressed
             }
             read_from = start - grace
             for horizon, final in _horizons(start, end, ceiling):
@@ -1448,9 +1474,7 @@ class TransitFeedHandle:
                         None,
                         headsigns=headsigns,
                     ):
-                        scheduled.setdefault(
-                            (dep.trip_id, dep.service_date, dep.stop_sequence), dep
-                        )
+                        scheduled.setdefault(_departure_key(dep), dep)
                 read_from = horizon
                 arrivals = await self._merged_arrivals(
                     list(scheduled.values()),
@@ -1828,8 +1852,8 @@ class TransitFeedHandle:
                 if ceiling is None:
                     results.append([])
                     continue
-                scheduled: dict[tuple[str, date, int], ScheduledTrip] = {
-                    (trip.trip_id, trip.service_date, trip.origin_stop_sequence): trip
+                scheduled: dict[_RowKey, ScheduledTrip] = {
+                    _journey_key(trip): trip
                     for trip in await self._index_read(
                         self._index.instance_trips,
                         addressed,
@@ -1851,21 +1875,12 @@ class TransitFeedHandle:
                             horizon - read_from,
                             None,
                         ):
-                            scheduled.setdefault(
-                                (
-                                    trip.trip_id,
-                                    trip.service_date,
-                                    trip.origin_stop_sequence,
-                                ),
-                                trip,
-                            )
+                            scheduled.setdefault(_journey_key(trip), trip)
                     read_from = horizon
                     rows = (
                         await self._merged_trips(
                             list(scheduled.values()),
                             start=start,
-                            end=horizon,
-                            grace=grace,
                             current_at=current_at,
                             updates=updates,
                             stops_by_id=stops_by_id,
@@ -1888,8 +1903,6 @@ class TransitFeedHandle:
         scheduled: list[ScheduledTrip],
         *,
         start: datetime,
-        end: datetime,
-        grace: timedelta,
         current_at: datetime,
         updates: TripUpdates,
         stops_by_id: Mapping[str, Stop],
@@ -2122,45 +2135,94 @@ class TransitFeedHandle:
         """
         if not modifications:
             return [], set()
+        # Only trips that can put a row at a queried stop matter: those
+        # calling at one, or whose entity names one as a replacement. Any
+        # other detoured run produces no row here, and dropping its
+        # schedule is invisible to this query.
         source_ids = sorted({tid for mod in modifications for tid in mod.trip_ids})
-        concrete = await self._index_read(self._index.concrete_trip_ids, source_ids)
-        runs = {
-            (trip_id, service_date)
-            for mod in modifications
-            for source_id in mod.trip_ids
-            for trip_id in concrete.get(source_id, ())
-            for service_date in mod.service_dates
-        }
-        instances = await self._index_read(
-            self._index.instance_trip_calls, sorted(runs)
+        relevant = await self._index_read(
+            self._index.trips_serving, source_ids, sorted(wanted_stops)
         )
+        relevant |= {
+            source_id
+            for mod in modifications
+            if any(
+                replacement.stop_id in wanted_stops
+                for modification in mod.modifications
+                for replacement in modification.replacements
+            )
+            for source_id in mod.trip_ids
+        }
+        concrete = await self._index_read(
+            self._index.concrete_trip_ids, sorted(relevant)
+        )
+        days = await self._index_read(
+            self._index.run_days,
+            sorted(
+                {
+                    (trip_id, service_date)
+                    for mod in modifications
+                    for source_id in mod.trip_ids
+                    for trip_id in concrete.get(source_id, ())
+                    for service_date in mod.service_dates
+                }
+            ),
+        )
+        # One template run per trip: its calls are offsets from its day's
+        # start, and a detour only adds offsets to them, so each (trip,
+        # modifications) rebuild is computed once and shifted to every day.
+        first_day: dict[str, date] = {}
+        for trip_id, service_date, _ in days:
+            first_day.setdefault(trip_id, service_date)
+        templates = {
+            instance.trip_id: instance
+            for instance in await self._index_read(
+                self._index.instance_trip_calls, sorted(first_day.items())
+            )
+        }
+        flat = [
+            (mod, modification)
+            for mod in modifications
+            for modification in mod.modifications
+        ]
+        rebuilt: dict[tuple[str, tuple[int, ...]], list[TripCall] | None] = {}
         rows: list[StopArrival] = []
         touched: set[tuple[str, date]] = set()
-        for instance in instances:
-            applicable = [
-                modification
-                for mod in modifications
-                if instance.source_trip_id in mod.trip_ids
-                and instance.service_date in mod.service_dates
+        for trip_id, service_date, day_start in days:
+            template = templates.get(trip_id)
+            if template is None:
+                # No calls (a frequency template's own trips row): no run
+                # a detour could rebuild.
+                continue
+            applicable = tuple(
+                n
+                for n, (mod, _) in enumerate(flat)
+                if template.source_trip_id in mod.trip_ids
+                and service_date in mod.service_dates
                 # An entity listing start_times addresses specific
                 # repetitions; one listing none addresses every instance.
-                and (not mod.start_secs or instance.start_secs in mod.start_secs)
-                for modification in mod.modifications
-            ]
+                and (not mod.start_secs or template.start_secs in mod.start_secs)
+            )
             if not applicable:
                 continue
-            calls = _modified_calls(instance, applicable, rt_stops, stops_by_id)
-            if calls == instance.calls:
+            key = (trip_id, applicable)
+            if key not in rebuilt:
+                modified = _modified_calls(
+                    template, [flat[n][1] for n in applicable], rt_stops, stops_by_id
+                )
+                rebuilt[key] = None if modified == template.calls else modified
+            calls = rebuilt[key]
+            if calls is None:
                 continue
-            touched.add((instance.trip_id, instance.service_date))
-            route = routes_by_id.get(instance.route_id)
+            touched.add((trip_id, service_date))
+            shift = day_start - template.day_start_utc
+            route = routes_by_id.get(template.route_id)
             for call in calls:
                 # An untimed call is never a row, as in the schedule itself.
-                if (
-                    call.stop_id not in wanted_stops
-                    or call.departure is None
-                    or (end is not None and call.departure > end)
-                ):
+                if call.stop_id not in wanted_stops or call.departure is None:
+                    continue
+                departure = call.departure + shift
+                if end is not None and departure > end:
                     continue
                 rows.append(
                     StopArrival(
@@ -2168,28 +2230,30 @@ class TransitFeedHandle:
                         # An RT-added stop is the ONLY definition of itself.
                         stop=rt_stops.get(call.stop_id)
                         or stops_by_id.get(call.stop_id),
-                        route_id=instance.route_id,
+                        route_id=template.route_id,
                         route=route,
-                        trip_id=instance.trip_id,
-                        service_id=instance.service_id,
-                        headsign=instance.headsign,
-                        scheduled_arrival=call.arrival,
-                        scheduled_departure=call.departure,
+                        trip_id=trip_id,
+                        service_id=template.service_id,
+                        headsign=template.headsign,
+                        scheduled_arrival=(
+                            call.arrival + shift if call.arrival else None
+                        ),
+                        scheduled_departure=departure,
                         predicted_arrival=None,
                         predicted_departure=None,
                         delay_seconds=None,
                         realtime=True,
                         vehicle_id=None,
                         vehicle=None,
-                        wheelchair_accessible=instance.wheelchair_accessible,
-                        bikes_allowed=instance.bikes_allowed,
-                        direction_id=instance.direction_id,
+                        wheelchair_accessible=template.wheelchair_accessible,
+                        bikes_allowed=template.bikes_allowed,
+                        direction_id=template.direction_id,
                         pickup_type=call.pickup_type,
                         drop_off_type=call.drop_off_type,
                         timepoint_exact=call.timepoint_exact,
                         stop_headsign=call.stop_headsign,
-                        trip_short_name=instance.trip_short_name,
-                        block_id=instance.block_id,
+                        trip_short_name=template.trip_short_name,
+                        block_id=template.block_id,
                     )
                 )
         return rows, touched
@@ -2233,7 +2297,7 @@ class TransitFeedHandle:
             ]
             ceiling = max((c for c in ceilings if c is not None), default=None)
             boards: list[list[StopArrival] | None] = [None] * len(queries)
-            seen: set[tuple[str, date, int]] = set()
+            seen: set[_RowKey] = set()
             rows: list[StopArrival] = []
             read_from = start
             for horizon, final in _horizons(start, end, ceiling):
@@ -2248,7 +2312,7 @@ class TransitFeedHandle:
                     None,
                     headsigns=headsigns,
                 ):
-                    key = (dep.trip_id, dep.service_date, dep.stop_sequence)
+                    key = _departure_key(dep)
                     if key not in seen:
                         seen.add(key)
                         rows.append(_scheduled_row(dep, stops_by_id, routes_by_id))

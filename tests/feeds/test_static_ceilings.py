@@ -206,3 +206,29 @@ async def test_handles_answer_promptly_for_calendars_running_forever(
             assert [row.trip_id for row in far] == ["T1"]
         finally:
             handle.close()
+
+
+def test_detour_index_helpers_accept_empty_input(tmp_path: Path) -> None:
+    index = _index(
+        tmp_path,
+        calendar="ALL,1,1,1,1,1,1,1,20260101,20261231\n",
+        stop_times=_TWO_STOPS,
+    )
+    assert index.trips_serving([], ["S1"]) == set()
+    assert index.trips_serving(["T1"], []) == set()
+    assert index.trips_serving(["T1", "T2"], ["S2"]) == {"T1"}
+    assert index.run_days([]) == []
+
+
+def test_a_stop_time_no_date_can_carry_has_no_current_run(tmp_path: Path) -> None:
+    """A garbage stop time (300000:00:00, decades past its day) on service
+    that only runs in year 9999: every candidate run's last call falls past
+    the end of datetime, so none is current -- not an OverflowError.
+    """
+    index = _index(
+        tmp_path,
+        calendar="ALL,1,1,1,1,1,1,1,99990101,99991231\n",
+        stop_times="T1,08:00:00,08:00:00,S1,1\nT1,300000:00:00,300000:00:00,S2,2\n",
+    )
+    at = datetime(9999, 11, 1, tzinfo=UTC)
+    assert index.current_service_dates(["T1"], at) == {}

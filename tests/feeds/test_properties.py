@@ -1696,7 +1696,9 @@ def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
         f"{draw(st.sampled_from(['Downtown', '終点🚌', '']))}"
         for t_idx, tid in enumerate(trip_ids)
     ]
-    times = ["00:00:00", "08:00:00", "24:00:00", "47:59:59", ""]
+    # 47:30:00 and 60:00:00: a night service and a multi-day trip, whose
+    # runs reach two and more days past their service day.
+    times = ["00:00:00", "08:00:00", "24:00:00", "47:30:00", "47:59:59", "60:00:00", ""]
     stop_times_rows = []
     for t_idx, tid in enumerate(trip_ids):
         n_rows = draw(st.integers(2, 3)) if t_idx == 0 else draw(st.integers(1, 3))

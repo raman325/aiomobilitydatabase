@@ -246,8 +246,11 @@ Notes on direct mode:
   are read whole before the scan begins; every other row sorts at its
   scheduled time, so a board is final as soon as it is full inside the
   slice read so far, and the answer is exactly that of reading the whole
-  window. An open-ended query with no limit raises `ValueError`. `end` bounds scheduled times; a delayed trip
-  predicted past it, and RT-added trips, still show.
+  window. Each slice looks back as many days as the feed's latest stop
+  time reaches (a night service at 47:30, a multi-day trip at 60:00), plus
+  an hour for DST. An open-ended query with no limit raises `ValueError`.
+  `end` bounds scheduled times; a delayed trip predicted past it, and
+  RT-added trips, still show.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
   or vehicle with no `start_date` applies only to the trip's run that is
   under way or still to come on the feed's own day (including last night's

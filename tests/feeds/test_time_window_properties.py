@@ -21,7 +21,7 @@ import asyncio
 import csv
 import io
 import zipfile
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -30,6 +30,7 @@ from google.transit import gtfs_realtime_pb2
 from hypothesis import HealthCheck, event, given, reject, settings
 from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds import transit as transit_module
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import (
@@ -139,10 +140,10 @@ async def _uncapped[T](
     """Run ``call`` as a plain read of its whole window.
 
     The reference a scan optimization is checked against must not share
-    the optimization: every per-query ceiling is lifted to ``until``, so an
-    unlimited query reads its whole window, and the up-front read of the
-    runs realtime addresses is switched off, so those rows come from the
-    window scan like any other. A ceiling that wrongly cut rows, or an
+    the optimization: every per-query ceiling is lifted to ``until`` and
+    the window is read in ONE pass, not in slices, and the up-front read
+    of the runs realtime addresses is switched off, so those rows come
+    from the window read like any other. A ceiling that wrongly cut rows, or an
     up-front read that added or lost any, shows up as a difference.
     """
     index = handle._index
@@ -153,11 +154,19 @@ async def _uncapped[T](
     async def nothing_up_front(*_a: object) -> list[object]:
         return []
 
+    def one_pass(
+        start: datetime, end: datetime | None, ceiling: datetime | None
+    ) -> Iterator[tuple[datetime, bool]]:
+        # The whole window in ONE read, not in slices.
+        yield list(_horizons(start, end, ceiling))[-1]
+
     handle._addressed_runs = nothing_up_front  # type: ignore[method-assign]
+    transit_module._horizons = one_pass
     try:
         return await call()
     finally:
         index.departures_ceiling, index.journeys_ceiling = saved
+        transit_module._horizons = _horizons
         del handle._addressed_runs
 
 
@@ -235,7 +244,23 @@ _REALTIME = st.tuples(
 # day, so date-less updates have a current run and dated ones a match;
 # otherwise most starts fall nowhere near a run and realtime binds nothing.
 _NEAR = st.tuples(
-    st.dates(min_value=date(2026, 1, 1), max_value=date(2027, 12, 31)),
+    st.one_of(
+        # Around DST changes (New York and Sydney), where a day is 23 or 25
+        # hours and a time past 24:00:00 lands an hour off.
+        st.sampled_from(
+            [
+                date(2026, 3, 7),
+                date(2026, 3, 8),
+                date(2026, 3, 9),
+                date(2026, 4, 4),
+                date(2026, 10, 4),
+                date(2026, 10, 31),
+                date(2026, 11, 1),
+                date(2027, 3, 14),
+            ]
+        ),
+        st.dates(min_value=date(2026, 1, 1), max_value=date(2027, 12, 31)),
+    ),
     st.integers(0, 150),
 )
 # Weights are drawn explicitly: st.one_of collapses identical branches, and
@@ -568,7 +593,8 @@ def test_board_settles_rules() -> None:
     start=_STARTS,
     stop_picks=st.lists(st.integers(0, 10), min_size=1, max_size=3),
     limit=st.integers(0, 5),
-    use_anchor=st.booleans(),
+    use_anchor=st.sampled_from([True, True, False]),
+    near=_NEAR_RUN,
     hours=st.integers(1, 96),
 )
 def test_scheduled_departures_do_not_depend_on_how_they_were_scanned(
@@ -578,9 +604,11 @@ def test_scheduled_departures_do_not_depend_on_how_they_were_scanned(
     stop_picks: list[int],
     limit: int,
     use_anchor: bool,
+    near: tuple[date, int] | None,
     hours: int,
 ) -> None:
     index = _build(zip_bytes)
+    start, _ = _near_run_start(index, start, near)
     stops = _stop_choices(index, stop_picks)
     if use_anchor:
         stops = sorted({*stops, _anchor(index)[1][0]})
