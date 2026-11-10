@@ -1,6 +1,7 @@
 """RFC 9111 freshness parsing and the shared producer-response cache."""
 
 import asyncio
+import locale
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime, parsedate_to_datetime
@@ -10,6 +11,7 @@ from hypothesis import event, given, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, precondition, rule
 
+from aiomobilitydatabase.feeds import _freshness as freshness_module
 from aiomobilitydatabase.feeds._freshness import (
     Freshness,
     FreshnessCache,
@@ -147,6 +149,10 @@ def test_a_last_modified_that_isnt_an_http_date_validates_nothing() -> None:
         "Thu, 30 Jul 2026 13:00 GMT",  # no seconds
         "Wed, 30 Jul 2026 13:00:00 GMT",  # wrong weekday
         "Thu, 31 Feb 2026 13:00:00 GMT",  # the right shape, no such day
+        "Thu, \u0663\u0660 Jul 2026 13:00:00 GMT",  # Arabic-Indic digits
+        "Thu, 30 Jul \uff12\uff10\uff12\uff16 13:00:00 GMT",  # full-width digits
+        "\xa0Thu, 30 Jul 2026 13:00:00 GMT",  # not optional whitespace
+        "Thu, 30 Jul 2026 23:59:60 GMT",  # a leap second: no such instant
     ],
 )
 def test_an_expires_that_isnt_an_http_date_is_already_expired(expires: str) -> None:
@@ -166,6 +172,50 @@ def test_an_expires_that_isnt_an_http_date_is_already_expired(expires: str) -> N
 )
 def test_every_http_date_form_is_read(expires: str) -> None:
     assert _fresh({"Date": _http(T0), "Expires": expires}) == Freshness(3600.0)
+    padded = f" {expires}\t"  # optional whitespace is space and tab
+    assert _fresh({"Date": _http(T0), "Expires": padded}) == Freshness(3600.0)
+
+
+def test_an_asctime_single_digit_day_is_space_padded() -> None:
+    assert freshness_module._http_date("Thu Jan  1 00:00:00 2026") == datetime(
+        2026, 1, 1, tzinfo=UTC
+    )
+
+
+def test_a_four_digit_year_is_taken_as_written() -> None:
+    """Year 0026 is AD 26 -- long expired -- not 2026."""
+    expires = "Tue, 10 Nov 0026 13:00:00 GMT"
+    assert _fresh({"Date": _http(T0), "Expires": expires}) == Freshness(0.0)
+
+
+@pytest.mark.parametrize(
+    ("value", "year"),
+    [
+        ("Thursday, 30-Jul-26 12:00:00 GMT", 2026),
+        # 2069 is less than 50 years after 2026, so "69" is 2069 (RFC 9110).
+        ("Tuesday, 01-Jan-69 00:00:00 GMT", 2069),
+        # 2077 is more than 50 years ahead: the past century's 1977.
+        ("Saturday, 01-Jan-77 00:00:00 GMT", 1977),
+    ],
+)
+def test_an_rfc850_year_follows_the_fifty_year_rule(value: str, year: int) -> None:
+    parsed = freshness_module._http_date(value, T0)
+    assert parsed is not None and parsed.year == year
+
+
+def test_dates_do_not_depend_on_the_process_locale() -> None:
+    """The weekday check must not use strftime("%a"), which follows LC_TIME."""
+    try:
+        previous = locale.setlocale(locale.LC_TIME)
+        locale.setlocale(locale.LC_TIME, "de_DE.UTF-8")
+    except locale.Error:
+        pytest.skip("de_DE.UTF-8 is not installed")
+    try:
+        expires = _http(T0 + timedelta(hours=1))
+        assert _fresh({"Date": _http(T0), "Expires": expires}) == Freshness(3600.0)
+        assert Validators.from_headers({"Last-Modified": THU}) == Validators(None, THU)
+    finally:
+        locale.setlocale(locale.LC_TIME, previous)
 
 
 def test_validators_from_headers_and_back() -> None:
@@ -294,6 +344,7 @@ def test_a_quote_that_isnt_an_argument_cannot_hide_no_store(header: str) -> None
         # Directive names are case-insensitive.
         ("No-Store", Freshness(None, storable=False)),
         ("NO-CACHE", Freshness(0.0)),
+        ("NO-STORE;x", Freshness(None, storable=False)),
     ],
 )
 def test_cache_control_follows_its_grammar(header: str, expected: Freshness) -> None:
@@ -590,6 +641,27 @@ async def test_a_304_must_match_every_validator_it_carries(
     await cache.get("u", producer)
     assert await cache.get("u", producer) == "b"
     assert producer.seen[2] is None  # re-asked unconditionally
+
+
+async def test_an_invalid_last_modified_is_no_validator_on_either_side() -> None:
+    """A weak tag plus a Last-Modified that isn't an HTTP-date: the request
+    carries only the tag, and the 304 repeating both selects on the tag --
+    the invalid Last-Modified is absent, not a mismatch forcing a retry.
+    """
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    both = {"ETag": 'W/"v1"', "Last-Modified": "garbage"}
+    producer = _Producer(
+        [
+            _raw("a", {**both, "Cache-Control": "max-age=0"}),
+            _raw(None, {**both, "Cache-Control": "max-age=60"}),
+        ]
+    )
+    await cache.get("u", producer)
+    await cache.get("u", producer)
+    clock.now = 59.0
+    assert await cache.get("u", producer) == "a"
+    assert producer.seen == [None, Validators('W/"v1"', None)]
 
 
 async def test_last_modified_is_compared_as_an_instant() -> None:

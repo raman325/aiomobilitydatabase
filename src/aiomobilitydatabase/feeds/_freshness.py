@@ -17,7 +17,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from email.utils import format_datetime, parsedate_to_datetime
+from email.utils import format_datetime
 from typing import Protocol
 
 # RFC 9111 section 1.2.2: a cache treats any delta-seconds value it cannot
@@ -30,14 +30,19 @@ _TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 # decoded (aiohttp: UTF-8 with surrogateescape), so anything non-ASCII.
 _ENTITY_TAG = re.compile(r'(W/)?"[^\x00-\x20"\x7f]*"')
 # RFC 9110 section 5.6.7: the three HTTP-date forms, and nothing else.
+# ASCII digits only ([0-9], not \d, which matches any Unicode digit).
+_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")  # fmt: skip
 _DAY = "(Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
 _LONG_DAY = "(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
 _MONTH = "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-_HTTP_DATE = re.compile(
-    rf"{_DAY}, \d{{2}} {_MONTH} \d{{4}} \d{{2}}:\d{{2}}:\d{{2}} GMT"  # IMF-fixdate
-    rf"|{_LONG_DAY}, \d{{2}}-{_MONTH}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}} GMT"  # RFC 850
-    rf"|{_DAY} {_MONTH} [ \d]\d \d{{2}}:\d{{2}}:\d{{2}} \d{{4}}"  # asctime
+_CLOCK = "([0-9]{2}):([0-9]{2}):([0-9]{2})"
+_IMF_FIXDATE = re.compile(rf"{_DAY}, ([0-9]{{2}}) {_MONTH} ([0-9]{{4}}) {_CLOCK} GMT")
+_RFC850_DATE = re.compile(
+    rf"{_LONG_DAY}, ([0-9]{{2}})-{_MONTH}-([0-9]{{2}}) {_CLOCK} GMT"
 )
+_ASCTIME_DATE = re.compile(rf"{_DAY} {_MONTH} ([ 0-9][0-9]) {_CLOCK} ([0-9]{{4}})")
 
 
 # A response's header fields: lower-cased name -> values, in the order
@@ -72,9 +77,7 @@ class Validators:
         that isn't an HTTP-date.
         """
         etag = _etag(fields)
-        last_modified = _first(fields, "last-modified")
-        if _http_date(last_modified) is None:
-            last_modified = None  # not an HTTP-date: validates nothing
+        last_modified = _valid_last_modified(fields)
         if not etag and not last_modified:
             return None
         return cls(etag=etag or None, last_modified=last_modified)
@@ -128,29 +131,50 @@ def _etag(fields: Fields) -> str | None:
     return value if _ENTITY_TAG.fullmatch(value) else None
 
 
-def _http_date(value: str | None) -> datetime | None:
+def _http_date(value: str | None, now: datetime | None = None) -> datetime | None:
     """Parse an HTTP-date (RFC 9110 section 5.6.7); None for anything else.
 
-    Only the three standard forms, with a weekday that matches the date:
-    RFC 9111 section 5.3 has a cache treat any other format (a numeric
-    zone, ``UTC``, no weekday, no seconds) as invalid -- an ``Expires`` in
-    it means "already expired", not whatever a lenient parser makes of it.
+    Only the three standard forms -- IMF-fixdate, RFC 850, asctime -- in
+    ASCII, around optional space or tab, naming a real instant whose
+    weekday matches. RFC 9111 section 5.3 has a cache treat any other
+    format as invalid: an ``Expires`` in it means "already expired", not
+    whatever a lenient parser makes of it. Built from the matched fields
+    rather than by a general parser, which would move a four-digit year
+    0026 into 2026 or read other scripts' digits. An RFC 850 two-digit
+    year is the one at most 50 years after ``now`` (RFC 9110). A leap
+    second (``:60``) names no representable instant and is invalid too.
     """
     if not value:
         return None
-    value = value.strip()
-    match = _HTTP_DATE.fullmatch(value)
-    if match is None:
+    value = value.strip(" \t")
+    if (match := _IMF_FIXDATE.fullmatch(value)) is not None:
+        day, mday, month, year, hour, minute, second = match.groups()
+        full_year = int(year)
+    elif (match := _RFC850_DATE.fullmatch(value)) is not None:
+        day, mday, month, year, hour, minute, second = match.groups()
+        reference = (now or datetime.now(UTC)).year
+        full_year = reference - reference % 100 + int(year)
+        if full_year > reference + 50:
+            full_year -= 100
+    elif (match := _ASCTIME_DATE.fullmatch(value)) is not None:
+        day, month, mday, hour, minute, second, year = match.groups()
+        full_year = int(year)
+    else:
         return None
     try:
-        parsed = parsedate_to_datetime(value)
-    except (TypeError, ValueError, IndexError, OverflowError):
-        return None
-    weekday = next(group for group in (match[1], match[3], match[5]) if group)
-    if parsed.strftime("%a") != weekday[:3]:
-        return None
-    # asctime carries no zone and parses naive; every HTTP-date is GMT.
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+        parsed = datetime(
+            full_year,
+            _MONTHS.index(month) + 1,
+            int(mday),
+            int(hour),
+            int(minute),
+            int(second),
+            tzinfo=UTC,
+        )
+    except ValueError:
+        return None  # no such instant: 31 Feb, year 0, hour 24, :60
+    # By index, never strftime: "%a" follows the process locale.
+    return parsed if _DAYS[parsed.weekday()] == day[:3] else None
 
 
 def _delta_seconds(value: str | None) -> int | None:
@@ -235,7 +259,10 @@ def _directives(values: Sequence[str]) -> tuple[dict[str, list[str | None]], boo
     quote, a missing comma -- is malformed, and reported so the caller can
     treat its freshness as invalid; every run of token characters in it is
     still read as a directive name, so a ``no-store`` or ``no-cache`` never
-    hides, whatever it is glued to (``;``, ``/``, a quote, a space).
+    hides, whatever it is glued to (``;``, ``/``, a quote, a space). That
+    can also read one out of an argument (``ext="no-store"`` in a broken
+    field): conservative -- not storing beats a stale-now copy -- though
+    such a response then skips the "never older" comparison.
     """
     directives: dict[str, list[str | None]] = {}
     malformed = False
@@ -293,14 +320,14 @@ def freshness_of(
         return Freshness(lifetime=None, storable=False)
     if "no-cache" in directives or malformed:
         return Freshness(lifetime=0.0)
-    date = _http_date(_first(fields, "date"))
+    date = _http_date(_first(fields, "date"), received_at)
     lifetime: float | None
     if "max-age" in directives:
         values = directives["max-age"]
         parsed = _delta_seconds(values[0])
         lifetime = float(parsed) if len(values) == 1 and parsed is not None else 0.0
     elif "expires" in fields:
-        expires = _http_date(_first(fields, "expires"))
+        expires = _http_date(_first(fields, "expires"), received_at)
         lifetime = (
             0.0
             if expires is None
@@ -324,6 +351,12 @@ def _entity_tag(fields: Fields) -> tuple[bool, str] | None:
     if value.startswith("W/"):
         return True, value[2:]
     return False, value
+
+
+def _valid_last_modified(fields: Fields) -> str | None:
+    """Return Last-Modified if it is an HTTP-date; None otherwise."""
+    value = _first(fields, "last-modified")
+    return value if _http_date(value) is not None else None
 
 
 def _same_instant(new: str, stored: str | None) -> bool:
@@ -350,8 +383,10 @@ def _selects(stored: Fields, new: Fields) -> bool:
     new_tag, stored_tag = _entity_tag(new), _entity_tag(stored)
     if new_tag is not None and not new_tag[0]:
         return stored_tag is not None and stored_tag == new_tag
-    new_modified = _first(new, "last-modified")
-    stored_modified = _first(stored, "last-modified")
+    # A Last-Modified that isn't an HTTP-date is no validator (it is never
+    # sent, see Validators.from_fields), on either side.
+    new_modified = _valid_last_modified(new)
+    stored_modified = _valid_last_modified(stored)
     if new_tag is None and not new_modified:
         return stored_tag is None and not stored_modified
     tag_matches = new_tag is None or (
