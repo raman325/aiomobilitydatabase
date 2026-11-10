@@ -226,7 +226,7 @@ def _delta_seconds(value: str | None, *, quoted: bool = False) -> int | None:
         return None
     value = value.strip(_OWS)
     if quoted and len(value) > 1 and value[0] == value[-1] == '"':
-        value = value[1:-1]
+        value = re.sub(r"\\(.)", r"\1", value[1:-1])  # quoted-pairs
     if not value or not value.isascii() or not value.isdigit():
         return None
     if len(value.lstrip("0")) > _DELTA_SECONDS_DIGITS:
@@ -341,6 +341,20 @@ def freshness_from_headers(
     )
 
 
+def _varies_by_everything(fields: Fields) -> bool:
+    """Whether Vary lists ``*``: such a response never matches a request.
+
+    RFC 9111 section 4.1: a stored response whose Vary contains ``*``
+    "always fails to match", and a cache MUST NOT reuse one that doesn't
+    match -- so it is never worth storing.
+    """
+    return any(
+        member.strip(_OWS) == "*"
+        for value in fields.get("vary", ())
+        for member in value.split(",")
+    )
+
+
 def freshness_of(
     fields: Fields, *, requested_at: datetime, received_at: datetime
 ) -> Freshness:
@@ -354,15 +368,20 @@ def freshness_of(
     cache can start its clock before the request without counting the
     response delay twice.
 
-    Strict throughout: ``no-store`` is never stored; any ``no-cache``, a
+    Dates are read as :func:`_received` pins them (against
+    ``received_at``), so this is exactly what the cache computes.
+
+    Strict throughout: ``no-store`` -- or ``Vary: *``, which never matches
+    -- is never stored; any ``no-cache``, a
     ``max-age`` that is missing its value, invalid or repeated, an
     unparseable ``Expires``, or a malformed Cache-Control field (an
     unterminated quote) all mean "stale now" (lifetime 0). A response with
     no freshness information at all declares nothing (None) -- this cache
     never invents a heuristic lifetime. Total over arbitrary fields.
     """
+    fields = _received(fields, received_at)  # idempotent for pinned fields
     directives, malformed = _directives(fields.get("cache-control", ()))
-    if "no-store" in directives:
+    if "no-store" in directives or _varies_by_everything(fields):
         return Freshness(lifetime=None, storable=False)
     if "no-cache" in directives or malformed:
         return Freshness(lifetime=0.0)
@@ -382,10 +401,9 @@ def freshness_of(
     else:
         return Freshness(lifetime=None)
     apparent_age = max(0.0, (received_at - date).total_seconds()) if date else 0.0
+    # RFC 9111 section 5.1: an invalid Age SHOULD be ignored (age_value 0).
     age_field = _first(fields, "age")
-    age = _delta_seconds(age_field.split(",")[0]) if age_field is not None else None
-    if age_field is not None and age is None:
-        return Freshness(lifetime=0.0)  # an invalid Age: no telling how old
+    age = _delta_seconds(age_field.split(",")[0]) if age_field else None
     response_delay = max(0.0, (received_at - requested_at).total_seconds())
     initial_age = max(apparent_age, (age or 0) + response_delay)
     return Freshness(lifetime=max(0.0, lifetime - initial_age + response_delay))
@@ -466,14 +484,21 @@ def _received(fields: Fields, received_at: datetime) -> Fields:
     6.6.1: a recipient caching a message without one MUST record it), so a
     304 lacking one replaces the stored Date instead of leaving it to age.
     """
+    received_at = received_at.astimezone(UTC)
     pinned = dict(fields)
     for name in ("date", "expires", "last-modified"):
         value = _first(fields, name)
         instant = _http_date(value, received_at)
-        if name == "date" and instant is None:
-            instant = received_at
-        if instant is not None:
-            pinned[name] = (format_datetime(instant, usegmt=True),)
+        if instant is not None and value is not None:
+            sent = value.strip(_OWS)
+            # An IMF-fixdate means the same whenever it is read: keep it as
+            # sent (a leap second's :60 included, so If-Modified-Since
+            # echoes the producer exactly); only the other forms, whose
+            # meaning hangs on the reading, become IMF-fixdate.
+            keep = _IMF_FIXDATE.fullmatch(sent) is not None
+            pinned[name] = (sent if keep else format_datetime(instant, usegmt=True),)
+        elif name == "date":
+            pinned[name] = (format_datetime(received_at, usegmt=True),)
         elif value is not None:
             pinned[name] = (_NO_INSTANT,)
     return pinned
@@ -657,6 +682,11 @@ class FreshnessCache[T]:
                 # fetch must have rejected this one already.
                 raise RuntimeError(f"304 to an unconditional request for {key}")
             merged = {**entry.fields, **fields}
+            if "age" not in fields:
+                # RFC 9111 section 5.1: no Age means the origin validated
+                # this response just now; the stored Age described an older
+                # trip through some cache.
+                merged.pop("age", None)
             freshness = freshness_of(
                 merged,
                 requested_at=response.requested_at,

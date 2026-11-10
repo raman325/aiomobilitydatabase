@@ -5,6 +5,7 @@ import locale
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime, parsedate_to_datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 from hypothesis import event, given, settings
@@ -85,14 +86,25 @@ SUN = _http(T0 - timedelta(days=4))
             Freshness(lifetime=0.0),
         ),
         ({"Expires": _http(T0 - timedelta(hours=1))}, Freshness(lifetime=0.0)),
-        # Age reduces the remaining lifetime; an invalid Age leaves no telling
-        # how old the response is, so it is stale now.
+        # Age reduces the remaining lifetime; an invalid Age is ignored
+        # (RFC 9111 section 5.1: a cache SHOULD ignore it -- age_value 0).
         ({"Cache-Control": "max-age=30", "Age": "12"}, Freshness(lifetime=18.0)),
         ({"Cache-Control": "max-age=30", "Age": "40"}, Freshness(lifetime=0.0)),
-        ({"Cache-Control": "max-age=30", "Age": "soon"}, Freshness(lifetime=0.0)),
-        ({"Cache-Control": "max-age=30", "Age": '"5"'}, Freshness(lifetime=0.0)),
-        ({"Cache-Control": "max-age=30", "Age": "\xa05"}, Freshness(lifetime=0.0)),
-        ({"Cache-Control": "max-age=30", "Age": "\u0665"}, Freshness(lifetime=0.0)),
+        ({"Cache-Control": "max-age=30", "Age": "soon"}, Freshness(lifetime=30.0)),
+        ({"Cache-Control": "max-age=30", "Age": ""}, Freshness(lifetime=30.0)),
+        ({"Cache-Control": "max-age=30", "Age": '"5"'}, Freshness(lifetime=30.0)),
+        ({"Cache-Control": "max-age=30", "Age": "\xa05"}, Freshness(lifetime=30.0)),
+        ({"Cache-Control": "max-age=30", "Age": "\u0665"}, Freshness(lifetime=30.0)),
+        ({"Cache-Control": "max-age=30", "Age": "-1"}, Freshness(lifetime=30.0)),
+        # A quoted-pair in a quoted max-age is just the character it escapes.
+        ({"Cache-Control": 'max-age="6\\0"'}, Freshness(lifetime=60.0)),
+        # Vary: * never matches a request, so it is never stored.
+        ({"Cache-Control": "max-age=60", "Vary": "*"}, Freshness(None, storable=False)),
+        (
+            {"Cache-Control": "max-age=60", "Vary": "Accept, *"},
+            Freshness(None, storable=False),
+        ),
+        ({"Cache-Control": "max-age=60", "Vary": "Accept"}, Freshness(60.0)),
         ({"Cache-Control": 'max-age="\u0666\u0660\u0660"'}, Freshness(lifetime=0.0)),
     ],
 )
@@ -190,6 +202,18 @@ def test_every_http_date_form_is_read(expires: str) -> None:
     assert _fresh({"Date": _http(T0), "Expires": expires}) == Freshness(3600.0)
     padded = f" {expires}\t"  # optional whitespace is space and tab
     assert _fresh({"Date": _http(T0), "Expires": padded}) == Freshness(3600.0)
+
+
+def test_freshness_of_reads_dates_as_the_cache_pins_them() -> None:
+    """With no Date, the recorded Date is the receipt time at HTTP-date
+    resolution (whole seconds), exactly as the cache stores it: received
+    half a second past the second, half a second of age counts.
+    """
+    received = T0 + timedelta(milliseconds=500)
+    fields = header_fields({"Cache-Control": "max-age=60"})
+    assert freshness_module.freshness_of(
+        fields, requested_at=received, received_at=received
+    ) == Freshness(59.5)
 
 
 def test_a_leap_second_is_the_second_before_it() -> None:
@@ -840,6 +864,79 @@ async def test_merged_dates_keep_the_meaning_they_arrived_with() -> None:
     assert stale._entries["u"].lifetime == 0.0
 
 
+async def test_a_304_without_age_drops_the_stored_age() -> None:
+    """RFC 9111 section 5.1: no Age on the 304 means the origin validated it
+    just now; the 200's Age (a trip through a cache) no longer applies.
+    """
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer(
+        [
+            _raw("a", {"Cache-Control": "max-age=30", "Age": "20", "ETag": '"1"'}),
+            _raw(None, {"ETag": '"1"'}),
+        ]
+    )
+    await cache.get("u", producer)
+    clock.now = 10.0  # 30 - 20: stale
+    await cache.get("u", producer)
+    clock.now = 35.0  # renewed for the full 30s, not 10
+    assert await cache.get("u", producer) == "a"
+    assert len(producer.seen) == 2
+
+
+async def test_a_vary_star_response_is_never_reused() -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    producer = _Producer(
+        [
+            _raw("a", {"Cache-Control": "max-age=600", "Vary": "*"}),
+            _raw("b", {"Cache-Control": "max-age=600", "Vary": "*"}),
+        ]
+    )
+    assert await cache.get("u", producer) == "a"
+    assert await cache.get("u", producer) == "b"
+    assert "u" not in cache._entries
+
+
+async def test_an_imf_last_modified_is_echoed_exactly() -> None:
+    """Kept as sent -- a leap second's :60 included -- so If-Modified-Since
+    is byte-identical to what the producer said.
+    """
+    leap = "Sat, 31 Dec 2016 23:59:60 GMT"
+    rfc850 = "Saturday, 31-Dec-16 23:59:59 GMT"
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    producer = _Producer(
+        [
+            _raw("a", {"Last-Modified": leap, "Cache-Control": "max-age=0"}),
+            _raw("b", {"Last-Modified": rfc850, "Cache-Control": "max-age=0"}),
+            _raw("c", {"Cache-Control": "max-age=0"}),
+        ]
+    )
+    for _ in range(3):
+        await cache.get("u", producer)
+    # The RFC 850 form, whose meaning hangs on when it is read, is sent
+    # back as IMF-fixdate.
+    assert producer.seen == [
+        None,
+        Validators(None, leap),
+        Validators(None, "Sat, 31 Dec 2016 23:59:59 GMT"),
+    ]
+
+
+async def test_a_non_utc_receipt_time_is_fine() -> None:
+    """The Fetch protocol doesn't require UTC; pinning normalizes."""
+    tokyo = ZoneInfo("Asia/Tokyo")
+    received = T0.astimezone(tokyo)
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    producer = _Producer(
+        [
+            Response(
+                "a", header_fields({"Cache-Control": "max-age=60"}), received, received
+            )
+        ]
+    )
+    assert await cache.get("u", producer) == "a"
+
+
 async def test_last_modified_is_compared_as_an_instant() -> None:
     """The same instant in RFC 850 form still selects the stored response."""
     clock = _Clock()
@@ -1231,6 +1328,38 @@ def _model_lifetime(
     return True, max(0.0, max_age - initial)
 
 
+_SHORT_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_LONG_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+              "Sunday")  # fmt: skip
+_MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
+                "Oct", "Nov", "Dec")  # fmt: skip
+
+
+def _render(when: datetime, style: str) -> str:
+    """An HTTP-date in one of RFC 9110's three forms."""
+    month = _MONTH_NAMES[when.month - 1]
+    if style == "rfc850":
+        return (
+            f"{_LONG_DAYS[when.weekday()]}, {when.day:02d}-{month}-"
+            f"{when.year % 100:02d} {when:%H:%M:%S} GMT"
+        )
+    if style == "asctime":
+        day = _SHORT_DAYS[when.weekday()]
+        return f"{day} {month} {when.day:>2} {when:%H:%M:%S} {when.year}"
+    return _http(when)
+
+
+def _canonical(value: str | None) -> str | None:
+    """The IMF-fixdate a cache keeps for a date, via email.utils (independent
+    of the code under test; the machine's years are all 20xx).
+    """
+    if value is None:
+        return None
+    parsed = parsedate_to_datetime(value)
+    # asctime carries no zone and parses naive; every HTTP-date is GMT.
+    return _http(parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed)
+
+
 def _model_selects(
     stored_etag: str | None, stored_lm: str | None, sent: dict[str, str]
 ) -> bool:
@@ -1242,7 +1371,7 @@ def _model_selects(
     format, so text equality is the instant). Nothing sent corresponds only
     to nothing stored.
     """
-    tag, lm = sent.get("ETag"), sent.get("Last-Modified")
+    tag, lm = sent.get("ETag"), _canonical(sent.get("Last-Modified"))
     if tag is not None and not tag.startswith("W/"):
         return tag == stored_etag
     if tag is None and lm is None:
@@ -1286,6 +1415,7 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.validators_offered = True
         self.weak = False
         self.lm_offered = False
+        self.date_style = "imf"
         self.date_mode = "now"
         self.age: int | None = None
         self.style_304 = "full"
@@ -1321,7 +1451,7 @@ class FreshnessMachine(RuleBasedStateMachine):
     def _lm(self, doc: _Doc) -> str | None:
         if not self.lm_offered:
             return None
-        return _http(datetime.fromtimestamp(doc.timestamp, UTC))
+        return _render(datetime.fromtimestamp(doc.timestamp, UTC), self.date_style)
 
     def _headers(self, etag: str | None, lm: str | None = None) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -1333,7 +1463,9 @@ class FreshnessMachine(RuleBasedStateMachine):
             headers["Last-Modified"] = lm
         if self.date_mode != "none":
             date = self._wall() - (20 if self.date_mode == "stale" else 0)
-            headers["Date"] = _http(datetime.fromtimestamp(date, UTC))
+            headers["Date"] = _render(
+                datetime.fromtimestamp(date, UTC), self.date_style
+            )
         if self.age is not None:
             headers["Age"] = str(self.age)
         return headers
@@ -1355,7 +1487,9 @@ class FreshnessMachine(RuleBasedStateMachine):
             or (etag is None and lm is not None and validators.last_modified == lm)
         )
         # Another edge's copy: the same tag, a different Last-Modified.
-        redated = _http(datetime.fromtimestamp(doc.timestamp + 3600, UTC))
+        redated = _render(
+            datetime.fromtimestamp(doc.timestamp + 3600, UTC), self.date_style
+        )
         if unchanged and etag is None:
             # Last-Modified alone: the tag-shaped styles collapse to these.
             style = {"bare": "bare", "another": "bare", "redated": "redated"}.get(
@@ -1479,6 +1613,11 @@ class FreshnessMachine(RuleBasedStateMachine):
     def set_304_style(self, style: str) -> None:
         self.style_304 = style
 
+    @rule(style=st.sampled_from(["rfc850", "asctime", "imf"]))
+    def set_date_style(self, style: str) -> None:
+        """Send Date and Last-Modified as RFC 850, asctime or IMF-fixdate."""
+        self.date_style = style
+
     @rule(
         date_mode=st.sampled_from(["now", "stale", "none"]),
         age=st.sampled_from([None, None, 5]),
@@ -1573,7 +1712,7 @@ class FreshnessMachine(RuleBasedStateMachine):
         """Apply the cache rules to what the producer served; return the answer."""
         received = self._received()
         date = (
-            int(parsedate_to_datetime(headers["Date"]).timestamp())
+            int(parsedate_to_datetime(_canonical(headers["Date"]) or "").timestamp())
             if "Date" in headers
             else int(received)  # dated at receipt
         )
@@ -1588,9 +1727,10 @@ class FreshnessMachine(RuleBasedStateMachine):
             if "ETag" in headers:
                 self.stored_etag = headers["ETag"]
             if "Last-Modified" in headers:
-                self.stored_lm = headers["Last-Modified"]
-            if "Age" in headers:
-                self.stored_age = age
+                self.stored_lm = _canonical(headers["Last-Modified"])
+            # A 304 without Age was validated by the origin just now: the
+            # stored Age (an older trip through a cache) goes.
+            self.stored_age = age if "Age" in headers else None
             self.stored_date = date
             storable, lifetime = _model_lifetime(
                 self.stored_cc, self.stored_date, self.stored_age, received
@@ -1617,7 +1757,7 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.stored = served
         self.stored_cc = headers.get("Cache-Control")
         self.stored_etag = headers.get("ETag")
-        self.stored_lm = headers.get("Last-Modified")
+        self.stored_lm = _canonical(headers.get("Last-Modified"))
         self.stored_date, self.stored_age = date, age
         self.stored_received = self._wall()
         self.stored_at, self.stored_lifetime = self.clock.now, lifetime
