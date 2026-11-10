@@ -81,7 +81,12 @@ that fetches and caches the actual data. GBFS needs no extra; GTFS and GTFS-RT
 ```python
 import asyncio
 
-from aiomobilitydatabase.feeds import ArrivalsQuery, Circle, MobilityFeedsClient
+from aiomobilitydatabase.feeds import (
+    ArrivalsQuery,
+    Circle,
+    MobilityFeedsClient,
+    TripQuery,
+)
 
 
 async def main() -> None:
@@ -117,7 +122,9 @@ async def main() -> None:
         # Pass several ArrivalsQuery objects to get several boards (each
         # with its own stops, route/headsign filters, and limit) from one
         # realtime fetch; the result has one list per query, in order.
-        # Delayed trips stay listed until their prediction passes.
+        # Delayed trips stay listed until their prediction passes. Boards
+        # are open-ended by default: each fills to its limit however far
+        # ahead the next departures are (pass end= to bound the window).
         [arrivals] = await transit.get_arrivals(
             [ArrivalsQuery([nearby_stops[0].id], limit=2)]
         )
@@ -131,15 +138,16 @@ async def main() -> None:
 
         # Origin→destination: the next departures from stop A on trips that
         # later reach stop B, with the same realtime overlay. is_first/is_last
-        # flag the first/last such departure of the service day.
-        trips = await transit.get_upcoming_trips(
-            nearby_stops[0].id, nearby_stops[1].id, limit=2
+        # flag the first/last such departure of the service day. Batched
+        # like get_arrivals: several stop pairs, one realtime fetch.
+        [trips] = await transit.get_upcoming_trips(
+            [TripQuery(nearby_stops[0].id, nearby_stops[1].id, limit=2)]
         )
         for trip in trips:
             name = trip.route.display_name if trip.route else trip.route_id
             print(name, trip.scheduled_departure, trip.is_last)
 
-        vehicles = await transit.get_vehicles()
+        vehicles = await transit.get_vehicles(zone=home)
         alerts = await transit.get_alerts()
 
         # GBFS bike/scooter share:
@@ -222,6 +230,16 @@ Notes on direct mode:
   because busier routes used up the limit. A `grace` window (default one hour)
   keeps a delayed trip listed past its scheduled time until its prediction
   passes, while a schedule-only departure still drops at its scheduled time.
+- **One time window everywhere, open-ended by default**: every dated query
+  takes `start` (default now), `end` and a limit. With `end=None` a board
+  fills to its limit however far ahead the departures are — overnight,
+  over a weekend, past a holiday — instead of going empty after the last
+  bus. The schedule is read over a doubling horizon (2h, 4h, 8h, ...) and
+  stops at the feed's last scheduled instant, so a stop nothing serves
+  still terminates. Realtime is fetched once, before the first horizon, and
+  a realtime board only settles once its last row sits an hour inside the
+  horizon: a trip scheduled just beyond it but running early can't be
+  missed. An open-ended query with no limit raises `ValueError`.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic
   `{trip_id}#{start_secs}` ids, so every schedule query — arrivals,
@@ -278,9 +296,12 @@ Notes on direct mode:
   names, a replacement stop may be defined only by an RT `Stop` entity, and
   a detour that routes a trip through a stop its static schedule never
   served shows up there.
-- **Schedule over a range**: `get_scheduled_departures(stops, start, end)` is
-  the calendar query — every departure between two instants, schedule only,
-  no limit and no grace, rather than `get_arrivals` stretched to days.
+- **Schedule only, never the network**: `get_scheduled_departures()` is the
+  schedule-only twin of `get_arrivals()` — same `ArrivalsQuery` batch, same
+  window rules, no realtime and no grace. It makes no network request, so a
+  calendar view or config flow keeps working when a producer's realtime
+  endpoint is down. For every departure in a range, pass `end` and
+  `limit=None`.
 - **Service calendars are answerable**: `get_services_on(date)` returns the
   service ids running on a GTFS service date — `calendar.txt` resolved
   against `calendar_dates` exceptions, removals winning when a producer
@@ -360,8 +381,8 @@ in the zip is ignored:
 Service calendars **are** answerable — `get_services_on(date)` resolves
 `calendar.txt` against `calendar_dates` exceptions, and rows carry their
 `service_id` — but the raw weekday pattern and validity range behind a
-service are not exposed as a model. `get_scheduled_departures(stops, start, end)`
-covers the range query a calendar view needs.
+service are not exposed as a model. `get_scheduled_departures()` with an
+`end` and `limit=None` covers the range query a calendar view needs.
 
 **GTFS-RT: trip shapes.** The RT `shape` entity (a detour's new geometry) is
 not read, for the same reason `shapes.txt` is not: nothing here draws a line
@@ -476,9 +497,13 @@ The suite combines example-based, property-based, and conformance testing:
     stop-call table: the self-join's direction rule (no return-trip rows) and
     the earliest-destination-call rule for loop trips, neither of which any
     test asserted before;
-  - window monotonicity — widening `lookahead` yields a prefix and widening
+  - window monotonicity — widening the window yields a prefix and widening
     `grace` yields a superset — which guards the scan-window regression class
     directly, without a hand-built oracle;
+  - open-ended equals bounded: for every dated query, `end=None, limit=k`
+    returns exactly the first `k` rows of the same query bounded at the
+    feed's scan ceiling — including with realtime predictions running up to
+    the early margin — so the expanding horizon is a pure optimization;
   - the cache as a round trip: a built index and the same index reopened from
     disk answer every query identically, including the stored timezone, and
     `purge_cache` removes exactly the named feed and nothing else for any
