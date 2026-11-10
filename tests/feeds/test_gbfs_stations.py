@@ -307,16 +307,28 @@ def test_endpoints_from_discovery_bad_feeds_still_tries_language_blocks() -> Non
         pytest.param(-5, id="negative"),
     ],
 )
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({}, id="no-http-freshness"),
+        pytest.param({"Cache-Control": "max-age=300"}, id="http-max-age"),
+    ],
+)
 async def test_malformed_ttl_degrades_to_no_caching(
-    mock_api: MockApi, feeds_client: MobilityFeedsClient, ttl: object
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    ttl: object,
+    headers: dict[str, str],
 ) -> None:
     """A ttl that isn't a usable number must not escape as ValueError or
-    TypeError: the document still parses and simply isn't cached.
+    TypeError: the document still parses and simply isn't cached -- not
+    even under a longer HTTP lifetime, since the document did declare one
+    and we can't tell how short it meant.
     """
     _mock_catalog(mock_api)
     payload = {**_just_updated(SYSTEM_INFO_23), "ttl": ttl}
-    mock_api.get("/gbfs/system_information.json", payload=payload)
-    mock_api.get("/gbfs/system_information.json", payload=payload)
+    for _ in range(2):
+        mock_api.get("/gbfs/system_information.json", payload=payload, headers=headers)
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     assert (await handle.get_system_info()).system_id == "test-bikes"
     await handle.get_system_info()

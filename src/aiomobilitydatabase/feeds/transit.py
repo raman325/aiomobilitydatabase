@@ -66,7 +66,7 @@ from .rt import (
     TripUpdateKey,
     TripUpdates,
     alerts_from_message,
-    feed_is_older,
+    feed_timestamp,
     fetch_feed_message,
     resolve_trip_predictions,
     stops_from_message,
@@ -93,6 +93,12 @@ _CACHE_KEY_HASH_CHARS = 16
 # Direct-URL RT feeds advertise every entity type: capabilities are unknown
 # without a catalog record, so every fetch tries all parsers and absent
 # types simply yield nothing.
+
+
+def _require_interval(rt_min_interval: timedelta) -> None:
+    """Reject a negative budget before any download or index build."""
+    if rt_min_interval < timedelta(0):
+        raise ValueError(f"rt_min_interval must not be negative: {rt_min_interval}")
 
 
 def _direct_cache_key(static_url: str) -> str:
@@ -989,9 +995,12 @@ class TransitFeedHandle:
         self._refresh_lock = asyncio.Lock()
         # Per-url parsed messages, reused only as the producer allows: within
         # its declared freshness (RFC 9111), after a 304, or -- opted into
-        # by the caller -- within rt_min_interval. Shared between concurrent
-        # calls; see FreshnessCache.
-        self._rt_cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
+        # by the caller, and only when the producer declared nothing --
+        # within rt_min_interval. Shared between concurrent calls; see
+        # FreshnessCache.
+        self._rt_cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache(
+            timestamp=feed_timestamp
+        )
         self._rt_min_interval = rt_min_interval.total_seconds()
         self._stops: tuple[Stop, ...] = tuple(index.stops())
         self._routes: tuple[Route, ...] = tuple(index.routes())
@@ -1069,6 +1078,7 @@ class TransitFeedHandle:
         rt_min_interval: timedelta = timedelta(0),
     ) -> TransitFeedHandle:
         """Resolve siblings via the catalog and ensure the static index."""
+        _require_interval(rt_min_interval)
         catalog = client.catalog
         feed = await catalog.get_feed(feed_id)
         if feed.data_type is DataType.GTFS:
@@ -1124,6 +1134,7 @@ class TransitFeedHandle:
         to the static download and every RT fetch made through this
         handle.
         """
+        _require_interval(rt_min_interval)
         _require_http_url(static_url, "static GTFS dataset URL")
         url_types: dict[str, list[EntityType]] = {}
         for urls, entity_type in (
@@ -1423,7 +1434,6 @@ class TransitFeedHandle:
                     timeout_seconds=self._client.timeout_seconds,
                 ),
                 min_interval=self._rt_min_interval,
-                is_older=feed_is_older,
             )
             if memo is not None:
                 memo[url] = message

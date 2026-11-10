@@ -259,9 +259,9 @@ def _as_bool(value: Any) -> bool | None:
 
 
 def _ttl_seconds(value: Any) -> float | None:
-    """Read a document's ``ttl`` in seconds; None when it declares nothing usable.
+    """Read a document's ``ttl`` in seconds; None when it is unusable.
 
-    A ttl that isn't a finite, non-negative number declares nothing (None)
+    A ttl that isn't a finite, non-negative number is unusable (None)
     rather than failing a document that otherwise parsed; ``0`` is a real
     declaration ("always refresh"). Plain numeric strings are accepted
     because producers do ship them, and an integer literal too large for a
@@ -278,36 +278,39 @@ def _ttl_seconds(value: Any) -> float | None:
 
 def _document_lifetime(
     document: Mapping[str, Any], header_lifetime: float | None, received_at: datetime
-) -> float:
-    """Remaining freshness of a GBFS document, in seconds.
+) -> float | None:
+    """Remaining freshness of a GBFS document, in seconds, at ``received_at``.
 
     The document's ``ttl`` counts from its own ``last_updated`` (GBFS: the
     data will be updated again ``ttl`` seconds after it last was), so a
     document already ``n`` seconds old has ``ttl - n`` left; a missing or
     unparseable ``last_updated`` counts from receipt, and the result never
     exceeds ``ttl`` (a ``last_updated`` in the future is clock skew, not
-    extra freshness). When the HTTP headers declare a lifetime too, the
-    shorter one wins; neither declaring anything means revalidate now.
+    extra freshness). A ``ttl`` that is present but unusable declares 0,
+    just as an invalid ``max-age`` would. When the HTTP headers declare a
+    lifetime too, the shorter one wins; neither declaring anything is None.
+    Runs on every response, a 304's included (with the stored document),
+    so a CDN's long ``max-age`` can never outlast the document's own ttl.
     """
     declared = [header_lifetime] if header_lifetime is not None else []
-    ttl = _ttl_seconds(document.get("ttl"))
-    if ttl is not None:
-        updated = _reported_at(document.get("last_updated")) or received_at
-        elapsed = max(0.0, (received_at - updated).total_seconds())
-        declared.append(max(0.0, ttl - elapsed))
-    return min(declared, default=0.0)
+    if "ttl" in document:
+        ttl = _ttl_seconds(document["ttl"])
+        if ttl is None:
+            declared.append(0.0)
+        else:
+            updated = _reported_at(document.get("last_updated")) or received_at
+            elapsed = max(0.0, (received_at - updated).total_seconds())
+            declared.append(max(0.0, ttl - elapsed))
+    return min(declared, default=None)
 
 
-def _document_is_older(stored: Mapping[str, Any], fetched: Mapping[str, Any]) -> bool:
-    """Whether ``fetched`` predates ``stored`` by ``last_updated``.
+def _document_timestamp(document: Mapping[str, Any]) -> datetime | None:
+    """When the producer last updated a document (``last_updated``), if stated.
 
-    A CDN edge that has not caught up can serve an older document after a
-    newer one. Either side lacking a parseable ``last_updated`` proves
-    nothing.
+    The freshness cache uses this to recognise a CDN edge serving an older
+    document after a newer one.
     """
-    stored_at = _reported_at(stored.get("last_updated"))
-    fetched_at = _reported_at(fetched.get("last_updated"))
-    return stored_at is not None and fetched_at is not None and fetched_at < stored_at
+    return _reported_at(document.get("last_updated"))
 
 
 def _endpoints_from_discovery(document: Any) -> dict[str, str]:
@@ -376,7 +379,9 @@ class GbfsFeedHandle:
         # Per-url parsed documents, reused only as the producer allows: its
         # ttl (from last_updated) and HTTP freshness, the shorter winning,
         # or after a 304. Shared between concurrent calls.
-        self._docs: FreshnessCache[dict[str, Any]] = FreshnessCache()
+        self._docs: FreshnessCache[dict[str, Any]] = FreshnessCache(
+            lifetime=_document_lifetime, timestamp=_document_timestamp
+        )
 
     @classmethod
     async def create(cls, client: MobilityFeedsClient, feed_id: str) -> GbfsFeedHandle:
@@ -430,7 +435,7 @@ class GbfsFeedHandle:
 
         With ``validators`` the request is conditional and a ``304`` comes
         back with no value; a 304 to an unconditional request raises. The
-        response carries the document's remaining freshness (see
+        cache derives the document's freshness from it (see
         :func:`_document_lifetime`).
         """
         _require_http_url(url, context)
@@ -459,10 +464,8 @@ class GbfsFeedHandle:
                     return Response(
                         value=None,
                         validators=Validators.from_headers(resp.headers),
-                        # The document's own ttl is unknown without a body;
-                        # only the 304's headers can extend freshness.
-                        lifetime=freshness.lifetime or 0.0,
-                        storable=freshness.storable,
+                        freshness=freshness,
+                        received_at=received_at,
                     )
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
@@ -480,8 +483,8 @@ class GbfsFeedHandle:
         return Response(
             value=document,
             validators=fresh,
-            lifetime=_document_lifetime(document, freshness.lifetime, received_at),
-            storable=freshness.storable,
+            freshness=freshness,
+            received_at=received_at,
         )
 
     async def _document(self, name: str) -> dict[str, Any]:
@@ -497,7 +500,6 @@ class GbfsFeedHandle:
                 self._headers,
                 f"GBFS {name} endpoint URL",
             ),
-            is_older=_document_is_older,
         )
 
     async def get_system_info(self) -> GbfsSystemInfo:

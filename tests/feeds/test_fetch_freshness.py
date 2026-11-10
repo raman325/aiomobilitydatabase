@@ -160,6 +160,44 @@ async def test_rt_min_interval_is_an_opt_in_request_budget(
     assert len(_rt_hits(mock_api)) == 2
 
 
+async def test_rt_min_interval_never_extends_a_declared_lifetime(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """max-age=0 is a declaration, not an absence: the budget doesn't apply."""
+    _mock_transit(mock_api)
+    for delay in (60, 120):
+        mock_api.get(
+            RT,
+            body=_t1_delayed(delay, timestamp=delay),
+            content_type=PB,
+            headers={"Cache-Control": "max-age=0"},
+        )
+    handle = await feeds_client.get_transit_feed(
+        "mdb-100", rt_min_interval=timedelta(seconds=10)
+    )
+    clock = _Clock()
+    handle._rt_cache._clock = clock
+    assert await _t1_delay(handle) == 60
+    clock.now += 1
+    assert await _t1_delay(handle) == 120
+
+
+async def test_negative_rt_min_interval_is_rejected_before_any_request(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_transit(mock_api)
+    with pytest.raises(ValueError, match="rt_min_interval"):
+        await feeds_client.get_transit_feed(
+            "mdb-100", rt_min_interval=timedelta(seconds=-1)
+        )
+    with pytest.raises(ValueError, match="rt_min_interval"):
+        await feeds_client.get_transit_feed_from_urls(
+            mock_api.url("/hosted/mdb-100.zip"),
+            rt_min_interval=timedelta(seconds=-1),
+        )
+    assert not mock_api.requests  # no catalog lookup, download or build
+
+
 async def test_without_freshness_every_call_asks(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
@@ -240,11 +278,38 @@ async def test_gbfs_ttl_counts_from_last_updated(
     clock = _Clock()
     handle._docs._clock = clock
     await handle.get_system_info()
-    clock.now += 9
+    # last_updated is whole seconds, so up to ~1s of the 10 may be gone.
+    clock.now += 8
     assert (await handle.get_system_info()).name == "Test Bikes"
     assert len(_info_hits(mock_api)) == 1
-    clock.now += 2
+    clock.now += 3
     assert (await handle.get_system_info()).name == "Renamed"
+
+
+async def test_gbfs_a_304_never_outlives_the_document_ttl(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """The 304 carries max-age=600, but the stored document still says it
+    is good for ttl 60 from a last_updated 50s ago: the renewal must not
+    stretch it to ten minutes.
+    """
+    _mock_gbfs(mock_api)
+    cacheable = {"Cache-Control": "max-age=600", "ETag": '"g1"'}
+    mock_api.get(INFO, payload=_info(ttl=60, age=50), headers=cacheable)
+    mock_api.get(INFO, status=304, headers=cacheable)
+    mock_api.get(INFO, status=304, headers=cacheable)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    clock = _Clock()
+    handle._docs._clock = clock
+    await handle.get_system_info()
+    clock.now += 11  # past the ttl: revalidate
+    await handle.get_system_info()
+    assert len(_info_hits(mock_api)) == 2
+    clock.now += 15  # well within max-age=600, but past the document's ttl
+    assert (await handle.get_system_info()).name == "Test Bikes"
+    hits = _info_hits(mock_api)
+    assert len(hits) == 3
+    assert hits[2].get("If-None-Match") == '"g1"'
 
 
 async def test_gbfs_the_shorter_declared_lifetime_wins(

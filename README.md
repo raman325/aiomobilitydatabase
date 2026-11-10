@@ -268,13 +268,19 @@ Notes on direct mode:
   `no-store` is never stored, invalid freshness counts as stale, and a
   response declaring nothing is revalidated on every call — no heuristic
   lifetimes. A GBFS document's `ttl` counts from its own `last_updated`,
-  and the shorter of `ttl` and the HTTP lifetime wins. Concurrent calls
-  share one in-flight request per URL (a cancelled caller cancels neither
-  it nor the other waiters), and a response older than the stored copy (a
-  CDN edge behind, by GTFS-RT header timestamp or GBFS `last_updated`)
-  never replaces it. `rt_min_interval=` on `get_transit_feed*` opts into
-  reusing realtime parses younger than that interval for producers that
-  send no caching headers; it never overrides `no-store`.
+  and the shorter of `ttl` and the HTTP lifetime wins — on a `304` too,
+  so a renewal never outlives the document; an unusable `ttl` means the
+  document isn't reused. Concurrent calls share one in-flight request per
+  URL (a cancelled caller cancels neither it nor the other waiters). A
+  response older than the stored copy (a CDN edge behind, by GTFS-RT
+  header timestamp or GBFS `last_updated`) never replaces it; the stored
+  copy is kept but asked about again on the next call. A stored timestamp
+  later than when we received it isn't trusted for this, and `no-store`
+  responses are passed through without comparison. `rt_min_interval=` on
+  `get_transit_feed*` is an opt-in request budget for producers that
+  declare no freshness at all: it reuses a realtime parse younger than the
+  interval, and never extends `no-cache`, `max-age=0`, an expired
+  lifetime, a rejected older copy or `no-store`.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
   or vehicle with no `start_date` applies to one run, judged at the feed's
   header timestamp alone (never a query setting): the run scheduled to be

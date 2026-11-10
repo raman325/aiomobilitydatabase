@@ -123,8 +123,8 @@ async def fetch_feed_message(
 
     With ``validators`` the request is conditional, and a ``304`` comes
     back as a :class:`Response` with no value. The response's freshness
-    (RFC 9111, see :func:`freshness_from_headers`) rides along; a response
-    that declares none has lifetime 0, i.e. revalidate on every use.
+    (RFC 9111, see :func:`freshness_from_headers`) rides along, with None
+    meaning the producer declared none.
     """
     _require_http_url(url, "GTFS-RT producer URL")
     params: dict[str, str] = {}
@@ -152,7 +152,6 @@ async def fetch_feed_message(
             freshness = freshness_from_headers(
                 resp.headers, requested_at=requested_at, received_at=received_at
             )
-            lifetime = freshness.lifetime or 0.0
             # 304 is the producer confirming the bytes are unchanged, so
             # reusing the previous parse is not a staleness risk.
             if resp.status == HTTPStatus.NOT_MODIFIED:
@@ -166,8 +165,8 @@ async def fetch_feed_message(
                 return Response(
                     value=None,
                     validators=Validators.from_headers(resp.headers),
-                    lifetime=lifetime,
-                    storable=freshness.storable,
+                    freshness=freshness,
+                    received_at=received_at,
                 )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
@@ -185,25 +184,20 @@ async def fetch_feed_message(
     return Response(
         value=message,
         validators=fresh,
-        lifetime=lifetime,
-        storable=freshness.storable,
+        freshness=freshness,
+        received_at=received_at,
     )
 
 
-def feed_is_older(
-    stored: gtfs_realtime_pb2.FeedMessage, fetched: gtfs_realtime_pb2.FeedMessage
-) -> bool:
-    """Whether ``fetched`` predates ``stored`` by its header timestamp.
+def feed_timestamp(message: gtfs_realtime_pb2.FeedMessage) -> datetime | None:
+    """When the producer built this snapshot (``header.timestamp``), if stated.
 
-    A CDN edge that has not caught up can serve an older snapshot after a
-    newer one; GTFS-RT header timestamps only move forward, so an older
-    one is a stale copy. Either message lacking a timestamp proves nothing.
+    GTFS-RT header timestamps only move forward, so the freshness cache
+    uses this to recognise a CDN edge serving an older snapshot.
     """
-    if not (
-        stored.header.HasField("timestamp") and fetched.header.HasField("timestamp")
-    ):
-        return False
-    return bool(fetched.header.timestamp < stored.header.timestamp)
+    if message.header.HasField("timestamp") and message.header.timestamp:
+        return _epoch_to_utc(message.header.timestamp)
+    return None
 
 
 # GTFS-RT's WheelchairAccessible is NOT the static wheelchair_accessible

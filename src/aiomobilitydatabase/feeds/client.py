@@ -188,10 +188,13 @@ class MobilityFeedsClient:
         """Resolve a GTFS or GTFS-RT feed ID into a TransitFeedHandle.
 
         Realtime responses are reused only as the producer allows (its
-        declared HTTP freshness, or a 304). ``rt_min_interval`` opts into
-        reusing any realtime parse younger than that interval even when the
-        producer declared no freshness -- a request budget for producers
-        that send no caching headers. It never overrides ``no-store``.
+        declared HTTP freshness, or a 304). ``rt_min_interval`` is an
+        opt-in request budget for producers that declare no freshness at
+        all: a parse from such a response is reused while younger than the
+        interval. It never extends a declared lifetime (``no-cache``,
+        ``max-age=0``, an expired ``max-age``/``Expires``), a copy kept
+        after rejecting an older response, or ``no-store``. A negative
+        interval raises ``ValueError``.
 
         ``on_progress``, if given, must not raise: it is called inline and
         is NOT wrapped in a try/except, so a raising callback aborts this
