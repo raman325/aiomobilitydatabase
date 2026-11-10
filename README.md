@@ -276,7 +276,12 @@ Notes on direct mode:
   from the merged headers. A stored copy answers only requests matching
   the request headers its `Vary` names: a cookie the producer set since,
   or a changed session default header, means asking again (a `304` then
-  makes it the answer for the new request); `Vary: *` is never stored.
+  makes it the answer for the new request); `Vary: *` is never stored, and
+  a header added outside the session's and handle's own (a middleware's)
+  can't be predicted, so a `Vary` naming it always asks. A redirected
+  response answers its original URL only while every redirect may be
+  reused too: the shortest lifetime of the chain, none when a redirect
+  declares none.
   A bare `no-cache` revalidates every time (one naming fields only bars
   passing those fields on, which this cache never does), `no-store` is
   never stored, invalid freshness (including a
@@ -285,8 +290,10 @@ Notes on direct mode:
   document's `ttl` counts from its own `last_updated`, and the shorter of
   `ttl` and the HTTP lifetime wins — on a `304` too, so a renewal never
   outlives the document; an unusable `ttl` means the document isn't
-  reused. Concurrent calls share one in-flight request per
-  URL (a cancelled caller cancels neither it nor the other waiters). A
+  reused. Concurrent calls share one in-flight request per URL and
+  request headers (a cancelled caller cancels neither it nor the other
+  waiters); requests for one URL with different headers run one at a
+  time, each checking the store first. A
   response older than the stored copy (a CDN edge behind, by GTFS-RT
   header timestamp or GBFS `last_updated`) never replaces it; the stored
   copy is kept but asked about again on the next call. A stored timestamp

@@ -19,6 +19,9 @@ from ._freshness import (
     request_fields,
     sent_fields,
 )
+from ._freshness import (
+    hops as _hops,
+)
 from ._frozen import FrozenDict
 from ._urls import _require_http_url  # deliberate friend access: shared URL guard
 from .const import GBFS_LANGUAGE_PREFERENCE
@@ -450,9 +453,10 @@ class GbfsFeedHandle:
         _require_http_url(url, context)
         session = client._get_session()  # deliberate friend access
         request_headers = dict(headers) if headers else {}
+        # Before the validators: they are the cache's, not the request's own.
+        controlled = request_fields(session, url, request_headers)
         if validators is not None:
             request_headers.update(validators.request_headers())
-        controlled = request_fields(session, url, request_headers)
         requested_at = datetime.now(UTC)
         try:
             async with session.get(
@@ -475,6 +479,7 @@ class GbfsFeedHandle:
                         requested_at=requested_at,
                         received_at=received_at,
                         request_fields=sent_fields(controlled, resp),
+                        hops=_hops(resp),
                     )
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
@@ -484,7 +489,7 @@ class GbfsFeedHandle:
                     document = await resp.json(content_type=None)
                 except ValueError as err:
                     raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
-                sent = sent_fields(controlled, resp)
+                sent, hops = sent_fields(controlled, resp), _hops(resp)
         except (TimeoutError, aiohttp.ClientError) as err:
             raise SourceConnectionError(f"Error fetching {url}: {err}") from err
         if not isinstance(document, dict) or "data" not in document:
@@ -495,6 +500,7 @@ class GbfsFeedHandle:
             requested_at=requested_at,
             received_at=received_at,
             request_fields=sent,
+            hops=hops,
         )
 
     async def _document(self, name: str) -> dict[str, Any]:

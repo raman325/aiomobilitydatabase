@@ -512,3 +512,73 @@ async def test_a_redirected_response_with_vary_is_never_reused_unasked(
     assert await _t1_delay(handle) == 60
     assert await _t1_delay(handle) == 160
     assert len([r for r in mock_api.requests if r.path == "/rt/moved"]) == 2
+
+
+async def _unsafe_jar_client(mock_api: MockApi, **session: object):  # type: ignore[no-untyped-def]
+    return aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True), **session)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("session_headers", "cookies", "sent"),
+    [
+        # Set b, then a: aiohttp sends them sorted, as the cache compares.
+        ({}, ["b=1", "a=2"], ["", "b=1", "a=2; b=1"]),
+        # An explicit cookie the jar replaces by name.
+        ({"Cookie": "a=1"}, ["a=2"], ["a=1", "a=2"]),
+        # An explicit cookie merged, sorted, with the jar's.
+        ({"Cookie": "z=1"}, ["a=2"], ["z=1", "a=2; z=1"]),
+    ],
+)
+async def test_vary_cookie_matches_the_cookie_aiohttp_sends(
+    mock_api: MockApi,
+    session_headers: dict[str, str],
+    cookies: list[str | None],
+    sent: list[str],
+) -> None:
+    """Under Vary: Cookie the cache asks exactly when the Cookie it would
+    send changed: once per new cookie, then a fresh answer -- however
+    aiohttp orders, merges or replaces cookies on the wire.
+    """
+    _mock_transit(mock_api)
+    vary = {"Cache-Control": "max-age=600", "Vary": "Cookie"}
+    for n, cookie in enumerate([*cookies, None]):
+        headers = {**vary, **({"Set-Cookie": cookie} if cookie else {})}
+        mock_api.get(
+            RT,
+            body=_t1_delayed(60 + n, timestamp=100 + n),
+            content_type=PB,
+            headers=headers,
+        )
+    async with (
+        await _unsafe_jar_client(mock_api, headers=session_headers) as session,
+        MobilityFeedsClient(
+            "test-refresh-token", session, base_url=mock_api.url()
+        ) as client,
+    ):
+        handle = await client.get_transit_feed("mdb-100")
+        for _ in range(len(sent) + 2):
+            await _t1_delay(handle)
+    hits = _rt_hits(mock_api)
+    assert [hit.get("Cookie", "") for hit in hits] == sent
+
+
+async def test_a_redirect_that_may_not_be_stored_is_asked_every_time(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """RFC 9111 section 4: the original URL is the key. Its redirect says
+    no-store (or nothing at all), so the target's max-age can't skip it.
+    """
+    _mock_transit(mock_api)
+    moved = mock_api.url("/rt/moved")
+    for hop in ({"Cache-Control": "no-store"}, {}):
+        mock_api.get(RT, status=302, headers={"Location": moved, **hop})
+        mock_api.get(
+            "/rt/moved",
+            body=_t1_delayed(60, timestamp=100),
+            content_type=PB,
+            headers={"Cache-Control": "max-age=600"},
+        )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    assert await _t1_delay(handle) == 60
+    assert await _t1_delay(handle) == 60
+    assert len(_rt_hits(mock_api)) == 2

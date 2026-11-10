@@ -5,12 +5,16 @@ import locale
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime, parsedate_to_datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import pytest
 from hypothesis import event, given, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, precondition, rule
+from multidict import CIMultiDict
+from yarl import URL
 
 from aiomobilitydatabase.feeds import _freshness as freshness_module
 from aiomobilitydatabase.feeds._freshness import (
@@ -1480,12 +1484,12 @@ async def test_a_finished_request_is_never_joined() -> None:
     producer = _Producer([_r("a", None, 0.0)], gate=asyncio.Event())
     waiter = asyncio.ensure_future(cache.get("u", producer))
     await asyncio.sleep(0)
-    task, _fields = cache._in_flight["u"]
+    [task] = cache._in_flight.values()
     observed: list[tuple[bool, bool]] = []
     producer.gate.set()  # type: ignore[union-attr]
     # Runs right after the request's own step, before any done-callback.
     asyncio.get_running_loop().call_soon(
-        lambda: observed.append((task.done(), "u" in cache._in_flight))
+        lambda: observed.append((task.done(), bool(cache._in_flight)))
     )
     assert await waiter == "a"
     assert observed == [(True, False)]
@@ -1500,7 +1504,8 @@ async def test_a_request_cancelled_before_it_runs_leaves_no_trace() -> None:
     waiter = asyncio.ensure_future(cache.get("u", producer))
     await asyncio.sleep(0)  # get() has scheduled the request, not run it
     assert not producer.seen
-    cache._in_flight["u"][0].cancel()
+    [task] = cache._in_flight.values()
+    task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
     await asyncio.sleep(0)
@@ -1522,6 +1527,7 @@ async def test_a_304_with_nothing_stored_is_a_bug_not_a_value() -> None:
 class _Doc:
     version: int
     timestamp: int
+    region: str = ""  # the variant, when the producer answers Vary: X-Region
 
 
 def _doc_time(doc: _Doc) -> datetime:
@@ -1683,13 +1689,15 @@ class FreshnessMachine(RuleBasedStateMachine):
     def _etag(self, doc: _Doc) -> str | None:
         if not self.validators_offered:
             return None
-        tag = f'"{doc.version}.{doc.timestamp}"'
+        tag = f'"{doc.version}.{doc.timestamp}{doc.region}"'
         return f"W/{tag}" if self.weak else tag
 
     def _lm(self, doc: _Doc) -> str | None:
         if not self.lm_offered:
             return None
-        return _render(datetime.fromtimestamp(doc.timestamp, UTC), self.date_style)
+        # Each variant its own Last-Modified, a second apart.
+        modified = doc.timestamp + (doc.region == "west")
+        return _render(datetime.fromtimestamp(modified, UTC), self.date_style)
 
     def _headers(self, etag: str | None, lm: str | None = None) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -1720,9 +1728,12 @@ class FreshnessMachine(RuleBasedStateMachine):
             self.log.append((validators, {}, None))
             raise ConnectionError("producer down")
         doc = self.published
+        if self.vary_offered:
+            doc = _Doc(doc.version, doc.timestamp, self.region)  # its variant
         if self.stale_next:
             self.stale_next = False
-            doc = _Doc(doc.version, doc.timestamp - 50)  # an older edge copy
+            # An older edge copy.
+            doc = _Doc(doc.version, doc.timestamp - 50, doc.region)
         etag, lm = self._etag(doc), self._lm(doc)
         now = T0 + timedelta(seconds=self.clock.now)
         unchanged = validators is not None and (
@@ -1938,6 +1949,20 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.clock.now = max(self.clock.now, expiry + 0.5)
         self.call(count=1)
 
+    @rule()
+    def renew_through_an_ageless_304(self) -> None:
+        """Store a response carrying Age, let it lapse, renew it with a 304
+        that has none, and probe the renewal's edges: the stored Age must
+        still count (RFC 9111 section 3.2).
+        """
+        self.date_mode, self.age = "now", 5
+        self.publish_cacheable()
+        self.vary_offered = False
+        self.call(count=1)
+        if self.stored is not None and self.stored_lifetime:
+            self.lapse_then_call_twice(style="ageless")
+            self.probe_the_lifetime_edge()
+
     @precondition(lambda self: self.stored is not None and self.vary_offered)
     @rule(style=_STYLES_304)
     def move_region_then_call_twice(self, style: str) -> None:
@@ -2040,10 +2065,13 @@ class FreshnessMachine(RuleBasedStateMachine):
             else:
                 self.stored = None
             return answer
-        if self.stored is not None:
+        if self.stored is not None and (
+            self.stored_vary is None or self.stored_region == self.region
+        ):
             # The newest thing we know of is the stored copy, as of its stamp
             # -- but no later than the second it actually reached us. An
-            # older copy loses even when it couldn't be stored.
+            # older copy loses even when it couldn't be stored; another
+            # region's variant is no answer to compare it with.
             known = min(self.stored.timestamp, self.stored_received)
             if served.timestamp < known:
                 event("stale edge rejected")
@@ -2069,3 +2097,203 @@ class FreshnessMachine(RuleBasedStateMachine):
 
 FreshnessMachine.TestCase.settings = settings(max_examples=600, deadline=None)
 TestFreshnessMachine = FreshnessMachine.TestCase
+
+
+async def test_another_variant_is_never_the_older_copys_answer() -> None:
+    """Vary: X-Region. East's copy is stored; west's 200 is stamped earlier,
+    but it answers a request east's copy doesn't match -- so it wins.
+    """
+    cache: FreshnessCache[int] = FreshnessCache(
+        _Clock(), timestamp=lambda v: datetime.fromtimestamp(v, UTC)
+    )
+    now = int(T0.timestamp())
+    vary = header_fields({"Cache-Control": "max-age=600", "Vary": "X-Region"})
+    east, west = {"x-region": ("east",)}, {"x-region": ("west",)}
+    producer = _Producer(  # type: ignore[arg-type]
+        [Response(now, vary, T0, T0, east), Response(now - 60, vary, T0, T0, west)]
+    )
+    assert await cache.get("u", producer, request_fields=east) == now  # type: ignore[arg-type]
+    assert await cache.get("u", producer, request_fields=west) == now - 60  # type: ignore[arg-type]
+
+
+async def _until_waiting() -> None:
+    """Let every scheduled request run up to the producer's gate."""
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+async def test_fetches_with_other_fields_run_one_at_a_time() -> None:
+    """Two callers with different fields: the second waits for the first,
+    then finds its answer stored (no Vary) and makes no request at all.
+    """
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    gate = asyncio.Event()
+    producer = _Producer([_raw("a", {"Cache-Control": "max-age=600"})], gate=gate)
+    first = asyncio.ensure_future(cache.get("u", producer, request_fields={}))
+    other = asyncio.ensure_future(
+        cache.get("u", producer, request_fields={"cookie": ("a=1",)})
+    )
+    await _until_waiting()
+    gate.set()
+    assert await asyncio.gather(first, other) == ["a", "a"]
+    assert len(producer.seen) == 1
+
+
+async def test_a_slower_older_copy_never_overwrites_a_newer_one() -> None:
+    """Concurrent requests with different fields are ordered: the second
+    one's older 200 is judged against what the first stored, not against
+    the entry both started from.
+    """
+    now = int(T0.timestamp())
+    cache: FreshnessCache[int] = FreshnessCache(
+        _Clock(), timestamp=lambda v: datetime.fromtimestamp(v, UTC)
+    )
+    stale = {"Cache-Control": "max-age=0"}
+    seed = _Producer([_raw(now - 600, stale)])  # type: ignore[list-item]
+    await cache.get("u", seed)  # type: ignore[arg-type]
+    gate = asyncio.Event()
+    producer = _Producer(  # type: ignore[arg-type]
+        [_raw(now - 120, stale), _raw(now - 300, stale)], gate=gate
+    )
+    fast = asyncio.ensure_future(cache.get("u", producer, request_fields={}))  # type: ignore[arg-type]
+    slow = asyncio.ensure_future(
+        cache.get("u", producer, request_fields={"x": ("1",)})  # type: ignore[arg-type]
+    )
+    await _until_waiting()
+    gate.set()
+    assert await asyncio.gather(fast, slow) == [now - 120, now - 120]
+    assert cache._entries["u"].value == now - 120
+
+
+async def test_each_set_of_request_fields_shares_its_own_fetch() -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    gate = asyncio.Event()
+    vary = {"Cache-Control": "max-age=600", "Vary": "Cookie"}
+    producer = _Producer(
+        [_sent("plain", vary), _sent("west", vary, cookie=("region=west",))],
+        gate=gate,
+    )
+    west = {"cookie": ("region=west",)}
+    calls = [
+        asyncio.ensure_future(cache.get("u", producer, request_fields=fields))
+        for fields in ({}, {}, west, west)
+    ]
+    await _until_waiting()
+    gate.set()
+    assert await asyncio.gather(*calls) == ["plain", "plain", "west", "west"]
+    assert len(producer.seen) == 2
+
+
+@pytest.mark.parametrize(
+    ("hops", "lifetime"),
+    [
+        ([{"cache-control": ("max-age=60",)}], 60.0),  # the shortest wins
+        ([{"cache-control": ("max-age=6000",)}], 600.0),
+        ([{}], None),  # a hop declaring nothing: the chain declares nothing
+        ([{"cache-control": ("max-age=60",)}, {}], None),
+    ],
+)
+async def test_a_redirect_chain_is_reused_only_as_long_as_every_hop(
+    hops: list[dict[str, tuple[str, ...]]], lifetime: float | None
+) -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    fields = header_fields({"Cache-Control": "max-age=600"})
+    response = Response("a", fields, T0, T0, None, hops)
+    await cache.get("u", _Producer([response]))
+    assert cache._entries["u"].lifetime == lifetime
+
+
+async def test_a_redirect_that_may_not_be_stored_keeps_nothing() -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    fields = header_fields({"Cache-Control": "max-age=600"})
+    hops = [header_fields({"Cache-Control": "no-store"})]
+    producer = _Producer(
+        [
+            Response("a", fields, T0, T0, None, hops),
+            Response("b", fields, T0, T0, None, hops),
+        ]
+    )
+    assert await cache.get("u", producer) == "a"
+    assert "u" not in cache._entries
+    assert await cache.get("u", producer) == "b"
+
+
+def _wire(headers: list[tuple[str, str]], *, redirected: bool = False):  # type: ignore[no-untyped-def]
+    """A stand-in aiohttp response whose request sent ``headers``."""
+    return SimpleNamespace(
+        history=(object(),) if redirected else (),
+        request_info=SimpleNamespace(headers=CIMultiDict(headers)),
+    )
+
+
+def test_sent_fields_keep_what_a_later_request_could_differ_in() -> None:
+    """Automatic headers and the cache's validators go, unless the client
+    set them; anything else on the wire stays -- a middleware's header
+    can't be predicted, so a Vary naming it never matches. Cookie comes
+    from the wire, canonical, whatever the snapshot said.
+    """
+    wire = _wire(
+        [
+            ("Host", "h"),
+            ("Accept", "*/*"),
+            ("Accept-Encoding", "gzip"),
+            ("User-Agent", "custom"),
+            ("If-None-Match", '"1"'),
+            ("Accept-Language", "fr"),
+            ("X-Api-Key", "k"),
+            ("Cookie", "b=2; a=1"),
+        ]
+    )
+    controlled = {"user-agent": ("custom",), "x-api-key": ("k",), "cookie": ("a=0",)}
+    assert freshness_module.sent_fields(controlled, wire) == {  # type: ignore[arg-type]
+        "user-agent": ("custom",),
+        "accept-language": ("fr",),
+        "x-api-key": ("k",),
+        "cookie": ("a=1", "b=2"),
+    }
+    assert freshness_module.sent_fields({}, _wire([], redirected=True)) is None  # type: ignore[arg-type]
+
+
+async def test_request_fields_merge_as_aiohttp_sends() -> None:
+    """A handle header replaces the session's whatever its case, a later
+    spelling replaces an earlier one, and cookies are canonical: by name,
+    jar cookies over explicit ones, sorted.
+    """
+    url = "http://feed.example/rt"
+    async with aiohttp.ClientSession(
+        headers={"X-Api-Key": "session", "Cookie": "z=1; a=0"},
+        cookie_jar=aiohttp.CookieJar(unsafe=True),
+    ) as session:
+        session.cookie_jar.update_cookies({"a": "2"}, URL(url))
+        fields = freshness_module.request_fields(
+            session, url, {"x-api-key": "first", "X-API-KEY": "last"}
+        )
+        # A multidict repeating one spelling sends every value.
+        repeated = freshness_module.request_fields(
+            session, url, CIMultiDict([("X-Tag", "a"), ("X-Tag", "b")])
+        )
+    assert fields["x-api-key"] == ("last",)
+    assert fields["cookie"] == ("a=2", "z=1")
+    assert repeated["x-tag"] == ("a", "b")
+
+
+@pytest.mark.parametrize(
+    ("sent", "upcoming", "reused"),
+    [
+        # Field lines combine with ", "; nothing inside a line is touched.
+        ({"accept": ("a, b",)}, {"accept": ("a", "b")}, True),
+        ({"accept": ('"x  y"',)}, {"accept": ('"x y"',)}, False),
+    ],
+)
+async def test_vary_normalization(
+    sent: dict[str, tuple[str, ...]], upcoming: dict[str, tuple[str, ...]], reused: bool
+) -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    headers = {"Cache-Control": "max-age=600", "Vary": "Accept"}
+    producer = _Producer(
+        [Response("a", header_fields(headers), T0, T0, sent), _raw("b", {})]
+    )
+    await cache.get("u", producer, request_fields=sent)
+    assert await cache.get("u", producer, request_fields=upcoming) == (
+        "a" if reused else "b"
+    )

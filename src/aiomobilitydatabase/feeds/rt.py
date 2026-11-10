@@ -20,6 +20,9 @@ from ._freshness import (
     request_fields,
     sent_fields,
 )
+from ._freshness import (
+    hops as _hops,
+)
 from ._urls import _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
@@ -172,9 +175,10 @@ async def fetch_feed_message(
     """
     _require_http_url(url, "GTFS-RT producer URL")
     params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
+    # Before the validators: they are the cache's, not the request's own.
+    controlled = request_fields(session, url, req_headers)
     if validators is not None:
         req_headers.update(validators.request_headers())
-    controlled = request_fields(session, url, req_headers)
     requested_at = datetime.now(UTC)
     try:
         async with session.get(
@@ -205,13 +209,14 @@ async def fetch_feed_message(
                     requested_at=requested_at,
                     received_at=received_at,
                     request_fields=sent_fields(controlled, resp),
+                    hops=_hops(resp),
                 )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
                     f"Producer error {resp.status}: {url}", status=resp.status
                 )
             raw = await resp.read()
-            sent = sent_fields(controlled, resp)
+            sent, hops = sent_fields(controlled, resp), _hops(resp)
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
     message = gtfs_realtime_pb2.FeedMessage()
@@ -225,6 +230,7 @@ async def fetch_feed_message(
         requested_at=requested_at,
         received_at=received_at,
         request_fields=sent,
+        hops=hops,
     )
 
 
