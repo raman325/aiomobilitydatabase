@@ -17,12 +17,12 @@ from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
 from .models import (
     GbfsAlert,
+    GbfsPricingPlan,
+    GbfsStation,
+    GbfsSystemInfo,
+    GbfsSystemRegion,
     GbfsVehicle,
-    PricingPlan,
-    Station,
-    SystemInfo,
-    SystemRegion,
-    VehicleType,
+    GbfsVehicleType,
 )
 
 if TYPE_CHECKING:
@@ -424,7 +424,7 @@ class GbfsFeedHandle:
         self._doc_cache[name] = (time.monotonic(), ttl, document)
         return document
 
-    async def get_system_info(self) -> SystemInfo:
+    async def get_system_info(self) -> GbfsSystemInfo:
         """GBFS system information.
 
         A document without a usable ``system_id`` raises
@@ -437,7 +437,7 @@ class GbfsFeedHandle:
         )
         if system_id is None:
             raise FeedParseError("GBFS system_information document has no system_id")
-        return SystemInfo(
+        return GbfsSystemInfo(
             system_id=system_id,
             name=_localized(data.get("name")),
             short_name=_localized(data.get("short_name")),
@@ -467,10 +467,10 @@ class GbfsFeedHandle:
             return []
         return _rows(await self._document(name), key)
 
-    async def get_vehicle_types(self) -> list[VehicleType]:
+    async def get_vehicle_types(self) -> list[GbfsVehicleType]:
         """Vehicle types, resolving the ids stations and vehicles reference."""
         return [
-            VehicleType(
+            GbfsVehicleType(
                 id=type_id,
                 form_factor=_plain_text(row.get("form_factor")),
                 propulsion_type=_plain_text(row.get("propulsion_type")),
@@ -482,10 +482,10 @@ class GbfsFeedHandle:
             if (type_id := _record_id(row.get("vehicle_type_id"))) is not None
         ]
 
-    async def get_pricing_plans(self) -> list[PricingPlan]:
+    async def get_pricing_plans(self) -> list[GbfsPricingPlan]:
         """Pricing plans, resolving a vehicle's ``pricing_plan_id``."""
         return [
-            PricingPlan(
+            GbfsPricingPlan(
                 id=plan_id,
                 name=_localized(row.get("name")),
                 currency=_plain_text(row.get("currency")),
@@ -497,10 +497,10 @@ class GbfsFeedHandle:
             if (plan_id := _record_id(row.get("plan_id"))) is not None
         ]
 
-    async def get_regions(self) -> list[SystemRegion]:
+    async def get_regions(self) -> list[GbfsSystemRegion]:
         """Service regions, resolving a station's ``region_id``."""
         return [
-            SystemRegion(id=region_id, name=_localized(row.get("name")))
+            GbfsSystemRegion(id=region_id, name=_localized(row.get("name")))
             for row in await self._optional_rows("system_regions", "regions")
             if (region_id := _record_id(row.get("region_id"))) is not None
         ]
@@ -527,7 +527,7 @@ class GbfsFeedHandle:
             if (alert_id := _record_id(row.get("alert_id"))) is not None
         ]
 
-    async def get_stations(self, zone: Circle | None = None) -> list[Station]:
+    async def get_stations(self, zone: Circle | None = None) -> list[GbfsStation]:
         """Stations with information and status merged by station_id.
 
         With ``zone``, only stations inside the circle are returned (stations
@@ -545,7 +545,7 @@ class GbfsFeedHandle:
         info_rows = _rows(await self._document("station_information"), "stations")
         status_rows = _rows(await self._document("station_status"), "stations")
         status_by_id = {_record_id(row.get("station_id")): row for row in status_rows}
-        stations: list[Station] = []
+        stations: list[GbfsStation] = []
         for info in info_rows:
             latitude = _coordinate(info.get("lat"))
             longitude = _coordinate(info.get("lon"))
@@ -560,7 +560,7 @@ class GbfsFeedHandle:
                 continue
             status: Mapping[str, Any] = status_by_id.get(station_id, {})
             stations.append(
-                Station(
+                GbfsStation(
                     id=station_id,
                     name=_localized(info.get("name")),
                     short_name=_localized(info.get("short_name")),
@@ -637,7 +637,7 @@ class GbfsFeedHandle:
                     # _record_id, matching _vehicle_types and
                     # get_vehicle_types: a producer using numeric type ids
                     # would otherwise yield int 7 here and "7" there, and
-                    # the VehicleType join would never match.
+                    # the GbfsVehicleType join would never match.
                     vehicle_type_id=_record_id(row.get("vehicle_type_id")),
                     current_range_m=_number(row.get("current_range_meters")),
                     current_fuel_percent=_number(row.get("current_fuel_percent")),

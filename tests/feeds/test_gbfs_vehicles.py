@@ -183,9 +183,9 @@ async def test_numeric_vehicle_type_id_joins_against_vehicle_types(
 ) -> None:
     """A numeric vehicle_type_id must normalize the same on both sides.
 
-    get_vehicle_types() and Station.vehicle_types_available both key on
+    get_vehicle_types() and GbfsStation.vehicle_types_available both key on
     _record_id, so a raw passthrough here yields int 7 against "7" and the
-    join this release added VehicleType for never matches.
+    join this release added GbfsVehicleType for never matches.
     """
     base = mock_api.url()
     mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)

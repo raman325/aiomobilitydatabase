@@ -15,15 +15,15 @@ from aiomobilitydatabase.feeds.models import (
     ArrivalsQuery,
     BikesAllowed,
     CongestionLevel,
+    GbfsStation,
+    GbfsSystemInfo,
     GbfsVehicle,
     OccupancyStatus,
     PickupDropOffType,
     Route,
     ServiceAlert,
-    Station,
     Stop,
     StopArrival,
-    SystemInfo,
     VehiclePosition,
     VehicleStopStatus,
     WheelchairAccess,
@@ -165,7 +165,7 @@ def test_vehicle_and_station_construct() -> None:
     assert vehicle.current_status is VehicleStopStatus.STOPPED_AT
     assert vehicle.congestion_level is CongestionLevel.RUNNING_SMOOTHLY
     assert vehicle.license_plate == "8ABC123"
-    station = Station(
+    station = GbfsStation(
         id="st1",
         name="Dock A",
         short_name="A",
@@ -205,7 +205,7 @@ def test_vehicle_and_station_construct() -> None:
         rental_uris=None,
     )
     assert gbfs_vehicle.id == "b1"
-    info = SystemInfo(
+    info = GbfsSystemInfo(
         system_id="sys",
         name="Test Bikes",
         short_name=None,

@@ -533,7 +533,7 @@ class ServiceAlert:
 
 
 @dataclass(frozen=True)
-class Station:
+class GbfsStation:
     """A GBFS station: information + status merged.
 
     ``rental_uris`` passes through the station's deep-link table as
@@ -616,7 +616,7 @@ class FeedInfo:
 
 
 @dataclass(frozen=True)
-class VehicleType:
+class GbfsVehicleType:
     """One vehicle type a GBFS system rents.
 
     Resolves the ``vehicle_type_id`` that stations and vehicles reference.
@@ -634,7 +634,7 @@ class VehicleType:
 
 
 @dataclass(frozen=True)
-class PricingPlan:
+class GbfsPricingPlan:
     """One pricing plan, resolving a vehicle's ``pricing_plan_id``.
 
     ``price`` is the base price in ``currency``; GBFS also allows per-km
@@ -651,7 +651,7 @@ class PricingPlan:
 
 
 @dataclass(frozen=True)
-class SystemRegion:
+class GbfsSystemRegion:
     """A named service region, resolving a station's ``region_id``."""
 
     id: str
@@ -665,7 +665,7 @@ class GbfsAlert:
     Distinct from :class:`ServiceAlert`, which is GTFS-RT: this one scopes
     to GBFS stations and regions rather than routes and trips, and its
     ``type`` is a raw string for the same reason as
-    :attr:`VehicleType.form_factor`.
+    :attr:`GbfsVehicleType.form_factor`.
     """
 
     id: str
@@ -680,7 +680,7 @@ class GbfsAlert:
 
 
 @dataclass(frozen=True)
-class SystemInfo:
+class GbfsSystemInfo:
     """GBFS system information."""
 
     system_id: str
