@@ -1,8 +1,8 @@
 """Runs that reach days past their service day, and runs no date can carry.
 
 GTFS times are offsets from the service day's start and may pass 24:00:00
--- or 48:00:00, for a multi-day trip -- so the window scan must look back as
-far as the feed's latest time reaches (plus an hour of DST). A run dated on
+-- or 48:00:00, for a multi-day trip -- so the window scan must look back
+exactly as far as the feed's times reach, whatever the clocks do. A run dated on
 the last representable day (a "forever" calendar's 9999-12-31) can't be
 dated at all, and must be skipped rather than overflow.
 """
@@ -456,6 +456,262 @@ def test_a_detour_shifted_past_the_end_of_datetime_is_skipped() -> None:
         assert _times(board) == [
             datetime(2026, 6, 11, 3, 10, tzinfo=UTC),  # the 10th's run, +10 min
             datetime(2026, 6, 12, 3, 0, tzinfo=UTC),
+        ]
+
+    _run(_index_from_zip_bytes(feed), body, message)
+
+
+@pytest.mark.parametrize(
+    ("calendar", "dates"),
+    [
+        pytest.param(
+            "NEVER,0,0,0,0,0,0,0,20260101,20261231",
+            "SVC,20260601,1\n",
+            id="calendar-dates-only",
+        ),
+        pytest.param(
+            "SVC,1,1,1,1,1,1,1,20260701,20261231",
+            "SVC,20260601,1\n",
+            id="added-before-start-date",
+        ),
+        pytest.param(
+            "SVC,1,1,1,1,1,1,1,2026-01-01,20261231\nX,1,1,1,1,1,1,1,00000000,20261231",
+            "SVC,20260601,1\nSVC,2026-05-01,1\nSVC,,1\nSVC,20261399,1\n",
+            id="unparseable-dates-around",
+        ),
+    ],
+)
+def test_the_first_service_day_never_cuts_a_run(calendar: str, dates: str) -> None:
+    """The look-back stops at the first day any service runs -- which may
+    come only from calendar_dates, or precede every calendar start_date. A
+    run of 06-01 reaching B at 60:00:00 must still show on 06-03.
+    """
+    feed = _feed(
+        "T,00:00:00,00:00:00,A,1\nT,60:00:00,60:00:00,B,2\n",
+        trips="R,SVC,T\n",
+        calendar=calendar,
+        extra={"calendar_dates.txt": "service_id,date,exception_type\n" + dates},
+    )
+    start = datetime(2026, 6, 3, 10, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [scheduled] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["B"], limit=None)],
+            start=start,
+            end=start + timedelta(hours=4),
+        )
+        [arrivals] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=1)], start=start
+        )
+        assert (
+            _times(scheduled)
+            == _times(arrivals)
+            == [datetime(2026, 6, 3, 12, tzinfo=UTC)]
+        )
+
+    _run(_index_from_zip_bytes(feed), body)
+
+
+def test_a_long_reaching_stop_time_is_placed_exactly_and_cheaply() -> None:
+    """A ten-day trip (X at 240:00:00), and one garbage stop time, on a
+    calendar started in 1900: the run of ten days ago reaches X now. Long
+    reaches are placed row by row, so it shows -- without the scan
+    visiting every day since 1900 for the garbage one.
+    """
+    feed = _feed(
+        "L,00:00:00,00:00:00,A,1\nL,240:00:00,240:00:00,X,2\n"
+        "G,30000000:00:00,30000000:00:00,A,1\n",  # and one garbage time
+        trips="R,DAILY,L\nR,DAILY,G\n",
+        calendar="DAILY,1,1,1,1,1,1,1,19000101,20261231",
+    )
+    index = _index_from_zip_bytes(feed)
+    start = datetime(2026, 6, 10, tzinfo=UTC)
+    scanned: list[date] = []
+    original = index.active_service_ids
+
+    def counting(service_date: date) -> set[str]:
+        scanned.append(service_date)
+        return original(service_date)
+
+    index.active_service_ids = counting  # type: ignore[method-assign]
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["X"], limit=None)],
+            start=start,
+            end=start + timedelta(hours=1),
+        )
+        assert _times(board) == [datetime(2026, 6, 10, tzinfo=UTC)]
+        assert len(scanned) < 20  # a few days, not 46,000
+
+    _run(index, body)
+
+
+def test_a_year_one_calendar_east_of_utc_crashes_nothing() -> None:
+    """A calendar from 0001-01-01 in Tokyo plus a garbage stop time: the
+    first day's start can't be represented, so it simply has no runs.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\nG,30000000:00:00,30000000:00:00,X,1\n",
+        timezone="Asia/Tokyo",
+        trips="R,DAILY,T\nR,DAILY,G\n",
+        calendar="DAILY,1,1,1,1,1,1,1,00010101,20991231",
+    )
+    start = datetime(2026, 6, 10, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["A"], limit=1)], start=start
+        )
+        assert _times(board) == [datetime(2026, 6, 10, 23, tzinfo=UTC)]
+
+    _run(_index_from_zip_bytes(feed), body)
+
+
+def test_a_dateless_update_for_a_garbage_trip_crashes_nothing() -> None:
+    """A date-less TripUpdate for a trip with a 30,000,000-hour stop time:
+    finding its current run walks back by binary search, bounded by the
+    first service day -- not past the start of datetime.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\nG,30000000:00:00,30000000:00:00,X,1\n",
+        trips="R,DAILY,T\nR,DAILY,G\n",
+    )
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    # Stamped at 07:00: T's 08:00 run is the current one (judged at the
+    # feed's own time); G's garbage run is still "under way" from 2026-01-01.
+    message.header.timestamp = int(datetime(2026, 6, 10, 7, tzinfo=UTC).timestamp())
+    for n, trip in enumerate(("G", "T")):
+        entity = message.entity.add()
+        entity.id = f"tu{n}"
+        entity.trip_update.trip.trip_id = trip
+        entity.trip_update.delay = 60
+        vehicle = message.entity.add()
+        vehicle.id = f"vp{n}"
+        vehicle.vehicle.trip.trip_id = trip
+        vehicle.vehicle.vehicle.id = f"V{n}"
+        vehicle.vehicle.position.latitude = 0
+        vehicle.vehicle.position.longitude = 0
+    start = datetime(2026, 6, 10, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["A"], limit=1)], start=start, with_vehicles=True
+        )
+        assert [row.predicted_departure for row in board] == [
+            datetime(2026, 6, 10, 8, 1, tzinfo=UTC)
+        ]
+
+    _run(_index_from_zip_bytes(feed), body, message)
+
+
+def test_the_index_reads_a_local_instant_as_an_instant() -> None:
+    """Given an instant in the feed's own zone on a DST-change day, the
+    index works in UTC rather than by wall clock against its day starts.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\n",
+        timezone="America/Los_Angeles",
+        calendar="DAILY,1,1,1,1,1,1,1,20260101,20261231",
+    )
+    index = _index_from_zip_bytes(feed)
+    local = ZoneInfo("America/Los_Angeles")
+    # 2026-03-08 is spring-forward: noon PDT minus 12h is 07:00 UTC, so the
+    # 08:00:00 run departs at 15:00 UTC (08:00 PDT).
+    now = datetime(2026, 3, 8, 7, 30, tzinfo=local)
+    [dep] = index.upcoming_departures(["A"], None, now, timedelta(hours=1))
+    assert dep.departure == datetime(2026, 3, 8, 15, tzinfo=UTC)
+    index.close()
+
+
+def test_an_unrepresentable_start_is_rejected() -> None:
+    index = _index_from_zip_bytes(_feed("T,08:00:00,08:00:00,A,1\n"))
+    edge = datetime.min.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+
+    async def body(handle: TransitFeedHandle) -> None:
+        with pytest.raises(ValueError, match="representable"):
+            await handle.get_scheduled_departures(
+                [ArrivalsQuery(["A"], limit=1)], start=edge
+            )
+
+    _run(index, body)
+
+
+def test_a_long_reach_from_spring_forward_day_is_placed() -> None:
+    """Spring-forward day's start (noon PDT minus 12h) is 23:00 PST the
+    evening before, so a ten-day stop time from it lands in a window whose
+    ten-days-earlier instant still reads as the previous local date.
+    """
+    feed = _feed(
+        "L,00:00:00,00:00:00,A,1\nL,240:00:00,240:00:00,X,2\n",
+        timezone="America/Los_Angeles",
+        trips="R,DAILY,L\n",
+    )
+    start = datetime(2026, 3, 18, 6, 30, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["X"], limit=None)],
+            start=start,
+            end=start + timedelta(hours=1),
+        )
+        # The 2026-03-08 run: 07:00 UTC + 240h.
+        assert _times(board) == [datetime(2026, 3, 18, 7, tzinfo=UTC)]
+
+    _run(_index_from_zip_bytes(feed), body)
+
+
+def test_runs_dated_where_no_day_start_exists_are_skipped() -> None:
+    """Tokyo, a calendar from 0001-01-01: that day's start (noon minus 12h,
+    in UTC) falls before datetime itself. A TripUpdate and a detour dated
+    00010101, and a stop time that would land from that day into today's
+    window, all name runs that can't be dated -- skipped on every path.
+    """
+    window_start = datetime(2026, 6, 10, tzinfo=UTC)
+    # Exactly half an hour after datetime.min, counted back from the window:
+    # only the window's far end still lands on a representable (year-1) day.
+    reach = int((window_start - datetime.min.replace(tzinfo=UTC)).total_seconds())
+    reach += 1800
+    far = f"{reach // 3600}:{reach % 3600 // 60:02d}:{reach % 60:02d}"
+    feed = _feed(
+        f"T,08:00:00,08:00:00,A,1\nT,08:10:00,08:10:00,B,2\nG,{far},{far},A,1\n",
+        timezone="Asia/Tokyo",
+        trips="R,DAILY,T\nR,DAILY,G\n",
+        calendar="DAILY,1,1,1,1,1,1,1,00010101,20991231",
+    )
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    update = message.entity.add()
+    update.id = "tu"
+    update.trip_update.trip.trip_id = "T"
+    update.trip_update.trip.start_date = "00010101"
+    update.trip_update.delay = 60
+    detour = message.entity.add()
+    detour.id = "mod"
+    detour.trip_modifications.selected_trips.add().trip_ids.append("T")
+    detour.trip_modifications.service_dates.append("00010101")
+    modification = detour.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+
+    async def body(handle: TransitFeedHandle) -> None:
+        end = window_start + timedelta(hours=1)
+        [scheduled] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["A"], limit=None)], start=window_start, end=end
+        )
+        [arrivals] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=1)], start=window_start
+        )
+        [trips] = await handle.get_upcoming_trips(
+            [TripQuery("A", "B", limit=1)], start=window_start
+        )
+        assert scheduled == []
+        # 08:10 in Tokyo is 23:10 UTC the day before.
+        assert _times(arrivals) == [datetime(2026, 6, 10, 23, 10, tzinfo=UTC)]
+        assert handle._index.instance_trip_calls([("T", date(1, 1, 1))]) == []
+        assert [trip.scheduled_departure for trip in trips] == [
+            datetime(2026, 6, 10, 23, tzinfo=UTC)
         ]
 
     _run(_index_from_zip_bytes(feed), body, message)

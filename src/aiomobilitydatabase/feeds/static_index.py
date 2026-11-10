@@ -113,6 +113,9 @@ _EXCEPTION_SERVICE_ADDED = 1
 # Open-ended scans never reach past this instant: a calendar running to year
 # 9999 ("forever") would otherwise overflow date arithmetic near datetime.max.
 _LATEST_INSTANT = datetime(9999, 12, 1, tzinfo=UTC)
+# Stop times reaching further past their service day than this are placed
+# row by row, not by scanning every day back (see StaticIndex._reach_profile).
+_LONG_REACH = 4 * 86_400
 _EXCEPTION_SERVICE_REMOVED = 2
 
 _WEEKDAY_COLUMNS = (
@@ -474,9 +477,9 @@ class StaticIndex:
         self.timezone_name = timezone_name
         self._tz = ZoneInfo(timezone_name)
         self._last_dates: dict[str, date] | None = None
-        self._max_secs: int | None = None
         self._first_date: date | None = None
         self._first_date_known = False
+        self._reach: tuple[int, tuple[int, ...]] | None = None
 
     # -- construction ------------------------------------------------------
 
@@ -1207,7 +1210,10 @@ class StaticIndex:
         found: list[TripInstanceCalls] = []
         for service_date in sorted(by_day):
             active = self.active_service_ids(service_date)
-            day_start = self._service_day_start(service_date).astimezone(UTC)
+            try:
+                day_start = self._service_day_start(service_date)
+            except OverflowError:
+                continue  # a day whose start can't be dated has no runs
             if active:
                 found.extend(
                     self._instance_calls_on(
@@ -1258,7 +1264,10 @@ class StaticIndex:
         )
         found: list[tuple[str, date, datetime]] = []
         for service_date in sorted(by_day):
-            day_start = self._service_day_start(service_date).astimezone(UTC)
+            try:
+                day_start = self._service_day_start(service_date)
+            except OverflowError:
+                continue  # a day whose start can't be dated has no runs
             active = self.active_service_ids(service_date)
             found.extend(
                 (trip_id, service_date, day_start)
@@ -1447,21 +1456,6 @@ class StaticIndex:
                 active.discard(service_id)
         return active
 
-    def _max_stop_secs(self) -> int:
-        """Return the feed's latest stop time, in seconds from its day's start.
-
-        GTFS times may pass 24:00:00 (and 48:00:00, for multi-day trips),
-        so this is how far a run can reach past its service day. Computed
-        once; the index never changes.
-        """
-        if self._max_secs is None:
-            row = self._conn.execute(
-                "SELECT MAX(MAX(COALESCE(arrival_secs, 0), "
-                "COALESCE(departure_secs, 0))) FROM stop_times"
-            ).fetchone()
-            self._max_secs = max(0, row[0] or 0)
-        return self._max_secs
-
     def _first_service_date(self) -> date | None:
         """Return the first day any service can run; None for no services.
 
@@ -1483,32 +1477,109 @@ class StaticIndex:
             self._first_date_known = True
         return self._first_date
 
+    def _reach_profile(self) -> tuple[int, tuple[int, ...]]:
+        """Return (normal reach, long reaches): how far runs reach past their day.
+
+        Most stop times end within a few days of their service day; those
+        bound the day scan's look-back. Longer ones (multi-week trips, or
+        garbage like 30000000:00:00) would drag every scan back years, so
+        they are listed separately and placed row by row. Computed once.
+        """
+        if self._reach is None:
+            reach = "MAX(COALESCE(arrival_secs, 0), COALESCE(departure_secs, 0))"
+            normal = self._conn.execute(
+                f"SELECT MAX({reach}) FROM stop_times WHERE {reach} < ?",
+                (_LONG_REACH,),
+            ).fetchone()[0]
+            long = self._conn.execute(
+                f"SELECT DISTINCT {reach} FROM stop_times WHERE {reach} >= ? "
+                f"ORDER BY {reach}",
+                (_LONG_REACH,),
+            ).fetchall()
+            self._reach = (normal or 0, tuple(row[0] for row in long))
+        return self._reach
+
+    def _reaches(self, service_date: date, secs: int, at: datetime) -> bool:
+        """Whether a run on ``service_date`` can still be under way at ``at``."""
+        try:
+            return self._service_day_start(service_date) + timedelta(seconds=secs) >= at
+        except OverflowError:
+            # Past the end of datetime it reaches anything; before its start
+            # (a year-1 day east of UTC) no run can be dated at all.
+            return service_date.year > 1
+
+    def _first_reaching_day(
+        self, lower: date, upper: date, secs: int, at: datetime
+    ) -> date | None:
+        """Return the first day in [lower, upper] whose runs reach ``at``.
+
+        Day starts only increase, so the days that reach are a suffix:
+        binary search, O(log days) whatever the stop times hold.
+        """
+        if lower > upper or not self._reaches(upper, secs, at):
+            return None
+        low, high = 0, (upper - lower).days
+        while low < high:
+            middle = (low + high) // 2
+            if self._reaches(lower + timedelta(days=middle), secs, at):
+                high = middle
+            else:
+                low = middle + 1
+        return lower + timedelta(days=low)
+
+    def _long_reach_days(
+        self, window_start: datetime, window_end: datetime, before: date
+    ) -> set[date]:
+        """Days before ``before`` that a long-reaching stop time can put in the window.
+
+        A row ``secs`` past its day lands in the window exactly when its
+        day starts within [window_start - secs, window_end - secs]: a
+        handful of days per distinct value (the window filter itself stays
+        exact), never a scan of every day back.
+        """
+        first = self._first_service_date()
+        days: set[date] = set()
+        if first is None:
+            return days
+        for secs in self._reach_profile()[1]:
+            span = timedelta(seconds=secs)
+            try:
+                latest = (window_end - span).astimezone(self._tz).date()
+            except OverflowError:
+                continue  # its day would start before datetime: no such run
+            try:
+                earliest = (window_start - span).astimezone(self._tz).date()
+            except OverflowError:
+                earliest = first
+            # A day starts at most an hour after its local midnight (noon
+            # minus 12h on a fall-back day) but can start the evening
+            # before (spring-forward: 23:00 the previous local date) --
+            # hence a day of margin after ``latest`` and none before.
+            day = max(first, earliest)
+            stop = min(before - timedelta(days=1), latest + timedelta(days=1))
+            while day <= stop:
+                days.add(day)
+                day += timedelta(days=1)
+        return days
+
     def _scan_start(self, window_start: datetime, local_today: date) -> date:
         """Return the earliest service day whose runs can reach ``window_start``.
 
-        A run on day D reaches its latest call at D's start plus the feed's
-        latest stop time (past 24:00:00, past 48:00:00 for multi-day trips).
-        Day starts only ever increase, so the days that can reach the window
-        are exactly those from some day onward: walk back from the window's
-        own day while the day before still reaches it. Exact in any zone --
-        a two-hour DST shift, a skipped day -- with no margin to guess, and
-        never before the feed's first service day, so a garbage stop time
-        can neither overflow nor scan millennia. At least one day back, as
-        an enclosure margin for DST edge instants.
+        A run on day D reaches D's start plus its latest stop time; with the
+        normal reach (see :meth:`_reach_profile`) that is exact in any zone
+        -- a two-hour DST jump, a skipped day -- by binary search, never
+        before the feed's first service day. Long-reaching rows are placed
+        separately (:meth:`_long_reach_days`). At least one day back: on a
+        fall-back day an instant's local date can precede the start of its
+        own service day (00:00-01:00, before noon minus 12h).
         """
-        latest = self._max_stop_secs()
+        floor = local_today - timedelta(days=1)
         first = self._first_service_date()
-        day = local_today
-        while first is not None and day > first:
-            before = day - timedelta(days=1)
-            start = self._service_day_start(before).astimezone(UTC)
-            try:
-                if start + timedelta(seconds=latest) < window_start:
-                    break
-            except OverflowError:
-                pass  # reaches past the end of datetime: certainly far enough
-            day = before
-        return min(day, local_today - timedelta(days=1))
+        if first is None:
+            return floor
+        normal = self._reach_profile()[0]
+        reaching = self._first_reaching_day(first, local_today, normal, window_start)
+        return min(reaching or local_today, floor)
 
     def _service_last_dates(self) -> dict[str, date]:
         """Map each service id to the last service date it can be active on.
@@ -1697,42 +1768,44 @@ class StaticIndex:
             list(trip_ids),
         ).fetchall()
         local_today = at.astimezone(self._tz).date()
+        first = self._first_service_date()
+        if first is None or first > local_today:
+            return {}
         active_by_day: dict[date, set[str]] = {}
         current: dict[str, date] = {}
         for trip_id, service_id, end_secs in trips:
             if end_secs is None or end_secs < 0:
                 continue
-            back = end_secs // 86_400 + 1
-            for offset in range(back, -1, -1):
-                service_date = local_today - timedelta(days=offset)
-                active = active_by_day.get(service_date)
+            # The days whose run is still under way at ``at`` are a suffix
+            # (day starts only increase): find where it begins by binary
+            # search, never before the feed's first service day -- a garbage
+            # stop time can't send this back millennia or past datetime.
+            back = min(end_secs // 86_400 + 1, (local_today - first).days)
+            day = self._first_reaching_day(
+                local_today - timedelta(days=back), local_today, end_secs, at
+            )
+            while day is not None and day <= local_today:
+                active = active_by_day.get(day)
                 if active is None:
-                    active = active_by_day[service_date] = self.active_service_ids(
-                        service_date
-                    )
-                if service_id not in active:
-                    continue
-                day_start = self._service_day_start(service_date).astimezone(UTC)
-                try:
-                    last_call = day_start + timedelta(seconds=end_secs)
-                except OverflowError:
-                    continue  # a garbage stop time no date can carry
-                if last_call >= at:
-                    current[trip_id] = service_date
+                    active = active_by_day[day] = self.active_service_ids(day)
+                if service_id in active:
+                    current[trip_id] = day
                     break
+                day += timedelta(days=1)
         return current
 
     def _service_day_start(self, service_date: date) -> datetime:
-        """Start instant of a GTFS service day: local noon minus 12 hours.
+        """Start instant of a GTFS service day: local noon minus 12 hours, UTC.
 
-        This resolves to the same instant as local midnight even on
-        DST-transition days (Python's aware-datetime arithmetic is
-        wall-clock, and noon is never itself ambiguous or skipped). The
-        actual DST safety comes later: callers must add GTFS elapsed
-        seconds to this anchor's UTC form, not to the aware local value.
+        GTFS measures times from "noon minus 12h" of the service day --
+        "effectively midnight except for days on which daylight savings
+        time changes occur". Twelve ELAPSED hours: subtracted in UTC, since
+        Python's aware-datetime arithmetic in the local zone is wall-clock
+        and would land on local midnight, an hour off on DST days. Raises
+        OverflowError for a day whose start can't be represented.
         """
         noon = datetime.combine(service_date, time(12, 0), tzinfo=self._tz)
-        return noon - timedelta(hours=12)
+        return noon.astimezone(UTC) - timedelta(hours=12)
 
     def _service_day_windows(
         self, now_utc: datetime, lookahead: timedelta, grace: timedelta
@@ -1742,8 +1815,10 @@ class StaticIndex:
         The window runs from ``now_utc - grace`` to ``now_utc + lookahead``.
         Shared by ``upcoming_departures`` and ``upcoming_trips`` so the
         DST-safe day-window arithmetic exists exactly once. Scans every
-        service day that could contribute: one day BEFORE the window
-        (>24:00:00 times still upcoming) through one day AFTER the window's
+        service day that could contribute: from the first whose runs reach
+        the window (see :meth:`_scan_start`; times past 24:00:00 are still
+        upcoming), plus the few earlier days a long-reaching stop time lands
+        from (:meth:`_long_reach_days`), through one day AFTER the window's
         local end date (enclosure margin for DST edge instants). Empty days
         cost one cheap indexed query; silently narrower bounds cost dropped
         departures (hypothesis-found bug, 2026-07-31: the old hardcoded
@@ -1761,21 +1836,23 @@ class StaticIndex:
         end_local = window_end.astimezone(self._tz).date()
         scan_start = self._scan_start(window_start, local_today)
         scan_end = end_local + timedelta(days=1)
-        num_scan_days = (scan_end - scan_start).days + 1
-        for offset in range(num_scan_days):
-            service_date = scan_start + timedelta(days=offset)
+        days = [
+            scan_start + timedelta(days=offset)
+            for offset in range((scan_end - scan_start).days + 1)
+        ]
+        # Plus the few earlier days a long-reaching stop time can land from.
+        days[:0] = sorted(self._long_reach_days(window_start, window_end, scan_start))
+        for service_date in days:
             active = self.active_service_ids(service_date)
             if not active:
                 continue
-            day_start = self._service_day_start(service_date)
-            # GTFS times are elapsed seconds from the service-day anchor, not
-            # wall-clock times: add them in UTC (an absolute, offset-stable
-            # timeline) rather than to the aware local `day_start`, whose
-            # addition Python resolves via wall-clock semantics and would
-            # drift by an hour across a DST transition.
-            day_start_utc = day_start.astimezone(UTC)
-            window_lo = (window_start - day_start).total_seconds()
-            window_hi = (window_end - day_start).total_seconds()
+            try:
+                # Already UTC: GTFS times are elapsed seconds from it.
+                day_start_utc = self._service_day_start(service_date)
+            except OverflowError:
+                continue  # a day whose start can't be dated has no runs
+            window_lo = (window_start - day_start_utc).total_seconds()
+            window_hi = (window_end - day_start_utc).total_seconds()
             if window_hi < 0:
                 continue
             yield service_date, day_start_utc, active, window_lo, window_hi
@@ -1967,7 +2044,10 @@ class StaticIndex:
             active = self.active_service_ids(service_date)
             if not active:
                 continue
-            day_start = self._service_day_start(service_date).astimezone(UTC)
+            try:
+                day_start = self._service_day_start(service_date)
+            except OverflowError:
+                continue  # a day whose start can't be dated has no runs
             trip_ids = sorted(by_day[service_date])
             rows.extend(
                 self._departures_on(
@@ -2164,7 +2244,10 @@ class StaticIndex:
             active = self.active_service_ids(service_date)
             if not active:
                 continue
-            day_start = self._service_day_start(service_date).astimezone(UTC)
+            try:
+                day_start = self._service_day_start(service_date)
+            except OverflowError:
+                continue  # a day whose start can't be dated has no runs
             trip_ids = sorted(by_day[service_date])
             rows.extend(
                 self._trips_on(

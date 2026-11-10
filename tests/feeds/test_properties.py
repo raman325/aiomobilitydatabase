@@ -160,9 +160,13 @@ def _index_from_zip_bytes(zip_bytes: bytes) -> StaticIndex:
 
 
 def _oracle_anchor_utc(service_date: date, tz: ZoneInfo) -> datetime:
-    """Independent restatement of the GTFS rule: noon minus 12h, in UTC."""
+    """Independent restatement of the GTFS rule: noon minus 12 ELAPSED hours.
+
+    Subtracting in the local zone would be wall-clock arithmetic and land on
+    local midnight, an hour off on DST days.
+    """
     noon = datetime.combine(service_date, time(12, 0), tzinfo=tz)
-    return (noon - timedelta(hours=12)).astimezone(UTC)
+    return noon.astimezone(UTC) - timedelta(hours=12)
 
 
 # DST-transition days (and their neighbors) for every DST-observing zone in

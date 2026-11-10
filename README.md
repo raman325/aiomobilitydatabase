@@ -246,9 +246,15 @@ Notes on direct mode:
   are read whole before the scan begins; every other row sorts at its
   scheduled time, so a board is final as soon as it is full inside the
   slice read so far, and the answer is exactly that of reading the whole
-  window. Each slice looks back as many days as the feed's latest stop
-  time reaches (a night service at 47:30, a multi-day trip at 60:00), plus
-  an hour for DST. An open-ended query with no limit raises `ValueError`.
+  window. Each slice looks back exactly as far as the feed's stop times
+  reach past their service day (a night service at 47:30, a multi-day trip
+  at 60:00), whatever the zone's clocks do, and never before its first
+  service day; a stop time reaching weeks or more past its day is placed
+  on its own instead of dragging every scan back. Times count from "noon
+  minus 12h" of the service day, in elapsed time as GTFS specifies, so on a
+  DST-change day they are an hour off local midnight. An open-ended query
+  with no limit raises `ValueError`, as do a naive (timezone-less) or
+  unrepresentable `start`/`end`.
   `end` bounds scheduled times; a delayed trip predicted past it, and
   RT-added trips, still show.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation

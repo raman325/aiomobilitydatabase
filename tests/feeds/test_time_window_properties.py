@@ -215,12 +215,18 @@ async def _uncapped[T](
                     calls,
                     timedelta(0),
                     wanted_stops=wanted_stops,
-                    end=end,
+                    end=None,  # the reference applies ``end`` itself
                     rt_stops=rt_stops,
                     stops_by_id=stops_by_id,
                     route=routes_by_id.get(instance.route_id),
                 )
             )
+        rows = [
+            row
+            for row in rows
+            if end is None
+            or (row.scheduled_departure is not None and row.scheduled_departure <= end)
+        ]
         return rows, touched
 
     handle._addressed_runs = nothing_up_front  # type: ignore[method-assign]

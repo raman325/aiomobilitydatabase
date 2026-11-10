@@ -529,10 +529,20 @@ def _utc_window(
     it never does. A naive datetime names no instant at all.
     """
     start = start or datetime.now(UTC)
+    window: list[datetime | None] = []
     for name, value in (("start", start), ("end", end)):
-        if value is not None and value.utcoffset() is None:
+        if value is None:
+            window.append(None)
+            continue
+        if value.utcoffset() is None:
             raise ValueError(f"{name} must be timezone-aware, got {value!r}")
-    return start.astimezone(UTC), end.astimezone(UTC) if end is not None else None
+        try:
+            window.append(value.astimezone(UTC))
+        except OverflowError as err:
+            raise ValueError(f"{name} is outside the representable range") from err
+    utc_start, utc_end = window
+    assert utc_start is not None
+    return utc_start, utc_end
 
 
 def _require_bound(end: datetime | None, limits: Sequence[int | None]) -> None:
@@ -1408,7 +1418,9 @@ class TransitFeedHandle:
         inside the slice read so far: nothing unread can sort ahead of it.
         The answer is exactly that of reading the whole window at once.
         Open-ended queries need a limit: ``end=None`` with any
-        ``limit=None`` query raises ``ValueError``. ``end < start`` returns
+        ``limit=None`` query raises ``ValueError``, as does a naive
+        (timezone-less) or unrepresentable ``start`` or ``end``. ``end <
+        start`` returns
         empty boards.
 
         ``grace`` reaches that far BEFORE ``start`` when collecting
@@ -1863,7 +1875,8 @@ class TransitFeedHandle:
         including the open-ended default: with ``end=None`` each query's
         result fills to its ``limit`` however far ahead the next journeys
         are, and ``end=None`` with a ``limit=None`` query raises
-        ``ValueError``. Each query's ``limit`` caps its merged result,
+        ``ValueError``, as does a naive or unrepresentable ``start``/``end``.
+        Each query's ``limit`` caps its merged result,
         nearest effective origin departure first. RT cancellations — and
         SKIPPED stops: a skipped origin or skipped destination kills the
         row (the rider cannot board or alight there), while a skipped
@@ -2325,7 +2338,8 @@ class TransitFeedHandle:
         The schedule-only twin of :meth:`get_arrivals`: same
         :class:`ArrivalsQuery` batch, same ``start``/``end``/``limit``
         rules (open-ended by default, ``ValueError`` for ``end=None`` with
-        a ``limit=None`` query, ``end < start`` gives empty boards), but no
+        a ``limit=None`` query or a naive ``start``/``end``, ``end < start``
+        gives empty boards), but no
         realtime overlay and no ``grace``. It never makes a network request,
         so a calendar view or a config flow keeps working when a producer's
         realtime endpoint is down or its API key has lapsed. For "every

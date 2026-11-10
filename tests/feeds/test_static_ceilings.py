@@ -220,10 +220,11 @@ def test_detour_index_helpers_accept_empty_input(tmp_path: Path) -> None:
     assert index.run_days([]) == []
 
 
-def test_a_stop_time_no_date_can_carry_has_no_current_run(tmp_path: Path) -> None:
+def test_a_stop_time_no_date_can_carry_is_still_under_way(tmp_path: Path) -> None:
     """A garbage stop time (300000:00:00, decades past its day) on service
-    that only runs in year 9999: every candidate run's last call falls past
-    the end of datetime, so none is current -- not an OverflowError.
+    that only runs in year 9999: the first run's last call falls past the
+    end of datetime, so that run is still under way -- found, not an
+    OverflowError.
     """
     index = _index(
         tmp_path,
@@ -231,4 +232,4 @@ def test_a_stop_time_no_date_can_carry_has_no_current_run(tmp_path: Path) -> Non
         stop_times="T1,08:00:00,08:00:00,S1,1\nT1,300000:00:00,300000:00:00,S2,2\n",
     )
     at = datetime(9999, 11, 1, tzinfo=UTC)
-    assert index.current_service_dates(["T1"], at) == {}
+    assert index.current_service_dates(["T1"], at) == {"T1": date(9999, 1, 1)}
