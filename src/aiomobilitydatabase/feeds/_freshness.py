@@ -72,9 +72,7 @@ class Validators:
     last_modified: str | None
 
     @classmethod
-    def from_fields(
-        cls, fields: Fields, now: datetime | None = None
-    ) -> Validators | None:
+    def from_fields(cls, fields: Fields) -> Validators | None:
         """Read the validators in a set of header fields; None when neither.
 
         An ETag that isn't exactly one quoted entity-tag (``*``, a list, an
@@ -82,7 +80,7 @@ class Validators:
         that isn't an HTTP-date.
         """
         etag = _etag(fields)
-        last_modified = _valid_last_modified(fields, now)
+        last_modified = _valid_last_modified(fields)
         if not etag and not last_modified:
             return None
         return cls(etag=etag or None, last_modified=last_modified)
@@ -216,15 +214,19 @@ def _rfc850_instant(
     return None
 
 
-def _delta_seconds(value: str | None) -> int | None:
+def _delta_seconds(value: str | None, *, quoted: bool = False) -> int | None:
     """Parse an RFC 9111 delta-seconds value: ASCII digits only.
 
     Values too large to represent, or above 2^31, are 2^31 (section 1.2.2),
     so a hostile header can't overflow the arithmetic that follows.
+    ``quoted`` admits the quoted form a ``max-age`` argument may arrive in;
+    an Age field has no such form.
     """
     if value is None:
         return None
-    value = value.strip(_OWS).strip('"')
+    value = value.strip(_OWS)
+    if quoted and len(value) > 1 and value[0] == value[-1] == '"':
+        value = value[1:-1]
     if not value or not value.isascii() or not value.isdigit():
         return None
     if len(value.lstrip("0")) > _DELTA_SECONDS_DIGITS:
@@ -248,11 +250,16 @@ def _split_field(value: str) -> list[str] | None:
     for char in value:
         if quoted:
             if escaped:
+                # quoted-pair: a backslash escapes HTAB, SP, VCHAR or obs-text.
+                if not (char == "\t" or " " <= char <= "~" or char >= "\x80"):
+                    return None
                 escaped = False
             elif char == "\\":
                 escaped = True
             elif char == '"':
                 quoted, closed = False, True
+            elif not (char in "\t " or "!" <= char <= "~" or char >= "\x80"):
+                return None  # qdtext: no controls, no DEL (RFC 9110 5.6.4)
             current.append(char)
             continue
         if char == ",":
@@ -260,7 +267,7 @@ def _split_field(value: str) -> list[str] | None:
             current, closed = [], False
             continue
         if char == '"':
-            if closed or not "".join(current).rstrip(_OWS).endswith("="):
+            if closed or not "".join(current).endswith("="):
                 return None
             quoted = True
         current.append(char)
@@ -363,7 +370,7 @@ def freshness_of(
     lifetime: float | None
     if "max-age" in directives:
         values = directives["max-age"]
-        parsed = _delta_seconds(values[0])
+        parsed = _delta_seconds(values[0], quoted=True)
         lifetime = float(parsed) if len(values) == 1 and parsed is not None else 0.0
     elif "expires" in fields:
         expires = _http_date(_first(fields, "expires"), received_at)
@@ -376,7 +383,9 @@ def freshness_of(
         return Freshness(lifetime=None)
     apparent_age = max(0.0, (received_at - date).total_seconds()) if date else 0.0
     age_field = _first(fields, "age")
-    age = _delta_seconds(age_field.split(",")[0]) if age_field else None
+    age = _delta_seconds(age_field.split(",")[0]) if age_field is not None else None
+    if age_field is not None and age is None:
+        return Freshness(lifetime=0.0)  # an invalid Age: no telling how old
     response_delay = max(0.0, (received_at - requested_at).total_seconds())
     initial_age = max(apparent_age, (age or 0) + response_delay)
     return Freshness(lifetime=max(0.0, lifetime - initial_age + response_delay))
@@ -392,27 +401,27 @@ def _entity_tag(fields: Fields) -> tuple[bool, str] | None:
     return False, value
 
 
-def _valid_last_modified(fields: Fields, now: datetime | None) -> str | None:
-    """Return Last-Modified if it is an HTTP-date as of ``now``; else None."""
+def _valid_last_modified(fields: Fields) -> str | None:
+    """Return Last-Modified if it is an HTTP-date; None otherwise.
+
+    The cache only ever reads fields pinned at receipt (see
+    :func:`_received`), whose dates mean the same whenever they are read.
+    """
     value = _first(fields, "last-modified")
-    return value if _http_date(value, now) is not None else None
+    return value if _http_date(value) is not None else None
 
 
-def _same_instant(
-    new: str, stored: str | None, new_now: datetime, stored_now: datetime
-) -> bool:
+def _same_instant(new: str, stored: str | None) -> bool:
     """Whether two Last-Modified values name the same instant.
 
     Compared as dates (an RFC 850 date equals its IMF-fixdate form); a value
     that isn't an HTTP-date names no instant and matches nothing.
     """
-    new_date = _http_date(new, new_now)
-    return new_date is not None and new_date == _http_date(stored, stored_now)
+    new_date = _http_date(new)
+    return new_date is not None and new_date == _http_date(stored)
 
 
-def _selects(
-    stored: Fields, new: Fields, stored_at: datetime, new_at: datetime
-) -> bool:
+def _selects(stored: Fields, new: Fields) -> bool:
     """Whether a 304 identifies the stored response (RFC 9111 section 4.3.4).
 
     A 304 carrying a strong ETag selects only a stored response with that
@@ -428,29 +437,46 @@ def _selects(
         return stored_tag is not None and stored_tag == new_tag
     # A Last-Modified that isn't an HTTP-date is no validator (it is never
     # sent, see Validators.from_fields), on either side.
-    new_modified = _valid_last_modified(new, new_at)
-    stored_modified = _valid_last_modified(stored, stored_at)
+    new_modified = _valid_last_modified(new)
+    stored_modified = _valid_last_modified(stored)
     if new_tag is None and not new_modified:
         return stored_tag is None and not stored_modified
     tag_matches = new_tag is None or (
         stored_tag is not None and stored_tag[1] == new_tag[1]
     )
-    modified_matches = not new_modified or _same_instant(
-        new_modified, stored_modified, new_at, stored_at
-    )
+    modified_matches = not new_modified or _same_instant(new_modified, stored_modified)
     return tag_matches and modified_matches
 
 
-def _dated(fields: Fields, received_at: datetime) -> Fields:
-    """Give a response with no Date its receipt time as Date.
+# Stands in for a date that named no instant when its response arrived.
+_NO_INSTANT = "-"
 
-    RFC 9110 section 6.6.1: a recipient caching a message without Date
-    MUST record when it was received as its Date -- so a 304 lacking one
-    replaces the stored Date instead of leaving the old one to age it.
+
+def _received(fields: Fields, received_at: datetime) -> Fields:
+    """Pin a response's dates to its own arrival.
+
+    Date, Expires and Last-Modified are read once, against when THIS
+    response arrived (which places an RFC 850 year), and kept as
+    IMF-fixdate, a form whose meaning no later reading can change -- so
+    after a 304 merges its fields into a stored response's, each date
+    still means what it meant on arrival. One that named no instant
+    becomes a marker that never parses: read later against another time,
+    an RFC 850 year could otherwise turn a stale Expires into fifty years.
+    A Date that is absent or invalid is the receipt time (RFC 9110 section
+    6.6.1: a recipient caching a message without one MUST record it), so a
+    304 lacking one replaces the stored Date instead of leaving it to age.
     """
-    if _first(fields, "date") is not None:
-        return fields
-    return {**fields, "date": (format_datetime(received_at, usegmt=True),)}
+    pinned = dict(fields)
+    for name in ("date", "expires", "last-modified"):
+        value = _first(fields, name)
+        instant = _http_date(value, received_at)
+        if name == "date" and instant is None:
+            instant = received_at
+        if instant is not None:
+            pinned[name] = (format_datetime(instant, usegmt=True),)
+        elif value is not None:
+            pinned[name] = (_NO_INSTANT,)
+    return pinned
 
 
 @dataclass(frozen=True)
@@ -608,11 +634,7 @@ class FreshnessCache[T]:
 
     async def _revalidate(self, key: str, fetch: Fetch[T]) -> T:
         entry = self._entries.get(key)
-        # Each side's dates are read as of when that side was received, so
-        # an RFC 850 year can't change meaning between request and 304.
-        validators = (
-            Validators.from_fields(entry.fields, entry.received_at) if entry else None
-        )
+        validators = Validators.from_fields(entry.fields) if entry else None
         requested = self._clock()
         response = await fetch(validators=validators)
         if (
@@ -620,7 +642,7 @@ class FreshnessCache[T]:
             and entry is not None
             and validators is not None
             and not _selects(
-                entry.fields, response.fields, entry.received_at, response.received_at
+                entry.fields, _received(response.fields, response.received_at)
             )
         ):
             # A 304 that doesn't identify the stored response can't update
@@ -628,7 +650,7 @@ class FreshnessCache[T]:
             validators = None
             requested = self._clock()
             response = await fetch(validators=None)
-        fields = _dated(response.fields, response.received_at)
+        fields = _received(response.fields, response.received_at)
         if response.value is None:
             if entry is None or validators is None:
                 # A 304 answers only a conditional request; the caller's

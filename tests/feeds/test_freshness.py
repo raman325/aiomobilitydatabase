@@ -85,10 +85,15 @@ SUN = _http(T0 - timedelta(days=4))
             Freshness(lifetime=0.0),
         ),
         ({"Expires": _http(T0 - timedelta(hours=1))}, Freshness(lifetime=0.0)),
-        # Age reduces the remaining lifetime; an invalid Age is ignored.
+        # Age reduces the remaining lifetime; an invalid Age leaves no telling
+        # how old the response is, so it is stale now.
         ({"Cache-Control": "max-age=30", "Age": "12"}, Freshness(lifetime=18.0)),
         ({"Cache-Control": "max-age=30", "Age": "40"}, Freshness(lifetime=0.0)),
-        ({"Cache-Control": "max-age=30", "Age": "soon"}, Freshness(lifetime=30.0)),
+        ({"Cache-Control": "max-age=30", "Age": "soon"}, Freshness(lifetime=0.0)),
+        ({"Cache-Control": "max-age=30", "Age": '"5"'}, Freshness(lifetime=0.0)),
+        ({"Cache-Control": "max-age=30", "Age": "\xa05"}, Freshness(lifetime=0.0)),
+        ({"Cache-Control": "max-age=30", "Age": "\u0665"}, Freshness(lifetime=0.0)),
+        ({"Cache-Control": 'max-age="\u0666\u0660\u0660"'}, Freshness(lifetime=0.0)),
     ],
 )
 def test_freshness_examples(headers: dict[str, str], expected: Freshness) -> None:
@@ -155,6 +160,7 @@ def test_a_last_modified_that_isnt_an_http_date_validates_nothing() -> None:
         "Thu, 30 Jul \uff12\uff10\uff12\uff16 13:00:00 GMT",  # full-width digits
         "\xa0Thu, 30 Jul 2026 13:00:00 GMT",  # not optional whitespace
         "Thu, 30 Jul 2026 12:00:60 GMT",  # :60 that isn't a leap second
+        "Thu, 30 Jul 2026 23:58:60 GMT",
         "Thu, 30 Jul 2026 1\u0663:00:00 GMT",  # an Arabic-Indic digit in the time
         "Thursday, \u0663\u0660-Jul-26 13:00:00 GMT",  # RFC 850, other digits
         "Thu Jul 30 13:00:00 \uff12\uff10\uff12\uff16",  # asctime, full-width year
@@ -281,6 +287,18 @@ def test_an_rfc850_year_follows_the_fifty_year_rule(value: str, year: int) -> No
             "Monday, 28-Feb-78 00:00:00 GMT",
             datetime(2028, 2, 29, tzinfo=UTC),
             datetime(2078, 2, 28, tzinfo=UTC),
+        ),
+        # On a leap day the limit is 28 Feb, 00:00: noon that day is past it.
+        (
+            "Tuesday, 28-Feb-78 12:00:00 GMT",
+            datetime(2028, 2, 29, tzinfo=UTC),
+            datetime(1978, 2, 28, 12, tzinfo=UTC),
+        ),
+        # From 9949 the limit is 9999 exactly, not the end of datetime.
+        (
+            "Sunday, 31-Dec-99 00:00:00 GMT",
+            datetime(9949, 6, 1, tzinfo=UTC),
+            datetime(9899, 12, 31, tzinfo=UTC),
         ),
         # Near the end of datetime the window simply ends there.
         (
@@ -445,6 +463,16 @@ def test_a_quote_that_isnt_an_argument_cannot_hide_no_store(header: str) -> None
         ("max-age=600,\u2028private", Freshness(0.0)),
         ("\x1fmax-age=600", Freshness(0.0)),
         (" \tmax-age=600 \t, public", Freshness(600.0)),
+        ("max-age=600,\xa0", Freshness(0.0)),  # an element of Unicode space
+        ("\vmax-age=600", Freshness(0.0)),  # ASCII, but not OWS
+        ("max-age=600\f", Freshness(0.0)),
+        ("max-age=600\r", Freshness(0.0)),
+        # A quoted-string holds no controls or DEL, nor escapes them.
+        ('max-age=600, ext="a\x01b"', Freshness(0.0)),
+        ('max-age=600, ext="a\x00b"', Freshness(0.0)),
+        ('max-age=600, ext="a\x7fb"', Freshness(0.0)),
+        ('max-age=600, ext="a\\\x01b"', Freshness(0.0)),
+        ('max-age=600, ext="tab\there \\"ok\\""', Freshness(600.0)),
     ],
 )
 def test_cache_control_follows_its_grammar(header: str, expected: Freshness) -> None:
@@ -762,6 +790,54 @@ async def test_an_invalid_last_modified_is_no_validator_on_either_side() -> None
     clock.now = 59.0
     assert await cache.get("u", producer) == "a"
     assert producer.seen == [None, Validators('W/"v1"', None)]
+
+
+async def test_merged_dates_keep_the_meaning_they_arrived_with() -> None:
+    """After a 304 merges its fields, each date still means what it meant
+    on arrival: an RFC 850 "-76" that read as 2076 then is not re-read as
+    1976 (an invalid date) against the older 200's arrival -- and one that
+    was invalid on the 200 doesn't become fifty years of freshness when a
+    later 304 is the reference.
+    """
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    t1 = datetime(2026, 11, 10, 12, tzinfo=UTC)
+    t2 = datetime(2026, 11, 11, 12, tzinfo=UTC)
+    t3 = datetime(2026, 11, 12, 12, tzinfo=UTC)
+    imf_2076 = "Wed, 11 Nov 2076 00:00:00 GMT"
+    rfc850_76 = "Wednesday, 11-Nov-76 00:00:00 GMT"  # 2076 from t2, 1976 from t1
+    producer = _Producer(
+        [
+            Response("a", header_fields({"Last-Modified": imf_2076}), t1, t1),
+            Response(None, header_fields({"Last-Modified": rfc850_76}), t2, t2),
+            Response(None, header_fields({"Last-Modified": rfc850_76}), t3, t3),
+        ]
+    )
+    for _ in range(3):
+        assert await cache.get("u", producer) == "a"
+    assert producer.seen == [
+        None,
+        Validators(None, imf_2076),
+        Validators(None, imf_2076),
+    ]
+
+    # Expires the other way round: invalid as read on the 200's arrival
+    # (1976 is a Thursday), so a bare 304 later mustn't revive it as 2076.
+    stale: FreshnessCache[str] = FreshnessCache(_Clock())
+    expiring = _Producer(
+        [
+            Response(
+                "b",
+                header_fields({"ETag": '"1"', "Expires": rfc850_76, "Date": _http(t1)}),
+                t1,
+                t1,
+            ),
+            Response(None, header_fields({"ETag": '"1"'}), t2, t2),
+        ]
+    )
+    await stale.get("u", expiring)
+    await stale.get("u", expiring)
+    assert stale._entries["u"].lifetime == 0.0
 
 
 async def test_last_modified_is_compared_as_an_instant() -> None:
