@@ -256,16 +256,17 @@ Notes on direct mode:
   open-ended query with no limit raises `ValueError`, as do a naive
   (timezone-less) or unrepresentable `start`/`end`, and a `start` (less
   `grace`) outside 0001-01-03 to 9999-12-01 UTC, where service days can
-  be dated.
+  be dated, and a negative `grace`.
   `end` bounds scheduled times; a delayed trip predicted past it, and
   RT-added trips, still show.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
-  or vehicle with no `start_date` applies only to the trip's run that is
-  under way or still to come on the current service day (including last
-  night's past-midnight run, and the run already under way when a
-  spring-forward day starts the evening before its date), judged at the
-  feed's header timestamp — never to
-  tomorrow's, however wide the window or late the board's `start`. A dated
+  or vehicle with no `start_date` applies only to the trip's current run,
+  judged at the feed's header timestamp: the run scheduled to be under way
+  (including last night's past-midnight run, and one already under way
+  when a spring-forward day starts the evening before its date); else the
+  run that ended within `grace`, so a late-running run keeps its updates;
+  else the run still to come today — never tomorrow's, however wide the
+  window or late the board's `start`. A dated
   one applies to exactly its day, including an RT-added trip's vehicle.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic

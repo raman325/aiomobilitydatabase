@@ -1017,12 +1017,13 @@ def test_current_service_dates_match_their_definition(
 
     Definition: "today" is the service day ``now`` falls in -- the latest
     day whose start (local noon minus 12 elapsed hours) is at or before
-    ``now``, found by trying every date around ``now``. The current run is
-    on the earliest day D up to today on which the trip's service runs and
-    whose run's last stop time is at or after ``now - grace``; every day
-    back to the trip's own length plus the grace is tried. Computed from the zip's own
-    CSV with an independent time parser and anchor; only service activity
-    (tested elsewhere) comes from the index.
+    ``now``, found by trying every date around ``now``. Among the runs up
+    to today on which the trip's service runs (every day back to the
+    trip's own length plus the grace is tried), the current one is the
+    earliest scheduled to be under way at ``now``; else the latest that
+    ended within ``grace``; else the earliest still to come. Computed from
+    the zip's own CSV with an independent time parser and anchor; only
+    service activity (tested elsewhere) comes from the index.
     """
     grace = timedelta(minutes=grace_minutes)
     restamped = _restamp(zip_bytes, timezone, frequencies=False)
@@ -1035,12 +1036,13 @@ def test_current_service_dates_match_their_definition(
             row["trip_id"]: row["service_id"]
             for row in csv.DictReader(io.StringIO(trips_csv))
         }
-        ends: dict[str, int] = {}
+        spans: dict[str, tuple[int, int]] = {}
         for row in csv.DictReader(io.StringIO(stop_times_csv)):
             for cell in (row["arrival_time"], row["departure_time"]):
                 secs = _secs(cell)
                 if secs is not None and row["trip_id"] in service_of:
-                    ends[row["trip_id"]] = max(ends.get(row["trip_id"], -1), secs)
+                    low, high = spans.get(row["trip_id"], (secs, secs))
+                    spans[row["trip_id"]] = (min(low, secs), max(high, secs))
         tz = ZoneInfo(timezone)
 
         def anchor(day: date) -> datetime:
@@ -1060,15 +1062,34 @@ def test_current_service_dates_match_their_definition(
             event("today is not the local date")
         for trip_id, service_id in service_of.items():
             expected = None
-            if trip_id in ends:
-                longest = ends[trip_id] // 86_400 + grace.days + 3
-                for back in range(longest, -1, -1):
-                    day = today - timedelta(days=back)
-                    if service_id in index.active_service_ids(day) and (
-                        anchor(day) + timedelta(seconds=ends[trip_id]) >= now - grace
-                    ):
-                        expected = day
-                        break
+            if trip_id in spans:
+                low, high = spans[trip_id]
+                longest = high // 86_400 + grace.days + 3
+                runs = [
+                    (
+                        day,
+                        anchor(day) + timedelta(seconds=low),
+                        anchor(day) + timedelta(seconds=high),
+                    )
+                    for day in (
+                        today - timedelta(days=back) for back in range(longest, -1, -1)
+                    )
+                    if service_id in index.active_service_ids(day)
+                ]
+                under_way = [day for day, first, last in runs if first <= now <= last]
+                ended = [day for day, _, last in runs if now - grace <= last < now]
+                to_come = [day for day, first, _ in runs if first > now]
+                if under_way:
+                    expected = min(under_way)
+                    event("current: under way")
+                elif ended:
+                    expected = max(ended)
+                    event("current: ended within grace")
+                elif to_come:
+                    expected = min(to_come)
+                    event("current: still to come")
+                if under_way and ended:
+                    event("an ended run in grace loses to one under way")
             assert got.get(trip_id) == expected, trip_id
         event(f"has a current run: {bool(got)}")
     finally:

@@ -797,6 +797,8 @@ def test_a_year_one_service_day_never_raises_the_ceiling() -> None:
         ("America/New_York", datetime(1, 1, 1, 1, tzinfo=UTC), timedelta(0)),
         ("UTC", datetime(1, 1, 1, 1, tzinfo=UTC), timedelta(0)),
         ("Asia/Tokyo", datetime(9999, 12, 31, 20, tzinfo=UTC), timedelta(0)),
+        # A negative grace would open the window after ``start``.
+        ("UTC", datetime(2026, 6, 10, tzinfo=UTC), timedelta(hours=-2)),
         # Representable, but the grace before it reaches past the floor --
         # or past datetime itself.
         ("UTC", datetime(1, 1, 3, 12, tzinfo=UTC), timedelta(hours=13)),
@@ -815,16 +817,18 @@ def test_a_start_outside_the_dated_range_is_rejected(
     )
 
     async def body(handle: TransitFeedHandle) -> None:
-        with pytest.raises(ValueError, match="must fall between"):
+        with pytest.raises(ValueError, match=r"must fall between|must not be negative"):
             await handle.get_arrivals(
                 [ArrivalsQuery(["A"], limit=1)], start=start, grace=grace
             )
-        with pytest.raises(ValueError, match="must fall between"):
+        with pytest.raises(ValueError, match=r"must fall between|must not be negative"):
             await handle.get_upcoming_trips(
                 [TripQuery("A", "B", limit=1)], start=start, grace=grace
             )
         if not grace:
-            with pytest.raises(ValueError, match="must fall between"):
+            with pytest.raises(
+                ValueError, match=r"must fall between|must not be negative"
+            ):
                 await handle.get_scheduled_departures(
                     [ArrivalsQuery(["A"], limit=1)], start=start
                 )
@@ -921,19 +925,46 @@ def test_a_dateless_update_before_its_days_start_on_fall_back_is_unbound() -> No
 
 def test_the_current_run_with_unbounded_grace_or_garbage_time() -> None:
     """Grace past the start of datetime keeps every run that ever ended:
-    the current run is the first one. A feed time outside the range days
-    can be dated in has no current run.
+    none is under way at midnight, so the latest ended one is current. A
+    feed time outside the range days can be dated in has none; a negative
+    grace is an error.
     """
     index = _index_from_zip_bytes(_feed("T,08:00:00,08:00:00,A,1\n"))
     now = datetime(2026, 6, 10, tzinfo=UTC)
-    assert index.current_service_dates(["T"], now, timedelta.max) == {
-        "T": date(2026, 1, 1)
-    }
-    assert index.current_service_dates(["T"], now, timedelta(days=3)) == {
-        "T": date(2026, 6, 7)
-    }
+    for grace in (timedelta.max, timedelta(days=3)):
+        assert index.current_service_dates(["T"], now, grace) == {"T": date(2026, 6, 9)}
+    # Without grace, nothing has ended "within" it: today's run is to come.
+    assert index.current_service_dates(["T"], now) == {"T": date(2026, 6, 10)}
     assert index.current_service_dates(["T"], datetime(1, 1, 1, tzinfo=UTC)) == {}
+    with pytest.raises(ValueError, match="grace"):
+        index.current_service_dates(["T"], now, timedelta(seconds=-1))
+    with pytest.raises(ValueError, match="grace"):
+        index.rt_instances([("T", None, None)], now, timedelta(seconds=-1))
     index.close()
+
+
+def test_a_run_under_way_beats_one_that_ended_within_grace() -> None:
+    """A trip from 08:00 to 31:30 (07:30 next morning). At 08:05 yesterday's
+    run ended 35 minutes ago -- inside the default hour of grace -- but
+    today's left at 08:00 and is running: a date-less update is today's.
+    """
+    feed = _feed("T,08:00:00,08:00:00,A,1\nT,31:30:00,31:30:00,B,2\n")
+    index = _index_from_zip_bytes(feed)
+    now = datetime(2026, 6, 10, 8, 5, tzinfo=UTC)
+    assert index.current_service_dates(["T"], now, timedelta(hours=1)) == {
+        "T": date(2026, 6, 10)
+    }
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=1)], start=now, with_vehicles=True
+        )
+        [row] = board
+        # Today's run reaches B at 07:30 tomorrow, five minutes late.
+        assert row.scheduled_departure == datetime(2026, 6, 11, 7, 30, tzinfo=UTC)
+        assert row.delay_seconds == 300
+
+    _run(index, body, _dateless_message(now))
 
 
 def test_a_forever_calendar_west_of_utc_caps_the_ceiling() -> None:
@@ -949,3 +980,11 @@ def test_a_forever_calendar_west_of_utc_caps_the_ceiling() -> None:
     index = _index_from_zip_bytes(feed)
     assert index.departures_ceiling(["A"]) == datetime(9999, 12, 1, tzinfo=UTC)
     index.close()
+
+
+def test_the_window_itself_rejects_a_negative_grace() -> None:
+    """Checked where the window is formed, before any index read."""
+    with pytest.raises(ValueError, match="grace must not be negative"):
+        transit_module._utc_window(
+            datetime(2026, 6, 10, tzinfo=UTC), None, timedelta(hours=-2)
+        )

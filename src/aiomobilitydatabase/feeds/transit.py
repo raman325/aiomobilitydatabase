@@ -189,9 +189,9 @@ def _rt_key_for_row(
     running on the current service day": it matches only the identity's
     CURRENT run, ``current_dates[identity]`` (see
     :meth:`StaticIndex.current_service_dates`). That is decided from the
-    whole trip and the query's ``start``, never from which runs happen to
-    fall in the window -- so a long or open-ended window can't move a
-    date-less update onto tomorrow's run once today's has finished. An
+    whole trip and the feed's own time (see ``_realtime_now``), never from
+    which runs happen to fall in the window -- so a long or open-ended
+    window can't move a date-less update onto tomorrow's run. An
     identity with no current run takes no date-less update at all. When a
     dated and a date-less key both exist for one row, the dated key wins
     (it is strictly more specific). A garbage start_date parses to None
@@ -530,10 +530,13 @@ def _utc_window(
     Python adds and compares two aware datetimes sharing a tzinfo by wall
     clock, ignoring their offsets: a ``start`` given in the feed's own
     zone would shift by a DST jump against the service-day starts. In UTC
-    it never does. A naive datetime names no instant at all. ``start``
-    (less ``grace``) must lie in the range service days can be dated in,
-    from 0001-01-03 to 9999-12-01 UTC; a later ``end`` reads to its end.
+    it never does. A naive datetime names no instant at all. ``grace``
+    must not be negative, and ``start`` (less ``grace``) must lie in the
+    range service days can be dated in, from 0001-01-03 to 9999-12-01 UTC;
+    a later ``end`` reads to its end.
     """
+    if grace < timedelta(0):
+        raise ValueError(f"grace must not be negative, got {grace!r}")
     start = start or datetime.now(UTC)
     window: list[datetime | None] = []
     for name, value in (("start", start), ("end", end)):
@@ -549,7 +552,7 @@ def _utc_window(
     utc_start, utc_end = window
     assert utc_start is not None
     try:
-        earliest = utc_start - max(grace, timedelta(0))
+        earliest = utc_start - grace
     except OverflowError:
         earliest = None
     if earliest is None or earliest < _EARLIEST_INSTANT or utc_start >= _LATEST_INSTANT:
@@ -1436,8 +1439,8 @@ class TransitFeedHandle:
         ``limit=None`` query raises ``ValueError``, as does a naive
         (timezone-less) or unrepresentable ``start`` or ``end``, or a
         ``start - grace`` outside the range service days can be dated in
-        (0001-01-03 to 9999-12-01 UTC). ``end < start`` returns empty
-        boards.
+        (0001-01-03 to 9999-12-01 UTC), or a negative ``grace``. ``end <
+        start`` returns empty boards.
 
         ``grace`` reaches that far BEFORE ``start`` when collecting
         scheduled candidates, so a trip whose scheduled time has passed
@@ -1896,7 +1899,8 @@ class TransitFeedHandle:
         result fills to its ``limit`` however far ahead the next journeys
         are, and ``end=None`` with a ``limit=None`` query raises
         ``ValueError``, as does a naive or unrepresentable ``start``/``end``
-        or a ``start - grace`` outside 0001-01-03 to 9999-12-01 UTC.
+        a ``start - grace`` outside 0001-01-03 to 9999-12-01 UTC, or a
+        negative ``grace``.
         Each query's ``limit`` caps its merged result,
         nearest effective origin departure first. RT cancellations — and
         SKIPPED stops: a skipped origin or skipped destination kills the
