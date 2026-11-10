@@ -11,7 +11,9 @@ import io
 import zipfile
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
+import pytest
 from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds import transit as transit_module
@@ -28,6 +30,7 @@ def _feed(
     timezone: str = "UTC",
     calendar: str = "DAILY,1,1,1,1,1,1,1,20260101,20261231",
     trips: str = "R,DAILY,T\n",
+    extra: dict[str, str] | None = None,
 ) -> bytes:
     files = {
         "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
@@ -39,6 +42,7 @@ def _feed(
         + stop_times,
         "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,"
         "saturday,sunday,start_date,end_date\n" + calendar + "\n",
+        **(extra or {}),
     }
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -247,3 +251,211 @@ def test_a_repeated_stop_sequence_keeps_both_rows_on_every_path() -> None:
 
     _run(_index_from_zip_bytes(feed), body, message)
     _run(_index_from_zip_bytes(feed), body)
+
+
+@pytest.mark.parametrize(
+    ("timezone", "stop_time", "calendar", "local_start", "expected"),
+    [
+        # Troll jumps TWO hours (UTC+0 -> +2): Saturday's 46:30 is Monday 00:30.
+        pytest.param(
+            "Antarctica/Troll",
+            "46:30:00",
+            "SVC,0,0,0,0,0,1,0,20260101,20261231",
+            datetime(2026, 3, 30),
+            datetime(2026, 3, 29, 22, 30, tzinfo=UTC),
+            id="two-hour-dst",
+        ),
+        # Samoa skipped 2011-12-30: Thursday's 24:30 is Saturday 00:30.
+        pytest.param(
+            "Pacific/Apia",
+            "24:30:00",
+            "SVC,0,0,0,1,0,0,0,20110101,20121231",
+            datetime(2011, 12, 31),
+            datetime(2011, 12, 30, 10, 30, tzinfo=UTC),
+            id="skipped-day",
+        ),
+    ],
+)
+def test_the_look_back_is_exact_whatever_the_clock_does(
+    timezone: str,
+    stop_time: str,
+    calendar: str,
+    local_start: datetime,
+    expected: datetime,
+) -> None:
+    """No fixed margin covers every zone; the look-back walks the actual
+    day starts. ``start`` is given in the feed's own zone, as a caller
+    would -- which must not shift it by the DST jump either.
+    """
+    index = _index_from_zip_bytes(
+        _feed(
+            f"N,{stop_time},{stop_time},X,1\n",
+            timezone=timezone,
+            calendar=calendar,
+            trips="R,SVC,N\n",
+        )
+    )
+    start = local_start.replace(tzinfo=ZoneInfo(timezone))
+    end = start + timedelta(hours=2)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [scheduled] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["X"], limit=None)], start=start, end=end
+        )
+        [arrivals] = await handle.get_arrivals(
+            [ArrivalsQuery(["X"], limit=None)], start=start, end=end
+        )
+        assert _times(scheduled) == [expected]
+        assert _times(arrivals) == [expected]
+
+    _run(index, body)
+
+
+@pytest.mark.parametrize("hours", [30_000_000, 80_000_000])
+def test_a_garbage_stop_time_costs_nothing_and_crashes_nothing(hours: int) -> None:
+    """One absurd stop time on an unrelated trip -- 3,400 years, or past the
+    end of datetime altogether: the look-back stops at the feed's first
+    service day instead of reaching back millennia (or overflowing).
+    """
+    index = _index_from_zip_bytes(
+        _feed(
+            f"T,08:00:00,08:00:00,A,1\nG,{hours}:00:00,{hours}:00:00,X,1\n",
+            trips="R,DAILY,T\nR,DAILY,G\n",
+        )
+    )
+    start = datetime(2026, 6, 10, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["A"], limit=1)], start=start
+        )
+        [arrivals] = await handle.get_arrivals(
+            [ArrivalsQuery(["A"], limit=1)], start=start
+        )
+        assert (
+            _times(board) == _times(arrivals) == [datetime(2026, 6, 10, 8, tzinfo=UTC)]
+        )
+
+    _run(index, body)
+
+
+def test_a_naive_start_is_rejected() -> None:
+    index = _index_from_zip_bytes(_feed("T,08:00:00,08:00:00,A,1\n"))
+
+    async def body(handle: TransitFeedHandle) -> None:
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await handle.get_scheduled_departures(
+                [ArrivalsQuery(["A"], limit=1)], start=datetime(2026, 6, 10)
+            )
+
+    _run(index, body)
+
+
+def test_two_entities_detour_one_trip_on_different_days() -> None:
+    """Each run gets the modifications naming ITS day: +10 min on the
+    10th, +20 min on the 11th -- the rebuild is cached per (trip, the
+    modifications that apply), never per trip alone, and applicability is
+    the run's day, not the template's.
+    """
+    feed = _feed("T,08:00:00,08:00:00,A,1\nT,08:10:00,08:10:00,B,2\n")
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    for n, (day, delay) in enumerate((("20260610", 600), ("20260611", 1200))):
+        entity = message.entity.add()
+        entity.id = f"mod{n}"
+        entity.trip_modifications.selected_trips.add().trip_ids.append("T")
+        entity.trip_modifications.service_dates.append(day)
+        modification = entity.trip_modifications.modifications.add()
+        modification.start_stop_selector.stop_sequence = 1
+        modification.end_stop_selector.stop_sequence = 1
+        modification.propagated_modification_delay = delay
+    start = datetime(2026, 6, 10, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=None)],
+            start=start,
+            end=start + timedelta(days=2),
+        )
+        assert _times(board) == [
+            datetime(2026, 6, 10, 8, 20, tzinfo=UTC),
+            datetime(2026, 6, 11, 8, 30, tzinfo=UTC),
+        ]
+
+    _run(_index_from_zip_bytes(feed), body, message)
+
+
+def test_a_detour_naming_start_times_changes_only_those_repetitions() -> None:
+    """A frequency template repeats every 30 min from 06:00; the detour
+    names the 06:30 repetition only. Its template's own trips row has no
+    calls (they moved to the repetitions) and is skipped, not a crash.
+    """
+    feed = _feed(
+        "F,06:00:00,06:00:00,A,1\nF,06:10:00,06:10:00,B,2\n",
+        trips="R,DAILY,F\n",
+        extra={
+            "frequencies.txt": "trip_id,start_time,end_time,headway_secs\n"
+            "F,06:00:00,07:00:00,1800\n"
+        },
+    )
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "mod"
+    entity.trip_modifications.selected_trips.add().trip_ids.append("F")
+    entity.trip_modifications.service_dates.append("20260610")
+    entity.trip_modifications.start_times.append("06:30:00")
+    modification = entity.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    modification.propagated_modification_delay = 600
+    start = datetime(2026, 6, 10, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=None)],
+            start=start,
+            end=start + timedelta(hours=12),
+        )
+        assert _times(board) == [
+            datetime(2026, 6, 10, 6, 10, tzinfo=UTC),
+            datetime(2026, 6, 10, 6, 50, tzinfo=UTC),
+        ]
+
+    _run(_index_from_zip_bytes(feed), body, message)
+
+
+def test_a_detour_shifted_past_the_end_of_datetime_is_skipped() -> None:
+    """One entity detours T on 2026-06-10 and on 9999-12-31 ("forever"): the
+    run is rebuilt on the first day and shifted to each; the 9999 run's 20:00
+    call lands in year 10000 and is skipped, not an OverflowError.
+    """
+    feed = _feed(
+        "T,00:00:00,00:00:00,A,1\nT,20:00:00,20:00:00,B,2\n",
+        timezone="America/Los_Angeles",
+        calendar="DAILY,1,1,1,1,1,1,1,20260101,99991231",
+    )
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "mod"
+    entity.trip_modifications.selected_trips.add().trip_ids.append("T")
+    entity.trip_modifications.service_dates.extend(["20260610", "99991231"])
+    modification = entity.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    modification.propagated_modification_delay = 600
+    start = datetime(2026, 6, 10, 7, tzinfo=UTC)  # 00:00 PDT
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=None)],
+            start=start,
+            end=start + timedelta(days=2),
+        )
+        assert _times(board) == [
+            datetime(2026, 6, 11, 3, 10, tzinfo=UTC),  # the 10th's run, +10 min
+            datetime(2026, 6, 12, 3, 0, tzinfo=UTC),
+        ]
+
+    _run(_index_from_zip_bytes(feed), body, message)

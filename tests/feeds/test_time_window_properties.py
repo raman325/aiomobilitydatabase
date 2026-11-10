@@ -58,7 +58,7 @@ _RT_SETTINGS = settings(
 )
 
 # The generated calendars run 2026-01-01 .. 2027-12-31 with stop times up to
-# 47:59:59 in UTC-11..UTC+11, detours add at most a few hours, so nothing is
+# 60:00:00 in UTC-11..UTC+11, detours add at most a few hours, so nothing is
 # scheduled after this instant: bounded queries ending here are the
 # reference an open-ended query must match.
 _BEYOND_SERVICE = datetime(2028, 1, 5, tzinfo=UTC)
@@ -69,7 +69,10 @@ _STARTS = st.datetimes(
     timezones=st.just(UTC),
 )
 _HOUR = 3600
-_TIMEZONES = st.sampled_from(["UTC", "America/New_York", "Australia/Sydney"])
+# Troll's DST jump is two hours: no fixed one-hour margin covers it.
+_TIMEZONES = st.sampled_from(
+    ["UTC", "America/New_York", "Australia/Sydney", "Antarctica/Troll"]
+)
 
 
 # -- feeds ----------------------------------------------------------------------
@@ -141,9 +144,11 @@ async def _uncapped[T](
 
     The reference a scan optimization is checked against must not share
     the optimization: every per-query ceiling is lifted to ``until`` and
-    the window is read in ONE pass, not in slices, and the up-front read
-    of the runs realtime addresses is switched off, so those rows come
-    from the window read like any other. A ceiling that wrongly cut rows, or an
+    the window is read in ONE pass, not in slices, looking back a fixed
+    generous five days; the up-front read of the runs realtime addresses
+    is switched off, so those rows come from the window read like any
+    other; and detoured runs are rebuilt one by one on their own days, with
+    no relevance filter and no shifting. A ceiling that wrongly cut rows, or an
     up-front read that added or lost any, shows up as a difference.
     """
     index = handle._index
@@ -160,7 +165,67 @@ async def _uncapped[T](
         # The whole window in ONE read, not in slices.
         yield list(_horizons(start, end, ceiling))[-1]
 
+    def generous_look_back(window_start: datetime, local_today: date) -> date:
+        # Generated stop times end by 60:00:00, so five days back reaches
+        # every run whatever the clocks do -- no reasoning about day starts.
+        return local_today - timedelta(days=5)
+
+    async def naive_detours(
+        modifications: Sequence[Any],
+        wanted_stops: set[str],
+        *,
+        end: datetime | None,
+        rt_stops: Any,
+        stops_by_id: Any,
+        routes_by_id: Any,
+    ) -> tuple[list[StopArrival], set[tuple[str, date]]]:
+        # Every named run, rebuilt on its own day: no relevance filter, no
+        # template, no shifting.
+        source_ids = sorted({trip for mod in modifications for trip in mod.trip_ids})
+        concrete = index.concrete_trip_ids(source_ids)
+        runs = {
+            (trip_id, service_date)
+            for mod in modifications
+            for source_id in mod.trip_ids
+            for trip_id in concrete.get(source_id, ())
+            for service_date in mod.service_dates
+        }
+        rows: list[StopArrival] = []
+        touched: set[tuple[str, date]] = set()
+        for instance in index.instance_trip_calls(sorted(runs)):
+            applicable = [
+                modification
+                for mod in modifications
+                if instance.source_trip_id in mod.trip_ids
+                and instance.service_date in mod.service_dates
+                and (not mod.start_secs or instance.start_secs in mod.start_secs)
+                for modification in mod.modifications
+            ]
+            if not applicable:
+                continue
+            calls = transit_module._modified_calls(
+                instance, applicable, rt_stops, stops_by_id
+            )
+            if calls == instance.calls:
+                continue
+            touched.add((instance.trip_id, instance.service_date))
+            rows.extend(
+                transit_module._detoured_rows(
+                    instance,
+                    calls,
+                    timedelta(0),
+                    wanted_stops=wanted_stops,
+                    end=end,
+                    rt_stops=rt_stops,
+                    stops_by_id=stops_by_id,
+                    route=routes_by_id.get(instance.route_id),
+                )
+            )
+        return rows, touched
+
     handle._addressed_runs = nothing_up_front  # type: ignore[method-assign]
+    handle._apply_trip_modifications = naive_detours  # type: ignore[method-assign]
+    index._scan_start = generous_look_back  # type: ignore[method-assign]
     transit_module._horizons = one_pass
     try:
         return await call()
@@ -168,6 +233,8 @@ async def _uncapped[T](
         index.departures_ceiling, index.journeys_ceiling = saved
         transit_module._horizons = _horizons
         del handle._addressed_runs
+        del handle._apply_trip_modifications
+        del index._scan_start
 
 
 def _trip_ids(index: StaticIndex) -> list[str]:
@@ -226,7 +293,8 @@ _ENTITY = st.one_of(
             min_size=1,
             max_size=3,
         ),
-        _DATE,
+        # One service date, or several (the spec allows a week's worth).
+        st.one_of(_DATE, st.tuples(_DATE, _DATE, _DATE)),
         _START_TIME,
     ),
     st.tuples(st.just("vehicle"), st.integers(0, 5), _DATE, _START_TIME),
@@ -251,6 +319,8 @@ _NEAR = st.tuples(
             [
                 date(2026, 3, 7),
                 date(2026, 3, 8),
+                date(2026, 3, 28),
+                date(2026, 3, 29),
                 date(2026, 3, 9),
                 date(2026, 4, 4),
                 date(2026, 10, 4),
@@ -281,11 +351,14 @@ _EARLY_TOMORROW = st.tuples(
     st.integers(0, 2 * _HOUR),
 )
 _DETOUR = st.tuples(
-    # A detour of the anchor's run through a stop no schedule serves.
+    # A detour of the anchor's run through a stop no schedule serves --
+    # always dated (an undated one is invalid and changes nothing), and
+    # mostly today's run, after start, where the board can show it.
+    # (Negative travel times come from the general detour entities.)
     st.just("detour"),
-    st.integers(-30 * 60, 3 * _HOUR),
+    st.integers(0, 3 * _HOUR),
     st.integers(-_HOUR, _HOUR),
-    _RUN_DAYS,
+    st.sampled_from(["RUN_DAY", "RUN_DAY", "RUN_DAY+1"]),
 )
 # Trips ignore detours, so their lead is an early or shifted run; usually
 # one (a lead is what makes the early-tomorrow case reachable at all).
@@ -296,11 +369,22 @@ _TRIP_LEAD = st.sampled_from(["early", "early", "shift", "none"]).flatmap(
         "none": st.none(),
     }[kind]
 )
-_LEAD = st.sampled_from(["early", "detour", "early", "detour", "shift"]).flatmap(
+# Two entities detouring the anchor's runs on consecutive days, differently:
+# each run must get the modifications naming ITS day.
+_DETOUR_PAIR = st.tuples(
+    st.just("detour_pair"),
+    st.integers(-_HOUR, 2 * _HOUR),
+    st.integers(-_HOUR, 2 * _HOUR),
+)
+# Hypothesis favours early elements, so the rarest shapes lead the list.
+_LEAD = st.sampled_from(
+    ["detour_pair", "detour", "early", "detour_pair", "detour", "early", "shift"]
+).flatmap(
     lambda kind: {
         "shift": st.tuples(st.just("shift"), _SHIFT, _RUN_DAYS),
         "early": _EARLY_TOMORROW,
         "detour": _DETOUR,
+        "detour_pair": _DETOUR_PAIR,
     }[kind]
 )
 
@@ -323,6 +407,13 @@ def _with_lead(
     elif lead[0] == "early_tomorrow":
         spec = ("stop_time", 0, sequence, lead[1], "RUN_DAY+1")
         stops = [anchor_stop]
+    elif lead[0] == "detour_pair":
+        _, first, second = lead
+        pair = [
+            ("detour", 0, [(sequence, [(0, 60)], delay)], day, None)
+            for delay, day in ((first, "RUN_DAY"), (second, "RUN_DAY+1"))
+        ]
+        return [*pair, *entities], [anchor_stop, "POPUP"]
     else:
         _, travel, delay, run_day = lead
         spec = ("detour", 0, [(sequence, [(0, travel)], delay)], run_day, None)
@@ -333,15 +424,26 @@ def _with_lead(
 def _near_run_start(
     index: StaticIndex, start: datetime, near: tuple[date, int] | None
 ) -> tuple[datetime, date | None]:
-    """``start``, or an instant ``minutes`` before the anchor departs on a day."""
+    """``start``, or an instant ``minutes`` before the anchor departs on a day.
+
+    The day is the first on or after the drawn one when the anchor's
+    service actually runs -- a run realtime can name, rather than a day
+    where every "RUN_DAY" entity would address nothing.
+    """
     if near is None:
         return start, None
     day, minutes = near
-    secs = index._conn.execute(
-        "SELECT departure_secs FROM stop_times ORDER BY rowid LIMIT 1"
-    ).fetchone()[0]
+    row = index._conn.execute(
+        "SELECT st.departure_secs, t.service_id FROM stop_times st "
+        "JOIN trips t ON t.id = st.trip_id ORDER BY st.rowid LIMIT 1"
+    ).fetchone()
+    secs = row[0] if row else None
     if secs is None:
         return start, None
+    for offset in range(14):
+        if row[1] in index.active_service_ids(day + timedelta(days=offset)):
+            day += timedelta(days=offset)
+            break
     anchor = index._service_day_start(day).astimezone(UTC)
     return anchor + timedelta(seconds=secs, minutes=-minutes), day
 
@@ -404,8 +506,10 @@ def _rt_message(  # noqa: PLR0912, PLR0915 -- a branch per generated entity kind
             _, i, modifications, date_choice, start_time = spec
             mods = entity.trip_modifications
             mods.selected_trips.add().trip_ids.append(trip(i))
-            if (service_date := day(date_choice)) is not None:
-                mods.service_dates.append(service_date)
+            choices = date_choice if isinstance(date_choice, tuple) else (date_choice,)
+            for choice in choices:
+                if (service_date := day(choice)) is not None:
+                    mods.service_dates.append(service_date)
             if start_time is not None:
                 mods.start_times.append(start_time)
             for sequence, replacements, delay in modifications:
@@ -639,7 +743,7 @@ def test_scheduled_departures_do_not_depend_on_how_they_were_scanned(
     _run(index, body)
 
 
-@_RT_SETTINGS
+@settings(_RT_SETTINGS, max_examples=300)
 @given(
     zip_bytes=_feed_variant(),
     start=_STARTS,
@@ -699,7 +803,12 @@ def test_arrivals_do_not_depend_on_how_they_were_scanned(
         assert _keys([await board(limit, end)]) == _keys([window[:limit]])
         assert _keys([await board(None, end)]) == _keys([window])
         event(f"rows: {min(len(open_ended), 3)}")
-        event(f"popup rows: {any(r.stop_id == 'POPUP' for r in whole)}")
+        popups = [r for r in whole if r.stop_id == "POPUP"]
+        event(f"popup rows: {min(len(popups), 2)}")
+        event(
+            "popup rows in the compared boards: "
+            f"{min(sum(r.stop_id == 'POPUP' for r in (*whole[:limit], *window)), 2)}"
+        )
         event(f"lead: {lead[0] if near else None}")
         event(f"predicted: {any(r.predicted_departure for r in open_ended)}")
         event(f"vehicle: {any(r.vehicle for r in open_ended)}")

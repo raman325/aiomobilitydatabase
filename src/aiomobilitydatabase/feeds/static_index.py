@@ -475,6 +475,8 @@ class StaticIndex:
         self._tz = ZoneInfo(timezone_name)
         self._last_dates: dict[str, date] | None = None
         self._max_secs: int | None = None
+        self._first_date: date | None = None
+        self._first_date_known = False
 
     # -- construction ------------------------------------------------------
 
@@ -1205,8 +1207,8 @@ class StaticIndex:
         found: list[TripInstanceCalls] = []
         for service_date in sorted(by_day):
             active = self.active_service_ids(service_date)
-            day_start = self._day_reachable(service_date)
-            if active and day_start is not None:
+            day_start = self._service_day_start(service_date).astimezone(UTC)
+            if active:
                 found.extend(
                     self._instance_calls_on(
                         service_date,
@@ -1237,8 +1239,7 @@ class StaticIndex:
     ) -> list[tuple[str, date, datetime]]:
         """Return the (concrete trip, day) runs that exist, with day starts.
 
-        A run exists when its trip's service operates that day and its
-        times can be dated (see :meth:`_day_reachable`). Cheap: no calls
+        A run exists when its trip's service operates that day. Cheap: no calls
         are read, so a caller can build one run's calls and shift them to
         every other day (GTFS times are offsets from the day's start).
         """
@@ -1257,9 +1258,7 @@ class StaticIndex:
         )
         found: list[tuple[str, date, datetime]] = []
         for service_date in sorted(by_day):
-            day_start = self._day_reachable(service_date)
-            if day_start is None:
-                continue
+            day_start = self._service_day_start(service_date).astimezone(UTC)
             active = self.active_service_ids(service_date)
             found.extend(
                 (trip_id, service_date, day_start)
@@ -1296,6 +1295,30 @@ class StaticIndex:
             by_trip.setdefault(row[0], []).append(row)
         for trip_id, trip_rows in by_trip.items():
             head = trip_rows[0]
+            try:
+                calls = [
+                    TripCall(
+                        stop_sequence=row[11],
+                        stop_id=row[12],
+                        arrival=(
+                            day_start_utc + timedelta(seconds=row[13])
+                            if row[13] is not None
+                            else None
+                        ),
+                        departure=(
+                            day_start_utc + timedelta(seconds=row[14])
+                            if row[14] is not None
+                            else None
+                        ),
+                        pickup_type=_enum_or_none(PickupDropOffType, row[15]),
+                        drop_off_type=_enum_or_none(PickupDropOffType, row[16]),
+                        timepoint_exact=_timepoint_exact(row[17]),
+                        stop_headsign=row[18],
+                    )
+                    for row in trip_rows
+                ]
+            except OverflowError:
+                continue  # a call past the end of datetime: no run to date
             instances.append(
                 TripInstanceCalls(
                     trip_id=trip_id,
@@ -1311,27 +1334,7 @@ class StaticIndex:
                     direction_id=head[8],
                     trip_short_name=head[9],
                     block_id=head[10],
-                    calls=[
-                        TripCall(
-                            stop_sequence=row[11],
-                            stop_id=row[12],
-                            arrival=(
-                                day_start_utc + timedelta(seconds=row[13])
-                                if row[13] is not None
-                                else None
-                            ),
-                            departure=(
-                                day_start_utc + timedelta(seconds=row[14])
-                                if row[14] is not None
-                                else None
-                            ),
-                            pickup_type=_enum_or_none(PickupDropOffType, row[15]),
-                            drop_off_type=_enum_or_none(PickupDropOffType, row[16]),
-                            timepoint_exact=_timepoint_exact(row[17]),
-                            stop_headsign=row[18],
-                        )
-                        for row in trip_rows
-                    ],
+                    calls=calls,
                 )
             )
         return instances
@@ -1459,18 +1462,53 @@ class StaticIndex:
             self._max_secs = max(0, row[0] or 0)
         return self._max_secs
 
-    def _day_reachable(self, service_date: date) -> datetime | None:
-        """Return a service day's start (UTC), or None if its runs can't be dated.
+    def _first_service_date(self) -> date | None:
+        """Return the first day any service can run; None for no services.
 
-        None when its runs would reach past the last representable instant
-        (a 9999-12-31 run): such runs lie beyond any window anyway.
+        From ``calendar`` rows that can run at all and ``calendar_dates``
+        ADDED dates: a lower bound, like :meth:`_service_last_dates`'s upper
+        one. Computed once; the index never changes.
         """
-        start = self._service_day_start(service_date).astimezone(UTC)
-        try:
-            reach = start + timedelta(seconds=self._max_stop_secs())
-        except OverflowError:
-            return None
-        return start if reach <= _LATEST_INSTANT else None
+        if not self._first_date_known:
+            weekday_any = " OR ".join(f"{day} = 1" for day in _WEEKDAY_COLUMNS)
+            rows = self._conn.execute(
+                "SELECT start_date FROM calendar "
+                f"WHERE ({weekday_any}) AND start_date <= end_date "
+                "UNION ALL SELECT MIN(date) FROM calendar_dates "
+                "WHERE exception_type = ?",
+                (_EXCEPTION_SERVICE_ADDED,),
+            )
+            dates = [d for (raw,) in rows if (d := _lenient_date(raw)) is not None]
+            self._first_date = min(dates, default=None)
+            self._first_date_known = True
+        return self._first_date
+
+    def _scan_start(self, window_start: datetime, local_today: date) -> date:
+        """Return the earliest service day whose runs can reach ``window_start``.
+
+        A run on day D reaches its latest call at D's start plus the feed's
+        latest stop time (past 24:00:00, past 48:00:00 for multi-day trips).
+        Day starts only ever increase, so the days that can reach the window
+        are exactly those from some day onward: walk back from the window's
+        own day while the day before still reaches it. Exact in any zone --
+        a two-hour DST shift, a skipped day -- with no margin to guess, and
+        never before the feed's first service day, so a garbage stop time
+        can neither overflow nor scan millennia. At least one day back, as
+        an enclosure margin for DST edge instants.
+        """
+        latest = self._max_stop_secs()
+        first = self._first_service_date()
+        day = local_today
+        while first is not None and day > first:
+            before = day - timedelta(days=1)
+            start = self._service_day_start(before).astimezone(UTC)
+            try:
+                if start + timedelta(seconds=latest) < window_start:
+                    break
+            except OverflowError:
+                pass  # reaches past the end of datetime: certainly far enough
+            day = before
+        return min(day, local_today - timedelta(days=1))
 
     def _service_last_dates(self) -> dict[str, date]:
         """Map each service id to the last service date it can be active on.
@@ -1711,16 +1749,17 @@ class StaticIndex:
         departures (hypothesis-found bug, 2026-07-31: the old hardcoded
         local_today +/- 1 day tuple ignored `lookahead` entirely).
         """
-        window_start = now_utc - grace
+        # In UTC: two aware datetimes sharing a tzinfo (a caller's instant
+        # in the feed's own zone, and the local day starts) would otherwise
+        # subtract and compare by wall clock, an hour off across DST.
+        now = now_utc.astimezone(UTC)
+        window_start = now - grace
         # Clamped so a window reaching the end of datetime (an explicit far
         # end, or a calendar running "forever") never overflows date math.
-        window_end = min(now_utc + lookahead, _LATEST_INSTANT)
+        window_end = min(now + lookahead, _LATEST_INSTANT)
         local_today = window_start.astimezone(self._tz).date()
         end_local = window_end.astimezone(self._tz).date()
-        # A run reaches its latest stop time past its day's start, and a
-        # day can start up to an hour early (DST): look back that far.
-        reach_days = (self._max_stop_secs() + 3600) // 86_400
-        scan_start = local_today - timedelta(days=max(1, reach_days))
+        scan_start = self._scan_start(window_start, local_today)
         scan_end = end_local + timedelta(days=1)
         num_scan_days = (scan_end - scan_start).days + 1
         for offset in range(num_scan_days):
@@ -1869,6 +1908,15 @@ class StaticIndex:
             trip_short_name,
             block_id,
         ) in self._conn.execute(sql, params):
+            try:
+                departure = day_start_utc + timedelta(seconds=dep_secs)
+                arrival = (
+                    day_start_utc + timedelta(seconds=arr_secs)
+                    if arr_secs is not None
+                    else None
+                )
+            except OverflowError:
+                continue  # past the end of datetime: no instant to show
             rows.append(
                 ScheduledDeparture(
                     trip_id=trip_id,
@@ -1877,12 +1925,8 @@ class StaticIndex:
                     headsign=headsign,
                     stop_id=stop_id,
                     stop_sequence=stop_sequence,
-                    arrival=(
-                        day_start_utc + timedelta(seconds=arr_secs)
-                        if arr_secs is not None
-                        else None
-                    ),
-                    departure=day_start_utc + timedelta(seconds=dep_secs),
+                    arrival=arrival,
+                    departure=departure,
                     source_trip_id=source_trip_id,
                     start_secs=start_secs,
                     service_date=service_date,
@@ -1921,9 +1965,9 @@ class StaticIndex:
         rows: list[ScheduledDeparture] = []
         for service_date in sorted(by_day):
             active = self.active_service_ids(service_date)
-            day_start = self._day_reachable(service_date)
-            if not active or day_start is None:
+            if not active:
                 continue
+            day_start = self._service_day_start(service_date).astimezone(UTC)
             trip_ids = sorted(by_day[service_date])
             rows.extend(
                 self._departures_on(
@@ -2059,6 +2103,11 @@ class StaticIndex:
             trip_short_name,
             block_id,
         ) in rows:
+            try:
+                departure = day_start_utc + timedelta(seconds=dep_secs)
+                arrival = day_start_utc + timedelta(seconds=arr_secs)
+            except OverflowError:
+                continue  # past the end of datetime: no instant to show
             found.append(
                 ScheduledTrip(
                     trip_id=trip_id,
@@ -2067,8 +2116,8 @@ class StaticIndex:
                     headsign=headsign,
                     origin_stop_id=origin_stop_id,
                     destination_stop_id=destination_stop_id,
-                    departure=day_start_utc + timedelta(seconds=dep_secs),
-                    arrival=day_start_utc + timedelta(seconds=arr_secs),
+                    departure=departure,
+                    arrival=arrival,
                     source_trip_id=source_trip_id,
                     start_secs=start_secs,
                     service_date=service_date,
@@ -2113,9 +2162,9 @@ class StaticIndex:
         rows: list[ScheduledTrip] = []
         for service_date in sorted(by_day):
             active = self.active_service_ids(service_date)
-            day_start = self._day_reachable(service_date)
-            if not active or day_start is None:
+            if not active:
                 continue
+            day_start = self._service_day_start(service_date).astimezone(UTC)
             trip_ids = sorted(by_day[service_date])
             rows.extend(
                 self._trips_on(

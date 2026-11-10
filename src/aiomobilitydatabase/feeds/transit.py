@@ -431,6 +431,68 @@ def _modified_calls(
     return calls
 
 
+def _detoured_rows(
+    template: TripInstanceCalls,
+    calls: Sequence[TripCall],
+    shift: timedelta,
+    *,
+    wanted_stops: Collection[str],
+    end: datetime | None,
+    rt_stops: Mapping[str, Stop],
+    stops_by_id: Mapping[str, Stop],
+    route: Route | None,
+) -> list[StopArrival]:
+    """One detoured run's rows at the queried stops.
+
+    ``calls`` were rebuilt on ``template``'s day; ``shift`` moves them to
+    the run's own day (GTFS times are offsets from the day's start, and a
+    detour only adds offsets, so this is exact). Untimed calls are never
+    rows, as in the schedule itself; nor are calls past ``end`` or past the
+    end of datetime.
+    """
+    rows: list[StopArrival] = []
+    for call in calls:
+        if call.stop_id not in wanted_stops or call.departure is None:
+            continue
+        try:
+            departure = call.departure + shift
+            arrival = call.arrival + shift if call.arrival else None
+        except OverflowError:
+            continue  # past the end of datetime: no instant to show
+        if end is not None and departure > end:
+            continue
+        rows.append(
+            StopArrival(
+                stop_id=call.stop_id,
+                # An RT-added stop is the ONLY definition of itself.
+                stop=rt_stops.get(call.stop_id) or stops_by_id.get(call.stop_id),
+                route_id=template.route_id,
+                route=route,
+                trip_id=template.trip_id,
+                service_id=template.service_id,
+                headsign=template.headsign,
+                scheduled_arrival=arrival,
+                scheduled_departure=departure,
+                predicted_arrival=None,
+                predicted_departure=None,
+                delay_seconds=None,
+                realtime=True,
+                vehicle_id=None,
+                vehicle=None,
+                wheelchair_accessible=template.wheelchair_accessible,
+                bikes_allowed=template.bikes_allowed,
+                direction_id=template.direction_id,
+                pickup_type=call.pickup_type,
+                drop_off_type=call.drop_off_type,
+                timepoint_exact=call.timepoint_exact,
+                stop_headsign=call.stop_headsign,
+                trip_short_name=template.trip_short_name,
+                block_id=template.block_id,
+            )
+        )
+    return rows
+
+
 def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
     """Predicted origin departure if any, else scheduled."""
     return trip.predicted_departure or trip.scheduled_departure
@@ -454,6 +516,23 @@ def _realtime_now(updates: TripUpdates, start: datetime) -> datetime:
     if updates.feed_time is not None:
         return updates.feed_time
     return min(start, datetime.now(UTC))
+
+
+def _utc_window(
+    start: datetime | None, end: datetime | None
+) -> tuple[datetime, datetime | None]:
+    """Return the query window in UTC (``start`` defaulting to now).
+
+    Python adds and compares two aware datetimes sharing a tzinfo by wall
+    clock, ignoring their offsets: a ``start`` given in the feed's own
+    zone would shift by a DST jump against the service-day starts. In UTC
+    it never does. A naive datetime names no instant at all.
+    """
+    start = start or datetime.now(UTC)
+    for name, value in (("start", start), ("end", end)):
+        if value is not None and value.utcoffset() is None:
+            raise ValueError(f"{name} must be timezone-aware, got {value!r}")
+    return start.astimezone(UTC), end.astimezone(UTC) if end is not None else None
 
 
 def _require_bound(end: datetime | None, limits: Sequence[int | None]) -> None:
@@ -1385,7 +1464,7 @@ class TransitFeedHandle:
         either way, so there the flag costs no extra request.
         """
         _require_bound(end, [query.limit for query in queries])
-        start = start or datetime.now(UTC)
+        start, end = _utc_window(start, end)
         all_stop_ids = sorted(
             {stop_id for query in queries for stop_id in query.stop_ids}
         )
@@ -1817,7 +1896,7 @@ class TransitFeedHandle:
         is filled from the realtime prediction either way.
         """
         _require_bound(end, [query.limit for query in queries])
-        start = start or datetime.now(UTC)
+        start, end = _utc_window(start, end)
         if not queries or (end is not None and end < start):
             return [[] for _ in queries]
         rt_memo: dict[str, gtfs_realtime_pb2.FeedMessage] = {}
@@ -2185,6 +2264,12 @@ class TransitFeedHandle:
             for mod in modifications
             for modification in mod.modifications
         ]
+        # Per producer trip, the modifications naming it (in feed order), so
+        # applicability costs a run's own modifications, not all of them.
+        by_source: dict[str, list[int]] = {}
+        for n, (mod, _) in enumerate(flat):
+            for source_id in dict.fromkeys(mod.trip_ids):
+                by_source.setdefault(source_id, []).append(n)
         rebuilt: dict[tuple[str, tuple[int, ...]], list[TripCall] | None] = {}
         rows: list[StopArrival] = []
         touched: set[tuple[str, date]] = set()
@@ -2196,9 +2281,8 @@ class TransitFeedHandle:
                 continue
             applicable = tuple(
                 n
-                for n, (mod, _) in enumerate(flat)
-                if template.source_trip_id in mod.trip_ids
-                and service_date in mod.service_dates
+                for n in by_source.get(template.source_trip_id, ())
+                if service_date in (mod := flat[n][0]).service_dates
                 # An entity listing start_times addresses specific
                 # repetitions; one listing none addresses every instance.
                 and (not mod.start_secs or template.start_secs in mod.start_secs)
@@ -2215,47 +2299,18 @@ class TransitFeedHandle:
             if calls is None:
                 continue
             touched.add((trip_id, service_date))
-            shift = day_start - template.day_start_utc
-            route = routes_by_id.get(template.route_id)
-            for call in calls:
-                # An untimed call is never a row, as in the schedule itself.
-                if call.stop_id not in wanted_stops or call.departure is None:
-                    continue
-                departure = call.departure + shift
-                if end is not None and departure > end:
-                    continue
-                rows.append(
-                    StopArrival(
-                        stop_id=call.stop_id,
-                        # An RT-added stop is the ONLY definition of itself.
-                        stop=rt_stops.get(call.stop_id)
-                        or stops_by_id.get(call.stop_id),
-                        route_id=template.route_id,
-                        route=route,
-                        trip_id=trip_id,
-                        service_id=template.service_id,
-                        headsign=template.headsign,
-                        scheduled_arrival=(
-                            call.arrival + shift if call.arrival else None
-                        ),
-                        scheduled_departure=departure,
-                        predicted_arrival=None,
-                        predicted_departure=None,
-                        delay_seconds=None,
-                        realtime=True,
-                        vehicle_id=None,
-                        vehicle=None,
-                        wheelchair_accessible=template.wheelchair_accessible,
-                        bikes_allowed=template.bikes_allowed,
-                        direction_id=template.direction_id,
-                        pickup_type=call.pickup_type,
-                        drop_off_type=call.drop_off_type,
-                        timepoint_exact=call.timepoint_exact,
-                        stop_headsign=call.stop_headsign,
-                        trip_short_name=template.trip_short_name,
-                        block_id=template.block_id,
-                    )
+            rows.extend(
+                _detoured_rows(
+                    template,
+                    calls,
+                    day_start - template.day_start_utc,
+                    wanted_stops=wanted_stops,
+                    end=end,
+                    rt_stops=rt_stops,
+                    stops_by_id=stops_by_id,
+                    route=routes_by_id.get(template.route_id),
                 )
+            )
         return rows, touched
 
     async def get_scheduled_departures(
@@ -2282,7 +2337,7 @@ class TransitFeedHandle:
         it is full inside the slice read so far.
         """
         _require_bound(end, [query.limit for query in queries])
-        start = start or datetime.now(UTC)
+        start, end = _utc_window(start, end)
         all_stop_ids = sorted(
             {stop_id for query in queries for stop_id in query.stop_ids}
         )
