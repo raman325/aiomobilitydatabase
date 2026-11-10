@@ -553,7 +553,7 @@ async def test_system_info_full_surface(
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     info = await handle.get_system_info()
     assert info.short_name == "TB"
-    assert info.languages == ["en"]  # 2.x singular "language"
+    assert info.languages == ("en",)  # 2.x singular "language"
     assert info.url == "https://example.com"
     assert info.purchase_url == "https://example.com/buy"
     assert info.start_date == date(2026, 1, 15)
@@ -611,15 +611,15 @@ async def test_system_alerts_scope_to_stations_and_regions(
     assert alert.summary == "Closed for a storm"
     # A numeric id is a legitimate GBFS id and is coerced, matching
     # _record_id elsewhere; only a null entry is dropped.
-    assert alert.station_ids == ["st1", "7"]
-    assert alert.region_ids == ["r1"]
+    assert alert.station_ids == ("st1", "7")
+    assert alert.region_ids == ("r1",)
     assert alert.last_updated == datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC)
-    assert alert.active_periods == [
+    assert alert.active_periods == (
         (
             datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC),
             datetime(2026, 7, 31, 13, 13, 20, tzinfo=UTC),
-        )
-    ]
+        ),
+    )
 
 
 async def test_unpublished_lookup_documents_are_empty_not_an_error(

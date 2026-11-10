@@ -574,7 +574,7 @@ class TransitFeedHandle:
             assert static_feed is not None and static_feed.id is not None
             self._feed_key = static_feed.id
             self._headers = None
-        self._rt_feeds = rt_feeds
+        self._rt_feeds = tuple(rt_feeds)
         self._index = index
         self._api_key = api_key
         self._guard = _IndexGuard()
@@ -583,9 +583,9 @@ class TransitFeedHandle:
         # reused on a 304, i.e. when the producer itself states the bytes
         # are unchanged -- this is revalidation, not a TTL cache.
         self._rt_validators: dict[str, tuple[FeedValidators, Any]] = {}
-        self._stops: list[Stop] = index.stops()
-        self._routes: list[Route] = index.routes()
-        self._agencies: list[Agency] = index.agencies()
+        self._stops: tuple[Stop, ...] = tuple(index.stops())
+        self._routes: tuple[Route, ...] = tuple(index.routes())
+        self._agencies: tuple[Agency, ...] = tuple(index.agencies())
         # None when the dataset ships no feed_info.txt (an optional file).
         self._feed_info: FeedInfo | None = index.feed_info()
 
@@ -624,22 +624,22 @@ class TransitFeedHandle:
         return None if self._static_feed is None else self._static_feed.latest_dataset
 
     @property
-    def rt_feeds(self) -> list[GtfsRtFeed]:
+    def rt_feeds(self) -> tuple[GtfsRtFeed, ...]:
         """GTFS-RT sources this handle fetches (catalog records or synthesized)."""
         return self._rt_feeds
 
     @property
-    def stops(self) -> list[Stop]:
+    def stops(self) -> tuple[Stop, ...]:
         """Every stop in the indexed dataset; replaced atomically on refresh."""
         return self._stops
 
     @property
-    def routes(self) -> list[Route]:
+    def routes(self) -> tuple[Route, ...]:
         """Every route in the indexed dataset; replaced atomically on refresh."""
         return self._routes
 
     @property
-    def agencies(self) -> list[Agency]:
+    def agencies(self) -> tuple[Agency, ...]:
         """Every agency in the indexed dataset; replaced atomically on refresh."""
         return self._agencies
 
@@ -1866,9 +1866,9 @@ class TransitFeedHandle:
         never leave ``static_dataset`` describing a dataset that is no
         longer the one being served.
         """
-        stops = await asyncio.to_thread(new_index.stops)
-        routes = await asyncio.to_thread(new_index.routes)
-        agencies = await asyncio.to_thread(new_index.agencies)
+        stops = tuple(await asyncio.to_thread(new_index.stops))
+        routes = tuple(await asyncio.to_thread(new_index.routes))
+        agencies = tuple(await asyncio.to_thread(new_index.agencies))
         feed_info = await asyncio.to_thread(new_index.feed_info)
         async with self._guard.writer():
             old_index = self._index

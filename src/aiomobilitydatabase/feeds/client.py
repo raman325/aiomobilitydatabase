@@ -52,7 +52,7 @@ class MobilityFeedsClient:
         self._base_url = base_url
         self._timeout = request_timeout
         self._catalog: MobilityDatabaseClient | None = None
-        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self._cache_dir = Path(cache_dir) if cache_dir is not None else None
 
     async def __aenter__(self) -> Self:
         """Enter the async context manager."""
@@ -120,6 +120,11 @@ class MobilityFeedsClient:
         """Request timeout shared by handle fetches."""
         return self._timeout
 
+    @property
+    def cache_dir(self) -> Path | None:
+        """Root of the on-disk static-index cache, or None for in-memory indexes."""
+        return self._cache_dir
+
     async def purge_cache(self, feed_id: str | None = None) -> None:
         """Delete cached static data for one feed, or all feeds when None.
 
@@ -139,12 +144,12 @@ class MobilityFeedsClient:
         containment-only check accepts those, because every path is
         relative to itself, and would delete every feed's cache.
         """
-        if self.cache_dir is None:
+        if self._cache_dir is None:
             return
         if feed_id is not None:
             candidate = Path(feed_id)
-            target = self.cache_dir / feed_id
-            root = self.cache_dir.resolve()
+            target = self._cache_dir / feed_id
+            root = self._cache_dir.resolve()
             # The input itself must be a bare child name. Resolving first
             # and checking only the destination accepts ids that reach a
             # feed the caller cannot name directly (an absolute path, or
@@ -165,7 +170,7 @@ class MobilityFeedsClient:
                 )
             targets = [target]
         else:
-            targets = [path for path in self.cache_dir.iterdir() if path.is_dir()]
+            targets = [path for path in self._cache_dir.iterdir() if path.is_dir()]
         for target in targets:
             if not target.exists():
                 continue

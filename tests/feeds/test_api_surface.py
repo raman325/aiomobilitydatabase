@@ -5,12 +5,15 @@ Rule: a public async *query* method is named ``get_*``. Synchronous methods
 reflection so a later change can't add an off-rule method unnoticed.
 """
 
+import dataclasses
 import inspect
+import re
 
 import pytest
 
 from aiomobilitydatabase import feeds
-from aiomobilitydatabase.feeds import GbfsFeedHandle, MobilityFeedsClient
+from aiomobilitydatabase.feeds import ArrivalsQuery, GbfsFeedHandle, MobilityFeedsClient
+from aiomobilitydatabase.feeds import models as feed_models
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle
 
 # Async methods that perform an action rather than answer a query.
@@ -89,3 +92,54 @@ def test_transit_snapshot_data_is_read_only(name: str) -> None:
     attr = inspect.getattr_static(TransitFeedHandle, name)
     assert isinstance(attr, property), f"{name} must be a property"
     assert attr.fset is None, f"{name} must not be settable"
+
+
+def _public_models(module: object) -> list[type]:
+    return [
+        obj
+        for name, obj in vars(module).items()
+        if not name.startswith("_")
+        and isinstance(obj, type)
+        and dataclasses.is_dataclass(obj)
+        and obj.__module__ == getattr(module, "__name__", None)
+    ]
+
+
+_MUTABLE_CONTAINER = re.compile(r"\b(list|dict|set)\[")
+
+
+@pytest.mark.parametrize(
+    "model", _public_models(feed_models), ids=lambda model: model.__name__
+)
+def test_feed_models_are_deeply_immutable(model: type) -> None:
+    params = model.__dataclass_params__  # type: ignore[attr-defined]
+    assert params.frozen, f"{model.__name__} must be frozen"
+    for field in dataclasses.fields(model):
+        annotation = str(field.type)
+        assert not _MUTABLE_CONTAINER.search(annotation), (
+            f"{model.__name__}.{field.name}: {annotation} is a mutable container; "
+            "use tuple[...] or Mapping[...]"
+        )
+
+
+def test_arrivals_query_copies_caller_sequences() -> None:
+    stop_ids = ["S1"]
+    route_ids = ["R1"]
+    query = ArrivalsQuery(stop_ids, route_ids=route_ids, headsigns=["Downtown"])
+    stop_ids.append("S2")
+    route_ids.append("R2")
+    assert query.stop_ids == ("S1",)
+    assert query.route_ids == ("R1",)
+    assert query.headsigns == ("Downtown",)
+
+
+def test_client_cache_dir_is_read_only() -> None:
+    attr = inspect.getattr_static(MobilityFeedsClient, "cache_dir")
+    assert isinstance(attr, property)
+    assert attr.fset is None
+
+
+@pytest.mark.parametrize("name", ["stops", "routes", "agencies", "rt_feeds"])
+def test_transit_snapshot_sequences_are_tuples(name: str) -> None:
+    prop = inspect.getattr_static(TransitFeedHandle, name)
+    assert "tuple[" in str(inspect.signature(prop.fget).return_annotation)

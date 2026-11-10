@@ -146,7 +146,7 @@ def test_vehicle_and_station_construct() -> None:
         trip_start_secs=28800,
         occupancy_status=OccupancyStatus.MANY_SEATS_AVAILABLE,
         occupancy_percentage=40,
-        carriages=[],
+        carriages=(),
         wheelchair_accessible=WheelchairAccess.POSSIBLE,
         odometer=12345.6,
         timestamp=datetime(2026, 7, 31, 15, 0, tzinfo=UTC),
@@ -211,7 +211,7 @@ def test_vehicle_and_station_construct() -> None:
         short_name=None,
         operator=None,
         timezone="America/Los_Angeles",
-        languages=["en"],
+        languages=("en",),
         url=None,
         purchase_url=None,
         start_date=None,
@@ -235,19 +235,19 @@ def test_vehicle_and_station_construct() -> None:
         effect=AlertEffect.DETOUR,
         effect_detail=None,
         severity=None,
-        images=[],
+        images=(),
         image_alternative_text=None,
-        agency_ids=[],
-        route_ids=["R1"],
-        route_types=[],
-        direction_ids=[],
-        stop_ids=[],
-        trip_ids=["T1"],
-        active_periods=[(datetime(2026, 7, 1, tzinfo=UTC), None)],
+        agency_ids=(),
+        route_ids=("R1",),
+        route_types=(),
+        direction_ids=(),
+        stop_ids=(),
+        trip_ids=("T1",),
+        active_periods=((datetime(2026, 7, 1, tzinfo=UTC), None),),
         url=None,
     )
-    assert alert.route_ids == ["R1"]
-    assert alert.trip_ids == ["T1"]
+    assert alert.route_ids == ("R1",)
+    assert alert.trip_ids == ("T1",)
     route = _route("R1", short_name="10", long_name="Main Line")
     assert route.display_name == "10 Main Line"
     assert route.color == "FFD700"
@@ -286,7 +286,7 @@ def test_fixtures_are_valid() -> None:
 
 def test_arrivals_query_defaults() -> None:
     query = ArrivalsQuery(["S1", "S2"])
-    assert query.stop_ids == ["S1", "S2"]
+    assert query.stop_ids == ("S1", "S2")
     assert query.route_ids is None
     assert query.headsigns is None
     assert query.limit == 10

@@ -113,8 +113,8 @@ async def test_get_alerts(mock_api: MockApi, feeds_client: MobilityFeedsClient) 
     handle = await feeds_client.get_transit_feed("mdb-100")
     alerts = await handle.get_alerts()
     assert alerts[0].header == "Detour on Main"
-    assert alerts[0].route_ids == ["R1"]
-    assert alerts[0].trip_ids == []
+    assert alerts[0].route_ids == ("R1",)
+    assert alerts[0].trip_ids == ()
 
 
 async def test_get_alerts_trip_scoped_is_not_agency_wide(
@@ -127,9 +127,9 @@ async def test_get_alerts_trip_scoped_is_not_agency_wide(
     mock_api.get("/rt/all", body=ALERTS_TRIP_SCOPED, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
     (alert,) = await handle.get_alerts()
-    assert alert.route_ids == []
-    assert alert.stop_ids == []
-    assert alert.trip_ids == ["T1", "T3"]
+    assert alert.route_ids == ()
+    assert alert.stop_ids == ()
+    assert alert.trip_ids == ("T1", "T3")
     # The documented unscoped predicate must be False for this alert.
     assert bool(alert.route_ids or alert.stop_ids or alert.trip_ids)
 
@@ -300,14 +300,14 @@ def test_service_alert_is_active() -> None:
             effect=None,
             effect_detail=None,
             severity=None,
-            images=[],
+            images=(),
             image_alternative_text=None,
-            agency_ids=[],
-            route_ids=[],
-            route_types=[],
-            direction_ids=[],
-            stop_ids=[],
-            trip_ids=[],
+            agency_ids=(),
+            route_ids=(),
+            route_types=(),
+            direction_ids=(),
+            stop_ids=(),
+            trip_ids=(),
             active_periods=periods,
             url=None,
         )
@@ -700,7 +700,7 @@ def test_alert_scoped_by_any_selector_is_not_feed_wide(
     HasField rather than truthiness.
     """
     [alert] = alerts_from_message(_scoped_alert(**selector))
-    assert getattr(alert, attribute) == expected
+    assert getattr(alert, attribute) == tuple(expected)
     scope = (
         alert.agency_ids
         + alert.route_ids

@@ -7,6 +7,7 @@ import time
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from http import HTTPStatus
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -78,7 +79,7 @@ def _version_key(version: str | None) -> tuple[int, ...]:
         return (0,)
 
 
-def _rental_uris(value: Any) -> dict[str, str] | None:
+def _rental_uris(value: Any) -> Mapping[str, str] | None:
     """Pass through a GBFS ``rental_uris`` object: platform key -> URI.
 
     Identical shape in 2.x and 3.x (``android``/``ios``/``web`` keys on
@@ -90,7 +91,7 @@ def _rental_uris(value: Any) -> dict[str, str] | None:
     if not isinstance(value, dict):
         return None
     uris = {str(key): uri for key, uri in value.items() if isinstance(uri, str)}
-    return uris or None
+    return MappingProxyType(uris) if uris else None
 
 
 def _coordinate(value: Any) -> float | None:
@@ -111,7 +112,7 @@ def _coordinate(value: Any) -> float | None:
     return coordinate if math.isfinite(coordinate) else None
 
 
-def _vehicle_types(value: Any) -> dict[str, int] | None:
+def _vehicle_types(value: Any) -> Mapping[str, int] | None:
     """Normalize a station's ``vehicle_types_available`` to id -> count.
 
     Entries without a usable type id, and counts that aren't parseable as
@@ -124,7 +125,7 @@ def _vehicle_types(value: Any) -> dict[str, int] | None:
     if not isinstance(value, list):
         return None
     if not value:
-        return {}
+        return MappingProxyType({})
     types: dict[str, int] = {}
     for entry in value:
         if not isinstance(entry, Mapping):
@@ -136,7 +137,7 @@ def _vehicle_types(value: Any) -> dict[str, int] | None:
             continue
         if type_id is not None:
             types[type_id] = count
-    return types or None
+    return MappingProxyType(types) if types else None
 
 
 def _reported_at(value: Any) -> datetime | None:
@@ -443,7 +444,7 @@ class GbfsFeedHandle:
             short_name=_localized(data.get("short_name")),
             operator=_localized(data.get("operator")),
             timezone=_plain_text(data.get("timezone")),
-            languages=_languages(data),
+            languages=tuple(_languages(data)),
             url=_plain_text(data.get("url")),
             purchase_url=_plain_text(data.get("purchase_url")),
             start_date=_iso_date(data.get("start_date")),
@@ -518,10 +519,10 @@ class GbfsFeedHandle:
                 summary=_localized(row.get("summary")),
                 description=_localized(row.get("description")),
                 url=_plain_text(row.get("url")),
-                station_ids=_id_list(row.get("station_ids")),
-                region_ids=_id_list(row.get("region_ids")),
+                station_ids=tuple(_id_list(row.get("station_ids"))),
+                region_ids=tuple(_id_list(row.get("region_ids"))),
                 last_updated=_reported_at(row.get("last_updated")),
-                active_periods=_alert_times(row.get("times")),
+                active_periods=tuple(_alert_times(row.get("times"))),
             )
             for row in await self._optional_rows("system_alerts", "alerts")
             if (alert_id := _record_id(row.get("alert_id"))) is not None
