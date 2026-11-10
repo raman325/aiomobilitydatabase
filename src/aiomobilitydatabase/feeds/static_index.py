@@ -453,6 +453,8 @@ class StaticIndex:
         self.dataset_id = dataset_id
         self.timezone_name = timezone_name
         self._tz = ZoneInfo(timezone_name)
+        self._scan_ceiling: datetime | None = None
+        self._scan_ceiling_known = False
 
     # -- construction ------------------------------------------------------
 
@@ -1337,6 +1339,53 @@ class StaticIndex:
             if exception_type == _EXCEPTION_SERVICE_REMOVED:
                 active.discard(service_id)
         return active
+
+    def last_service_date(self) -> date | None:
+        """Latest service date any calendar can be active on, or None.
+
+        The later of every ``calendar.end_date`` and every ``calendar_dates``
+        ADDED date. Dates are parsed leniently in Python rather than with
+        SQL ``MAX``: a malformed cell sorts above every digit string, so a
+        textual maximum would let one garbage row hide the real last date.
+        A removal can only shorten service, so removals are ignored -- this
+        is an upper bound, which is all an open-ended scan needs to stop.
+        """
+        candidates = [
+            parsed
+            for (raw,) in self._conn.execute(
+                "SELECT DISTINCT end_date FROM calendar "
+                "UNION SELECT DISTINCT date FROM calendar_dates "
+                "WHERE exception_type = ?",
+                (_EXCEPTION_SERVICE_ADDED,),
+            )
+            if (parsed := _lenient_date(raw)) is not None
+        ]
+        return max(candidates, default=None)
+
+    def scan_ceiling(self) -> datetime | None:
+        """Latest instant any scheduled stop time can fall at, or None.
+
+        The start of :meth:`last_service_date`'s service day plus the
+        largest arrival/departure offset in ``stop_times`` (GTFS times run
+        past 24:00:00, so the last service day's trips can end days later).
+        Open-ended queries scan forward until they reach this instant; None
+        means the feed has no service at all. Computed once per index: the
+        index is immutable after build, and the ``MAX`` is a full scan.
+        """
+        if self._scan_ceiling_known:
+            return self._scan_ceiling
+        last = self.last_service_date()
+        ceiling: datetime | None = None
+        if last is not None:
+            max_departure, max_arrival = self._conn.execute(
+                "SELECT MAX(departure_secs), MAX(arrival_secs) FROM stop_times"
+            ).fetchone()
+            max_secs = max(max_departure or 0, max_arrival or 0)
+            ceiling = self._service_day_start(last).astimezone(UTC) + timedelta(
+                seconds=max_secs
+            )
+        self._scan_ceiling, self._scan_ceiling_known = ceiling, True
+        return ceiling
 
     def _service_day_start(self, service_date: date) -> datetime:
         """Start instant of a GTFS service day: local noon minus 12 hours.

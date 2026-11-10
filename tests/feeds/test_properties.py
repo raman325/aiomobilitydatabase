@@ -22,6 +22,7 @@ from google.transit import gtfs_realtime_pb2
 from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds import TripQuery
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
@@ -3183,7 +3184,7 @@ def _run_arrivals_merge_scenario(
                     before = _rt_fetch_count(api)
                     boards.append(
                         await handle.get_arrivals(
-                            queries, lookahead=lookahead, now_utc=now
+                            queries, start=now, end=now + lookahead
                         )
                     )
                     fetches.append(_rt_fetch_count(api) - before)
@@ -4168,8 +4169,8 @@ def _run_frequencies_rt_scenario(
                         ArrivalsQuery([stop_id], limit=10)
                         for stop_id in ("S1", "S2", "S3")
                     ],
-                    lookahead=timedelta(hours=2),
-                    now_utc=datetime(2026, 7, 30, 12, 45, tzinfo=UTC),
+                    start=datetime(2026, 7, 30, 12, 45, tzinfo=UTC),
+                    end=datetime(2026, 7, 30, 12, 45, tzinfo=UTC) + timedelta(hours=2),
                 )
                 return [row for rows in per_stop for row in rows]
         finally:
@@ -4382,18 +4383,17 @@ def _run_propagation_scenario(
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
                 [arrivals] = await handle.get_arrivals(
-                    [ArrivalsQuery(stop_ids, limit=150)],
-                    lookahead=lookahead,
-                    now_utc=now,
+                    [ArrivalsQuery(stop_ids, limit=150)], start=now, end=now + lookahead
                 )
                 trips = {}
                 for origin, destination in pairs:
-                    trips[(origin, destination)] = await handle.get_upcoming_trips(
-                        origin,
-                        destination,
-                        lookahead=lookahead,
-                        now_utc=now,
-                    )
+                    trips[(origin, destination)] = (
+                        await handle.get_upcoming_trips(
+                            [TripQuery(origin, destination)],
+                            start=now,
+                            end=now + lookahead,
+                        )
+                    )[0]
                 return arrivals, trips
         finally:
             await api.stop()
@@ -5392,8 +5392,8 @@ def _run_multi_rt_scenario(
                 )
                 [arrivals] = await handle.get_arrivals(
                     [ArrivalsQuery(_MULTI_RT_STOPS, limit=150)],
-                    lookahead=timedelta(hours=6),
-                    now_utc=_MULTI_RT_NOW,
+                    start=_MULTI_RT_NOW,
+                    end=_MULTI_RT_NOW + timedelta(hours=6),
                 )
                 return arrivals
         finally:
@@ -5527,8 +5527,8 @@ def _run_route_filter_scenario(
                 handle = await client.get_transit_feed("mdb-100")
                 [unfiltered] = await handle.get_arrivals(
                     [ArrivalsQuery(["S0", "S1", "S2"], limit=_UNLIMITED)],
-                    lookahead=timedelta(hours=6),
-                    now_utc=_PROP_NOW,
+                    start=_PROP_NOW,
+                    end=_PROP_NOW + timedelta(hours=6),
                 )
                 [filtered] = await handle.get_arrivals(
                     [
@@ -5536,8 +5536,8 @@ def _run_route_filter_scenario(
                             ["S0", "S1", "S2"], route_ids, limit=_ROUTE_FILTER_LIMIT
                         )
                     ],
-                    lookahead=timedelta(hours=6),
-                    now_utc=_PROP_NOW,
+                    start=_PROP_NOW,
+                    end=_PROP_NOW + timedelta(hours=6),
                 )
                 return unfiltered, filtered
         finally:
