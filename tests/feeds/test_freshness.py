@@ -118,7 +118,9 @@ def test_repeated_cache_control_fields_merge() -> None:
     assert _fresh(TwoFields()) == Freshness(lifetime=0.0)
 
 
-@pytest.mark.parametrize("etag", ["*", '"a", "b"', "bare", 'W/"x" junk', 'w/"x"'])
+@pytest.mark.parametrize(
+    "etag", ["*", '"a", "b"', "bare", 'W/"x" junk', 'w/"x"', '\xa0"v1"', '"v1"\u2028']
+)
 def test_an_etag_that_isnt_one_entity_tag_validates_nothing(etag: str) -> None:
     """``*`` or a list would change what If-None-Match means."""
     assert Validators.from_headers({"ETag": etag}) is None
@@ -152,7 +154,15 @@ def test_a_last_modified_that_isnt_an_http_date_validates_nothing() -> None:
         "Thu, \u0663\u0660 Jul 2026 13:00:00 GMT",  # Arabic-Indic digits
         "Thu, 30 Jul \uff12\uff10\uff12\uff16 13:00:00 GMT",  # full-width digits
         "\xa0Thu, 30 Jul 2026 13:00:00 GMT",  # not optional whitespace
-        "Thu, 30 Jul 2026 23:59:60 GMT",  # a leap second: no such instant
+        "Thu, 30 Jul 2026 12:00:60 GMT",  # :60 that isn't a leap second
+        "Thu, 30 Jul 2026 1\u0663:00:00 GMT",  # an Arabic-Indic digit in the time
+        "Thursday, \u0663\u0660-Jul-26 13:00:00 GMT",  # RFC 850, other digits
+        "Thu Jul 30 13:00:00 \uff12\uff10\uff12\uff16",  # asctime, full-width year
+        "Thu, 30-Jul-26 13:00:00 GMT",  # RFC 850 needs the long day name
+        "Thursdayx, 30-Jul-26 13:00:00 GMT",
+        "Thursday, 31-Feb-26 13:00:00 GMT",  # RFC 850, in no century
+        "Thu Jul 2 13:00:00 2026",  # asctime pads a one-digit day with a space
+        "Thu, 30 Jul 2026 13:00:00 gmt",  # case-sensitive
     ],
 )
 def test_an_expires_that_isnt_an_http_date_is_already_expired(expires: str) -> None:
@@ -174,6 +184,39 @@ def test_every_http_date_form_is_read(expires: str) -> None:
     assert _fresh({"Date": _http(T0), "Expires": expires}) == Freshness(3600.0)
     padded = f" {expires}\t"  # optional whitespace is space and tab
     assert _fresh({"Date": _http(T0), "Expires": padded}) == Freshness(3600.0)
+
+
+def test_a_leap_second_is_the_second_before_it() -> None:
+    """RFC 9110 allows 23:59:60; datetime can't hold it, so 23:59:59."""
+    assert freshness_module._http_date("Sat, 31 Dec 2016 23:59:60 GMT") == datetime(
+        2016, 12, 31, 23, 59, 59, tzinfo=UTC
+    )
+
+
+def _day_name(when: datetime) -> str:
+    return ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+            "Sunday")[when.weekday()]  # fmt: skip
+
+
+def test_an_rfc850_date_is_placed_by_its_own_receipt_time() -> None:
+    """Received in 2090, "-90" is 2090: the receipt time places the year,
+    for Expires and for Date alike -- not the wall clock (2026's "-90" is
+    1990, whose weekday doesn't match).
+    """
+    received = datetime(2090, 7, 30, 12, tzinfo=UTC)
+
+    def rfc850(when: datetime) -> str:
+        return f"{_day_name(when)}, {when:%d-%b-%y %H:%M:%S} GMT"
+
+    expires = {"Expires": rfc850(received + timedelta(hours=1))}
+    assert freshness_module.freshness_of(
+        header_fields(expires), requested_at=received, received_at=received
+    ) == Freshness(3600.0)
+    dated = {"Cache-Control": "max-age=3600", "Date": rfc850(received)}
+    later = received + timedelta(minutes=30)
+    assert freshness_module.freshness_of(
+        header_fields(dated), requested_at=later, received_at=later
+    ) == Freshness(1800.0)
 
 
 def test_an_asctime_single_digit_day_is_space_padded() -> None:
@@ -201,6 +244,56 @@ def test_a_four_digit_year_is_taken_as_written() -> None:
 def test_an_rfc850_year_follows_the_fifty_year_rule(value: str, year: int) -> None:
     parsed = freshness_module._http_date(value, T0)
     assert parsed is not None and parsed.year == year
+
+
+@pytest.mark.parametrize(
+    ("value", "now", "expected"),
+    [
+        # The rule compares instants, not years: from 2026-11-10, 1 Nov 2076
+        # is within 50 years, 1 Dec 2076 is not (so it is 1976).
+        (
+            "Sunday, 01-Nov-76 00:00:00 GMT",
+            datetime(2026, 11, 10, tzinfo=UTC),
+            datetime(2076, 11, 1, tzinfo=UTC),
+        ),
+        (
+            "Wednesday, 01-Dec-76 00:00:00 GMT",
+            datetime(2026, 11, 10, tzinfo=UTC),
+            datetime(1976, 12, 1, tzinfo=UTC),
+        ),
+        # 1 Dec 2076's own weekday is no longer a valid reading.
+        ("Tuesday, 01-Dec-76 00:00:00 GMT", datetime(2026, 11, 10, tzinfo=UTC), None),
+        # After 2050 the window reaches into the next century: from 2060,
+        # "05" is 2105, not 2005.
+        (
+            "Thursday, 01-Jan-05 00:00:00 GMT",
+            datetime(2060, 1, 1, tzinfo=UTC),
+            datetime(2105, 1, 1, tzinfo=UTC),
+        ),
+        # From 1990, "20" is 2020 -- not 1920, and not a fixed 2000s century.
+        (
+            "Wednesday, 01-Jan-20 00:00:00 GMT",
+            datetime(1990, 1, 1, tzinfo=UTC),
+            datetime(2020, 1, 1, tzinfo=UTC),
+        ),
+        # Asked on a leap day: 50 years on is 28 Feb.
+        (
+            "Monday, 28-Feb-78 00:00:00 GMT",
+            datetime(2028, 2, 29, tzinfo=UTC),
+            datetime(2078, 2, 28, tzinfo=UTC),
+        ),
+        # Near the end of datetime the window simply ends there.
+        (
+            "Monday, 01-Jan-90 00:00:00 GMT",
+            datetime(9990, 6, 1, tzinfo=UTC),
+            datetime(9990, 1, 1, tzinfo=UTC),
+        ),
+    ],
+)
+def test_the_fifty_year_rule_compares_instants(
+    value: str, now: datetime, expected: datetime | None
+) -> None:
+    assert freshness_module._http_date(value, now) == expected
 
 
 def test_dates_do_not_depend_on_the_process_locale() -> None:
@@ -345,6 +438,13 @@ def test_a_quote_that_isnt_an_argument_cannot_hide_no_store(header: str) -> None
         ("No-Store", Freshness(None, storable=False)),
         ("NO-CACHE", Freshness(0.0)),
         ("NO-STORE;x", Freshness(None, storable=False)),
+        # Optional whitespace is space and tab (RFC 9110 section 5.6.3); any
+        # other space character breaks the field.
+        ("\xa0max-age=600", Freshness(0.0)),
+        ("max-age=600\x85", Freshness(0.0)),
+        ("max-age=600,\u2028private", Freshness(0.0)),
+        ("\x1fmax-age=600", Freshness(0.0)),
+        (" \tmax-age=600 \t, public", Freshness(600.0)),
     ],
 )
 def test_cache_control_follows_its_grammar(header: str, expected: Freshness) -> None:

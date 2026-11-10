@@ -29,6 +29,9 @@ _TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 # etagc is any visible character but DQUOTE, plus obs-text -- which arrives
 # decoded (aiohttp: UTF-8 with surrogateescape), so anything non-ASCII.
 _ENTITY_TAG = re.compile(r'(W/)?"[^\x00-\x20"\x7f]*"')
+# RFC 9110 section 5.6.3: optional whitespace is space and tab, nothing else
+# (str.strip() would also eat NBSP, NEL, U+2028 and friends).
+_OWS = " \t"
 # RFC 9110 section 5.6.7: the three HTTP-date forms, and nothing else.
 # ASCII digits only ([0-9], not \d, which matches any Unicode digit).
 _DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -69,7 +72,9 @@ class Validators:
     last_modified: str | None
 
     @classmethod
-    def from_fields(cls, fields: Fields) -> Validators | None:
+    def from_fields(
+        cls, fields: Fields, now: datetime | None = None
+    ) -> Validators | None:
         """Read the validators in a set of header fields; None when neither.
 
         An ETag that isn't exactly one quoted entity-tag (``*``, a list, an
@@ -77,7 +82,7 @@ class Validators:
         that isn't an HTTP-date.
         """
         etag = _etag(fields)
-        last_modified = _valid_last_modified(fields)
+        last_modified = _valid_last_modified(fields, now)
         if not etag and not last_modified:
             return None
         return cls(etag=etag or None, last_modified=last_modified)
@@ -127,7 +132,7 @@ def _etag(fields: Fields) -> str | None:
     value = _first(fields, "etag")
     if value is None:
         return None
-    value = value.strip()
+    value = value.strip(_OWS)
     return value if _ENTITY_TAG.fullmatch(value) else None
 
 
@@ -141,40 +146,74 @@ def _http_date(value: str | None, now: datetime | None = None) -> datetime | Non
     whatever a lenient parser makes of it. Built from the matched fields
     rather than by a general parser, which would move a four-digit year
     0026 into 2026 or read other scripts' digits. An RFC 850 two-digit
-    year is the one at most 50 years after ``now`` (RFC 9110). A leap
-    second (``:60``) names no representable instant and is invalid too.
+    year is placed by RFC 9110's 50-year rule against ``now`` (see
+    :func:`_rfc850_instant`). A leap second (``23:59:60``, the only valid
+    ``:60``) reads as the second before it, which datetime can hold.
     """
     if not value:
         return None
-    value = value.strip(" \t")
+    value = value.strip(_OWS)
     if (match := _IMF_FIXDATE.fullmatch(value)) is not None:
         day, mday, month, year, hour, minute, second = match.groups()
         full_year = int(year)
     elif (match := _RFC850_DATE.fullmatch(value)) is not None:
         day, mday, month, year, hour, minute, second = match.groups()
-        reference = (now or datetime.now(UTC)).year
-        full_year = reference - reference % 100 + int(year)
-        if full_year > reference + 50:
-            full_year -= 100
+        full_year = None
     elif (match := _ASCTIME_DATE.fullmatch(value)) is not None:
         day, month, mday, hour, minute, second, year = match.groups()
         full_year = int(year)
     else:
         return None
-    try:
-        parsed = datetime(
-            full_year,
-            _MONTHS.index(month) + 1,
-            int(mday),
-            int(hour),
-            int(minute),
-            int(second),
-            tzinfo=UTC,
-        )
-    except ValueError:
-        return None  # no such instant: 31 Feb, year 0, hour 24, :60
+    # 23:59:60 is a leap second (RFC 9110 lists it); datetime can't hold
+    # one, so it is the second before. Any other :60 is no time at all.
+    leap = (hour, minute, second) == ("23", "59", "60")
+    fields = (_MONTHS.index(month) + 1, int(mday), int(hour), int(minute))
+    seconds = 59 if leap else int(second)
+    if full_year is not None:
+        try:
+            parsed = datetime(full_year, *fields, seconds, tzinfo=UTC)
+        except ValueError:
+            return None  # no such instant: 31 Feb, year 0, hour 24, :60
+    else:
+        parsed_850 = _rfc850_instant(int(year), fields, seconds, now)
+        if parsed_850 is None:
+            return None
+        parsed = parsed_850
     # By index, never strftime: "%a" follows the process locale.
     return parsed if _DAYS[parsed.weekday()] == day[:3] else None
+
+
+def _rfc850_instant(
+    two_digits: int,
+    fields: tuple[int, int, int, int],
+    seconds: int,
+    now: datetime | None,
+) -> datetime | None:
+    """Place an RFC 850 two-digit year (RFC 9110 section 5.6.7).
+
+    A timestamp that "appears to be more than 50 years in the future" is
+    the most recent past year with those two digits -- an instant-level
+    test: start a century ahead and step back while the candidate lies
+    beyond ``now`` plus 50 calendar years. A candidate that doesn't exist
+    in its century (29 Feb) is skipped.
+    """
+    reference = now or datetime.now(UTC)
+    if reference.year + 50 > datetime.max.year:
+        limit = datetime.max.replace(tzinfo=UTC)
+    else:
+        try:
+            limit = reference.replace(year=reference.year + 50)
+        except ValueError:  # 29 Feb, and 50 years on is no leap year
+            limit = reference.replace(year=reference.year + 50, day=28)
+    century = reference.year - reference.year % 100
+    for base in (century + 100, century, century - 100):
+        try:
+            candidate = datetime(base + two_digits, *fields, seconds, tzinfo=UTC)
+        except ValueError:
+            continue
+        if candidate <= limit:
+            return candidate
+    return None
 
 
 def _delta_seconds(value: str | None) -> int | None:
@@ -185,7 +224,7 @@ def _delta_seconds(value: str | None) -> int | None:
     """
     if value is None:
         return None
-    value = value.strip().strip('"')
+    value = value.strip(_OWS).strip('"')
     if not value or not value.isascii() or not value.isdigit():
         return None
     if len(value.lstrip("0")) > _DELTA_SECONDS_DIGITS:
@@ -221,7 +260,7 @@ def _split_field(value: str) -> list[str] | None:
             current, closed = [], False
             continue
         if char == '"':
-            if closed or not "".join(current).rstrip().endswith("="):
+            if closed or not "".join(current).rstrip(_OWS).endswith("="):
                 return None
             quoted = True
         current.append(char)
@@ -268,9 +307,9 @@ def _directives(values: Sequence[str]) -> tuple[dict[str, list[str | None]], boo
     malformed = False
     for value in values:
         parts = _split_field(value)
-        parsed = [] if parts is None else [_directive(p.strip()) for p in parts]
+        parsed = [] if parts is None else [_directive(p.strip(_OWS)) for p in parts]
         if parts is None or any(
-            directive is None and part.strip()
+            directive is None and part.strip(_OWS)
             for directive, part in zip(parsed, parts, strict=True)
         ):
             malformed = True
@@ -353,23 +392,27 @@ def _entity_tag(fields: Fields) -> tuple[bool, str] | None:
     return False, value
 
 
-def _valid_last_modified(fields: Fields) -> str | None:
-    """Return Last-Modified if it is an HTTP-date; None otherwise."""
+def _valid_last_modified(fields: Fields, now: datetime | None) -> str | None:
+    """Return Last-Modified if it is an HTTP-date as of ``now``; else None."""
     value = _first(fields, "last-modified")
-    return value if _http_date(value) is not None else None
+    return value if _http_date(value, now) is not None else None
 
 
-def _same_instant(new: str, stored: str | None) -> bool:
+def _same_instant(
+    new: str, stored: str | None, new_now: datetime, stored_now: datetime
+) -> bool:
     """Whether two Last-Modified values name the same instant.
 
     Compared as dates (an RFC 850 date equals its IMF-fixdate form); a value
     that isn't an HTTP-date names no instant and matches nothing.
     """
-    new_date = _http_date(new)
-    return new_date is not None and new_date == _http_date(stored)
+    new_date = _http_date(new, new_now)
+    return new_date is not None and new_date == _http_date(stored, stored_now)
 
 
-def _selects(stored: Fields, new: Fields) -> bool:
+def _selects(
+    stored: Fields, new: Fields, stored_at: datetime, new_at: datetime
+) -> bool:
     """Whether a 304 identifies the stored response (RFC 9111 section 4.3.4).
 
     A 304 carrying a strong ETag selects only a stored response with that
@@ -385,14 +428,16 @@ def _selects(stored: Fields, new: Fields) -> bool:
         return stored_tag is not None and stored_tag == new_tag
     # A Last-Modified that isn't an HTTP-date is no validator (it is never
     # sent, see Validators.from_fields), on either side.
-    new_modified = _valid_last_modified(new)
-    stored_modified = _valid_last_modified(stored)
+    new_modified = _valid_last_modified(new, new_at)
+    stored_modified = _valid_last_modified(stored, stored_at)
     if new_tag is None and not new_modified:
         return stored_tag is None and not stored_modified
     tag_matches = new_tag is None or (
         stored_tag is not None and stored_tag[1] == new_tag[1]
     )
-    modified_matches = not new_modified or _same_instant(new_modified, stored_modified)
+    modified_matches = not new_modified or _same_instant(
+        new_modified, stored_modified, new_at, stored_at
+    )
     return tag_matches and modified_matches
 
 
@@ -563,14 +608,20 @@ class FreshnessCache[T]:
 
     async def _revalidate(self, key: str, fetch: Fetch[T]) -> T:
         entry = self._entries.get(key)
-        validators = Validators.from_fields(entry.fields) if entry else None
+        # Each side's dates are read as of when that side was received, so
+        # an RFC 850 year can't change meaning between request and 304.
+        validators = (
+            Validators.from_fields(entry.fields, entry.received_at) if entry else None
+        )
         requested = self._clock()
         response = await fetch(validators=validators)
         if (
             response.value is None
             and entry is not None
             and validators is not None
-            and not _selects(entry.fields, response.fields)
+            and not _selects(
+                entry.fields, response.fields, entry.received_at, response.received_at
+            )
         ):
             # A 304 that doesn't identify the stored response can't update
             # it (RFC 9111 section 4.3.4): ask again, unconditionally.
