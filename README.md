@@ -110,7 +110,7 @@ async def main() -> None:
         home = Circle(latitude=45.52, longitude=-122.68, radius_m=800)
         stations = transit.stations_in(home)
         nearby_stops = transit.stops_in(home)
-        routes = await transit.routes_serving(stations[0].stop_ids[0])
+        routes = await transit.get_routes_serving(stations[0].stop_ids[0])
 
         # Scheduled arrivals merged with realtime (delays, cancellations,
         # RT-added trips) when the feed publishes GTFS-RT TripUpdates.
@@ -132,7 +132,7 @@ async def main() -> None:
         # Origin→destination: the next departures from stop A on trips that
         # later reach stop B, with the same realtime overlay. is_first/is_last
         # flag the first/last such departure of the service day.
-        trips = await transit.upcoming_trips(
+        trips = await transit.get_upcoming_trips(
             nearby_stops[0].id, nearby_stops[1].id, limit=2
         )
         for trip in trips:
@@ -270,22 +270,22 @@ Notes on direct mode:
   names, a replacement stop may be defined only by an RT `Stop` entity, and
   a detour that routes a trip through a stop its static schedule never
   served shows up there.
-- **Schedule over a range**: `scheduled_departures(stops, start, end)` is
+- **Schedule over a range**: `get_scheduled_departures(stops, start, end)` is
   the calendar query — every departure between two instants, schedule only,
   no limit and no grace, rather than `get_arrivals` stretched to days.
-- **Service calendars are answerable**: `services_on(date)` returns the
+- **Service calendars are answerable**: `get_services_on(date)` returns the
   service ids running on a GTFS service date — `calendar.txt` resolved
   against `calendar_dates` exceptions, removals winning when a producer
   lists both types for one date — and every row carries its `service_id`,
   so "does this trip run next Tuesday" needs no second arrivals query.
 - **GBFS ids resolve**: `get_vehicle_types()`, `get_pricing_plans()`,
-  `get_regions()`, and `get_system_alerts()` turn the `vehicle_type_id`,
+  `get_regions()`, and `get_alerts()` turn the `vehicle_type_id`,
   `pricing_plan_id`, and `region_id` on stations and vehicles into records.
   All four documents are optional in GBFS, so an unpublished one is `[]`
   rather than an error.
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
-  `headsigns_serving()` alongside the stop/route helpers.
+  `get_headsigns_serving()` alongside the stop/route helpers.
 - **Alert scoping covers every selector GTFS-RT offers**: `ServiceAlert`
   carries `agency_ids`, `route_ids`, `route_types`, `direction_ids`,
   `stop_ids`, and `trip_ids` — an alert is feed-wide only when *all* of them
@@ -296,7 +296,7 @@ Notes on direct mode:
   (`is_installed` alongside `is_renting`/`is_returning` — a station removed
   from the street is not "operational"; disabled counts, address, region,
   virtual-station flag), free-floating vehicle docking and fuel state, and a
-  `SystemInfo` with the operator's contact, licensing, and terms URLs.
+  `GbfsSystemInfo` with the operator's contact, licensing, and terms URLs.
   `last_reported` is exposed on both stations and vehicles so you can tell
   fresh data from stale, and is parsed from either GBFS 2.x POSIX seconds or
   3.0 RFC3339. Plus `rental_uris` deep links and TTL-based document caching.
@@ -349,10 +349,10 @@ in the zip is ignored:
   raw cell, but nothing interprets it.)
 - `translations.txt` — text is returned as the feed wrote it.
 
-Service calendars **are** answerable — `services_on(date)` resolves
+Service calendars **are** answerable — `get_services_on(date)` resolves
 `calendar.txt` against `calendar_dates` exceptions, and rows carry their
 `service_id` — but the raw weekday pattern and validity range behind a
-service are not exposed as a model. `scheduled_departures(stops, start, end)`
+service are not exposed as a model. `get_scheduled_departures(stops, start, end)`
 covers the range query a calendar view needs.
 
 **GTFS-RT: trip shapes.** The RT `shape` entity (a detour's new geometry) is
@@ -364,7 +364,7 @@ annotated* — and the `stop` entities they define are read.
 polygon geometry while zones here are deliberately circles — supporting it
 means polygon containment, which is a geometry feature rather than another
 document. And `system_hours`, which GBFS 3.0 removed in favour of
-`system_information.opening_hours` (exposed as `SystemInfo.opening_hours`).
+`system_information.opening_hours` (exposed as `GbfsSystemInfo.opening_hours`).
 
 **Behaviour, not data.** There is no polling loop or scheduler (see *Pull, not
 push*), no write access of any kind, and no cross-feed journey planning.
