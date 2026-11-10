@@ -760,5 +760,8 @@ async def test_mapping_fields_are_frozen_and_serializable(
         assert pickle.loads(pickle.dumps(model)) == model
         assert copy.deepcopy(model) == model
         assert dataclasses.asdict(model)["rental_uris"] == model.rental_uris
-        json.dumps(dataclasses.asdict(model), default=str)
+        # default=str only covers the datetimes: a mapping the encoder could
+        # not handle natively would come back as a string, not an object.
+        encoded = json.loads(json.dumps(dataclasses.asdict(model), default=str))
+        assert encoded["rental_uris"] == dict(model.rental_uris)
         assert hash(model) == hash(copy.deepcopy(model))

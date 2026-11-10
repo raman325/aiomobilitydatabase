@@ -436,7 +436,7 @@ def _select_arrivals(
     return selected[: query.limit]
 
 
-def group_stations(stops: list[Stop]) -> list[StationGroup]:
+def group_stations(stops: Sequence[Stop]) -> list[StationGroup]:
     """Group boarding stops into logical stations, sorted by name.
 
     GTFS models stations as hierarchies: platforms (location_type 0, or

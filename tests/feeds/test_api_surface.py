@@ -155,3 +155,31 @@ def test_client_cache_dir_is_read_only() -> None:
 def test_transit_snapshot_sequences_are_tuples(name: str) -> None:
     prop = inspect.getattr_static(TransitFeedHandle, name)
     assert "tuple[" in str(inspect.signature(prop.fget).return_annotation)
+
+
+_READ_ONLY_ABSTRACTION = re.compile(r"\b(Mapping|Sequence)\[")
+
+
+@pytest.mark.parametrize(
+    "model",
+    _public_models(),
+    ids=lambda model: (
+        f"{model.__module__.removeprefix('aiomobilitydatabase.')}.{model.__name__}"
+    ),
+)
+def test_models_with_abstract_collections_convert_them(model: type) -> None:
+    """A Mapping/Sequence field also accepts a mutable dict/list on input.
+
+    The annotation only describes what consumers read; immutability needs a
+    runtime conversion, so any model with such a field must define
+    ``__post_init__`` (to store a FrozenDict or tuple).
+    """
+    abstract = [
+        field.name
+        for field in dataclasses.fields(model)
+        if _READ_ONLY_ABSTRACTION.search(str(field.type))
+    ]
+    if abstract:
+        assert "__post_init__" in vars(model), (
+            f"{model.__name__} has {abstract} but no __post_init__ to freeze them"
+        )

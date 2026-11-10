@@ -205,6 +205,21 @@ def test_vehicle_and_station_construct() -> None:
         rental_uris=None,
     )
     assert gbfs_vehicle.id == "b1"
+    # Built with plain dict literals, the mapping fields are still frozen:
+    # read-only, and the model hashes. dataclasses.replace reruns the
+    # conversion, so a replaced model is frozen too.
+    assert station.rental_uris == {"web": "https://example.com/stations/st1"}
+    with pytest.raises(TypeError):
+        station.rental_uris["ios"] = "x"  # type: ignore[index]
+    hash(station)
+    restocked = dataclasses.replace(station, vehicle_types_available={"bike": 3})
+    with pytest.raises(TypeError):
+        restocked.vehicle_types_available["bike"] = 4  # type: ignore[index]
+    assert hash(restocked) != hash(station)
+    linked = dataclasses.replace(gbfs_vehicle, rental_uris={"web": "https://e.com"})
+    with pytest.raises(TypeError):
+        linked.rental_uris["web"] = "x"  # type: ignore[index]
+    hash(linked)
     info = GbfsSystemInfo(
         system_id="sys",
         name="Test Bikes",

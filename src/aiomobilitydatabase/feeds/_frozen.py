@@ -17,7 +17,13 @@ class FrozenDict[K, V](dict[K, V]):
     ``mappingproxy``; and JSON encoders (``json``, ``orjson``) encode
     ``dict`` subclasses natively. Equality is plain ``dict`` equality, so a
     ``FrozenDict`` still equals the ``dict`` literal with the same items.
+
+    Like ``object.__setattr__`` on a frozen dataclass, calling ``dict``'s
+    own methods directly (``dict.__setitem__(fd, ...)``, ``fd.__init__``)
+    still mutates one. That is a deliberate bypass, not a supported path.
     """
+
+    __slots__ = ()
 
     def __hash__(self) -> int:  # type: ignore[override]
         """Hash the items, so models holding one stay hashable."""
@@ -32,14 +38,41 @@ class FrozenDict[K, V](dict[K, V]):
         """
         return (type(self), (dict(self),))
 
-    def _readonly(self, *args: Any, **kwargs: Any) -> NoReturn:
+    def _refuse(self) -> NoReturn:
         raise TypeError(f"{type(self).__name__} is read-only")
 
-    __setitem__ = _readonly
-    __delitem__ = _readonly
-    __ior__ = _readonly
-    clear = _readonly
-    pop = _readonly
-    popitem = _readonly
-    setdefault = _readonly
-    update = _readonly
+    # Each mutator is spelled out rather than aliased to one function: the
+    # lowest supported mypy rejects assigning a plain callable over dict's
+    # overloaded methods, while a ``*args: Any, **kwargs: Any`` override is
+    # compatible with every overload.
+    def __setitem__(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Refuse item assignment."""
+        self._refuse()
+
+    def __delitem__(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Refuse item deletion."""
+        self._refuse()
+
+    def __ior__(self, *args: Any, **kwargs: Any) -> NoReturn:  # type: ignore[misc]
+        """Refuse in-place merge (``|=``)."""
+        self._refuse()
+
+    def clear(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Refuse clearing."""
+        self._refuse()
+
+    def pop(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Refuse popping a key."""
+        self._refuse()
+
+    def popitem(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Refuse popping an item."""
+        self._refuse()
+
+    def setdefault(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Refuse inserting a default."""
+        self._refuse()
+
+    def update(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Refuse merging in place."""
+        self._refuse()

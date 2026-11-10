@@ -7,6 +7,21 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import IntEnum, StrEnum
 
+from ._frozen import FrozenDict
+
+
+def _freeze_mappings(model: object, *names: str) -> None:
+    """Store each named mapping field as a :class:`FrozenDict`.
+
+    Library-built models already hold one; this covers models a consumer
+    builds or ``dataclasses.replace``s with a plain ``dict`` (a test
+    fixture, say), which would otherwise be mutable and unhashable.
+    """
+    for name in names:
+        value = getattr(model, name)
+        if value is not None and not isinstance(value, FrozenDict):
+            object.__setattr__(model, name, FrozenDict(value))
+
 
 class WheelchairAccess(IntEnum):
     """Wheelchair support, as GTFS's shared 0/1/2 vocabulary.
@@ -575,6 +590,10 @@ class GbfsStation:
     vehicle_types_available: Mapping[str, int] | None
     rental_uris: Mapping[str, str] | None
 
+    def __post_init__(self) -> None:
+        """Freeze mapping fields given as plain dicts."""
+        _freeze_mappings(self, "vehicle_types_available", "rental_uris")
+
 
 @dataclass(frozen=True)
 class GbfsVehicle:
@@ -598,6 +617,10 @@ class GbfsVehicle:
     home_station_id: str | None
     pricing_plan_id: str | None
     rental_uris: Mapping[str, str] | None
+
+    def __post_init__(self) -> None:
+        """Freeze the mapping field when given as a plain dict."""
+        _freeze_mappings(self, "rental_uris")
 
 
 @dataclass(frozen=True)
