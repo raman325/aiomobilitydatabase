@@ -715,3 +715,237 @@ def test_runs_dated_where_no_day_start_exists_are_skipped() -> None:
         ]
 
     _run(_index_from_zip_bytes(feed), body, message)
+
+
+def _dateless_message(
+    at: datetime, trip_id: str = "T"
+) -> gtfs_realtime_pb2.FeedMessage:
+    """A feed stamped ``at``: a date-less delay and vehicle for ``trip_id``."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    message.header.timestamp = int(at.timestamp())
+    update = message.entity.add()
+    update.id = "tu"
+    update.trip_update.trip.trip_id = trip_id
+    update.trip_update.delay = 300
+    vehicle = message.entity.add()
+    vehicle.id = "vp"
+    vehicle.vehicle.trip.trip_id = trip_id
+    vehicle.vehicle.vehicle.id = "BUS1"
+    vehicle.vehicle.position.latitude = 0
+    vehicle.vehicle.position.longitude = 0
+    return message
+
+
+@pytest.mark.parametrize(
+    ("timezone", "now", "day"),
+    [
+        # Spring-forward eve: 2026-03-08 starts at noon EDT minus 12h, 04:00
+        # UTC -- 23:00 EST on the 7th, a local date before its own.
+        ("America/New_York", datetime(2026, 3, 8, 4, 20, tzinfo=UTC), date(2026, 3, 8)),
+        # An ordinary night, twenty minutes after midnight: one hour of grace
+        # reaches back into yesterday, but "today" is still today.
+        ("UTC", datetime(2026, 6, 10, 0, 20, tzinfo=UTC), date(2026, 6, 10)),
+    ],
+)
+def test_a_dateless_update_reaches_the_run_under_way(
+    timezone: str, now: datetime, day: date
+) -> None:
+    """A run that left at 00:10 is under way at ``now``: it is the current
+    run, so a date-less delay and vehicle attach to it.
+    """
+    feed = _feed(
+        "T,00:10:00,00:10:00,A,1\nT,00:40:00,00:40:00,B,2\n", timezone=timezone
+    )
+    index = _index_from_zip_bytes(feed)
+    assert index.current_service_dates(["T"], now, timedelta(hours=1)) == {"T": day}
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=1)], start=now, with_vehicles=True
+        )
+        [row] = board
+        assert row.realtime
+        assert row.delay_seconds == 300
+        assert row.vehicle is not None and row.vehicle.vehicle_id == "BUS1"
+
+    _run(index, body, _dateless_message(now))
+
+
+def test_a_year_one_service_day_never_raises_the_ceiling() -> None:
+    """A service added only on 0001-01-01, in Tokyo: that day can't be
+    dated, so it has no runs -- it must not make open-ended queries read
+    toward year 9999.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\nOLD,09:00:00,09:00:00,A,1\n",
+        timezone="Asia/Tokyo",
+        trips="R,DAILY,T\nR,OLD,OLD\n",
+        extra={
+            "calendar_dates.txt": "service_id,date,exception_type\nOLD,00010101,1\n"
+        },
+    )
+    index = _index_from_zip_bytes(feed)
+    # The last DAILY run: 2026-12-31 08:00 in Tokyo.
+    assert index.departures_ceiling(["A"]) == datetime(2026, 12, 30, 23, tzinfo=UTC)
+    index.close()
+
+
+@pytest.mark.parametrize(
+    ("timezone", "start", "grace"),
+    [
+        ("America/New_York", datetime(1, 1, 1, 1, tzinfo=UTC), timedelta(0)),
+        ("UTC", datetime(1, 1, 1, 1, tzinfo=UTC), timedelta(0)),
+        ("Asia/Tokyo", datetime(9999, 12, 31, 20, tzinfo=UTC), timedelta(0)),
+        # Representable, but the grace before it reaches past the floor --
+        # or past datetime itself.
+        ("UTC", datetime(1, 1, 3, 12, tzinfo=UTC), timedelta(hours=13)),
+        ("UTC", datetime(2026, 6, 10, tzinfo=UTC), timedelta.max),
+    ],
+)
+def test_a_start_outside_the_dated_range_is_rejected(
+    timezone: str, start: datetime, grace: timedelta
+) -> None:
+    """Every dated query takes local dates and day starts around ``start``;
+    one too close to either end of datetime is a ValueError, not an
+    OverflowError from deep inside the scan.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\nT,09:00:00,09:00:00,B,2\n", timezone=timezone
+    )
+
+    async def body(handle: TransitFeedHandle) -> None:
+        with pytest.raises(ValueError, match="must fall between"):
+            await handle.get_arrivals(
+                [ArrivalsQuery(["A"], limit=1)], start=start, grace=grace
+            )
+        with pytest.raises(ValueError, match="must fall between"):
+            await handle.get_upcoming_trips(
+                [TripQuery("A", "B", limit=1)], start=start, grace=grace
+            )
+        if not grace:
+            with pytest.raises(ValueError, match="must fall between"):
+                await handle.get_scheduled_departures(
+                    [ArrivalsQuery(["A"], limit=1)], start=start
+                )
+
+    _run(_index_from_zip_bytes(feed), body)
+
+
+def test_a_departure_is_placed_by_its_own_time_not_its_arrival() -> None:
+    """Arrival 100:00:00, departure 60:00:00: the window is read by
+    departure, so the row is found from two and a half days back, not
+    placed four days back by its arrival.
+    """
+    feed = _feed("T,00:00:00,00:00:00,B,1\nT,100:00:00,60:00:00,A,2\n")
+    start = datetime(2026, 6, 10, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["A"], limit=1)], start=start
+        )
+        # The 2026-06-07 run: 00:00 UTC + 60h.
+        assert _times(board) == [datetime(2026, 6, 10, 12, tzinfo=UTC)]
+
+    _run(_index_from_zip_bytes(feed), body)
+
+
+def test_a_long_reach_from_year_one_is_placed() -> None:
+    """A window a few days past datetime.min: counting a 100-hour departure
+    back from it passes the start of datetime, so its day is found from
+    the feed's first service day instead.
+    """
+    feed = _feed(
+        "L,100:00:00,100:00:00,A,1\nL,101:00:00,101:00:00,B,2\n",
+        trips="R,DAILY,L\n",
+        calendar="DAILY,1,1,1,1,1,1,1,00010101,00010131",
+    )
+    start = datetime(1, 1, 3, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["A"], limit=None)],
+            start=start,
+            end=datetime(1, 1, 6, tzinfo=UTC),
+        )
+        # The 0001-01-01 run: its day start plus 100h. (The 01-02 run's
+        # lands just past the window's end.)
+        assert _times(board) == [datetime(1, 1, 5, 4, tzinfo=UTC)]
+
+    _run(_index_from_zip_bytes(feed), body)
+
+
+def test_a_long_reach_from_a_skipped_date_is_placed() -> None:
+    """Apia skipped 2011-12-30: that service day starts at the NEXT date's
+    midnight, so a window exactly 100 hours after it holds the 12-30 and
+    12-31 runs alike, though counting back reads the 31st.
+    """
+    feed = _feed(
+        "L,100:00:00,100:00:00,A,1\n",
+        timezone="Pacific/Apia",
+        trips="R,DAILY,L\n",
+        calendar="DAILY,1,1,1,1,1,1,1,20111201,20120131",
+    )
+    index = _index_from_zip_bytes(feed)
+    day_start = index._service_day_start(date(2011, 12, 30))
+    assert day_start == index._service_day_start(date(2011, 12, 31))
+    instant = day_start + timedelta(hours=100)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["A"], limit=None)], start=instant, end=instant
+        )
+        assert _times(board) == [instant, instant]
+
+    _run(index, body)
+
+
+def test_a_dateless_update_before_its_days_start_on_fall_back_is_unbound() -> None:
+    """New York, 2026-11-01 00:30 EDT: the fall-back day starts only at
+    01:00 EST (noon EST minus 12h), so it is still 10-31's service day --
+    whose run is over. The 11-01 run hasn't begun: nothing is current.
+    """
+    feed = _feed(
+        "T,00:10:00,00:10:00,A,1\nT,00:40:00,00:40:00,B,2\n",
+        timezone="America/New_York",
+    )
+    index = _index_from_zip_bytes(feed)
+    now = datetime(2026, 11, 1, 4, 30, tzinfo=UTC)
+    assert index._service_day_of(now) == date(2026, 10, 31)
+    assert index.current_service_dates(["T"], now) == {}
+    # Once the day has started, its run is the current one.
+    later = datetime(2026, 11, 1, 5, 20, tzinfo=UTC)
+    assert index.current_service_dates(["T"], later) == {"T": date(2026, 11, 1)}
+    index.close()
+
+
+def test_the_current_run_with_unbounded_grace_or_garbage_time() -> None:
+    """Grace past the start of datetime keeps every run that ever ended:
+    the current run is the first one. A feed time outside the range days
+    can be dated in has no current run.
+    """
+    index = _index_from_zip_bytes(_feed("T,08:00:00,08:00:00,A,1\n"))
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    assert index.current_service_dates(["T"], now, timedelta.max) == {
+        "T": date(2026, 1, 1)
+    }
+    assert index.current_service_dates(["T"], now, timedelta(days=3)) == {
+        "T": date(2026, 6, 7)
+    }
+    assert index.current_service_dates(["T"], datetime(1, 1, 1, tzinfo=UTC)) == {}
+    index.close()
+
+
+def test_a_forever_calendar_west_of_utc_caps_the_ceiling() -> None:
+    """UTC-12, a calendar to 9999-12-31: that day's start can't be dated
+    (its noon is past datetime's end), so the ceiling is the latest instant
+    any scan reads to -- not an error, not a skipped service.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\n",
+        timezone="Etc/GMT+12",
+        calendar="DAILY,1,1,1,1,1,1,1,20260101,99991231",
+    )
+    index = _index_from_zip_bytes(feed)
+    assert index.departures_ceiling(["A"]) == datetime(9999, 12, 1, tzinfo=UTC)
+    index.close()

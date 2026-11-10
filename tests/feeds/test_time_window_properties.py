@@ -58,10 +58,10 @@ _RT_SETTINGS = settings(
 )
 
 # The generated calendars run 2026-01-01 .. 2027-12-31 with stop times up to
-# 60:00:00 in UTC-11..UTC+11, detours add at most a few hours, so nothing is
+# 250:00:00 in UTC-11..UTC+11, detours add at most a few hours, so nothing is
 # scheduled after this instant: bounded queries ending here are the
 # reference an open-ended query must match.
-_BEYOND_SERVICE = datetime(2028, 1, 5, tzinfo=UTC)
+_BEYOND_SERVICE = datetime(2028, 1, 13, tzinfo=UTC)
 
 _STARTS = st.datetimes(
     min_value=datetime(2025, 12, 1),
@@ -144,8 +144,9 @@ async def _uncapped[T](
 
     The reference a scan optimization is checked against must not share
     the optimization: every per-query ceiling is lifted to ``until`` and
-    the window is read in ONE pass, not in slices, looking back a fixed
-    generous five days; the up-front read of the runs realtime addresses
+    the window is read in ONE pass, not in slices, looking back two days
+    past the feed's longest stop time, with no separate placement of
+    long-reaching rows; the up-front read of the runs realtime addresses
     is switched off, so those rows come from the window read like any
     other; and detoured runs are rebuilt one by one on their own days, with
     no relevance filter and no shifting. A ceiling that wrongly cut rows, or an
@@ -165,10 +166,19 @@ async def _uncapped[T](
         # The whole window in ONE read, not in slices.
         yield list(_horizons(start, end, ceiling))[-1]
 
+    # Every day back to the feed's longest stop time, plus two: reaches
+    # every run whatever the clocks do -- no reasoning about day starts.
+    longest = index._conn.execute(
+        "SELECT MAX(MAX(COALESCE(arrival_secs, 0), COALESCE(departure_secs, 0))) "
+        "FROM stop_times"
+    ).fetchone()[0]
+    look_back = timedelta(days=(longest or 0) // 86_400 + 2)
+
     def generous_look_back(window_start: datetime, local_today: date) -> date:
-        # Generated stop times end by 60:00:00, so five days back reaches
-        # every run whatever the clocks do -- no reasoning about day starts.
-        return local_today - timedelta(days=5)
+        return local_today - look_back
+
+    def no_long_reach(*_a: object) -> set[date]:
+        return set()
 
     async def naive_detours(
         modifications: Sequence[Any],
@@ -232,6 +242,7 @@ async def _uncapped[T](
     handle._addressed_runs = nothing_up_front  # type: ignore[method-assign]
     handle._apply_trip_modifications = naive_detours  # type: ignore[method-assign]
     index._scan_start = generous_look_back  # type: ignore[method-assign]
+    index._long_reach_days = no_long_reach  # type: ignore[method-assign]
     transit_module._horizons = one_pass
     try:
         return await call()
@@ -241,6 +252,7 @@ async def _uncapped[T](
         del handle._addressed_runs
         del handle._apply_trip_modifications
         del index._scan_start
+        del index._long_reach_days
 
 
 def _trip_ids(index: StaticIndex) -> list[str]:
@@ -968,19 +980,51 @@ def _secs(cell: str) -> int | None:
     return hours * 3600 + minutes * 60 + seconds
 
 
-@_SETTINGS
-@given(zip_bytes=_random_gtfs_zip(), at=_STARTS, timezone=_TIMEZONES)
+# A day start on a DST change (New York, Sydney, Troll) and minutes from
+# it: where "today" is not the local date of ``now`` -- a spring-forward day
+# starts the evening before, a fall-back day after midnight.
+_NEAR_DAY_START = st.tuples(
+    st.sampled_from(
+        [
+            date(2026, 3, 8),
+            date(2026, 3, 29),
+            date(2026, 4, 5),
+            date(2026, 10, 4),
+            date(2026, 10, 25),
+            date(2026, 11, 1),
+        ]
+    ),
+    st.integers(-180, 180),
+)
+
+
+@settings(_SETTINGS, max_examples=300)
+@given(
+    zip_bytes=_random_gtfs_zip(),
+    now=_STARTS,
+    near=st.one_of(_NEAR_DAY_START, st.none()),
+    timezone=_TIMEZONES,
+    grace_minutes=st.sampled_from([60, 0, 180, 4320]),
+)
 def test_current_service_dates_match_their_definition(
-    zip_bytes: bytes, at: datetime, timezone: str
+    zip_bytes: bytes,
+    now: datetime,
+    near: tuple[date, int] | None,
+    timezone: str,
+    grace_minutes: int,
 ) -> None:
     """The run a date-less update addresses, from the raw files.
 
-    Definition: the earliest service day D, among the three days before
-    ``at``'s local date and that date itself, on which the trip's service
-    runs and whose run's last stop time is at or after ``at``. Computed
-    from the zip's own CSV with an independent time parser and anchor;
-    only service activity (tested elsewhere) comes from the index.
+    Definition: "today" is the service day ``now`` falls in -- the latest
+    day whose start (local noon minus 12 elapsed hours) is at or before
+    ``now``, found by trying every date around ``now``. The current run is
+    on the earliest day D up to today on which the trip's service runs and
+    whose run's last stop time is at or after ``now - grace``; every day
+    back to the trip's own length plus the grace is tried. Computed from the zip's own
+    CSV with an independent time parser and anchor; only service activity
+    (tested elsewhere) comes from the index.
     """
+    grace = timedelta(minutes=grace_minutes)
     restamped = _restamp(zip_bytes, timezone, frequencies=False)
     index = _build(restamped)
     try:
@@ -997,19 +1041,31 @@ def test_current_service_dates_match_their_definition(
                 secs = _secs(cell)
                 if secs is not None and row["trip_id"] in service_of:
                     ends[row["trip_id"]] = max(ends.get(row["trip_id"], -1), secs)
-        got = index.current_service_dates(sorted(service_of), at)
         tz = ZoneInfo(timezone)
-        local_today = at.astimezone(tz).date()
+
+        def anchor(day: date) -> datetime:
+            noon = datetime.combine(day, time(12), tzinfo=tz).astimezone(UTC)
+            return noon - timedelta(hours=12)
+
+        if near is not None:
+            now = anchor(near[0]) + timedelta(minutes=near[1])
+        got = index.current_service_dates(sorted(service_of), now, grace)
+        local = now.astimezone(tz).date()
+        today = max(
+            day
+            for day in (local + timedelta(days=k) for k in range(-3, 4))
+            if anchor(day) <= now
+        )
+        if today != local:
+            event("today is not the local date")
         for trip_id, service_id in service_of.items():
             expected = None
             if trip_id in ends:
-                for back in (3, 2, 1, 0):
-                    day = local_today - timedelta(days=back)
-                    anchor = (
-                        datetime.combine(day, time(12), tzinfo=tz) - timedelta(hours=12)
-                    ).astimezone(UTC)
+                longest = ends[trip_id] // 86_400 + grace.days + 3
+                for back in range(longest, -1, -1):
+                    day = today - timedelta(days=back)
                     if service_id in index.active_service_ids(day) and (
-                        anchor + timedelta(seconds=ends[trip_id]) >= at
+                        anchor(day) + timedelta(seconds=ends[trip_id]) >= now - grace
                     ):
                         expected = day
                         break

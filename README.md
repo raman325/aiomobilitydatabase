@@ -246,21 +246,25 @@ Notes on direct mode:
   are read whole before the scan begins; every other row sorts at its
   scheduled time, so a board is final as soon as it is full inside the
   slice read so far, and the answer is exactly that of reading the whole
-  window. Each slice looks back exactly as far as the feed's stop times
+  window. Each slice looks back exactly as far as the feed's departures
   reach past their service day (a night service at 47:30, a multi-day trip
   at 60:00), whatever the zone's clocks do, and never before its first
-  service day; a stop time reaching weeks or more past its day is placed
-  on its own instead of dragging every scan back. Times count from "noon
-  minus 12h" of the service day, in elapsed time as GTFS specifies, so on a
-  DST-change day they are an hour off local midnight. An open-ended query
-  with no limit raises `ValueError`, as do a naive (timezone-less) or
-  unrepresentable `start`/`end`.
+  service day; a departure four or more days past its day is placed on its
+  own instead of dragging every scan back. Times count from "noon minus
+  12h" of the service day, in elapsed time as GTFS specifies, so on a
+  DST-change day they are off local midnight by the size of the jump. An
+  open-ended query with no limit raises `ValueError`, as do a naive
+  (timezone-less) or unrepresentable `start`/`end`, and a `start` (less
+  `grace`) outside 0001-01-03 to 9999-12-01 UTC, where service days can
+  be dated.
   `end` bounds scheduled times; a delayed trip predicted past it, and
   RT-added trips, still show.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
   or vehicle with no `start_date` applies only to the trip's run that is
-  under way or still to come on the feed's own day (including last night's
-  past-midnight run), judged at the feed's header timestamp — never to
+  under way or still to come on the current service day (including last
+  night's past-midnight run, and the run already under way when a
+  spring-forward day starts the evening before its date), judged at the
+  feed's header timestamp — never to
   tomorrow's, however wide the window or late the board's `start`. A dated
   one applies to exactly its day, including an RT-added trip's vehicle.
 - **frequencies.txt is materialized at build time**: headway-based trips

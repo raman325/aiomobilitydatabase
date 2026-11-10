@@ -1701,8 +1701,19 @@ def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
         for t_idx, tid in enumerate(trip_ids)
     ]
     # 47:30:00 and 60:00:00: a night service and a multi-day trip, whose
-    # runs reach two and more days past their service day.
-    times = ["00:00:00", "08:00:00", "24:00:00", "47:30:00", "47:59:59", "60:00:00", ""]
+    # runs reach two and more days past their service day; 100:00:00 and
+    # 250:00:00 reach past four days, where rows are placed one by one.
+    times = [
+        "00:00:00",
+        "08:00:00",
+        "24:00:00",
+        "47:30:00",
+        "47:59:59",
+        "60:00:00",
+        "100:00:00",
+        "250:00:00",
+        "",
+    ]
     stop_times_rows = []
     for t_idx, tid in enumerate(trip_ids):
         n_rows = draw(st.integers(2, 3)) if t_idx == 0 else draw(st.integers(1, 3))
@@ -5942,14 +5953,19 @@ def _oracle_service_days(
 ) -> list[tuple[date, datetime, set[str]]]:
     """``(service_date, anchor_utc, active_ids)`` for every day that can contribute.
 
-    Three days of margin before the window and one after: the generator's
-    largest GTFS time (47:59:59) spills at most two service days forward, so
-    a day outside this range can never land a departure in the window — which
-    makes the range a bound on the production scan, not a copy of it, and the
-    oracle therefore catches under-scanning.
+    Margin before the window of the feed's longest stored time in days plus
+    two, and one day after: a day outside this range can never land a
+    departure in the window whatever the clocks do — which makes the range a
+    bound on the production scan, not a copy of it, and the oracle therefore
+    catches under-scanning.
     """
     tz = ZoneInfo(index.timezone_name)
-    first = (now - grace).astimezone(tz).date() - timedelta(days=3)
+    longest = index._conn.execute(
+        "SELECT MAX(MAX(COALESCE(arrival_secs, 0), COALESCE(departure_secs, 0))) "
+        "FROM stop_times"
+    ).fetchone()[0]
+    margin = timedelta(days=(longest or 0) // 86_400 + 2)
+    first = (now - grace).astimezone(tz).date() - margin
     last = (now + lookahead).astimezone(tz).date() + timedelta(days=1)
     return [
         (service_date, _oracle_anchor_utc(service_date, tz), active)

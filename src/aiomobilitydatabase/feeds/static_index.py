@@ -113,6 +113,9 @@ _EXCEPTION_SERVICE_ADDED = 1
 # Open-ended scans never reach past this instant: a calendar running to year
 # 9999 ("forever") would otherwise overflow date arithmetic near datetime.max.
 _LATEST_INSTANT = datetime(9999, 12, 1, tzinfo=UTC)
+# Nor start before this one: two days past datetime.min, so every local date
+# and service-day start a query derives from it stays representable.
+_EARLIEST_INSTANT = datetime(1, 1, 3, tzinfo=UTC)
 # Stop times reaching further past their service day than this are placed
 # row by row, not by scanning every day back (see StaticIndex._reach_profile).
 _LONG_REACH = 4 * 86_400
@@ -1478,22 +1481,24 @@ class StaticIndex:
         return self._first_date
 
     def _reach_profile(self) -> tuple[int, tuple[int, ...]]:
-        """Return (normal reach, long reaches): how far runs reach past their day.
+        """Return (normal reach, long reaches): how far departures reach past their day.
 
-        Most stop times end within a few days of their service day; those
-        bound the day scan's look-back. Longer ones (multi-week trips, or
-        garbage like 30000000:00:00) would drag every scan back years, so
-        they are listed separately and placed row by row. Computed once.
+        The window scans select rows by departure time, so departures alone
+        decide which days they read -- an arrival, however late, never puts
+        a row in a window. Most departures fall within a few days of their
+        service day; those bound the day scan's look-back. Later ones
+        (multi-week trips, or garbage like 30000000:00:00) would drag every
+        scan back years, so they are listed separately and placed row by
+        row. Computed once.
         """
         if self._reach is None:
-            reach = "MAX(COALESCE(arrival_secs, 0), COALESCE(departure_secs, 0))"
             normal = self._conn.execute(
-                f"SELECT MAX({reach}) FROM stop_times WHERE {reach} < ?",
+                "SELECT MAX(departure_secs) FROM stop_times WHERE departure_secs < ?",
                 (_LONG_REACH,),
             ).fetchone()[0]
             long = self._conn.execute(
-                f"SELECT DISTINCT {reach} FROM stop_times WHERE {reach} >= ? "
-                f"ORDER BY {reach}",
+                "SELECT DISTINCT departure_secs FROM stop_times "
+                "WHERE departure_secs >= ? ORDER BY departure_secs",
                 (_LONG_REACH,),
             ).fetchall()
             self._reach = (normal or 0, tuple(row[0] for row in long))
@@ -1551,11 +1556,14 @@ class StaticIndex:
                 earliest = (window_start - span).astimezone(self._tz).date()
             except OverflowError:
                 earliest = first
-            # A day starts at most an hour after its local midnight (noon
-            # minus 12h on a fall-back day) but can start the evening
-            # before (spring-forward: 23:00 the previous local date) --
-            # hence a day of margin after ``latest`` and none before.
-            day = max(first, earliest)
+            # A day can start the evening before its date (spring-forward:
+            # 23:00 the previous local date), hours after its local midnight
+            # (fall-back: 01:00, 02:00 in Troll), or at the NEXT date's
+            # midnight (a skipped date, like Apia's 2011-12-30) -- hence a
+            # day of margin on both sides.
+            day = (
+                max(first, earliest - timedelta(days=1)) if earliest > first else first
+            )
             stop = min(before - timedelta(days=1), latest + timedelta(days=1))
             while day <= stop:
                 days.add(day)
@@ -1618,11 +1626,16 @@ class StaticIndex:
             if last is None or max_secs is None:
                 continue
             try:
-                instant = self._service_day_start(last).astimezone(UTC) + timedelta(
-                    seconds=max_secs
-                )
+                day_start = self._service_day_start(last)
             except OverflowError:
+                if last.year == 1:
+                    continue  # its day would start before datetime: no runs
                 instant = _LATEST_INSTANT
+            else:
+                try:
+                    instant = day_start + timedelta(seconds=max_secs)
+                except OverflowError:
+                    instant = _LATEST_INSTANT
             best = instant if best is None else max(best, instant)
         return None if best is None else min(best, _LATEST_INSTANT)
 
@@ -1688,7 +1701,7 @@ class StaticIndex:
         return self._ceiling_from(rows)
 
     def rt_instances[K: tuple[str, date | None, int | None]](
-        self, keys: Iterable[K], at: datetime
+        self, keys: Iterable[K], now: datetime, grace: timedelta = timedelta(0)
     ) -> list[tuple[tuple[str, date], K]]:
         """Resolve TripUpdate keys to the concrete runs they address.
 
@@ -1697,8 +1710,8 @@ class StaticIndex:
         trip only by a key without start_secs, a frequency repetition only
         by its own start. A dated key addresses that day's run if the
         trip's service runs that day; a date-less key its current run as of
-        ``at`` (:meth:`current_service_dates`). Returns ``((concrete trip
-        id, service date), key)`` pairs.
+        ``now`` (:meth:`current_service_dates`, with ``grace``). Returns
+        ``((concrete trip id, service date), key)`` pairs.
         """
         keys = list(keys)
         if not keys:
@@ -1720,7 +1733,7 @@ class StaticIndex:
             for source, day, secs in keys
             if day is None and (trip_id := by_identity.get((source, secs)))
         ]
-        current = self.current_service_dates(dateless, at)
+        current = self.current_service_dates(dateless, now, grace)
         active: dict[date, set[str]] = {}
         found: list[tuple[tuple[str, date], K]] = []
         for key in keys:
@@ -1739,26 +1752,33 @@ class StaticIndex:
         return found
 
     def current_service_dates(
-        self, trip_ids: Sequence[str], at: datetime
+        self, trip_ids: Sequence[str], now: datetime, grace: timedelta = timedelta(0)
     ) -> dict[str, date]:
-        """Map each trip to the service day of its CURRENT run, as of ``at``.
+        """Map each trip to the service day of its CURRENT run, as of ``now``.
 
         GTFS-RT addresses a trip without ``start_date`` as the run "on the
         current service day". That is the earliest service day D, among
-        today and the days before it whose runs can still be under way
-        (GTFS times pass 24:00:00), on which the trip's service runs and
+        today -- the service day ``now`` falls in, which on a spring-forward
+        eve is already the next date from 23:00 local (see
+        :meth:`_service_day_of`) -- and the days before it whose runs can
+        still be under way (GTFS times pass 24:00:00), on which the trip's
+        service runs and
         whose LAST scheduled stop time -- over the whole trip, not just the
-        stops a query asked about -- is at or after ``at``. A trip whose run
-        today is over, or that does not run today, has no current run: a
-        later day's run is never "current", so a date-less update can't
-        leak onto tomorrow. Callers pass ``at = start - grace`` so a run
-        still finishing late keeps its updates.
+        stops a query asked about -- is at or after ``now - grace``. A trip
+        whose run today is over, or that does not run today, has no current
+        run: a later day's run is never "current", so a date-less update
+        can't leak onto tomorrow. ``grace`` keeps the updates of a run
+        finishing late; it never moves "today", which is judged at ``now``.
 
-        An ``at`` past the last instant any service day can be dated (a
+        A ``now`` outside the range service days can be dated in (a
         garbage but representable feed timestamp) has no current run.
         """
-        if not trip_ids or at >= _LATEST_INSTANT:
+        if not trip_ids or not _EARLIEST_INSTANT <= now < _LATEST_INSTANT:
             return {}
+        try:
+            at = now - grace
+        except OverflowError:
+            at = datetime.min.replace(tzinfo=UTC)  # every run has ended since
         marks = ",".join("?" * len(trip_ids))
         trips = self._conn.execute(
             "SELECT t.id, t.service_id, "
@@ -1767,9 +1787,9 @@ class StaticIndex:
             f"WHERE t.id IN ({marks}) GROUP BY t.id",
             list(trip_ids),
         ).fetchall()
-        local_today = at.astimezone(self._tz).date()
+        today = self._service_day_of(now)
         first = self._first_service_date()
-        if first is None or first > local_today:
+        if first is None or first > today:
             return {}
         active_by_day: dict[date, set[str]] = {}
         current: dict[str, date] = {}
@@ -1778,13 +1798,10 @@ class StaticIndex:
                 continue
             # The days whose run is still under way at ``at`` are a suffix
             # (day starts only increase): find where it begins by binary
-            # search, never before the feed's first service day -- a garbage
-            # stop time can't send this back millennia or past datetime.
-            back = min(end_secs // 86_400 + 1, (local_today - first).days)
-            day = self._first_reaching_day(
-                local_today - timedelta(days=back), local_today, end_secs, at
-            )
-            while day is not None and day <= local_today:
+            # search from the feed's first service day -- exact for any
+            # grace, and a garbage stop time can't send it past datetime.
+            day = self._first_reaching_day(first, today, end_secs, at)
+            while day is not None and day <= today:
                 active = active_by_day.get(day)
                 if active is None:
                     active = active_by_day[day] = self.active_service_ids(day)
@@ -1793,6 +1810,23 @@ class StaticIndex:
                     break
                 day += timedelta(days=1)
         return current
+
+    def _service_day_of(self, at: datetime) -> date:
+        """Return the service day ``at`` falls in: the latest day started by then.
+
+        Not always ``at``'s local date: a day starts at noon minus 12
+        ELAPSED hours, so a spring-forward day starts at 23:00 the evening
+        before (22:00 in Troll), and a fall-back day only at 01:00 (02:00
+        in Troll). Day starts never decrease, and every day starts within
+        a day of its local midnight, so the answer is the local date or
+        one of its neighbours. ``at`` must lie in [``_EARLIEST_INSTANT``,
+        ``_LATEST_INSTANT``), where all three days' starts can be dated.
+        """
+        local = at.astimezone(self._tz).date()
+        for day in (local + timedelta(days=1), local):
+            if self._service_day_start(day) <= at:
+                return day
+        return local - timedelta(days=1)
 
     def _service_day_start(self, service_date: date) -> datetime:
         """Start instant of a GTFS service day: local noon minus 12 hours, UTC.

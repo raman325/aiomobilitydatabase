@@ -73,6 +73,8 @@ from .rt import (
     vehicles_from_message,
 )
 from .static_index import (
+    _EARLIEST_INSTANT,
+    _LATEST_INSTANT,
     ScheduledDeparture,
     ScheduledTrip,
     StaticIndex,
@@ -519,14 +521,18 @@ def _realtime_now(updates: TripUpdates, start: datetime) -> datetime:
 
 
 def _utc_window(
-    start: datetime | None, end: datetime | None
+    start: datetime | None,
+    end: datetime | None,
+    grace: timedelta = timedelta(0),
 ) -> tuple[datetime, datetime | None]:
     """Return the query window in UTC (``start`` defaulting to now).
 
     Python adds and compares two aware datetimes sharing a tzinfo by wall
     clock, ignoring their offsets: a ``start`` given in the feed's own
     zone would shift by a DST jump against the service-day starts. In UTC
-    it never does. A naive datetime names no instant at all.
+    it never does. A naive datetime names no instant at all. ``start``
+    (less ``grace``) must lie in the range service days can be dated in,
+    from 0001-01-03 to 9999-12-01 UTC; a later ``end`` reads to its end.
     """
     start = start or datetime.now(UTC)
     window: list[datetime | None] = []
@@ -542,6 +548,15 @@ def _utc_window(
             raise ValueError(f"{name} is outside the representable range") from err
     utc_start, utc_end = window
     assert utc_start is not None
+    try:
+        earliest = utc_start - max(grace, timedelta(0))
+    except OverflowError:
+        earliest = None
+    if earliest is None or earliest < _EARLIEST_INSTANT or utc_start >= _LATEST_INSTANT:
+        raise ValueError(
+            f"start (less grace) must fall between {_EARLIEST_INSTANT} and "
+            f"{_LATEST_INSTANT}, got {start!r}"
+        )
     return utc_start, utc_end
 
 
@@ -1419,9 +1434,10 @@ class TransitFeedHandle:
         The answer is exactly that of reading the whole window at once.
         Open-ended queries need a limit: ``end=None`` with any
         ``limit=None`` query raises ``ValueError``, as does a naive
-        (timezone-less) or unrepresentable ``start`` or ``end``. ``end <
-        start`` returns
-        empty boards.
+        (timezone-less) or unrepresentable ``start`` or ``end``, or a
+        ``start - grace`` outside the range service days can be dated in
+        (0001-01-03 to 9999-12-01 UTC). ``end < start`` returns empty
+        boards.
 
         ``grace`` reaches that far BEFORE ``start`` when collecting
         scheduled candidates, so a trip whose scheduled time has passed
@@ -1476,7 +1492,7 @@ class TransitFeedHandle:
         either way, so there the flag costs no extra request.
         """
         _require_bound(end, [query.limit for query in queries])
-        start, end = _utc_window(start, end)
+        start, end = _utc_window(start, end, grace)
         all_stop_ids = sorted(
             {stop_id for query in queries for stop_id in query.stop_ids}
         )
@@ -1510,7 +1526,7 @@ class TransitFeedHandle:
             vehicles = _vehicle_index(
                 await self._vehicles_from(vehicle_messages, stops_by_id, routes_by_id)
             )
-            current_at = _realtime_now(updates, start) - grace
+            realtime_now = _realtime_now(updates, start)
             # Realtime moves exactly the runs it names: those a TripUpdate
             # addresses and those a detour rebuilds. Both are read whole,
             # here, with the window applied to their scheduled times -- so
@@ -1522,7 +1538,7 @@ class TransitFeedHandle:
                 dep
                 for dep in await self._index_read(
                     self._index.instance_departures,
-                    await self._addressed_runs(updates, current_at),
+                    await self._addressed_runs(updates, realtime_now, grace),
                     batch_stops,
                     batch_routes,
                     batch_headsigns,
@@ -1571,7 +1587,8 @@ class TransitFeedHandle:
                     list(scheduled.values()),
                     all_stop_ids,
                     start=start,
-                    current_at=current_at,
+                    realtime_now=realtime_now,
+                    grace=grace,
                     updates=updates,
                     modified_rows=modified_rows,
                     modified_instances=modified_instances,
@@ -1597,20 +1614,20 @@ class TransitFeedHandle:
             return [board or [] for board in boards]
 
     async def _addressed_runs(
-        self, updates: TripUpdates, current_at: datetime
+        self, updates: TripUpdates, now: datetime, grace: timedelta
     ) -> list[_TripInstance]:
         """Return the runs TripUpdates address, resolved as the merge does.
 
         Dated keys name their day; date-less ones the current run as of
-        ``current_at``. These are the only scheduled runs realtime can move
-        (detours aside), so they are read whole before any scan. Caller
-        holds the reader guard.
+        ``now``, keeping one that ended within ``grace``. These are the
+        only scheduled runs realtime can move (detours aside), so they are
+        read whole before any scan. Caller holds the reader guard.
         """
         return sorted(
             {
                 instance
                 for instance, _key in await self._index_read(
-                    self._index.rt_instances, list(updates.trips), current_at
+                    self._index.rt_instances, list(updates.trips), now, grace
                 )
             }
         )
@@ -1620,7 +1637,8 @@ class TransitFeedHandle:
         rows: Sequence[tuple[str, str, int | None]],
         updates: TripUpdates,
         vehicles: _Vehicles,
-        at: datetime,
+        now: datetime,
+        grace: timedelta,
     ) -> dict[_RtIdentity, date]:
         """Current-run service days for the identities that need one.
 
@@ -1642,7 +1660,7 @@ class TransitFeedHandle:
         if not wanted:
             return {}
         dates = await self._index_read(
-            self._index.current_service_dates, sorted(wanted), at
+            self._index.current_service_dates, sorted(wanted), now, grace
         )
         return {
             wanted[trip_id]: service_date for trip_id, service_date in dates.items()
@@ -1654,7 +1672,8 @@ class TransitFeedHandle:
         all_stop_ids: list[str],
         *,
         start: datetime,
-        current_at: datetime,
+        realtime_now: datetime,
+        grace: timedelta,
         updates: TripUpdates,
         modified_rows: Sequence[StopArrival],
         modified_instances: Collection[tuple[str, date]],
@@ -1690,7 +1709,8 @@ class TransitFeedHandle:
             [(dep.trip_id, dep.source_trip_id, dep.start_secs) for dep in scheduled],
             updates,
             vehicles,
-            current_at,
+            realtime_now,
+            grace,
         )
         resolved = await self._resolve_predictions(
             updates,
@@ -1875,7 +1895,8 @@ class TransitFeedHandle:
         including the open-ended default: with ``end=None`` each query's
         result fills to its ``limit`` however far ahead the next journeys
         are, and ``end=None`` with a ``limit=None`` query raises
-        ``ValueError``, as does a naive or unrepresentable ``start``/``end``.
+        ``ValueError``, as does a naive or unrepresentable ``start``/``end``
+        or a ``start - grace`` outside 0001-01-03 to 9999-12-01 UTC.
         Each query's ``limit`` caps its merged result,
         nearest effective origin departure first. RT cancellations — and
         SKIPPED stops: a skipped origin or skipped destination kills the
@@ -1909,7 +1930,7 @@ class TransitFeedHandle:
         is filled from the realtime prediction either way.
         """
         _require_bound(end, [query.limit for query in queries])
-        start, end = _utc_window(start, end)
+        start, end = _utc_window(start, end, grace)
         if not queries or (end is not None and end < start):
             return [[] for _ in queries]
         rt_memo: dict[str, gtfs_realtime_pb2.FeedMessage] = {}
@@ -1925,10 +1946,10 @@ class TransitFeedHandle:
             vehicles = _vehicle_index(
                 await self._vehicles_from(vehicle_messages, stops_by_id, routes_by_id)
             )
-            current_at = _realtime_now(updates, start) - grace
+            realtime_now = _realtime_now(updates, start)
             # As in get_arrivals: the runs realtime addresses are read whole
             # up front, so the scan only adds rows at their scheduled time.
-            addressed = await self._addressed_runs(updates, current_at)
+            addressed = await self._addressed_runs(updates, realtime_now, grace)
             memo = _PredictionMemo()
             results: list[list[UpcomingTrip]] = []
             for query in queries:
@@ -1973,7 +1994,8 @@ class TransitFeedHandle:
                         await self._merged_trips(
                             list(scheduled.values()),
                             start=start,
-                            current_at=current_at,
+                            realtime_now=realtime_now,
+                            grace=grace,
                             updates=updates,
                             stops_by_id=stops_by_id,
                             routes_by_id=routes_by_id,
@@ -1995,7 +2017,8 @@ class TransitFeedHandle:
         scheduled: list[ScheduledTrip],
         *,
         start: datetime,
-        current_at: datetime,
+        realtime_now: datetime,
+        grace: timedelta,
         updates: TripUpdates,
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
@@ -2019,7 +2042,8 @@ class TransitFeedHandle:
             ],
             updates,
             vehicles,
-            current_at,
+            realtime_now,
+            grace,
         )
         resolved = await self._resolve_predictions(
             updates,
@@ -2338,8 +2362,9 @@ class TransitFeedHandle:
         The schedule-only twin of :meth:`get_arrivals`: same
         :class:`ArrivalsQuery` batch, same ``start``/``end``/``limit``
         rules (open-ended by default, ``ValueError`` for ``end=None`` with
-        a ``limit=None`` query or a naive ``start``/``end``, ``end < start``
-        gives empty boards), but no
+        a ``limit=None`` query, a naive ``start``/``end`` or a ``start``
+        outside 0001-01-03 to 9999-12-01 UTC; ``end < start`` gives empty
+        boards), but no
         realtime overlay and no ``grace``. It never makes a network request,
         so a calendar view or a config flow keeps working when a producer's
         realtime endpoint is down or its API key has lapsed. For "every
