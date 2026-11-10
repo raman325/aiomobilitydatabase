@@ -32,6 +32,13 @@ def _http(when: datetime) -> str:
     return format_datetime(when, usegmt=True)
 
 
+# Last-Modified values must be HTTP-dates to validate anything.
+MON = _http(T0 - timedelta(days=3))
+TUE = _http(T0 - timedelta(days=2))
+THU = _http(T0)
+SUN = _http(T0 - timedelta(days=4))
+
+
 # -- freshness_from_headers: examples -------------------------------------------
 
 
@@ -69,10 +76,11 @@ def _http(when: datetime) -> str:
         ),
         ({"Expires": _http(T0 + timedelta(seconds=45))}, Freshness(lifetime=45.0)),
         ({"Expires": "0"}, Freshness(lifetime=0.0)),
-        # A "-0000" zone parses naive; HTTP dates are always GMT.
+        # A numeric zone isn't an HTTP-date (RFC 9110 section 5.6.7): an
+        # invalid Expires means already expired (RFC 9111 section 5.3).
         (
             {"Expires": _http(T0 + timedelta(seconds=45)).replace("GMT", "-0000")},
-            Freshness(lifetime=45.0),
+            Freshness(lifetime=0.0),
         ),
         ({"Expires": _http(T0 - timedelta(hours=1))}, Freshness(lifetime=0.0)),
         # Age reduces the remaining lifetime; an invalid Age is ignored.
@@ -108,22 +116,65 @@ def test_repeated_cache_control_fields_merge() -> None:
     assert _fresh(TwoFields()) == Freshness(lifetime=0.0)
 
 
-@pytest.mark.parametrize("etag", ["*", '"a", "b"', "bare", 'W/"x" junk'])
+@pytest.mark.parametrize("etag", ["*", '"a", "b"', "bare", 'W/"x" junk', 'w/"x"'])
 def test_an_etag_that_isnt_one_entity_tag_validates_nothing(etag: str) -> None:
     """``*`` or a list would change what If-None-Match means."""
     assert Validators.from_headers({"ETag": etag}) is None
-    assert Validators.from_headers({"ETag": etag, "Last-Modified": "Mon"}) == (
-        Validators(etag=None, last_modified="Mon")
+    assert Validators.from_headers({"ETag": etag, "Last-Modified": MON}) == (
+        Validators(etag=None, last_modified=MON)
     )
+
+
+def test_a_non_ascii_etag_is_still_one_entity_tag() -> None:
+    """obs-text is allowed in an entity-tag; it arrives decoded."""
+    assert Validators.from_headers({"ETag": '"€1"'}) == Validators('"€1"', None)
+
+
+def test_a_last_modified_that_isnt_an_http_date_validates_nothing() -> None:
+    assert Validators.from_headers({"Last-Modified": "garbage"}) is None
+    assert Validators.from_headers({"ETag": '"1"', "Last-Modified": "Mon"}) == (
+        Validators('"1"', None)
+    )
+
+
+@pytest.mark.parametrize(
+    "expires",
+    [
+        "Thu, 30 Jul 2026 13:00:00 +0000",  # numeric zone
+        "Thu, 30 Jul 2026 13:00:00 UTC",  # not GMT
+        "30 Jul 2026 13:00:00 GMT",  # no weekday
+        "Thu, 3 Jul 2026 13:00:00 GMT",  # one-digit day
+        "Thu, 30 Jul 2026 13:00 GMT",  # no seconds
+        "Wed, 30 Jul 2026 13:00:00 GMT",  # wrong weekday
+        "Thu, 31 Feb 2026 13:00:00 GMT",  # the right shape, no such day
+    ],
+)
+def test_an_expires_that_isnt_an_http_date_is_already_expired(expires: str) -> None:
+    """RFC 9111 section 5.3: a cache MUST treat invalid date formats as in
+    the past -- not as whatever a lenient parser makes of them.
+    """
+    assert _fresh({"Date": _http(T0), "Expires": expires}) == Freshness(0.0)
+
+
+@pytest.mark.parametrize(
+    "expires",
+    [
+        "Thu, 30 Jul 2026 13:00:00 GMT",  # IMF-fixdate
+        "Thursday, 30-Jul-26 13:00:00 GMT",  # RFC 850
+        "Thu Jul 30 13:00:00 2026",  # asctime
+    ],
+)
+def test_every_http_date_form_is_read(expires: str) -> None:
+    assert _fresh({"Date": _http(T0), "Expires": expires}) == Freshness(3600.0)
 
 
 def test_validators_from_headers_and_back() -> None:
     assert Validators.from_headers({}) is None
-    validators = Validators.from_headers({"etag": '"v1"', "Last-Modified": "Thu"})
-    assert validators == Validators(etag='"v1"', last_modified="Thu")
+    validators = Validators.from_headers({"etag": '"v1"', "Last-Modified": THU})
+    assert validators == Validators(etag='"v1"', last_modified=THU)
     assert validators.request_headers() == {
         "If-None-Match": '"v1"',
-        "If-Modified-Since": "Thu",
+        "If-Modified-Since": THU,
     }
 
 
@@ -234,6 +285,15 @@ def test_a_quote_that_isnt_an_argument_cannot_hide_no_store(header: str) -> None
         ("max-age=60, ext=a;b", Freshness(0.0)),
         # Empty list elements are fine (RFC 9110 section 5.6.1).
         ("max-age=60,, public", Freshness(60.0)),
+        # A no-store glued on by any separator is still a no-store.
+        ("no-cache;no-store", Freshness(None, storable=False)),
+        ("max-age=60;no-store", Freshness(None, storable=False)),
+        ("public/no-store", Freshness(None, storable=False)),
+        ("no-store:true", Freshness(None, storable=False)),
+        ("x=y=no-store", Freshness(None, storable=False)),
+        # Directive names are case-insensitive.
+        ("No-Store", Freshness(None, storable=False)),
+        ("NO-CACHE", Freshness(0.0)),
     ],
 )
 def test_cache_control_follows_its_grammar(header: str, expected: Freshness) -> None:
@@ -441,15 +501,15 @@ async def test_no_store_on_a_304_drops_the_entry() -> None:
 
 
 async def test_a_selecting_304_rotates_only_the_validators_it_carries() -> None:
-    both = Validators(etag='"1"', last_modified="Mon")
+    both = Validators(etag='"1"', last_modified=MON)
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
     producer = _Producer(
         [
             _r("a", both, 0.0),
             # Same strong ETag (selects), new Last-Modified: rotates it.
-            _r(None, Validators(etag='"1"', last_modified="Tue"), 0.0),
+            _r(None, Validators(etag='"1"', last_modified=TUE), 0.0),
             # Only a Last-Modified, matching what is now stored: selects.
-            _r(None, Validators(etag=None, last_modified="Tue"), 0.0),
+            _r(None, Validators(etag=None, last_modified=TUE), 0.0),
             _r(None, V1, 0.0),
         ]
     )
@@ -458,8 +518,8 @@ async def test_a_selecting_304_rotates_only_the_validators_it_carries() -> None:
     assert producer.seen == [
         None,
         both,
-        Validators(etag='"1"', last_modified="Tue"),  # ETag kept
-        Validators(etag='"1"', last_modified="Tue"),
+        Validators(etag='"1"', last_modified=TUE),  # ETag kept
+        Validators(etag='"1"', last_modified=TUE),
     ]
 
 
@@ -469,7 +529,7 @@ async def test_a_selecting_304_rotates_only_the_validators_it_carries() -> None:
         pytest.param({}, id="no-validator"),
         pytest.param({"ETag": '"2"'}, id="another-strong-etag"),
         pytest.param({"ETag": 'W/"2"'}, id="a-non-matching-weak-etag"),
-        pytest.param({"Last-Modified": "Sun"}, id="a-non-matching-last-modified"),
+        pytest.param({"Last-Modified": SUN}, id="a-non-matching-last-modified"),
     ],
 )
 async def test_a_304_that_selects_nothing_updates_nothing(
@@ -480,7 +540,7 @@ async def test_a_304_that_selects_nothing_updates_nothing(
     again unconditionally instead of renewing ``a`` for ten minutes.
     """
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
-    stored = {"ETag": '"1"', "Last-Modified": "Mon", "Cache-Control": "max-age=0"}
+    stored = {"ETag": '"1"', "Last-Modified": MON, "Cache-Control": "max-age=0"}
     producer = _Producer(
         [
             _raw("a", stored),
@@ -490,7 +550,7 @@ async def test_a_304_that_selects_nothing_updates_nothing(
     )
     await cache.get("u", producer)
     assert await cache.get("u", producer) == "b"
-    assert producer.seen == [None, Validators('"1"', "Mon"), None]
+    assert producer.seen == [None, Validators('"1"', MON), None]
 
 
 @pytest.mark.parametrize(
@@ -511,6 +571,9 @@ async def test_a_304_that_selects_nothing_updates_nothing(
             {"ETag": 'W/"1"', "Last-Modified": _http(T0)},
             id="last-modified-the-stored-copy-lacks",
         ),
+        # A bare 304 against Last-Modified alone: the strict rule's cost --
+        # a producer leaving Last-Modified off its 304s gets a full retry.
+        pytest.param({"Last-Modified": THU}, {}, id="bare-304-vs-last-modified"),
     ],
 )
 async def test_a_304_must_match_every_validator_it_carries(
@@ -920,18 +983,30 @@ def _model_lifetime(
     return True, max(0.0, max_age - initial)
 
 
-def _model_selects(stored_etag: str | None, sent: dict[str, str]) -> bool:
-    """RFC 9111 section 4.3.4, restated for ETags only (no Last-Modified)."""
-    new = sent.get("ETag")
-    if new is None:
-        return stored_etag is None
-    if not new.startswith("W/"):
-        return new == stored_etag
-    return stored_etag is not None and stored_etag.removeprefix("W/") == new[2:]
+def _model_selects(
+    stored_etag: str | None, stored_lm: str | None, sent: dict[str, str]
+) -> bool:
+    """RFC 9111 section 4.3.4, restated for what the producer sends.
+
+    A strong tag must equal the stored tag. Otherwise every validator sent
+    must correspond: a weak tag to the stored tag's opaque part, a
+    Last-Modified to the stored one (the producer always writes the same
+    format, so text equality is the instant). Nothing sent corresponds only
+    to nothing stored.
+    """
+    tag, lm = sent.get("ETag"), sent.get("Last-Modified")
+    if tag is not None and not tag.startswith("W/"):
+        return tag == stored_etag
+    if tag is None and lm is None:
+        return stored_etag is None and stored_lm is None
+    tag_ok = tag is None or (
+        stored_etag is not None and stored_etag.removeprefix("W/") == tag[2:]
+    )
+    return tag_ok and (lm is None or lm == stored_lm)
 
 
 _STYLES_304 = st.sampled_from(
-    ["full", "validator_only", "weakened", "strengthened", "bare", "another"]
+    ["full", "redated", "validator_only", "weakened", "strengthened", "bare", "another"]
 )
 
 
@@ -962,6 +1037,7 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.cache_control: str | None = None
         self.validators_offered = True
         self.weak = False
+        self.lm_offered = False
         self.date_mode = "now"
         self.age: int | None = None
         self.style_304 = "full"
@@ -974,6 +1050,7 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.stored: _Doc | None = None
         self.stored_cc: str | None = None
         self.stored_etag: str | None = None
+        self.stored_lm: str | None = None
         self.stored_date: int | None = None
         self.stored_age: int | None = None
         self.stored_received = 0
@@ -993,12 +1070,19 @@ class FreshnessMachine(RuleBasedStateMachine):
         tag = f'"{doc.version}.{doc.timestamp}"'
         return f"W/{tag}" if self.weak else tag
 
-    def _headers(self, etag: str | None) -> dict[str, str]:
+    def _lm(self, doc: _Doc) -> str | None:
+        if not self.lm_offered:
+            return None
+        return _http(datetime.fromtimestamp(doc.timestamp, UTC))
+
+    def _headers(self, etag: str | None, lm: str | None = None) -> dict[str, str]:
         headers: dict[str, str] = {}
         if self.cache_control is not None:
             headers["Cache-Control"] = self.cache_control
         if etag is not None:
             headers["ETag"] = etag
+        if lm is not None:
+            headers["Last-Modified"] = lm
         if self.date_mode != "none":
             date = self._wall() - (20 if self.date_mode == "stale" else 0)
             headers["Date"] = _http(datetime.fromtimestamp(date, UTC))
@@ -1016,11 +1100,30 @@ class FreshnessMachine(RuleBasedStateMachine):
         if self.stale_next:
             self.stale_next = False
             doc = _Doc(doc.version, doc.timestamp - 50)  # an older edge copy
-        etag = self._etag(doc)
+        etag, lm = self._etag(doc), self._lm(doc)
         now = T0 + timedelta(seconds=self.clock.now)
-        if validators is not None and etag is not None and validators.etag == etag:
+        unchanged = validators is not None and (
+            (etag is not None and validators.etag == etag)
+            or (etag is None and lm is not None and validators.last_modified == lm)
+        )
+        # Another edge's copy: the same tag, a different Last-Modified.
+        redated = _http(datetime.fromtimestamp(doc.timestamp + 3600, UTC))
+        if unchanged and etag is None:
+            # Last-Modified alone: the tag-shaped styles collapse to these.
+            style = {"bare": "bare", "another": "bare", "redated": "redated"}.get(
+                self.style_304, "lm_only"
+            )
             headers = {
-                "full": self._headers(etag),
+                "lm_only": {**self._headers(None), "Last-Modified": lm or ""},
+                "redated": {**self._headers(None), "Last-Modified": redated},
+                "bare": {},
+            }[style]
+            self.log.append((validators, headers, None))
+            return Response(None, header_fields(headers), now, now)
+        if unchanged:
+            assert etag is not None
+            headers = {
+                "full": self._headers(etag, lm),
                 "validator_only": {"ETag": etag},
                 # A CDN weakening the tag (as compression does): selects by
                 # weak comparison.
@@ -1034,12 +1137,15 @@ class FreshnessMachine(RuleBasedStateMachine):
                     **self._headers(etag),
                     "ETag": etag.removeprefix("W/"),
                 },
+                # A matching tag but another Last-Modified: selects only if
+                # the tag is strong (a weak one needs every validator).
+                "redated": {**self._headers(etag, lm), "Last-Modified": redated},
                 "bare": {},
                 "another": {"ETag": '"another"', "Cache-Control": "max-age=600"},
             }[self.style_304]
             self.log.append((validators, headers, None))
             return Response(None, header_fields(headers), now, now)
-        headers = self._headers(etag)
+        headers = self._headers(etag, lm)
         self.log.append((validators, headers, doc))
         return Response(doc, header_fields(headers), now, now)
 
@@ -1077,12 +1183,20 @@ class FreshnessMachine(RuleBasedStateMachine):
         ),
         validators=st.booleans(),
         weak=st.booleans(),
+        last_modified=st.booleans(),
     )
-    def publish(self, cache_control: str | None, validators: bool, weak: bool) -> None:
+    def publish(
+        self,
+        cache_control: str | None,
+        validators: bool,
+        weak: bool,
+        last_modified: bool = False,
+    ) -> None:
         self.version += 1
         self.published = _Doc(self.version, self._wall() - 5)
         self.cache_control = cache_control
         self.validators_offered, self.weak = validators, weak
+        self.lm_offered = last_modified
 
     @rule()
     def publish_cacheable(self) -> None:
@@ -1091,6 +1205,15 @@ class FreshnessMachine(RuleBasedStateMachine):
         """
         self.publish(cache_control="max-age=30", validators=True, weak=False)
         self.style_304, self.date_mode = "full", "now"
+
+    @rule(weak=st.booleans())
+    def publish_dated_cacheable(self, weak: bool) -> None:
+        """Fresh for 30s with Last-Modified, and a weak tag or none: the shapes
+        where Last-Modified decides whether a 304 selects.
+        """
+        self.publish(cache_control="max-age=30", validators=weak, weak=True)
+        self.lm_offered = True
+        self.date_mode = "now"
 
     @rule(ahead=st.sampled_from([2, 10**8]))
     def publish_from_a_fast_clock(self, ahead: int) -> None:
@@ -1154,8 +1277,9 @@ class FreshnessMachine(RuleBasedStateMachine):
         expect_fresh = self._expect_fresh()
         will_fail = self.fail_next and not expect_fresh
         sent = (
-            Validators(etag=self.stored_etag, last_modified=None)
-            if self.stored is not None and self.stored_etag is not None
+            Validators(etag=self.stored_etag, last_modified=self.stored_lm)
+            if self.stored is not None
+            and (self.stored_etag is not None or self.stored_lm is not None)
             else None
         )
         self.log = []
@@ -1177,7 +1301,15 @@ class FreshnessMachine(RuleBasedStateMachine):
             return
         assert all(r == results[0] for r in results)
         _, headers, served = self.log[0]
-        if served is None and not _model_selects(self.stored_etag, headers):
+        if served is None and "ETag" not in headers:
+            event(
+                "304 by Last-Modified alone"
+                if "Last-Modified" in headers
+                else "304 with no validator"
+            )
+        if served is None and not _model_selects(
+            self.stored_etag, self.stored_lm, headers
+        ):
             # A 304 that identifies nothing: asked again, unconditionally.
             event(f"304 ({self.style_304}) selects nothing: re-asked")
             assert len(self.log) == 2
@@ -1207,6 +1339,8 @@ class FreshnessMachine(RuleBasedStateMachine):
                 self.stored_cc = headers["Cache-Control"]
             if "ETag" in headers:
                 self.stored_etag = headers["ETag"]
+            if "Last-Modified" in headers:
+                self.stored_lm = headers["Last-Modified"]
             if "Age" in headers:
                 self.stored_age = age
             self.stored_date = date
@@ -1235,6 +1369,7 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.stored = served
         self.stored_cc = headers.get("Cache-Control")
         self.stored_etag = headers.get("ETag")
+        self.stored_lm = headers.get("Last-Modified")
         self.stored_date, self.stored_age = date, age
         self.stored_received = self._wall()
         self.stored_at, self.stored_lifetime = self.clock.now, lifetime

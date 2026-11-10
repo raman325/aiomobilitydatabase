@@ -266,7 +266,10 @@ Notes on direct mode:
   request; afterwards the request is conditional (`ETag`/`Last-Modified`),
   so an unchanged feed costs a `304`. A `304` counts only if its validator
   identifies the stored copy; one naming another `ETag`, or none at all,
-  changes nothing and is asked again unconditionally. A counting `304`
+  changes nothing and is asked again unconditionally. Validators must be
+  well-formed: an unquoted `ETag` (`abc123`, a common misconfiguration),
+  `*` or a list, and a `Last-Modified` that isn't an HTTP-date, validate
+  nothing — such a producer gets unconditional requests. A counting `304`
   updates only the headers it carries — one with just its `ETag` after
   `no-cache` is still `no-cache`; one without `Date` is dated on arrival —
   and freshness is recomputed from the merged headers. `no-cache` revalidates

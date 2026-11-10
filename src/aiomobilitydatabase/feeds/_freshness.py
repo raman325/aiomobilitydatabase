@@ -26,7 +26,18 @@ _DELTA_SECONDS_MAX = 2_147_483_648
 _DELTA_SECONDS_DIGITS = len(str(_DELTA_SECONDS_MAX))
 # RFC 9110 section 5.6.2 token, and section 8.8.3 entity-tag.
 _TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-_ENTITY_TAG = re.compile(r'(W/)?"[\x21\x23-\x7e\x80-\xff]*"')
+# etagc is any visible character but DQUOTE, plus obs-text -- which arrives
+# decoded (aiohttp: UTF-8 with surrogateescape), so anything non-ASCII.
+_ENTITY_TAG = re.compile(r'(W/)?"[^\x00-\x20"\x7f]*"')
+# RFC 9110 section 5.6.7: the three HTTP-date forms, and nothing else.
+_DAY = "(Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
+_LONG_DAY = "(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+_MONTH = "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+_HTTP_DATE = re.compile(
+    rf"{_DAY}, \d{{2}} {_MONTH} \d{{4}} \d{{2}}:\d{{2}}:\d{{2}} GMT"  # IMF-fixdate
+    rf"|{_LONG_DAY}, \d{{2}}-{_MONTH}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}} GMT"  # RFC 850
+    rf"|{_DAY} {_MONTH} [ \d]\d \d{{2}}:\d{{2}}:\d{{2}} \d{{4}}"  # asctime
+)
 
 
 # A response's header fields: lower-cased name -> values, in the order
@@ -56,13 +67,17 @@ class Validators:
     def from_fields(cls, fields: Fields) -> Validators | None:
         """Read the validators in a set of header fields; None when neither.
 
-        An ETag that isn't one entity-tag (``*``, a list) validates nothing.
+        An ETag that isn't exactly one quoted entity-tag (``*``, a list, an
+        unquoted ``abc123``) validates nothing, nor does a Last-Modified
+        that isn't an HTTP-date.
         """
         etag = _etag(fields)
         last_modified = _first(fields, "last-modified")
+        if _http_date(last_modified) is None:
+            last_modified = None  # not an HTTP-date: validates nothing
         if not etag and not last_modified:
             return None
-        return cls(etag=etag or None, last_modified=last_modified or None)
+        return cls(etag=etag or None, last_modified=last_modified)
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> Validators | None:
@@ -114,15 +129,28 @@ def _etag(fields: Fields) -> str | None:
 
 
 def _http_date(value: str | None) -> datetime | None:
+    """Parse an HTTP-date (RFC 9110 section 5.6.7); None for anything else.
+
+    Only the three standard forms, with a weekday that matches the date:
+    RFC 9111 section 5.3 has a cache treat any other format (a numeric
+    zone, ``UTC``, no weekday, no seconds) as invalid -- an ``Expires`` in
+    it means "already expired", not whatever a lenient parser makes of it.
+    """
     if not value:
+        return None
+    value = value.strip()
+    match = _HTTP_DATE.fullmatch(value)
+    if match is None:
         return None
     try:
         parsed = parsedate_to_datetime(value)
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
-    if parsed.tzinfo is None:  # "-0000" parses naive; HTTP dates are GMT
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
+    weekday = next(group for group in (match[1], match[3], match[5]) if group)
+    if parsed.strftime("%a") != weekday[:3]:
+        return None
+    # asctime carries no zone and parses naive; every HTTP-date is GMT.
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
 
 
 def _delta_seconds(value: str | None) -> int | None:
@@ -205,9 +233,9 @@ def _directives(values: Sequence[str]) -> tuple[dict[str, list[str | None]], boo
     Each field is split on its own, so one field's dangling quote can't
     swallow the next field. A field that breaks the grammar -- a stray
     quote, a missing comma -- is malformed, and reported so the caller can
-    treat its freshness as invalid; it is still scanned for directive
-    names split on commas, whitespace AND quotes, so a ``no-store`` or
-    ``no-cache`` in it never hides (not even glued to a quoted string).
+    treat its freshness as invalid; every run of token characters in it is
+    still read as a directive name, so a ``no-store`` or ``no-cache`` never
+    hides, whatever it is glued to (``;``, ``/``, a quote, a space).
     """
     directives: dict[str, list[str | None]] = {}
     malformed = False
@@ -219,10 +247,10 @@ def _directives(values: Sequence[str]) -> tuple[dict[str, list[str | None]], boo
             for directive, part in zip(parsed, parts, strict=True)
         ):
             malformed = True
-            for word in re.split(r'[,\s"]+', value):
-                name, sep, arg = word.partition("=")
-                if name:
-                    directives.setdefault(name.lower(), []).append(arg if sep else None)
+            # Its freshness is invalid either way; what must still be seen
+            # is a no-store, however it is glued on (``no-cache;no-store``).
+            for name in _TOKEN.findall(value):
+                directives.setdefault(name.lower(), []).append(None)
             continue
         for directive in parsed:
             if directive is not None:
@@ -301,15 +329,11 @@ def _entity_tag(fields: Fields) -> tuple[bool, str] | None:
 def _same_instant(new: str, stored: str | None) -> bool:
     """Whether two Last-Modified values name the same instant.
 
-    Compared as dates when both parse (an RFC 850 date equals its IMF-fixdate
-    form), as text otherwise.
+    Compared as dates (an RFC 850 date equals its IMF-fixdate form); a value
+    that isn't an HTTP-date names no instant and matches nothing.
     """
-    if stored is None:
-        return False
-    new_date, stored_date = _http_date(new), _http_date(stored)
-    if new_date is not None and stored_date is not None:
-        return new_date == stored_date
-    return new == stored
+    new_date = _http_date(new)
+    return new_date is not None and new_date == _http_date(stored)
 
 
 def _selects(stored: Fields, new: Fields) -> bool:
