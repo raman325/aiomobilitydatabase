@@ -618,7 +618,7 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
     }
     built.close()
     assert (SCHEMA_VERSION, fingerprint) == (
-        4,
+        5,
         {
             "agencies": [
                 "email",

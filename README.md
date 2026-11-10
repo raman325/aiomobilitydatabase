@@ -234,12 +234,23 @@ Notes on direct mode:
   takes `start` (default now), `end` and a limit. With `end=None` a board
   fills to its limit however far ahead the departures are — overnight,
   over a weekend, past a holiday — instead of going empty after the last
-  bus. The schedule is read over a doubling horizon (2h, 4h, 8h, ...) and
-  stops at the feed's last scheduled instant, so a stop nothing serves
-  still terminates. Realtime is fetched once, before the first horizon, and
-  a realtime board only settles once its last row sits an hour inside the
-  horizon: a trip scheduled just beyond it but running early can't be
-  missed. An open-ended query with no limit raises `ValueError`.
+  bus. Every dated query reads the schedule in doubling slices (2h, 4h,
+  8h, ...), each pass reading only the new slice for boards still filling,
+  with route and headsign filters applied in SQL; a limited board stops
+  as soon as it is settled, bounded or not. A board stops scanning once
+  nothing more can match: past the last day any service that serves its stops,
+  routes and headsigns runs — so a filter matching nothing, a seasonal
+  route, or a calendar running "forever" all end promptly. Realtime is
+  fetched once, and a realtime board only settles once its last row sits
+  an hour inside the horizon: a trip scheduled just beyond it but running
+  early can't be missed. An open-ended query with no limit raises
+  `ValueError`. `end` bounds scheduled times; a delayed trip predicted past
+  it, and RT-added trips, still show.
+- **Date-less realtime means the current run**: a TripUpdate, cancellation
+  or vehicle with no `start_date` applies only to the trip's run that is
+  under way or still to come today (including last night's past-midnight
+  run) — never to tomorrow's, however wide the window. A dated one applies
+  to exactly its day.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic
   `{trip_id}#{start_secs}` ids, so every schedule query — arrivals,
@@ -501,9 +512,10 @@ The suite combines example-based, property-based, and conformance testing:
     `grace` yields a superset — which guards the scan-window regression class
     directly, without a hand-built oracle;
   - open-ended equals bounded: for every dated query, `end=None, limit=k`
-    returns exactly the first `k` rows of the same query bounded at the
-    feed's scan ceiling — including with realtime predictions running up to
-    the early margin — so the expanding horizon is a pure optimization;
+    returns exactly the first `k` rows of the same query bounded beyond the
+    end of service — including with realtime delays, early running up to
+    the margin, dated and date-less cancellations, and batches whose
+    queries settle at different horizons;
   - the cache as a round trip: a built index and the same index reopened from
     disk answer every query identically, including the stored timezone, and
     `purge_cache` removes exactly the named feed and nothing else for any

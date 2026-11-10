@@ -11,7 +11,7 @@ import csv
 import io
 import sqlite3
 import zipfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
@@ -34,12 +34,15 @@ from .models import (
 # v3: descriptive surface sweep (stop desc/url/zone/timezone, route
 # desc/sort_order, trip short_name/block_id, feed_info table).
 # v4: agencies.email, feed_info.contact_email/contact_url.
+# v5: calendar and calendar_dates dates stored canonical (YYYYMMDD, or NULL
+#     when unparseable) -- same columns, different contents, so old caches
+#     must not be reused.
 # BUMP THIS whenever _SCHEMA changes. A cache stamped with an older
 # version is discarded and rebuilt; leaving the number alone makes a
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -107,6 +110,9 @@ CREATE INDEX ix_calendar_dates_date ON calendar_dates (date);
 """
 
 _EXCEPTION_SERVICE_ADDED = 1
+# Open-ended scans never reach past this instant: a calendar running to year
+# 9999 ("forever") would otherwise overflow date arithmetic near datetime.max.
+_LATEST_INSTANT = datetime(9999, 12, 1, tzinfo=UTC)
 _EXCEPTION_SERVICE_REMOVED = 2
 
 _WEEKDAY_COLUMNS = (
@@ -258,6 +264,19 @@ def _lenient_date(value: str | None) -> date | None:
         return date(int(value[:4]), int(value[4:6]), int(value[6:8]))
     except ValueError:
         return None
+
+
+def _canonical_date(value: str | None) -> str | None:
+    """Store a service date as canonical ``YYYYMMDD`` text, or None.
+
+    Service activity compares these cells as text, and the scan ceiling
+    takes their maximum; both must read the same dates. Canonicalizing at
+    load time makes that true: a cell :func:`_lenient_date` rejects (wrong
+    length, dashes, month 13) is stored NULL and is never active, instead
+    of comparing by accident of its characters.
+    """
+    parsed = _lenient_date(value)
+    return parsed.strftime("%Y%m%d") if parsed is not None else None
 
 
 def _enum_or_none[IntEnumT: IntEnum](
@@ -453,8 +472,7 @@ class StaticIndex:
         self.dataset_id = dataset_id
         self.timezone_name = timezone_name
         self._tz = ZoneInfo(timezone_name)
-        self._scan_ceiling: datetime | None = None
-        self._scan_ceiling_known = False
+        self._last_dates: dict[str, date] | None = None
 
     # -- construction ------------------------------------------------------
 
@@ -958,8 +976,8 @@ class StaticIndex:
                         _strict_int(row.get(day) or "0", day)
                         for day in _WEEKDAY_COLUMNS
                     ),
-                    row.get("start_date") or "",
-                    row.get("end_date") or "",
+                    _canonical_date(row.get("start_date")),
+                    _canonical_date(row.get("end_date")),
                 )
             )
             if len(rows) >= _BATCH_SIZE:
@@ -980,10 +998,15 @@ class StaticIndex:
         rows: list[tuple[object, ...]] = []
         sql = "INSERT INTO calendar_dates VALUES (?,?,?)"
         for row in reader:
+            day = _canonical_date(row["date"])
+            if day is None:
+                # An exception on a date that does not parse can never apply:
+                # skip it (it would match no service day anyway).
+                continue
             rows.append(
                 (
                     row["service_id"],
-                    row["date"],
+                    day,
                     _strict_int(row["exception_type"], "exception_type"),
                 )
             )
@@ -1340,52 +1363,153 @@ class StaticIndex:
                 active.discard(service_id)
         return active
 
-    def last_service_date(self) -> date | None:
-        """Latest service date any calendar can be active on, or None.
+    def _service_last_dates(self) -> dict[str, date]:
+        """Map each service id to the last service date it can be active on.
 
-        The later of every ``calendar.end_date`` and every ``calendar_dates``
-        ADDED date. Dates are parsed leniently in Python rather than with
-        SQL ``MAX``: a malformed cell sorts above every digit string, so a
-        textual maximum would let one garbage row hide the real last date.
-        A removal can only shorten service, so removals are ignored -- this
-        is an upper bound, which is all an open-ended scan needs to stop.
+        From ``calendar`` rows that can run at all (some weekday set, start
+        not after end) and from ``calendar_dates`` ADDED dates, the later
+        winning. Removals can only shorten service, so they are ignored:
+        this is an upper bound. Computed once; the index never changes.
         """
-        candidates = [
-            parsed
-            for (raw,) in self._conn.execute(
-                "SELECT DISTINCT end_date FROM calendar "
-                "UNION SELECT DISTINCT date FROM calendar_dates "
-                "WHERE exception_type = ?",
-                (_EXCEPTION_SERVICE_ADDED,),
-            )
-            if (parsed := _lenient_date(raw)) is not None
-        ]
-        return max(candidates, default=None)
+        if self._last_dates is not None:
+            return self._last_dates
+        weekday_any = " OR ".join(f"{day} = 1" for day in _WEEKDAY_COLUMNS)
+        last: dict[str, date] = {}
+        rows = self._conn.execute(
+            "SELECT service_id, end_date FROM calendar "
+            f"WHERE ({weekday_any}) AND start_date <= end_date "
+            "UNION ALL SELECT service_id, MAX(date) FROM calendar_dates "
+            "WHERE exception_type = ? GROUP BY service_id",
+            (_EXCEPTION_SERVICE_ADDED,),
+        )
+        for service_id, raw in rows:
+            parsed = _lenient_date(raw)
+            if parsed is not None and (
+                service_id not in last or parsed > last[service_id]
+            ):
+                last[service_id] = parsed
+        self._last_dates = last
+        return last
 
-    def scan_ceiling(self) -> datetime | None:
-        """Latest instant any scheduled stop time can fall at, or None.
+    def _ceiling_from(self, rows: Iterable[tuple[str, int]]) -> datetime | None:
+        """Latest instant across (service id, latest stop-time secs) rows."""
+        last_dates = self._service_last_dates()
+        best: datetime | None = None
+        for service_id, max_secs in rows:
+            last = last_dates.get(service_id)
+            if last is None or max_secs is None:
+                continue
+            try:
+                instant = self._service_day_start(last).astimezone(UTC) + timedelta(
+                    seconds=max_secs
+                )
+            except OverflowError:
+                instant = _LATEST_INSTANT
+            best = instant if best is None else max(best, instant)
+        return None if best is None else min(best, _LATEST_INSTANT)
 
-        The start of :meth:`last_service_date`'s service day plus the
-        largest arrival/departure offset in ``stop_times`` (GTFS times run
-        past 24:00:00, so the last service day's trips can end days later).
-        Open-ended queries scan forward until they reach this instant; None
-        means the feed has no service at all. Computed once per index: the
-        index is immutable after build, and the ``MAX`` is a full scan.
+    def departures_ceiling(
+        self,
+        stop_ids: list[str],
+        route_ids: list[str] | None = None,
+        headsigns: list[str] | None = None,
+    ) -> datetime | None:
+        """Latest instant a departure matching these filters can fall at.
+
+        Considers only the services that actually have a timed departure at
+        ``stop_ids`` passing the route/headsign filters, each up to the last
+        day it can run. None means no such departure can ever occur, so an
+        open-ended query over these filters has nothing to scan for. Far
+        tighter than the feed's own end: a filter matching nothing ends at
+        once, and a seasonal route ends with its season.
         """
-        if self._scan_ceiling_known:
-            return self._scan_ceiling
-        last = self.last_service_date()
-        ceiling: datetime | None = None
-        if last is not None:
-            max_departure, max_arrival = self._conn.execute(
-                "SELECT MAX(departure_secs), MAX(arrival_secs) FROM stop_times"
-            ).fetchone()
-            max_secs = max(max_departure or 0, max_arrival or 0)
-            ceiling = self._service_day_start(last).astimezone(UTC) + timedelta(
-                seconds=max_secs
-            )
-        self._scan_ceiling, self._scan_ceiling_known = ceiling, True
-        return ceiling
+        if not stop_ids:
+            return None
+        sql = (
+            "SELECT t.service_id, MAX(st.departure_secs) "
+            "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
+            f"WHERE st.stop_id IN ({','.join('?' * len(stop_ids))}) "
+            "AND st.departure_secs IS NOT NULL"
+        )
+        params: list[object] = list(stop_ids)
+        if route_ids:
+            sql += f" AND t.route_id IN ({','.join('?' * len(route_ids))})"
+            params.extend(route_ids)
+        if headsigns:
+            sql += f" AND t.headsign IN ({','.join('?' * len(headsigns))})"
+            params.extend(headsigns)
+        sql += " GROUP BY t.service_id"
+        return self._ceiling_from(self._conn.execute(sql, params))
+
+    def journeys_ceiling(
+        self, origin_stop_id: str, destination_stop_id: str
+    ) -> datetime | None:
+        """Latest origin departure of any journey from origin to destination.
+
+        The :meth:`departures_ceiling` of the stop pair, under the same
+        candidate predicate as :meth:`upcoming_trips` (right direction, both
+        ends timed). None means no journey between them can ever occur.
+        """
+        rows = self._conn.execute(
+            "SELECT t.service_id, MAX(o.departure_secs) "
+            "FROM stop_times o "
+            "JOIN stop_times d ON d.trip_id = o.trip_id "
+            "JOIN trips t ON t.id = o.trip_id "
+            "WHERE o.stop_id = ? AND d.stop_id = ? "
+            "AND o.stop_sequence < d.stop_sequence "
+            "AND o.departure_secs IS NOT NULL AND d.arrival_secs IS NOT NULL "
+            "GROUP BY t.service_id",
+            (origin_stop_id, destination_stop_id),
+        )
+        return self._ceiling_from(rows)
+
+    def current_service_dates(
+        self, trip_ids: Sequence[str], at: datetime
+    ) -> dict[str, date]:
+        """Map each trip to the service day of its CURRENT run, as of ``at``.
+
+        GTFS-RT addresses a trip without ``start_date`` as the run "on the
+        current service day". That is the earliest service day D, among
+        today and the days before it whose runs can still be under way
+        (GTFS times pass 24:00:00), on which the trip's service runs and
+        whose LAST scheduled stop time -- over the whole trip, not just the
+        stops a query asked about -- is at or after ``at``. A trip whose run
+        today is over, or that does not run today, has no current run: a
+        later day's run is never "current", so a date-less update can't
+        leak onto tomorrow. Callers pass ``at = start - grace`` so a run
+        still finishing late keeps its updates.
+        """
+        if not trip_ids:
+            return {}
+        marks = ",".join("?" * len(trip_ids))
+        trips = self._conn.execute(
+            "SELECT t.id, t.service_id, "
+            "MAX(MAX(COALESCE(st.arrival_secs, -1), COALESCE(st.departure_secs, -1))) "
+            "FROM trips t JOIN stop_times st ON st.trip_id = t.id "
+            f"WHERE t.id IN ({marks}) GROUP BY t.id",
+            list(trip_ids),
+        ).fetchall()
+        local_today = at.astimezone(self._tz).date()
+        active_by_day: dict[date, set[str]] = {}
+        current: dict[str, date] = {}
+        for trip_id, service_id, end_secs in trips:
+            if end_secs is None or end_secs < 0:
+                continue
+            back = end_secs // 86_400 + 1
+            for offset in range(back, -1, -1):
+                service_date = local_today - timedelta(days=offset)
+                active = active_by_day.get(service_date)
+                if active is None:
+                    active = active_by_day[service_date] = self.active_service_ids(
+                        service_date
+                    )
+                if service_id not in active:
+                    continue
+                day_start = self._service_day_start(service_date).astimezone(UTC)
+                if day_start + timedelta(seconds=end_secs) >= at:
+                    current[trip_id] = service_date
+                    break
+        return current
 
     def _service_day_start(self, service_date: date) -> datetime:
         """Start instant of a GTFS service day: local noon minus 12 hours.
@@ -1415,7 +1539,9 @@ class StaticIndex:
         local_today +/- 1 day tuple ignored `lookahead` entirely).
         """
         window_start = now_utc - grace
-        window_end = now_utc + lookahead
+        # Clamped so a window reaching the end of datetime (an explicit far
+        # end, or a calendar running "forever") never overflows date math.
+        window_end = min(now_utc + lookahead, _LATEST_INSTANT)
         local_today = window_start.astimezone(self._tz).date()
         end_local = window_end.astimezone(self._tz).date()
         scan_start = local_today - timedelta(days=1)
@@ -1448,6 +1574,7 @@ class StaticIndex:
         per_stop_limit: int | None = None,
         *,
         grace: timedelta = timedelta(0),
+        headsigns: list[str] | None = None,
     ) -> list[ScheduledDeparture]:
         """Scheduled departures at the given stops within the query window.
 
@@ -1465,7 +1592,8 @@ class StaticIndex:
         Frequency-based trips (frequencies.txt) surface as one row per
         materialized repetition, under synthetic ``{trip_id}#{start_secs}``
         trip ids (see ``_load_frequencies``); the bare template trip id
-        never appears.
+        never appears. ``route_ids``/``headsigns`` (trip-level headsign)
+        narrow the rows in SQL; None or empty means no narrowing.
         """
         results: list[ScheduledDeparture] = []
         for (
@@ -1494,6 +1622,10 @@ class StaticIndex:
                 route_marks = ",".join("?" * len(route_ids))
                 sql += f" AND t.route_id IN ({route_marks})"
                 params.extend(route_ids)
+            if headsigns:
+                headsign_marks = ",".join("?" * len(headsigns))
+                sql += f" AND t.headsign IN ({headsign_marks})"
+                params.extend(headsigns)
             for (
                 trip_id,
                 route_id,

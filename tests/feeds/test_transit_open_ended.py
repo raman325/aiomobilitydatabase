@@ -332,3 +332,142 @@ async def test_a_feed_without_calendars_has_no_scheduled_answers(
     assert await handle.get_upcoming_trips([TripQuery("S1", "S2")], start=start) == [[]]
     [board] = await handle.get_arrivals([ArrivalsQuery(["S1", "S2"])], start=start)
     assert [row.trip_id for row in board] == ["ADDED-9"]
+
+
+def _feed_message(*entities: gtfs_realtime_pb2.FeedEntity) -> bytes:
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    message.entity.extend(entities)
+    return message.SerializeToString()
+
+
+def _trip_update(
+    trip_id: str,
+    *,
+    canceled: bool = False,
+    delay: int | None = None,
+    start_date: str | None = None,
+) -> gtfs_realtime_pb2.FeedEntity:
+    entity = gtfs_realtime_pb2.FeedEntity()
+    entity.id = f"tu-{trip_id}-{start_date}"
+    entity.trip_update.trip.trip_id = trip_id
+    if start_date is not None:
+        entity.trip_update.trip.start_date = start_date
+    if canceled:
+        entity.trip_update.trip.schedule_relationship = (
+            gtfs_realtime_pb2.TripDescriptor.CANCELED
+        )
+    if delay is not None:
+        entity.trip_update.delay = delay
+    return entity
+
+
+def _vehicle(
+    vehicle_id: str, trip_id: str, *, start_date: str | None = None
+) -> gtfs_realtime_pb2.FeedEntity:
+    entity = gtfs_realtime_pb2.FeedEntity()
+    entity.id = f"vp-{vehicle_id}"
+    entity.vehicle.vehicle.id = vehicle_id
+    entity.vehicle.trip.trip_id = trip_id
+    if start_date is not None:
+        entity.vehicle.trip.start_date = start_date
+    entity.vehicle.position.latitude = 34.0
+    entity.vehicle.position.longitude = -118.0
+    return entity
+
+
+async def test_a_dateless_cancellation_never_reaches_tomorrows_run(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Today's T1 left S1 at 08:00:30; at 09:30 its run is over.
+
+    A cancellation without start_date means "the current run". There is no
+    current T1 run any more, so Friday's T1 must stay on the board.
+    """
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all",
+        body=_feed_message(_trip_update("T1", canceled=True)),
+        content_type=PB,
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [board] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"], limit=4)], start=_pdt(7, 30, 9, 30)
+    )
+    assert _times(board) == [
+        ("T3", _pdt(7, 31, 1, 31)),
+        ("T1", _pdt(7, 31, 8, 0, 30)),
+        ("T2", _pdt(7, 31, 8, 30, 30)),
+        ("T4", _pdt(7, 31, 9, 0, 30)),
+    ]
+    assert not any(row.realtime for row in board)
+
+
+async def test_a_dateless_cancellation_still_cancels_the_current_run(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all",
+        body=_feed_message(_trip_update("T1", canceled=True)),
+        content_type=PB,
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [board] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"], limit=3)], start=_pdt(7, 30, 7, 45)
+    )
+    # Today's T1 is gone; tomorrow's T1 is untouched.
+    assert _times(board) == [
+        ("T2", _pdt(7, 30, 8, 30, 30)),
+        ("T3", _pdt(7, 31, 1, 31)),
+        ("T1", _pdt(7, 31, 8, 0, 30)),
+    ]
+
+
+async def test_a_dateless_delay_binds_to_last_nights_past_midnight_run(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """At 00:30 Friday, Thursday's T3 (25:31 -> 01:31 Friday) is the current run."""
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all", body=_feed_message(_trip_update("T3", delay=300)), content_type=PB
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [board] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"], route_ids=["R2"], limit=2)], start=_pdt(7, 31, 0, 30)
+    )
+    assert [(row.scheduled_departure, row.predicted_departure) for row in board] == [
+        (_pdt(7, 31, 1, 31), _pdt(7, 31, 1, 36)),  # Thursday's run, delayed
+        (_pdt(8, 1, 1, 31), None),  # Friday's run: not current, untouched
+    ]
+
+
+async def test_vehicles_match_their_own_run_only(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A date-less vehicle rides the current run; a dated one, its own day."""
+    _mock_catalog(mock_api, rt=True)
+    body = _feed_message(
+        _vehicle("TODAY", "T2"),  # no start_date: the current T2 run
+        _vehicle("FRIDAY", "T1", start_date="20260731"),
+    )
+    for _ in range(2):
+        mock_api.get("/rt/all", body=body, content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [board] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"], route_ids=["R1"], limit=4)],
+        start=_pdt(7, 30, 7, 45),
+        with_vehicles=True,
+    )
+    vehicles = {
+        (row.trip_id, row.scheduled_departure): (
+            row.vehicle.vehicle_id if row.vehicle else None
+        )
+        for row in board
+    }
+    assert vehicles == {
+        ("T1", _pdt(7, 30, 8, 0, 30)): None,  # Thursday: FRIDAY is dated away
+        ("T2", _pdt(7, 30, 8, 30, 30)): "TODAY",
+        ("T1", _pdt(7, 31, 8, 0, 30)): "FRIDAY",
+        ("T2", _pdt(7, 31, 8, 30, 30)): None,  # not the current T2 run
+    }
