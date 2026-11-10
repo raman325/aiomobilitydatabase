@@ -988,3 +988,103 @@ def test_the_window_itself_rejects_a_negative_grace() -> None:
         transit_module._utc_window(
             datetime(2026, 6, 10, tzinfo=UTC), None, timedelta(hours=-2)
         )
+
+
+def test_a_stop_time_longer_than_datetime_spans_crashes_nothing() -> None:
+    """A garbage departure longer than timedelta can hold, on an unrelated
+    trip, lands in no window: every dated query still answers.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\nT,09:00:00,09:00:00,B,2\n"
+        "G,99999999999:00:00,99999999999:00:00,X,1\n",
+        trips="R,DAILY,T\nR,DAILY,G\n",
+    )
+    start = datetime(2026, 6, 10, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [scheduled] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["A", "X"], limit=1)], start=start
+        )
+        [arrivals] = await handle.get_arrivals(
+            [ArrivalsQuery(["A", "X"], limit=1)], start=start
+        )
+        [trips] = await handle.get_upcoming_trips(
+            [TripQuery("A", "B", limit=1)], start=start
+        )
+        assert (
+            _times(scheduled)
+            == _times(arrivals)
+            == [datetime(2026, 6, 10, 8, tzinfo=UTC)]
+        )
+        assert [trip.scheduled_departure for trip in trips] == [
+            datetime(2026, 6, 10, 8, tzinfo=UTC)
+        ]
+
+    _run(_index_from_zip_bytes(feed), body)
+
+
+def _forever_feed() -> bytes:
+    return _feed(
+        "T,00:00:00,00:00:00,A,1\nT,01:00:00,01:00:00,B,2\n",
+        calendar="DAILY,1,1,1,1,1,1,1,20260101,99991231",
+    )
+
+
+def test_a_delay_past_the_end_of_datetime_is_no_prediction() -> None:
+    """A two-day delay on the 9999-12-31 run lands in year 10000: that end
+    has no predicted instant, and the rest of the board is untouched.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    update = message.entity.add()
+    update.id = "tu"
+    update.trip_update.trip.trip_id = "T"
+    update.trip_update.trip.start_date = "99991231"
+    update.trip_update.delay = 2 * 86_400
+    start = datetime(9999, 11, 30, tzinfo=UTC)
+    last = datetime(9999, 12, 31, 1, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=None)], start=start, end=last
+        )
+        assert _times(board)[0] == datetime(9999, 11, 30, 1, tzinfo=UTC)
+        [row] = [row for row in board if row.scheduled_departure == last]
+        assert row.predicted_departure is None
+
+    _run(_index_from_zip_bytes(_forever_feed()), body, message)
+
+
+def test_detour_times_past_the_end_of_datetime_are_untimed() -> None:
+    """On the 9999-12-31 run, a replacement stop two days after its
+    reference and a propagated two-day delay both land in year 10000: the
+    replacement is not placed and the shifted call is untimed -- neither
+    is a row, and nothing raises.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "mod"
+    entity.trip_modifications.selected_trips.add().trip_ids.append("T")
+    entity.trip_modifications.service_dates.append("99991231")
+    modification = entity.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    modification.propagated_modification_delay = 2 * 86_400
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = "X"
+    replacement.travel_time_to_stop = 2 * 86_400
+    start = datetime(9999, 11, 30, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B", "X"], limit=None)],
+            start=start,
+            end=datetime(9999, 12, 31, 23, tzinfo=UTC),
+        )
+        times = _times(board)
+        assert times[0] == datetime(9999, 11, 30, 1, tzinfo=UTC)
+        assert all(row.stop_id == "B" for row in board)
+        assert datetime(9999, 12, 31, 1, tzinfo=UTC) not in times
+
+    _run(_index_from_zip_bytes(_forever_feed()), body, message)

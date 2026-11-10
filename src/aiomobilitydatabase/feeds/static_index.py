@@ -1560,7 +1560,10 @@ class StaticIndex:
         if first is None:
             return days
         for secs in self._reach_profile()[1]:
-            span = timedelta(seconds=secs)
+            try:
+                span = timedelta(seconds=secs)
+            except OverflowError:
+                continue  # longer than datetime spans: lands in no window
             try:
                 latest = (window_end - span).astimezone(self._tz).date()
             except OverflowError:

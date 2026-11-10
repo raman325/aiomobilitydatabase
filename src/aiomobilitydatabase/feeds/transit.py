@@ -152,13 +152,24 @@ def _predicted_time(
     StopTimeUpdate takes precedence exactly as before this seam existed;
     otherwise a known (possibly propagated or trip-level) delay shifts the
     scheduled instant. No prediction when neither applies (e.g. a delay
-    with no scheduled time at that end).
+    with no scheduled time at that end), nor when the shifted instant falls
+    outside what datetime can hold (a delay on a 9999-12-31 run).
     """
     if explicit is not None:
         return explicit
     if scheduled is not None and delay_seconds is not None:
-        return scheduled + timedelta(seconds=delay_seconds)
+        return _shifted(scheduled, delay_seconds)
     return None
+
+
+def _shifted(when: datetime | None, seconds: int) -> datetime | None:
+    """Return ``when`` moved by ``seconds``; None if it has no such instant."""
+    if when is None:
+        return None
+    try:
+        return when + timedelta(seconds=seconds)
+    except OverflowError:
+        return None  # past either end of datetime: no instant to show
 
 
 # A scheduled row's date-less RT identity: (source_trip_id, start_secs) --
@@ -373,7 +384,9 @@ def _apply_modification(
             # Untimed: no travel time, or an untimed reference call to
             # measure it from. Placing it anyway would invent a time.
             continue
-        when = anchor_time + timedelta(seconds=replacement.travel_time_to_stop)
+        when = _shifted(anchor_time, replacement.travel_time_to_stop)
+        if when is None:
+            continue  # its time lies past the end of datetime: untimed
         replacements.append(
             TripCall(
                 # Synthetic sequence numbers keep the span ordered between
@@ -389,13 +402,15 @@ def _apply_modification(
             )
         )
     tail = calls[end + 1 :]
-    delay = timedelta(seconds=modification.propagated_delay_seconds)
+    delay = modification.propagated_delay_seconds
     shifted = [
         TripCall(
             stop_sequence=call.stop_sequence,
             stop_id=call.stop_id,
-            arrival=call.arrival + delay if call.arrival else None,
-            departure=call.departure + delay if call.departure else None,
+            # A time the delay moves past either end of datetime has no
+            # instant: that end of the call becomes untimed.
+            arrival=_shifted(call.arrival, delay),
+            departure=_shifted(call.departure, delay),
             pickup_type=call.pickup_type,
             drop_off_type=call.drop_off_type,
             timepoint_exact=call.timepoint_exact,
