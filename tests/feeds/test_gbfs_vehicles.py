@@ -21,7 +21,10 @@ async def test_vehicles_23_and_zone_filter(
     base = mock_api.url()
     mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
     mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=with_base(GBFS_FEED, base))
-    mock_api.get("/gbfs/free_bike_status.json", payload=FREE_BIKE_STATUS_23)
+    # Two reads: the fixture's last_updated is long past, so its ttl has
+    # already run out and the zoned call fetches again.
+    for _ in range(2):
+        mock_api.get("/gbfs/free_bike_status.json", payload=FREE_BIKE_STATUS_23)
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     all_vehicles = await handle.get_vehicles()
     assert {v.id for v in all_vehicles} == {"b1", "b2"}

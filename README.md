@@ -259,6 +259,22 @@ Notes on direct mode:
   be dated, and a negative `grace`.
   `end` bounds scheduled times; a delayed trip predicted past it, and
   RT-added trips, still show.
+- **Producers decide how fresh is fresh**: realtime and GBFS fetches
+  follow HTTP caching strictly (RFC 9111, as a private cache). Inside a
+  response's declared lifetime (`Cache-Control: max-age`, or
+  `Expires`/`Date`, less its `Age`) the stored parse is reused with no
+  request; afterwards the request is conditional (`ETag`/`Last-Modified`),
+  so an unchanged feed costs a `304`. `no-cache` revalidates every time,
+  `no-store` is never stored, invalid freshness counts as stale, and a
+  response declaring nothing is revalidated on every call — no heuristic
+  lifetimes. A GBFS document's `ttl` counts from its own `last_updated`,
+  and the shorter of `ttl` and the HTTP lifetime wins. Concurrent calls
+  share one in-flight request per URL (a cancelled caller cancels neither
+  it nor the other waiters), and a response older than the stored copy (a
+  CDN edge behind, by GTFS-RT header timestamp or GBFS `last_updated`)
+  never replaces it. `rt_min_interval=` on `get_transit_feed*` opts into
+  reusing realtime parses younger than that interval for producers that
+  send no caching headers; it never overrides `no-store`.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
   or vehicle with no `start_date` applies to one run, judged at the feed's
   header timestamp alone (never a query setting): the run scheduled to be

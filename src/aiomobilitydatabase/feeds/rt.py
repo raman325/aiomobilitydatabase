@@ -13,6 +13,7 @@ from typing import Any
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
+from ._freshness import Response, Validators, freshness_from_headers
 from ._urls import _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
@@ -96,14 +97,6 @@ def _vocab_or_none[StrEnumT: StrEnum](
         return None
 
 
-@dataclass(frozen=True)
-class FeedValidators:
-    """HTTP cache validators a producer offered for one RT url."""
-
-    etag: str | None
-    last_modified: str | None
-
-
 async def fetch_feed_message(
     session: aiohttp.ClientSession,
     url: str,
@@ -113,8 +106,8 @@ async def fetch_feed_message(
     api_key: str | None = None,
     headers: Mapping[str, str] | None = None,
     timeout_seconds: float = 30.0,
-    validators: FeedValidators | None = None,
-) -> tuple[gtfs_realtime_pb2.FeedMessage | None, FeedValidators | None]:
+    validators: Validators | None = None,
+) -> Response[gtfs_realtime_pb2.FeedMessage]:
     """GET a GTFS-RT producer URL and parse the protobuf FeedMessage.
 
     ``auth_type`` follows the catalog's ``source_info.authentication_type``:
@@ -127,6 +120,11 @@ async def fetch_feed_message(
     query auth the key never touches the headers, so a same-named custom
     header is a different namespace and passes through untouched. Parsing
     runs in a thread (CPU-bound for large feeds).
+
+    With ``validators`` the request is conditional, and a ``304`` comes
+    back as a :class:`Response` with no value. The response's freshness
+    (RFC 9111, see :func:`freshness_from_headers`) rides along; a response
+    that declares none has lifetime 0, i.e. revalidate on every use.
     """
     _require_http_url(url, "GTFS-RT producer URL")
     params: dict[str, str] = {}
@@ -137,10 +135,8 @@ async def fetch_feed_message(
         elif auth_type == _AUTH_TYPE_HEADER:
             req_headers[api_key_name] = api_key
     if validators is not None:
-        if validators.etag:
-            req_headers["If-None-Match"] = validators.etag
-        if validators.last_modified:
-            req_headers["If-Modified-Since"] = validators.last_modified
+        req_headers.update(validators.request_headers())
+    requested_at = datetime.now(UTC)
     try:
         async with session.get(
             url,
@@ -148,23 +144,36 @@ async def fetch_feed_message(
             headers=req_headers or None,
             timeout=aiohttp.ClientTimeout(total=timeout_seconds),
         ) as resp:
+            received_at = datetime.now(UTC)
             if resp.status in _AUTH_STATUSES:
                 raise SourceAuthenticationError(
                     f"Producer rejected credentials ({resp.status}): {url}"
                 )
+            freshness = freshness_from_headers(
+                resp.headers, requested_at=requested_at, received_at=received_at
+            )
+            lifetime = freshness.lifetime or 0.0
             # 304 is the producer confirming the bytes are unchanged, so
-            # reusing the previous parse is not a staleness risk the way a
-            # TTL cache would be -- there is nothing newer to have missed.
+            # reusing the previous parse is not a staleness risk.
             if resp.status == HTTPStatus.NOT_MODIFIED:
-                return None, validators
+                if validators is None:
+                    # Unsolicited: there is no previous parse to reuse. A
+                    # misbehaving proxy must raise the library's own error.
+                    raise SourceConnectionError(
+                        f"Producer answered 304 to an unconditional request: {url}",
+                        status=int(HTTPStatus.NOT_MODIFIED),
+                    )
+                return Response(
+                    value=None,
+                    validators=Validators.from_headers(resp.headers),
+                    lifetime=lifetime,
+                    storable=freshness.storable,
+                )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
                     f"Producer error {resp.status}: {url}", status=resp.status
                 )
-            fresh = FeedValidators(
-                etag=resp.headers.get("ETag"),
-                last_modified=resp.headers.get("Last-Modified"),
-            )
+            fresh = Validators.from_headers(resp.headers)
             raw = await resp.read()
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
@@ -173,7 +182,28 @@ async def fetch_feed_message(
         await asyncio.to_thread(message.ParseFromString, raw)
     except Exception as err:  # DecodeError subclasses Exception, not a shared base
         raise FeedParseError(f"Undecodable GTFS-RT protobuf from {url}") from err
-    return message, (fresh if fresh.etag or fresh.last_modified else None)
+    return Response(
+        value=message,
+        validators=fresh,
+        lifetime=lifetime,
+        storable=freshness.storable,
+    )
+
+
+def feed_is_older(
+    stored: gtfs_realtime_pb2.FeedMessage, fetched: gtfs_realtime_pb2.FeedMessage
+) -> bool:
+    """Whether ``fetched`` predates ``stored`` by its header timestamp.
+
+    A CDN edge that has not caught up can serve an older snapshot after a
+    newer one; GTFS-RT header timestamps only move forward, so an older
+    one is a stale copy. Either message lacking a timestamp proves nothing.
+    """
+    if not (
+        stored.header.HasField("timestamp") and fetched.header.HasField("timestamp")
+    ):
+        return False
+    return bool(fetched.header.timestamp < stored.header.timestamp)
 
 
 # GTFS-RT's WheelchairAccessible is NOT the static wheelchair_accessible
