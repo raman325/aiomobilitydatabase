@@ -35,6 +35,28 @@ by design: without the extra, `from aiomobilitydatabase.feeds import *` and
 
 Requires Python 3.12+.
 
+## Upgrading to 0.7.0
+
+0.7.0 makes the API consistent, and breaks it to get there:
+
+- **Async queries are named `get_*`** (or `search_*` for free-text search):
+  `TransitFeedHandle.upcoming_trips`, `scheduled_departures`,
+  `services_on`, `routes_serving` and `headsigns_serving` gained the
+  `get_` prefix, and `GbfsFeedHandle.get_system_alerts` is now `get_alerts`.
+- **GBFS models carry the `Gbfs` prefix**: `Station`, `VehicleType`,
+  `PricingPlan`, `SystemRegion` and `SystemInfo` are now `GbfsStation`,
+  `GbfsVehicleType`, `GbfsPricingPlan`, `GbfsSystemRegion` and
+  `GbfsSystemInfo`.
+- **Model collections are tuples, not lists.** A tuple never equals a
+  list, and the comparison doesn't raise: `feed.entity_types ==
+  [EntityType.TRIP_UPDATES]` and `alert.route_ids == []` are now always
+  `False`. Compare against tuples, or wrap in `list(...)`.
+  `handle.stops + [extra]` raises `TypeError`. `to_dict()` output still
+  uses lists, so serialized data is unchanged.
+- **Handle snapshot data is read-only**: `stops`, `routes`, `agencies`,
+  `feed_info`, `rt_feeds` and `MobilityFeedsClient.cache_dir` can no
+  longer be assigned.
+
 ## Authentication
 
 Sign up at [mobilitydatabase.org](https://mobilitydatabase.org) and copy your
@@ -249,11 +271,12 @@ Notes on direct mode:
   repetitions of one template trip are indistinguishable.
 - **Everything the library hands out is immutable**: every model (catalog
   and feeds) is a frozen dataclass whose collections are tuples or
-  read-only mappings, and a handle's `stops`/`routes`/`agencies`/`rt_feeds`
-  are tuples. Shared state can't be changed from outside, and models are
-  hashable except `GbfsStation`/`GbfsVehicle`, whose mapping fields aren't.
-  Query results (`get_arrivals()` and friends) are fresh lists the caller
-  owns.
+  read-only dicts, and a handle's `stops`/`routes`/`agencies`/`rt_feeds`
+  are tuples. Shared state can't be changed from outside, and every model
+  is hashable. The read-only dicts are real `dict` subclasses, so models
+  still work with `dataclasses.asdict`, `copy.deepcopy`, `pickle` and JSON
+  encoders. Query results (`get_arrivals()` and friends) are fresh lists
+  the caller owns.
 - **The full descriptive surface is exposed, typed by shape**: closed GTFS
   vocabularies are enums (`WheelchairAccess`, `BikesAllowed`,
   `PickupDropOffType`, `StopLocationType`, alert cause/effect/severity,

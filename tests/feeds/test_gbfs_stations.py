@@ -1,5 +1,9 @@
 """Tests for GBFS endpoint resolution, ttl caching, system info, stations."""
 
+import copy
+import dataclasses
+import json
+import pickle
 from datetime import UTC, date, datetime
 
 import pytest
@@ -17,6 +21,7 @@ from aiomobilitydatabase.feeds.gbfs import (
 from aiomobilitydatabase.feeds.geo import Circle
 
 from tests.feeds.fixtures import (
+    FREE_BIKE_STATUS_23,
     GBFS_FEED,
     GTFS_FEED,
     PRICING_PLANS,
@@ -724,3 +729,36 @@ def test_id_list_degrades(value: object, expected: list[str]) -> None:
 )
 def test_alert_times_degrades(value: object, expected_count: int) -> None:
     assert len(_alert_times(value)) == expected_count
+
+
+async def test_mapping_fields_are_frozen_and_serializable(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Station/vehicle mapping fields can't be mutated, yet still serialize.
+
+    Consumers diagnose with dataclasses.asdict (which deep-copies any
+    non-dict mapping), copy models, and pickle them; all three must keep
+    working on a model whose mapping fields are populated.
+    """
+    _mock_catalog(mock_api)
+    mock_api.get("/gbfs/station_information.json", payload=STATION_INFO_23)
+    mock_api.get("/gbfs/station_status.json", payload=STATION_STATUS_23)
+    mock_api.get("/gbfs/free_bike_status.json", payload=FREE_BIKE_STATUS_23)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    station = {s.id: s for s in await handle.get_stations()}["st1"]
+    vehicle = {v.id: v for v in await handle.get_vehicles()}["b1"]
+    mappings = [
+        station.vehicle_types_available,
+        station.rental_uris,
+        vehicle.rental_uris,
+    ]
+    for mapping in mappings:
+        assert mapping
+        with pytest.raises(TypeError):
+            mapping["extra"] = 1  # type: ignore[index]
+    for model in (station, vehicle):
+        assert pickle.loads(pickle.dumps(model)) == model
+        assert copy.deepcopy(model) == model
+        assert dataclasses.asdict(model)["rental_uris"] == model.rental_uris
+        json.dumps(dataclasses.asdict(model), default=str)
+        assert hash(model) == hash(copy.deepcopy(model))

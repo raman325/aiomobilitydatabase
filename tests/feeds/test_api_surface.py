@@ -1,8 +1,10 @@
-"""Public feeds API invariants: naming rule and read-only snapshot data.
+"""Public API invariants: naming rule, read-only state, immutable models.
 
-Rule: a public async *query* method is named ``get_*``. Synchronous methods
-(in-memory pickers) are not. Lifecycle actions are exempt. Enforced by
-reflection so a later change can't add an off-rule method unnoticed.
+Naming rule: a public async *query* method is named ``get_*`` (or
+``search_*`` for free-text search). Synchronous methods (in-memory pickers)
+are not. Lifecycle actions are exempt. Every public model is a frozen
+dataclass without mutable container fields. Enforced by reflection so a
+later change can't add an off-rule method or model unnoticed.
 """
 
 import dataclasses
@@ -11,10 +13,9 @@ import re
 
 import pytest
 
-from aiomobilitydatabase import feeds
-from aiomobilitydatabase import models as catalog_models
+import aiomobilitydatabase
+from aiomobilitydatabase import MobilityDatabaseClient, feeds
 from aiomobilitydatabase.feeds import ArrivalsQuery, GbfsFeedHandle, MobilityFeedsClient
-from aiomobilitydatabase.feeds import models as feed_models
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle
 
 # Async methods that perform an action rather than answer a query.
@@ -37,8 +38,12 @@ def _public_methods(cls: type) -> dict[str, object]:
     }
 
 
+_QUERY_PREFIXES = ("get_", "search_")
+
+
 @pytest.mark.parametrize(
-    "cls", [TransitFeedHandle, GbfsFeedHandle, MobilityFeedsClient]
+    "cls",
+    [TransitFeedHandle, GbfsFeedHandle, MobilityFeedsClient, MobilityDatabaseClient],
 )
 def test_async_queries_are_get_prefixed_and_sync_methods_are_not(cls: type) -> None:
     for name, member in _public_methods(cls).items():
@@ -46,9 +51,11 @@ def test_async_queries_are_get_prefixed_and_sync_methods_are_not(cls: type) -> N
         if name in _ACTIONS:
             continue
         if inspect.iscoroutinefunction(func):
-            assert name.startswith("get_"), f"{cls.__name__}.{name} is async"
+            assert name.startswith(_QUERY_PREFIXES), f"{cls.__name__}.{name} is async"
         else:
-            assert not name.startswith("get_"), f"{cls.__name__}.{name} is sync"
+            assert not name.startswith(_QUERY_PREFIXES), (
+                f"{cls.__name__}.{name} is sync"
+            )
 
 
 @pytest.mark.parametrize(
@@ -95,15 +102,15 @@ def test_transit_snapshot_data_is_read_only(name: str) -> None:
     assert attr.fset is None, f"{name} must not be settable"
 
 
-def _public_models(module: object) -> list[type]:
-    return [
-        obj
-        for name, obj in vars(module).items()
-        if not name.startswith("_")
-        and isinstance(obj, type)
-        and dataclasses.is_dataclass(obj)
-        and obj.__module__ == getattr(module, "__name__", None)
-    ]
+def _public_models() -> list[type]:
+    """Every dataclass either package exports, wherever it is defined."""
+    found: dict[str, type] = {}
+    for package in (aiomobilitydatabase, feeds):
+        for name in package.__all__:
+            obj = getattr(package, name)
+            if isinstance(obj, type) and dataclasses.is_dataclass(obj):
+                found[f"{obj.__module__}.{obj.__qualname__}"] = obj
+    return sorted(found.values(), key=lambda model: model.__qualname__)
 
 
 _MUTABLE_CONTAINER = re.compile(r"\b(list|dict|set)\[")
@@ -111,8 +118,10 @@ _MUTABLE_CONTAINER = re.compile(r"\b(list|dict|set)\[")
 
 @pytest.mark.parametrize(
     "model",
-    [*_public_models(catalog_models), *_public_models(feed_models)],
-    ids=lambda model: f"{model.__module__.rsplit('.', 2)[-2]}.{model.__name__}",
+    _public_models(),
+    ids=lambda model: (
+        f"{model.__module__.removeprefix('aiomobilitydatabase.')}.{model.__name__}"
+    ),
 )
 def test_public_models_are_deeply_immutable(model: type) -> None:
     params = model.__dataclass_params__  # type: ignore[attr-defined]

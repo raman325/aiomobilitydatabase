@@ -7,11 +7,11 @@ import time
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from http import HTTPStatus
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
+from ._frozen import FrozenDict
 from ._urls import _require_http_url  # deliberate friend access: shared URL guard
 from .const import GBFS_LANGUAGE_PREFERENCE
 from .exceptions import FeedParseError, SourceConnectionError
@@ -91,7 +91,7 @@ def _rental_uris(value: Any) -> Mapping[str, str] | None:
     if not isinstance(value, dict):
         return None
     uris = {str(key): uri for key, uri in value.items() if isinstance(uri, str)}
-    return MappingProxyType(uris) if uris else None
+    return FrozenDict(uris) if uris else None
 
 
 def _coordinate(value: Any) -> float | None:
@@ -125,7 +125,7 @@ def _vehicle_types(value: Any) -> Mapping[str, int] | None:
     if not isinstance(value, list):
         return None
     if not value:
-        return MappingProxyType({})
+        return FrozenDict({})
     types: dict[str, int] = {}
     for entry in value:
         if not isinstance(entry, Mapping):
@@ -137,7 +137,7 @@ def _vehicle_types(value: Any) -> Mapping[str, int] | None:
             continue
         if type_id is not None:
             types[type_id] = count
-    return MappingProxyType(types) if types else None
+    return FrozenDict(types) if types else None
 
 
 def _reported_at(value: Any) -> datetime | None:
@@ -509,8 +509,8 @@ class GbfsFeedHandle:
     async def get_alerts(self) -> list[GbfsAlert]:
         """GBFS system alerts.
 
-        Named apart from the GTFS-RT ``get_alerts`` on the transit handle:
-        these scope to GBFS stations and regions, not routes and trips.
+        The same name as the transit handle's ``get_alerts``, scoped the
+        GBFS way: to stations and regions, not routes and trips.
         """
         return [
             GbfsAlert(
