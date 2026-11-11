@@ -444,10 +444,12 @@ async def test_get_stations_total_over_malformed_envelopes(
     ("available", "expected"),
     [
         pytest.param([{"vehicle_type_id": "bike", "count": 4}], {"bike": 4}, id="ok"),
-        pytest.param([{"vehicle_type_id": "bike"}], {"bike": 0}, id="absent-count"),
-        pytest.param(
-            [{"vehicle_type_id": "bike", "count": "4"}], {"bike": 4}, id="str"
-        ),
+        # count is a REQUIRED non-negative integer: never invented or coerced.
+        pytest.param([{"vehicle_type_id": "bike"}], None, id="absent-count"),
+        pytest.param([{"vehicle_type_id": "bike", "count": "4"}], None, id="str"),
+        pytest.param([{"vehicle_type_id": "bike", "count": -3}], None, id="negative"),
+        pytest.param([{"vehicle_type_id": "bike", "count": 2.9}], None, id="fraction"),
+        pytest.param([{"vehicle_type_id": "bike", "count": True}], None, id="bool"),
         pytest.param([{"vehicle_type_id": "bike", "count": None}], None, id="null"),
         pytest.param([{"count": 4}], None, id="no-type-id"),
         pytest.param({"bike": 4}, None, id="object-not-a-list"),
@@ -521,12 +523,14 @@ async def test_station_coordinates_normalized_and_zone_filter_stays_total(
         {"station_id": "junk", "lat": "near the pier", "lon": -118.25},
         {"station_id": "boolean", "lat": True, "lon": -118.25},
     ]
+    now = int(datetime.now(UTC).timestamp())
     mock_api.get(
         "/gbfs/station_information.json",
-        payload={"ttl": 60, "data": {"stations": rows}},
+        payload={"ttl": 60, "last_updated": now, "data": {"stations": rows}},
     )
     mock_api.get(
-        "/gbfs/station_status.json", payload={"ttl": 60, "data": {"stations": []}}
+        "/gbfs/station_status.json",
+        payload={"ttl": 60, "last_updated": now, "data": {"stations": []}},
     )
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     by_id = {s.id: s for s in await handle.get_stations()}
@@ -680,12 +684,30 @@ async def test_unpublished_lookup_documents_are_empty_not_an_error(
             datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC),
             id="3x-rfc3339",
         ),
-        # GBFS defines its timestamps as UTC, so a naive one is not ambiguous.
         pytest.param(
-            "2026-07-31T12:13:20",
+            "2026-07-31T14:13:20+02:00",
             datetime(2026, 7, 31, 12, 13, 20, tzinfo=UTC),
-            id="3x-naive-is-utc",
+            id="3x-offset",
         ),
+        pytest.param(
+            "2026-07-31t12:13:20.5z",
+            datetime(2026, 7, 31, 12, 13, 20, 500000, tzinfo=UTC),
+            id="3x-lowercase-fraction",
+        ),
+        pytest.param(
+            "2016-12-31T23:59:60Z",
+            datetime(2016, 12, 31, 23, 59, 59, tzinfo=UTC),
+            id="leap-second",
+        ),
+        # RFC 3339 requires the offset: without one, no instant (GBFS
+        # defines no default zone), nor in other ISO 8601 forms.
+        pytest.param("2026-07-31T12:13:20", None, id="3x-naive"),
+        pytest.param("2026-07-31", None, id="date-only"),
+        pytest.param("20260731T121320Z", None, id="basic-format"),
+        pytest.param("2026-W31-5T12:13:20+02:00", None, id="week-date"),
+        # The right shape, but no such instant.
+        pytest.param("2026-13-01T00:00:00Z", None, id="month-13"),
+        pytest.param("2026-07-31T24:00:00Z", None, id="hour-24"),
         pytest.param(True, None, id="bool-is-not-an-epoch"),
         pytest.param(10**20, None, id="epoch-out-of-range"),
         pytest.param("yesterday", None, id="unparseable-string"),
@@ -747,7 +769,9 @@ def test_id_list_degrades(value: object, expected: list[str]) -> None:
     [
         pytest.param([{"start": 1785500000, "end": 1785503600}], 1, id="pair"),
         pytest.param([{"start": 1785500000}], 1, id="open-ended"),
-        pytest.param([{}, 7, None], 1, id="junk-entries-skipped"),
+        pytest.param([{}, 7, None], 0, id="junk-entries-skipped"),
+        # start is REQUIRED: a period without one is never active forever.
+        pytest.param([{"end": 1785503600}, {"start": "soon"}], 0, id="no-start"),
         pytest.param("soon", 0, id="not-a-list"),
     ],
 )

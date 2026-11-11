@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
@@ -40,6 +41,16 @@ if TYPE_CHECKING:
     from .client import MobilityFeedsClient
 
 
+# RFC 3339 section 5.6 date-time: the offset is REQUIRED; "T" may be "t"
+# or a space (its NOTE). ASCII digits only.
+_RFC3339 = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2})[Tt ]([0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?"
+    r"([Zz]|[+-][0-9]{2}:[0-9]{2})"
+)
+# GBFS Date: "ISO 8601 Complete Date Extended Format: YYYY-MM-DD".
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
 def _entry_text(entry: dict[str, Any]) -> str | None:
     """One localized entry's ``text``: an absent/null text is None.
 
@@ -65,15 +76,23 @@ def _record_id(value: Any) -> str | None:
     return str(value) or None
 
 
+def _is_preferred_language(tag: Any) -> bool:
+    """Whether a BCP 47 tag is the preferred language (tags ignore case)."""
+    return isinstance(tag, str) and tag.casefold() == GBFS_LANGUAGE_PREFERENCE
+
+
 def _localized(value: Any) -> str | None:
-    """Normalize GBFS text: 3.x localized lists vs 2.x plain strings."""
+    """Normalize GBFS text: 3.x localized lists vs 2.x plain strings.
+
+    Also the 3.0 localized URL fields (``terms_url``, ``alerts[].url``):
+    a Localized URL has the same ``{text, language}`` shape.
+    """
     if value is None or isinstance(value, str):
         return value
     if isinstance(value, list):
         for entry in value:
-            if (
-                isinstance(entry, dict)
-                and entry.get("language") == GBFS_LANGUAGE_PREFERENCE
+            if isinstance(entry, dict) and _is_preferred_language(
+                entry.get("language")
             ):
                 return _entry_text(entry)
         if value and isinstance(value[0], dict):
@@ -124,12 +143,11 @@ def _coordinate(value: Any) -> float | None:
 def _vehicle_types(value: Any) -> Mapping[str, int] | None:
     """Normalize a station's ``vehicle_types_available`` to id -> count.
 
-    Entries without a usable type id, and counts that aren't parseable as
-    an int (``int(None)`` used to raise), are dropped rather than
-    coerced; an absent count is the spec's 0. An explicitly empty list is
-    {}, i.e. zero of every type. Anything that isn't a list, or a non-empty
-    list with no usable entry, is None, i.e. "not published". A count
-    of ``1e999`` parses as inf, which int() refuses, so it is dropped too.
+    ``count`` is a REQUIRED non-negative integer: an entry without a usable
+    type id or count (absent, negative, fractional, a string) is dropped
+    rather than coerced. An explicitly empty list is {}, i.e. zero of every
+    type. Anything that isn't a list, or a non-empty list with no usable
+    entry, is None, i.e. "not published".
     """
     if not isinstance(value, list):
         return None
@@ -140,11 +158,8 @@ def _vehicle_types(value: Any) -> Mapping[str, int] | None:
         if not isinstance(entry, Mapping):
             continue
         type_id = _record_id(entry.get("vehicle_type_id"))
-        try:
-            count = int(entry.get("count", 0))
-        except (OverflowError, TypeError, ValueError):
-            continue
-        if type_id is not None:
+        count = _count(entry.get("count"))
+        if type_id is not None and count is not None:
             types[type_id] = count
     return FrozenDict(types) if types else None
 
@@ -152,9 +167,12 @@ def _vehicle_types(value: Any) -> Mapping[str, int] | None:
 def _reported_at(value: Any) -> datetime | None:
     """Parse a GBFS ``last_reported``, which changed type across versions.
 
-    2.x ships POSIX seconds, 3.0 ships an RFC3339 string. Anything else --
-    including a bool, which is an int in Python -- degrades to None like
-    every other malformed scalar at this boundary.
+    2.x ships POSIX seconds, 3.0 ships an RFC 3339 string, whose offset
+    is REQUIRED (section 5.6): one without (``2026-07-31T12:13:20``), a
+    bare date, or another ISO 8601 form names no instant, so None -- GBFS
+    defines no default zone. A leap second (``:60``) reads as the second
+    before it. Anything else -- including a bool, which is an int in Python
+    -- degrades to None like every other malformed scalar at this boundary.
     """
     if isinstance(value, bool):
         return None
@@ -163,19 +181,24 @@ def _reported_at(value: Any) -> datetime | None:
             return datetime.fromtimestamp(value, tz=UTC)
         except (OverflowError, OSError, ValueError):
             return None
-    if isinstance(value, str):
+    if isinstance(value, str) and (match := _RFC3339.fullmatch(value)) is not None:
+        day, clock, fraction, offset = match.groups()
+        if clock.endswith(":60"):
+            clock = clock[:-2] + "59"
+        offset = "+00:00" if offset in ("Z", "z") else offset
         try:
-            parsed = datetime.fromisoformat(value)
+            return datetime.fromisoformat(f"{day}T{clock}{fraction or ''}{offset}")
         except ValueError:
             return None
-        # A naive RFC3339 value is UTC by GBFS's own definition.
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     return None
 
 
 def _iso_date(value: Any) -> date | None:
-    """Parse a GBFS ``YYYY-MM-DD`` cell, degrading to None on anything else."""
-    if not isinstance(value, str):
+    """Parse a GBFS ``YYYY-MM-DD`` cell, degrading to None on anything else.
+
+    Only that form: ISO 8601's basic (``20260115``) and week dates aren't.
+    """
+    if not isinstance(value, str) or not _ISO_DATE.fullmatch(value):
         return None
     try:
         return date.fromisoformat(value)
@@ -229,14 +252,19 @@ def _id_list(value: Any) -> list[str]:
     return [found for item in value if (found := _record_id(item)) is not None]
 
 
-def _alert_times(value: Any) -> list[tuple[datetime | None, datetime | None]]:
-    """Return a GBFS alert's ``times`` array as (start, end) pairs."""
+def _alert_times(value: Any) -> list[tuple[datetime, datetime | None]]:
+    """Return a GBFS alert's ``times`` array as (start, end) pairs.
+
+    ``start`` is REQUIRED: a period without a usable one is dropped, never
+    read as active since forever. A missing ``end`` is open-ended.
+    """
     if not isinstance(value, list):
         return []
     return [
-        (_reported_at(item.get("start")), _reported_at(item.get("end")))
+        (start, _reported_at(item.get("end")))
         for item in value
         if isinstance(item, Mapping)
+        and (start := _reported_at(item.get("start"))) is not None
     ]
 
 
@@ -291,11 +319,12 @@ def _document_lifetime(
 
     The document's ``ttl`` counts from its own ``last_updated`` (GBFS: the
     data will be updated again ``ttl`` seconds after it last was), so a
-    document already ``n`` seconds old when requested has ``ttl - n`` left;
-    a missing or unparseable ``last_updated`` counts from the request, and
-    the result never exceeds ``ttl`` (a ``last_updated`` in the future is
-    clock skew, not extra freshness). A ``ttl`` that is present but
-    unusable declares 0, just as an invalid ``max-age`` would. When the
+    document already ``n`` seconds old when requested has ``ttl - n`` left,
+    and the result never exceeds ``ttl`` (a ``last_updated`` in the future
+    is clock skew, not extra freshness). A ``ttl`` that is present but
+    unusable -- or can't be placed in time, its REQUIRED ``last_updated``
+    missing or unparseable -- declares 0, just as an invalid ``max-age``
+    would. When the
     HTTP headers declare a lifetime too (``header_lifetime``, also counted
     from the request), the shorter one wins; neither declaring anything is
     None. Runs on every response, a 304's included (with the stored
@@ -305,10 +334,10 @@ def _document_lifetime(
     declared = [header_lifetime] if header_lifetime is not None else []
     if "ttl" in document:
         ttl = _ttl_seconds(document["ttl"])
-        if ttl is None:
+        updated = _reported_at(document.get("last_updated"))
+        if ttl is None or updated is None:
             declared.append(0.0)
         else:
-            updated = _reported_at(document.get("last_updated")) or requested_at
             elapsed = max(0.0, (requested_at - updated).total_seconds())
             declared.append(max(0.0, ttl - elapsed))
     return min(declared, default=None)
@@ -339,10 +368,17 @@ def _endpoints_from_discovery(document: Any) -> dict[str, str]:
                 for block in data.values()
                 if isinstance(block, Mapping) and isinstance(block.get("feeds"), list)
             ]
-            preferred = data.get(GBFS_LANGUAGE_PREFERENCE)
-            if isinstance(preferred, Mapping) and isinstance(
-                preferred.get("feeds"), list
-            ):
+            preferred = next(
+                (
+                    block
+                    for tag, block in data.items()
+                    if _is_preferred_language(tag)
+                    and isinstance(block, Mapping)
+                    and isinstance(block.get("feeds"), list)
+                ),
+                None,
+            )
+            if preferred is not None:
                 candidates.insert(0, preferred)
             if candidates:
                 feeds = candidates[0]["feeds"]
@@ -362,7 +398,10 @@ class GbfsFeedHandle:
     Endpoints resolve either from catalog metadata (:meth:`create`) or
     straight from the system's own auto-discovery document
     (:meth:`create_from_url`); every snapshot method behaves identically
-    on both.
+    on both. A discovery document is a GBFS file like any other: once its
+    ``ttl`` lapses it is asked again, so a long-lived handle follows
+    endpoints the system moves. Catalog endpoints are fixed for the
+    handle's life.
     """
 
     def __init__(
@@ -371,12 +410,15 @@ class GbfsFeedHandle:
         feed: GbfsFeed | None,
         endpoints: dict[str, str],
         headers: Mapping[str, str] | None = None,
+        *,
+        discovery_url: str | None = None,
     ) -> None:
         """Initialize; internal — use MobilityFeedsClient.get_gbfs_feed()."""
         self._client = client
         self._feed = feed
         self._endpoints = endpoints
         self._headers = headers
+        self._discovery_url = discovery_url
         # Per-url parsed documents, reused only as the producer allows: its
         # ttl (from last_updated) and HTTP freshness, the shorter winning,
         # or after a 304. Shared between concurrent calls.
@@ -417,12 +459,17 @@ class GbfsFeedHandle:
         ``headers`` apply to the discovery fetch and every subsequent
         document fetch made through this handle.
         """
-        response = await cls._fetch_json_document(
-            client, discovery_url, headers, "GBFS discovery URL"
-        )
-        # Unconditional request, so never a 304: the value is always there.
-        document = cast("dict[str, Any]", response.value)
-        return cls(client, None, _endpoints_from_discovery(document), headers=headers)
+        handle = cls(client, None, {}, headers=headers, discovery_url=discovery_url)
+        await handle._endpoint_table()  # fetched now: a bad URL fails here
+        return handle
+
+    async def _endpoint_table(self) -> dict[str, str]:
+        """Return the endpoint table, re-read from discovery once its ttl lapses."""
+        if self._discovery_url is not None:
+            self._endpoints = _endpoints_from_discovery(
+                await self._fetch_cached(self._discovery_url, "GBFS discovery URL")
+            )
+        return self._endpoints
 
     @staticmethod
     async def _fetch_json_document(
@@ -504,18 +551,23 @@ class GbfsFeedHandle:
             url=answered,
         )
 
-    async def _document(self, name: str) -> dict[str, Any]:
-        url = self._endpoints.get(name)
+    async def _document(
+        self, name: str, endpoints: Mapping[str, str] | None = None
+    ) -> dict[str, Any]:
+        """One endpoint's document; ``endpoints`` is a table read this call."""
+        if endpoints is None:
+            endpoints = await self._endpoint_table()
+        url = endpoints.get(name)
         if url is None:
             raise SourceConnectionError(f"GBFS endpoint not published: {name}")
+        return await self._fetch_cached(url, f"GBFS {name} endpoint URL")
+
+    async def _fetch_cached(self, url: str, context: str) -> dict[str, Any]:
+        """One GBFS document, reused as long as the producer allows."""
         return await self._docs.get(
             url,
             partial(
-                self._fetch_json_document,
-                self._client,
-                url,
-                self._headers,
-                f"GBFS {name} endpoint URL",
+                self._fetch_json_document, self._client, url, self._headers, context
             ),
             request_fields=request_fields(
                 self._client._get_session(),  # deliberate friend access
@@ -551,8 +603,8 @@ class GbfsFeedHandle:
             email=_plain_text(data.get("email")),
             feed_contact_email=_plain_text(data.get("feed_contact_email")),
             license_url=_plain_text(data.get("license_url")),
-            terms_url=_plain_text(data.get("terms_url")),
-            privacy_url=_plain_text(data.get("privacy_url")),
+            terms_url=_localized(data.get("terms_url")) or None,
+            privacy_url=_localized(data.get("privacy_url")) or None,
             opening_hours=_plain_text(data.get("opening_hours")),
         )
 
@@ -561,11 +613,20 @@ class GbfsFeedHandle:
 
         Every one of these endpoints is optional in GBFS, and discovery
         only lists what a system actually serves -- so "not published"
-        is a normal answer meaning "no such records", not a failure.
+        is a normal answer meaning "no such records", not a failure. So is
+        a listed one answering 404: "OPTIONAL files MAY 404. A 404 of an
+        OPTIONAL file SHOULD NOT be considered an error." Any other error
+        still raises.
         """
-        if name not in self._endpoints:
+        endpoints = await self._endpoint_table()
+        if name not in endpoints:
             return []
-        return _rows(await self._document(name), key)
+        try:
+            return _rows(await self._document(name, endpoints), key)
+        except SourceConnectionError as err:
+            if err.status == HTTPStatus.NOT_FOUND:
+                return []
+            raise
 
     async def get_vehicle_types(self) -> list[GbfsVehicleType]:
         """Vehicle types, resolving the ids stations and vehicles reference."""
@@ -617,7 +678,7 @@ class GbfsFeedHandle:
                 type=_plain_text(row.get("type")),
                 summary=_localized(row.get("summary")),
                 description=_localized(row.get("description")),
-                url=_plain_text(row.get("url")),
+                url=_localized(row.get("url")) or None,
                 station_ids=tuple(_id_list(row.get("station_ids"))),
                 region_ids=tuple(_id_list(row.get("region_ids"))),
                 last_updated=_reported_at(row.get("last_updated")),
@@ -640,10 +701,15 @@ class GbfsFeedHandle:
         """
         # Dockless-only systems publish no stations; mirror get_vehicles()'s
         # [] for docked-only systems instead of failing.
-        if self._endpoints and "station_information" not in self._endpoints:
+        endpoints = await self._endpoint_table()
+        if endpoints and "station_information" not in endpoints:
             return []
-        info_rows = _rows(await self._document("station_information"), "stations")
-        status_rows = _rows(await self._document("station_status"), "stations")
+        info_rows = _rows(
+            await self._document("station_information", endpoints), "stations"
+        )
+        status_rows = _rows(
+            await self._document("station_status", endpoints), "stations"
+        )
         status_by_id = {_record_id(row.get("station_id")): row for row in status_rows}
         stations: list[GbfsStation] = []
         for info in info_rows:
@@ -702,19 +768,23 @@ class GbfsFeedHandle:
         return stations
 
     async def get_vehicles(self, zone: Circle | None = None) -> list[GbfsVehicle]:
-        """Free-floating vehicles, optionally filtered to a circular zone.
+        """Vehicles not in active rental, optionally filtered to a circular zone.
 
         Uses ``vehicle_status`` (GBFS 3.x) when published, else falls back to
         ``free_bike_status`` (2.x). Returns [] for docked-only systems.
         Filtering is client-side: GBFS has no server-side geo-query.
-        Rows without a usable id are skipped, as are rows without
-        coordinates (a free-floating vehicle IS its position).
+        Rows without a usable id are skipped. A vehicle at a station need not
+        report coordinates (``lat``/``lon`` are REQUIRED only without a
+        ``station_id``): it is kept with None coordinates, and left out only
+        when filtering by ``zone``. A row with neither is invalid and
+        skipped (a free-floating vehicle IS its position).
         """
-        if "vehicle_status" in self._endpoints:
-            rows = _rows(await self._document("vehicle_status"), "vehicles")
+        endpoints = await self._endpoint_table()
+        if "vehicle_status" in endpoints:
+            rows = _rows(await self._document("vehicle_status", endpoints), "vehicles")
             id_key = "vehicle_id"
-        elif "free_bike_status" in self._endpoints:
-            rows = _rows(await self._document("free_bike_status"), "bikes")
+        elif "free_bike_status" in endpoints:
+            rows = _rows(await self._document("free_bike_status", endpoints), "bikes")
             id_key = "bike_id"
         else:
             return []
@@ -723,9 +793,15 @@ class GbfsFeedHandle:
             vehicle_id = _record_id(row.get(id_key))
             latitude = _coordinate(row.get("lat"))
             longitude = _coordinate(row.get("lon"))
-            if vehicle_id is None or latitude is None or longitude is None:
+            station_id = _record_id(row.get("station_id"))
+            located = latitude is not None and longitude is not None
+            if vehicle_id is None or not (located or station_id is not None):
                 continue
-            if zone is not None and not in_circle(zone, latitude, longitude):
+            if zone is not None and not (
+                latitude is not None
+                and longitude is not None
+                and in_circle(zone, latitude, longitude)
+            ):
                 continue
             vehicles.append(
                 GbfsVehicle(
@@ -742,7 +818,7 @@ class GbfsFeedHandle:
                     current_range_m=_number(row.get("current_range_meters")),
                     current_fuel_percent=_number(row.get("current_fuel_percent")),
                     last_reported=_reported_at(row.get("last_reported")),
-                    station_id=_record_id(row.get("station_id")),
+                    station_id=station_id,
                     home_station_id=_record_id(row.get("home_station_id")),
                     pricing_plan_id=_record_id(row.get("pricing_plan_id")),
                     rental_uris=_rental_uris(row.get("rental_uris")),
