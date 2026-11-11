@@ -449,6 +449,12 @@ async def test_get_stations_total_over_malformed_envelopes(
         pytest.param([{"vehicle_type_id": "bike", "count": "4"}], None, id="str"),
         pytest.param([{"vehicle_type_id": "bike", "count": -3}], None, id="negative"),
         pytest.param([{"vehicle_type_id": "bike", "count": 2.9}], None, id="fraction"),
+        # JSON has one number type: 2.0 is the integer 2.
+        pytest.param(
+            [{"vehicle_type_id": "bike", "count": 2.0}],
+            {"bike": 2},
+            id="integral-float",
+        ),
         pytest.param([{"vehicle_type_id": "bike", "count": True}], None, id="bool"),
         pytest.param([{"vehicle_type_id": "bike", "count": None}], None, id="null"),
         pytest.param([{"count": 4}], None, id="no-type-id"),
@@ -713,6 +719,7 @@ async def test_unpublished_lookup_documents_are_empty_not_an_error(
         pytest.param("2026-07-31T12:60:00Z", None, id="minute-60"),
         pytest.param("2026-07-31T12:00:61Z", None, id="second-61"),
         pytest.param("2026-07-31T12:00:00+24:00", None, id="offset-24"),
+        pytest.param("2026-07-31T12:00:00+05:99", None, id="offset-minute-99"),
         pytest.param(True, None, id="bool-is-not-an-epoch"),
         pytest.param(10**20, None, id="epoch-out-of-range"),
         pytest.param("yesterday", None, id="unparseable-string"),

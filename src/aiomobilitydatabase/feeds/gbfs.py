@@ -224,7 +224,13 @@ def _plain_text(value: Any) -> str | None:
 
 
 def _count(value: Any) -> int | None:
-    """Return a non-negative count; bools and junk degrade to None."""
+    """Return a non-negative count; bools and junk degrade to None.
+
+    JSON has one number type: ``2.0`` is the integer 2 (JSON Schema's
+    ``integer`` accepts it); ``2.5`` is no count.
+    """
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if value >= 0 else None
@@ -467,11 +473,20 @@ class GbfsFeedHandle:
         return handle
 
     async def _endpoint_table(self) -> dict[str, str]:
-        """Return the endpoint table, re-read from discovery once its ttl lapses."""
+        """Return the endpoint table, re-read from discovery once its ttl lapses.
+
+        A re-read that fails keeps the last table that worked: it only lists
+        where the documents are, which are each still fetched fresh. The
+        first read, when the handle is created, has none to keep and raises.
+        """
         if self._discovery_url is not None:
-            self._endpoints = _endpoints_from_discovery(
-                await self._fetch_cached(self._discovery_url, "GBFS discovery URL")
-            )
+            try:
+                self._endpoints = _endpoints_from_discovery(
+                    await self._fetch_cached(self._discovery_url, "GBFS discovery URL")
+                )
+            except (SourceConnectionError, FeedParseError):
+                if not self._endpoints:
+                    raise
         return self._endpoints
 
     @staticmethod
@@ -614,12 +629,13 @@ class GbfsFeedHandle:
     async def _optional_rows(self, name: str, key: str) -> list[Mapping[str, Any]]:
         """Rows from a document a system need not publish at all.
 
-        Every one of these endpoints is optional in GBFS, and discovery
-        only lists what a system actually serves -- so "not published"
-        is a normal answer meaning "no such records", not a failure. So is
-        a listed one answering 404: "OPTIONAL files MAY 404. A 404 of an
-        OPTIONAL file SHOULD NOT be considered an error." Any other error
-        still raises.
+        These endpoints are optional in GBFS (``vehicle_types`` only
+        conditionally required -- without it every vehicle is a
+        non-motorized bicycle), and discovery only lists what a system
+        actually serves -- so "not published" is a normal answer meaning
+        "no such records", not a failure. So is a listed one answering 404:
+        "OPTIONAL files MAY 404. A 404 of an OPTIONAL file SHOULD NOT be
+        considered an error." Any other error still raises.
         """
         endpoints = await self._endpoint_table()
         if name not in endpoints:
@@ -770,6 +786,19 @@ class GbfsFeedHandle:
             )
         return stations
 
+    async def _station_positions(
+        self, endpoints: Mapping[str, str]
+    ) -> dict[str, tuple[float | None, float | None]]:
+        """Each station's published position, by id ({} without stations)."""
+        if "station_information" not in endpoints:
+            return {}
+        rows = _rows(await self._document("station_information", endpoints), "stations")
+        return {
+            station_id: (_coordinate(row.get("lat")), _coordinate(row.get("lon")))
+            for row in rows
+            if (station_id := _record_id(row.get("station_id"))) is not None
+        }
+
     async def get_vehicles(self, zone: Circle | None = None) -> list[GbfsVehicle]:
         """Vehicles not in active rental, optionally filtered to a circular zone.
 
@@ -778,9 +807,10 @@ class GbfsFeedHandle:
         Filtering is client-side: GBFS has no server-side geo-query.
         Rows without a usable id are skipped. A vehicle at a station need not
         report coordinates (``lat``/``lon`` are REQUIRED only without a
-        ``station_id``): it is kept with None coordinates, and left out only
-        when filtering by ``zone``. A row with neither is invalid and
-        skipped (a free-floating vehicle IS its position).
+        ``station_id``): it is kept with None coordinates, and a ``zone``
+        places it at its station (from ``station_information``). A row
+        with neither is invalid and skipped (a free-floating vehicle IS its
+        position).
         """
         endpoints = await self._endpoint_table()
         if "vehicle_status" in endpoints:
@@ -791,6 +821,16 @@ class GbfsFeedHandle:
             id_key = "bike_id"
         else:
             return []
+        station_at = (
+            await self._station_positions(endpoints)
+            if zone is not None
+            and any(
+                _coordinate(row.get("lat")) is None
+                or _coordinate(row.get("lon")) is None
+                for row in rows
+            )
+            else {}
+        )
         vehicles: list[GbfsVehicle] = []
         for row in rows:
             vehicle_id = _record_id(row.get(id_key))
@@ -800,10 +840,15 @@ class GbfsFeedHandle:
             located = latitude is not None and longitude is not None
             if vehicle_id is None or not (located or station_id is not None):
                 continue
+            position = (
+                (latitude, longitude)
+                if located
+                else station_at.get(station_id or "", (None, None))
+            )
             if zone is not None and not (
-                latitude is not None
-                and longitude is not None
-                and in_circle(zone, latitude, longitude)
+                position[0] is not None
+                and position[1] is not None
+                and in_circle(zone, position[0], position[1])
             ):
                 continue
             vehicles.append(

@@ -404,8 +404,9 @@ Notes on direct mode:
 - **GBFS ids resolve**: `get_vehicle_types()`, `get_pricing_plans()`,
   `get_regions()`, and `get_alerts()` turn the `vehicle_type_id`,
   `pricing_plan_id`, and `region_id` on stations and vehicles into records.
-  All four documents are optional in GBFS, so an unpublished one — or a
-  listed one answering `404`, which GBFS says is not an error — is `[]`.
+  These documents are optional in GBFS (`vehicle_types` only conditionally
+  required), so an unpublished one — or a listed one answering `404`,
+  which GBFS says is not an error — is `[]`.
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
   `get_headsigns_serving()` alongside the stop/route helpers.
@@ -418,8 +419,9 @@ Notes on direct mode:
 - **GBFS exposes what the documents carry**: the full station surface
   (`is_installed` alongside `is_renting`/`is_returning` — a station removed
   from the street is not "operational"; disabled counts, address, region,
-  virtual-station flag), vehicle docking and fuel state (a vehicle docked at
-  a station need not report a position: its coordinates are `None`), and a
+  virtual-station flag), vehicle docking and fuel state (a vehicle docked
+  at a station need not report a position: its coordinates are `None`, and
+  a zone places it at its station), and a
   `GbfsSystemInfo` with the operator's contact, licensing, and terms URLs.
   `last_reported` is exposed on both stations and vehicles so you can tell
   fresh data from stale, and is parsed from either GBFS 2.x POSIX seconds or

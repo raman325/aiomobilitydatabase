@@ -162,22 +162,48 @@ async def test_a_docked_vehicle_without_coordinates_is_kept(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
     """lat/lon are REQUIRED only without a station_id: a docked vehicle is
-    kept with None coordinates (and left out of a zone); a row with neither
-    is invalid."""
+    kept with None coordinates, and a zone places it at its station; a row
+    with neither is invalid."""
     _mock_catalog(mock_api)
     bikes = [
-        {"bike_id": "docked", "station_id": "st1", "is_reserved": False},
+        {"bike_id": "docked", "station_id": "here", "is_reserved": False},
+        {"bike_id": "elsewhere", "station_id": "far", "is_reserved": False},
         {"bike_id": "loose", "lat": 34.05, "lon": -118.25},
         {"bike_id": "lost", "is_reserved": False},
     ]
+    stations = [
+        {"station_id": "here", "lat": 34.05, "lon": -118.25},
+        {"station_id": "far", "lat": 40.7, "lon": -74.0},
+    ]
     for _ in range(2):
         mock_api.get("/gbfs/free_bike_status.json", payload=_doc({"bikes": bikes}))
+    mock_api.get("/gbfs/station_information.json", payload=_doc({"stations": stations}))
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     by_id = {v.id: v for v in await handle.get_vehicles()}
-    assert set(by_id) == {"docked", "loose"}
-    assert (by_id["docked"].latitude, by_id["docked"].station_id) == (None, "st1")
+    assert set(by_id) == {"docked", "elsewhere", "loose"}
+    assert (by_id["docked"].latitude, by_id["docked"].station_id) == (None, "here")
     zone = Circle(latitude=34.05, longitude=-118.25, radius_m=1000)
-    assert [v.id for v in await handle.get_vehicles(zone)] == ["loose"]
+    zoned = await handle.get_vehicles(zone)
+    assert sorted(v.id for v in zoned) == ["docked", "loose"]
+    assert next(v for v in zoned if v.id == "docked").latitude is None  # as published
+
+
+async def test_a_failed_discovery_re_read_keeps_the_last_table(
+    mock_api: MockApi, direct_client: MobilityFeedsClient
+) -> None:
+    """The table only says where the documents are -- each still fetched
+    fresh -- so a re-read that fails keeps the one that worked."""
+    feeds = [{"name": "system_information", "url": mock_api.url("/gbfs/si.json")}]
+    mock_api.get("/gbfs/gbfs.json", payload=_doc({"feeds": feeds}, ttl=0))
+    mock_api.get("/gbfs/gbfs.json", status=503, body=b"", content_type="text/plain")
+    mock_api.get("/gbfs/gbfs.json", payload={"data": {}})  # parses to no feeds
+    for name in ("One", "Two"):
+        mock_api.get(
+            "/gbfs/si.json", payload=_doc({"system_id": "s", "name": name}, ttl=0)
+        )
+    handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+    assert (await handle.get_system_info()).name == "One"
+    assert (await handle.get_system_info()).name == "Two"
 
 
 # -- D10: BCP 47 tags are case-insensitive ---------------------------------------
