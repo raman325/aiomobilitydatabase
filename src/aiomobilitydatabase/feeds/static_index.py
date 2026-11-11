@@ -276,6 +276,16 @@ def _lenient_date(value: str | None) -> date | None:
         return None
 
 
+def _gtfs_date(day: date) -> str:
+    """Format a date as GTFS ``YYYYMMDD``, the year always four digits.
+
+    Never ``strftime("%Y")``: the C library decides its width, and glibc
+    writes year 1 as ``1`` (macOS as ``0001``), so stored and looked-up
+    dates would disagree on one platform only.
+    """
+    return f"{day.year:04d}{day.month:02d}{day.day:02d}"
+
+
 def _canonical_date(value: str | None) -> str | None:
     """Store a service date as canonical ``YYYYMMDD`` text, or None.
 
@@ -286,7 +296,7 @@ def _canonical_date(value: str | None) -> str | None:
     of comparing by accident of its characters.
     """
     parsed = _lenient_date(value)
-    return parsed.strftime("%Y%m%d") if parsed is not None else None
+    return _gtfs_date(parsed) if parsed is not None else None
 
 
 def _enum_or_none[IntEnumT: IntEnum](
@@ -1455,7 +1465,7 @@ class StaticIndex:
 
     def active_service_ids(self, service_date: date) -> set[str]:
         """Service IDs active on the given local service date."""
-        datestr = service_date.strftime("%Y%m%d")
+        datestr = _gtfs_date(service_date)
         weekday_col = _WEEKDAY_COLUMNS[service_date.weekday()]
         active = {
             row[0]
