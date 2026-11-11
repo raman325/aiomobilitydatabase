@@ -16,6 +16,7 @@ from google.transit import gtfs_realtime_pb2
 from ._freshness import (
     Response,
     Validators,
+    first_hop_fields,
     header_fields,
     request_fields,
     sent_fields,
@@ -213,6 +214,7 @@ async def fetch_feed_message(
                     request_fields=sent_fields(controlled, resp),
                     hops=_hops(resp),
                     url=str(resp.url),
+                    first_hop_request_fields=first_hop_fields(controlled, resp),
                 )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
@@ -228,6 +230,7 @@ async def fetch_feed_message(
             raw = await resp.read()
             sent, hops = sent_fields(controlled, resp), _hops(resp)
             answered = str(resp.url)
+            first = first_hop_fields(controlled, resp)
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
     message = gtfs_realtime_pb2.FeedMessage()
@@ -243,6 +246,7 @@ async def fetch_feed_message(
         request_fields=sent,
         hops=hops,
         url=answered,
+        first_hop_request_fields=first,
     )
 
 

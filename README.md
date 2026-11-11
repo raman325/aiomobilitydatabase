@@ -281,17 +281,21 @@ Notes on direct mode:
   can't be predicted, so a `Vary` naming it always asks. A redirected
   response answers its original URL only while every redirect may be
   reused too: the shortest lifetime of the chain, none when a redirect
-  declares none (and a 302, 303 or 307 without freshness of its own, or a
-  `public` marking, is asked every time, even under `rt_min_interval`),
-  and a redirect's own `Vary` counts. Through a redirect only aiohttp's
-  automatic headers can be shown to match, so a `Vary: Accept-Encoding`
-  still lets a redirected feed be reused and a `Vary` on anything else
-  doesn't. A handle's own `Cache-Control` request header is honoured:
-  `no-cache` revalidates, `max-age=N` bounds the age it accepts, and
-  `no-store` keeps responses out of the cache. A `304` from the redirect's target speaks for that
-  resource, not the stored one, so it is asked again unconditionally.
-  Only a `200` (or `203`) carries a feed: any other status below 400 is a
-  `SourceConnectionError`, never an empty feed stored in its place.
+  declares none. A 302, 303 or 307 that has neither freshness of its own
+  nor a `public` marking is asked every time, even under
+  `rt_min_interval`. A redirect's own `Vary` counts: the first redirect's
+  is matched against the original request, while later hops and the
+  target can only be shown to match on aiohttp's automatic headers — so a
+  `Vary: Accept-Encoding` still lets a redirected feed be reused. A `304`
+  from the redirect's target speaks for that resource, not the stored
+  one, so it is asked again unconditionally. Only a `200` (or `203`)
+  carries a feed: any other status below 400 is a `SourceConnectionError`,
+  never an empty feed stored in its place. A handle's own `Cache-Control`
+  request header is honoured, read as strictly as a response's: `no-cache`
+  revalidates, `max-age=N` accepts a response at most N seconds old (its
+  own age included), `min-fresh=N` one fresh for N more seconds, `no-store`
+  keeps responses out of the cache, and an invalid or malformed one
+  accepts nothing stored.
   A bare `no-cache` revalidates every time (one naming fields only bars
   passing those fields on, which this cache never does), `no-store` is
   never stored, invalid freshness (including a

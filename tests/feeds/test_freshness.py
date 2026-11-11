@@ -2594,11 +2594,11 @@ async def test_a_redirects_vary_is_replaced_never_accumulated() -> None:
     for _ in range(6):
         assert await cache.get("u", producer) == "a"
     entry = cache._entries["u"]
-    assert entry.hop_vary == ("Accept-Encoding",)
+    assert entry.first_hop_vary == ("Accept-Encoding",)
     assert "vary" not in entry.fields
     producer.queue.append(Response(None, target, T0, T0, {}, (), url="https://p/b"))
     await cache.get("u", producer)
-    assert entry.hop_vary == ()
+    assert entry.first_hop_vary == ()
     assert not entry.redirected
 
 
@@ -2715,3 +2715,121 @@ def test_repeated_cookie_names_keep_their_order() -> None:
     """``a=2; a=1`` and ``a=1; a=2`` differ: a server may read the first."""
     pairs = freshness_module._cookie_pairs
     assert pairs(["a=2; a=1"]) != pairs(["a=1; a=2"])
+
+
+async def test_a_requests_max_age_counts_the_responses_own_age() -> None:
+    """A CDN copy fresh for 7200s but already 3000s old (Age): a request
+    asking for at most 60s of age gets a fresh fetch, not the stored copy
+    -- its age is the response's own plus the time held."""
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer(
+        [
+            _raw("old", {"Cache-Control": "max-age=7200", "Age": "3000"}),
+            _raw("new", {"Cache-Control": "max-age=7200"}),
+        ]
+    )
+    await cache.get("u", producer)
+    clock.now = 1.0
+    asked = {"cache-control": ("max-age=60",)}
+    assert await cache.get("u", producer, request_fields=asked) == "new"
+    assert await cache.get("u", producer, request_fields=asked) == "new"  # 1s old
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "max-age=abc",
+        "max-age=-1",
+        "max-age=5, max-age=10",
+        'max-age=5, "x',
+        'foo, "bar',  # malformed, whatever it holds
+        "min-fresh=abc",
+    ],
+)
+async def test_an_invalid_request_directive_accepts_nothing(directive: str) -> None:
+    """Read as strictly as a response's: invalid, repeated or malformed
+    means the stored copy isn't acceptable unvalidated."""
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer(
+        [
+            _raw("a", {"Cache-Control": "max-age=600"}),
+            _raw("b", {"Cache-Control": "max-age=600"}),
+        ]
+    )
+    await cache.get("u", producer)
+    clock.now = 30.0
+    asked = {"cache-control": (directive,)}
+    assert await cache.get("u", producer, request_fields=asked) == "b"
+
+
+async def test_a_requests_min_fresh_needs_that_much_freshness_left() -> None:
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer(
+        [
+            _raw("a", {"Cache-Control": "max-age=60"}),
+            _raw("b", {"Cache-Control": "max-age=60"}),
+        ]
+    )
+    await cache.get("u", producer)
+    clock.now = 30.0
+    enough = {"cache-control": ("min-fresh=30",)}
+    assert await cache.get("u", producer, request_fields=enough) == "a"  # 30s left
+    clock.now = 31.0
+    assert await cache.get("u", producer, request_fields=enough) == "b"  # 29s left
+    # Declaring no lifetime, a response has none left to promise.
+    bare = FreshnessCache[str](_Clock())
+    undeclared = _Producer([_raw("x", {}), _raw("y", {})])
+    await bare.get("u", undeclared, min_interval=60)
+    asked = {"cache-control": ("min-fresh=0",)}
+    assert await bare.get("u", undeclared, min_interval=60, request_fields=asked) == "y"
+
+
+async def test_a_request_max_age_edge_is_inclusive() -> None:
+    """``max-age=N`` accepts a response exactly N seconds old."""
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer([_raw("a", {"Cache-Control": "max-age=600"}), _raw("b", {})])
+    await cache.get("u", producer)
+    clock.now = 10.0
+    asked = {"cache-control": ("max-age=10",)}
+    assert await cache.get("u", producer, request_fields=asked) == "a"
+
+
+async def test_a_no_store_request_keeps_the_existing_entry() -> None:
+    """Not storing the new response doesn't drop the one already stored."""
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer(
+        [
+            _raw("a", {"Cache-Control": "max-age=10"}),
+            _raw("b", {"Cache-Control": "max-age=600"}),
+        ]
+    )
+    await cache.get("u", producer)
+    clock.now = 20.0
+    assert (
+        await cache.get("u", producer, request_fields={"cache-control": ("no-store",)})
+        == "b"
+    )
+    assert cache._entries["u"].value == "a"
+
+
+async def test_the_first_redirects_vary_matches_the_original_request() -> None:
+    """A cacheable 301 varying by X-Region answered the original request,
+    whose fields are known: the same region reuses the chain, another asks."""
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    fields = header_fields({"Cache-Control": "max-age=600"})
+    hops = [_hop(301, Cache_Control="max-age=3600", Vary="X-Region")]
+    east = {"x-region": ("east",)}
+    producer = _Producer(
+        [
+            Response("a", fields, T0, T0, {}, hops, first_hop_request_fields=east),
+            Response("b", fields, T0, T0, {}, hops, first_hop_request_fields=east),
+        ]
+    )
+    await cache.get("u", producer, request_fields=east)
+    assert await cache.get("u", producer, request_fields=east) == "a"
+    assert await cache.get("u", producer, request_fields={"x-region": ("west",)}) == "b"

@@ -517,25 +517,49 @@ def request_fields(
 
 def sent_fields(
     controlled: Fields, response: aiohttp.ClientResponse
-) -> dict[str, tuple[str, ...]] | None:
-    """Return the request fields a response was drawn by, as sent; None if unknown.
+) -> dict[str, tuple[str, ...]]:
+    """Return the request fields that reached the response's target, as sent.
 
-    Every field on the wire (``response.request_info``), Cookie canonical,
-    except what no later request can differ in: aiohttp's automatic
-    headers and the cache's own validators, unless ``controlled`` (the
-    :func:`request_fields` taken before sending) set them. So any other
-    header a middleware or trace hook added counts -- it can't be
-    predicted, and a Vary naming it never matches (one of the automatic
-    names is the exception: it is taken to be aiohttp's fixed value). A
-    redirected request's hops carried headers no later request can be
-    checked against in advance, all but the automatic ones: those the
-    client set are kept, the rest are aiohttp's own on every hop.
+    For a direct response, every field on the wire (see
+    :func:`_wire_fields`). A redirected request's later hops carried headers
+    no later request can be checked against in advance, all but the
+    automatic ones: those the client set are kept, the rest are aiohttp's
+    own on every hop. (The original request's fields, which the first
+    redirect answered, are :func:`first_hop_fields`.)
     """
     if response.history:
         return {
             name: tuple(controlled[name]) for name in controlled if name in _AUTOMATIC
         }
-    sent = header_fields(response.request_info.headers)
+    return _wire_fields(controlled, response.request_info.headers)
+
+
+def first_hop_fields(
+    controlled: Fields, response: aiohttp.ClientResponse
+) -> dict[str, tuple[str, ...]] | None:
+    """Return the original request's fields when a response was redirected.
+
+    The first redirect answered exactly that request, as sent (see
+    :func:`_wire_fields`); None for a response that wasn't redirected.
+    """
+    if not response.history:
+        return None
+    return _wire_fields(controlled, response.history[0].request_info.headers)
+
+
+def _wire_fields(
+    controlled: Fields, headers: Mapping[str, str]
+) -> dict[str, tuple[str, ...]]:
+    """Return a request's fields as sent, for matching a Vary against.
+
+    Every field on the wire, Cookie canonical, except what no later request
+    can differ in: aiohttp's automatic headers and the cache's own
+    validators, unless ``controlled`` (the :func:`request_fields` taken
+    before sending) set them. So any other header a middleware or trace hook
+    added counts -- it can't be predicted, and a Vary naming it never
+    matches (an automatic name is taken to be aiohttp's fixed value).
+    """
+    sent = header_fields(headers)
     fields = {
         name: values
         for name, values in sent.items()
@@ -621,13 +645,28 @@ def freshness_of(
         )
     else:
         return Freshness(lifetime=None)
+    age = _age_when_requested(
+        fields, requested_at=requested_at, received_at=received_at
+    )
+    return Freshness(lifetime=max(0.0, lifetime - age))
+
+
+def _age_when_requested(
+    fields: Fields, *, requested_at: datetime, received_at: datetime
+) -> float:
+    """Return a response's age as of its request, in seconds (RFC 9111 4.2.3).
+
+    The initial age -- ``max(apparent_age, Age + response_delay)`` -- less
+    the response delay, so that adding the time since the request gives the
+    current age without counting the delay twice. Reads pinned fields (see
+    :func:`_received`); an invalid Age is ignored (section 5.1).
+    """
+    date = _http_date(_first(fields, "date"), received_at)
     apparent_age = max(0.0, (received_at - date).total_seconds()) if date else 0.0
-    # RFC 9111 section 5.1: an invalid Age SHOULD be ignored (age_value 0).
     age_field = _first(fields, "age")
     age = _delta_seconds(age_field.split(",")[0]) if age_field else None
     response_delay = max(0.0, (received_at - requested_at).total_seconds())
-    initial_age = max(apparent_age, (age or 0) + response_delay)
-    return Freshness(lifetime=max(0.0, lifetime - initial_age + response_delay))
+    return max(0.0, max(apparent_age, (age or 0) + response_delay) - response_delay)
 
 
 def _entity_tag(fields: Fields) -> tuple[bool, str] | None:
@@ -739,6 +778,8 @@ class Response[T]:
     ORIGINAL URL only for as long as every hop may be reused too. ``url``
     is the URL that answered (the last hop's target): a 304 from any other
     resource says nothing about the stored one (RFC 9110 section 8.8.3).
+    ``first_hop_request_fields`` are the original request's fields when it
+    was redirected, which the first redirect's own Vary is matched against.
     """
 
     value: T | None
@@ -748,6 +789,9 @@ class Response[T]:
     request_fields: Fields | None = field(default_factory=dict)
     hops: Sequence[Hop] = ()
     url: str | None = None
+    # The original request's fields, as sent (see :func:`sent_fields`), when
+    # the response was redirected; None otherwise or when unknown.
+    first_hop_request_fields: Fields | None = None
 
 
 class Fetch[T](Protocol):
@@ -774,8 +818,14 @@ class _Entry[T]:
     url: str | None = None  # the resource that answered (after redirects)
     redirected: bool = False  # reached through redirects
     # The redirects' own Vary values: replaced whole by each response, never
-    # merged into ``fields`` (which a 304 updates).
+    # merged into ``fields`` (which a 304 updates). The first redirect's are
+    # kept apart: its request was the original one, whose fields are known.
     hop_vary: tuple[str, ...] = ()
+    first_hop_vary: tuple[str, ...] = ()
+    first_hop_request_fields: Fields | None = None
+    # The response's age when its request was sent (stored_at): its current
+    # age is this plus the time held.
+    age: float = 0.0
     # Through a redirect declaring nothing: ``lifetime`` is None, and an
     # opt-in ``min_interval`` may reuse it no longer than this.
     cap: float | None = None
@@ -812,13 +862,20 @@ def _hop_freshness(response: Response[object]) -> list[Freshness]:
     return found
 
 
-def _hop_vary(response: Response[object]) -> tuple[str, ...]:
-    """Return the Vary values of the redirects a response was reached through.
+def _hop_vary(response: Response[object]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return (first redirect's, later redirects') Vary values.
 
     A redirect varying by request fields answers only requests that match
-    (RFC 9111 section 4.1), just as the target does.
+    (RFC 9111 section 4.1), just as the target does. The first was drawn by
+    the original request, so its Vary is matched against that request's
+    known fields; the later ones only through automatic headers.
     """
-    return tuple(value for hop in response.hops for value in hop.fields.get("vary", ()))
+    if not response.hops:
+        return (), ()
+    first, *later = response.hops
+    return tuple(first.fields.get("vary", ())), tuple(
+        value for hop in later for value in hop.fields.get("vary", ())
+    )
 
 
 def _storable(freshness: Freshness, response: Response[object]) -> bool:
@@ -826,19 +883,68 @@ def _storable(freshness: Freshness, response: Response[object]) -> bool:
     return freshness.storable and all(hop.storable for hop in _hop_freshness(response))
 
 
-def _entry_vary(entry: _Entry[Any]) -> set[str]:
-    """Return the request fields a stored response's Vary, and its hops', name."""
-    return _vary_names({"vary": (*entry.fields.get("vary", ()), *entry.hop_vary)})
+def _entry_matches(
+    entry: _Entry[Any],
+    original: Fields | None,
+    final: Fields | None,
+    *,
+    redirected: bool,
+) -> bool:
+    """Whether a stored response (and its redirects) answer a request.
+
+    ``original`` are the request's own fields, which the first redirect's
+    Vary is matched against exactly; ``final`` those reaching the target,
+    which the target's and later redirects' Vary are matched against --
+    only through automatic headers when either side was ``redirected``.
+    """
+    later = _vary_names({"vary": (*entry.fields.get("vary", ()), *entry.hop_vary)})
+    return _vary_matches(
+        _vary_names({"vary": entry.first_hop_vary}),
+        entry.first_hop_request_fields,
+        original,
+    ) and _vary_matches(later, entry.request_fields, final, redirected=redirected)
 
 
 def _answers(entry: _Entry[Any], response: Response[Any]) -> bool:
     """Whether a stored response answers the request a new response drew."""
-    return _vary_matches(
-        _entry_vary(entry),
-        entry.request_fields,
+    original = (
+        response.first_hop_request_fields if response.hops else response.request_fields
+    )
+    return _entry_matches(
+        entry,
+        original,
         response.request_fields,
         redirected=entry.redirected or bool(response.hops),
     )
+
+
+def _request_accepts(
+    request_fields: Fields, current_age: float, remaining: float | None
+) -> bool:
+    """Whether a request's own Cache-Control accepts a stored response.
+
+    RFC 9111 section 5.2.1, read as strictly as a response's directives:
+    ``no-cache`` asks for validation; ``max-age=N`` accepts a response no
+    older than N (its current age: initial age plus time held);
+    ``min-fresh=N`` one still fresh for N more seconds (``remaining``; a
+    response declaring no lifetime has none). A malformed field, or a
+    repeated or invalid argument, accepts nothing.
+    """
+    asked, malformed = _directives(request_fields.get("cache-control", ()))
+    if malformed or "no-cache" in asked:
+        return False
+    for name in ("max-age", "min-fresh"):
+        if name not in asked:
+            continue
+        values = asked[name]
+        limit = _delta_seconds(values[0], quoted=True) if len(values) == 1 else None
+        if limit is None:
+            return False
+        if name == "max-age" and current_age > limit:
+            return False
+        if name == "min-fresh" and (remaining is None or remaining < limit):
+            return False
+    return True
 
 
 def _frozen(fields: Fields) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -917,24 +1023,17 @@ class FreshnessCache[T]:
     def _fresh(
         self, entry: _Entry[T], min_interval: float, request_fields: Fields
     ) -> bool:
-        if not _vary_matches(
-            _entry_vary(entry),
-            entry.request_fields,
-            request_fields,
-            redirected=entry.redirected,
+        if not _entry_matches(
+            entry, request_fields, request_fields, redirected=entry.redirected
         ):
             return False  # it answers a different request (RFC 9111 4.1)
         age = self._clock() - entry.stored_at
-        # The request's own directives (RFC 9111 section 5.2.1), from the
-        # handle's headers: no-cache asks for validation, max-age bounds the
-        # age it accepts.
-        asked, _ = _directives(request_fields.get("cache-control", ()))
-        if "no-cache" in asked:
+        if not _request_accepts(
+            request_fields,
+            entry.age + age,
+            None if entry.lifetime is None else entry.lifetime - age,
+        ):
             return False
-        if "max-age" in asked and len(asked["max-age"]) == 1:
-            limit = _delta_seconds(asked["max-age"][0], quoted=True)
-            if limit is not None and age > limit:
-                return False
         if entry.lifetime is not None:
             # A declared lifetime (0 included: revalidate) is binding.
             return age < entry.lifetime
@@ -1098,7 +1197,14 @@ class FreshnessCache[T]:
                 return entry.value
             entry.fields = merged
             entry.request_fields = response.request_fields
-            entry.redirected, entry.hop_vary = bool(response.hops), _hop_vary(response)
+            entry.redirected = bool(response.hops)
+            entry.first_hop_vary, entry.hop_vary = _hop_vary(response)
+            entry.first_hop_request_fields = response.first_hop_request_fields
+            entry.age = _age_when_requested(
+                merged,
+                requested_at=response.requested_at,
+                received_at=response.received_at,
+            )
             entry.stored_at = requested
             entry.lifetime, entry.cap = self._lifetime_of(
                 entry.value, freshness, response
@@ -1132,6 +1238,13 @@ class FreshnessCache[T]:
             url=response.url,
             cap=cap,
             redirected=bool(response.hops),
-            hop_vary=_hop_vary(response),
+            hop_vary=_hop_vary(response)[1],
+            first_hop_vary=_hop_vary(response)[0],
+            first_hop_request_fields=response.first_hop_request_fields,
+            age=_age_when_requested(
+                fields,
+                requested_at=response.requested_at,
+                received_at=response.received_at,
+            ),
         )
         return response.value

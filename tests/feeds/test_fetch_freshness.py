@@ -495,13 +495,16 @@ async def test_a_redirected_response_with_vary_is_never_reused_unasked(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
     """The final hop of a redirect carried headers no later request can be
-    checked against in advance: under a Vary, each call asks.
+    checked against in advance: under a Vary on anything but aiohttp's
+    automatic headers, each call asks -- even through a cacheable redirect.
     """
     _mock_transit(mock_api)
     moved = mock_api.url("/rt/moved")
-    vary = {"Cache-Control": "max-age=600", "Vary": "Accept"}
+    vary = {"Cache-Control": "max-age=600", "Vary": "X-Region"}
     for timestamp in (100, 200):
-        mock_api.get(RT, status=302, headers={"Location": moved})
+        mock_api.get(
+            RT, status=301, headers={"Location": moved, "Cache-Control": "max-age=600"}
+        )
         mock_api.get(
             "/rt/moved",
             body=_t1_delayed(timestamp - 40, timestamp=timestamp),
@@ -612,13 +615,17 @@ async def test_a_redirect_targets_304_never_revalidates_the_original(
     assert [hit.get("If-None-Match") for hit in moved_hits] == ['"1"', None]
 
 
-async def test_a_redirect_varying_by_cookie_is_asked_again(
-    mock_api: MockApi, feeds_client: MobilityFeedsClient
+@pytest.mark.parametrize(("sets_cookie", "requests"), [(False, 1), (True, 2)])
+async def test_a_redirect_varying_by_cookie_matches_the_original_request(
+    mock_api: MockApi, sets_cookie: bool, requests: int
 ) -> None:
-    """A cacheable 302 varying by Cookie: the next call can't be shown to
-    carry the same cookies through the redirect, so it asks."""
+    """A cacheable 302 varying by Cookie answered the original request,
+    whose fields are known: the same cookies next time reuse the chain; a
+    cookie the redirect set since changes the request, so it asks again.
+    """
     _mock_transit(mock_api)
     for timestamp, target in ((100, "/rt/east"), (200, "/rt/west")):
+        cookie = {"Set-Cookie": "region=west"} if sets_cookie else {}
         mock_api.get(
             RT,
             status=302,
@@ -626,6 +633,7 @@ async def test_a_redirect_varying_by_cookie_is_asked_again(
                 "Location": mock_api.url(target),
                 "Cache-Control": "max-age=600",
                 "Vary": "Cookie",
+                **cookie,
             },
         )
         mock_api.get(
@@ -634,9 +642,16 @@ async def test_a_redirect_varying_by_cookie_is_asked_again(
             content_type=PB,
             headers={"Cache-Control": "max-age=600"},
         )
-    handle = await feeds_client.get_transit_feed("mdb-100")
-    assert await _t1_delay(handle) == 60
-    assert await _t1_delay(handle) == 160
+    async with (
+        await _unsafe_jar_client(mock_api) as session,
+        MobilityFeedsClient(
+            "test-refresh-token", session, base_url=mock_api.url()
+        ) as client,
+    ):
+        handle = await client.get_transit_feed("mdb-100")
+        assert await _t1_delay(handle) == 60
+        assert await _t1_delay(handle) == (160 if sets_cookie else 60)
+    assert len(_rt_hits(mock_api)) == requests
 
 
 async def test_rt_min_interval_never_reuses_a_302_without_freshness(

@@ -15,6 +15,7 @@ from ._freshness import (
     FreshnessCache,
     Response,
     Validators,
+    first_hop_fields,
     header_fields,
     request_fields,
     sent_fields,
@@ -481,6 +482,7 @@ class GbfsFeedHandle:
                         request_fields=sent_fields(controlled, resp),
                         hops=_hops(resp),
                         url=str(resp.url),
+                        first_hop_request_fields=first_hop_fields(controlled, resp),
                     )
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
@@ -501,6 +503,7 @@ class GbfsFeedHandle:
                     raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
                 sent, hops = sent_fields(controlled, resp), _hops(resp)
                 answered = str(resp.url)
+                first = first_hop_fields(controlled, resp)
         except (TimeoutError, aiohttp.ClientError) as err:
             raise SourceConnectionError(f"Error fetching {url}: {err}") from err
         if not isinstance(document, dict) or "data" not in document:
@@ -513,6 +516,7 @@ class GbfsFeedHandle:
             request_fields=sent,
             hops=hops,
             url=answered,
+            first_hop_request_fields=first,
         )
 
     async def _document(self, name: str) -> dict[str, Any]:
