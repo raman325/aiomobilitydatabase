@@ -35,6 +35,31 @@ def _origin(url: URL) -> tuple[str, str | None, int | None]:
     return url.scheme, url.host, url.port
 
 
+def _remaining(deadline: float | None) -> float | None:
+    """Seconds left before ``deadline`` (None: no bound); none left raises."""
+    if deadline is None:
+        return None
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
+
+
+def _same_resource(target: URL, query: Mapping[str, str] | None, other: URL) -> bool:
+    """Whether a hop requesting ``target`` (plus ``query``) asks for ``other``.
+
+    Credentials in the URL aren't part of the resource; query parameters
+    are, in any order.
+    """
+    asked = target.with_user(None)
+    if query:
+        asked = asked.update_query(query)
+    other = other.with_user(None)
+    return asked.with_query(None) == other.with_query(None) and sorted(
+        asked.query.items()
+    ) == sorted(other.query.items())
+
+
 def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str) -> URL:
     """Resolve a Location as aiohttp does; only an HTTP(S) URL is followed."""
     try:
@@ -70,7 +95,10 @@ async def get_withholding(
     ``url``): sent only on a hop asking for exactly that resource. Never
     carried along a redirect to another (RFC 9110 section 15.4 step 2.4),
     and never sent to a URL that redirected to the one they came from
-    (RFC 9111 section 4.3.1) -- whose own request then gets them.
+    (RFC 9111 section 4.3.1) -- whose own request then gets them. Where a
+    hop by hand can't withhold the session's own credentials (below) and
+    no ``secret`` is at stake, the request is made again unconditionally,
+    aiohttp following the redirects and dropping them itself.
 
     Without a ``secret`` header or ``conditional`` aiohttp follows
     redirects itself. Otherwise they are followed here: from the first hop
@@ -110,11 +138,9 @@ async def get_withholding(
     userinfo = (target.user, target.password) if target.user is not None else None
     userinfo_origin = _origin(target)
     while True:
-        remaining = None if deadline is None else deadline - monotonic()
-        if remaining is not None and remaining <= 0:
-            raise TimeoutError
+        remaining = _remaining(deadline)
         # The validators go to the resource they came from, and only to it.
-        asked = target.with_user(None) == validated.with_user(None)
+        asked = _same_resource(target, query, validated)
         hop_headers = {**sent, **conditional} if conditional and asked else sent
         response = await session.get(
             target,
@@ -140,6 +166,8 @@ async def get_withholding(
             if session.auth is not None or any(
                 name.lower() in withheld for name in session.headers
             ):
+                if secret is None:
+                    break  # only validators made this hand-followed: retry
                 raise SourceConnectionError(
                     f"Producer redirected to another origin ({following.origin()}) "
                     f"and the session carries credentials that can't be withheld: {url}"
@@ -153,3 +181,11 @@ async def get_withholding(
         elif userinfo is not None and origin == userinfo_origin:
             following = following.with_user(userinfo[0]).with_password(userinfo[1])
         target, query = following, None
+    remaining = _remaining(deadline)
+    async with session.get(
+        url,
+        params=params or None,
+        headers=headers or None,
+        timeout=aiohttp.ClientTimeout(total=remaining),
+    ) as response:
+        yield response, response.history

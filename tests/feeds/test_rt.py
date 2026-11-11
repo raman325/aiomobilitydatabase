@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, date, datetime
+from functools import partial
 
 import aiohttp
 import pytest
@@ -11,6 +12,7 @@ from google.transit import gtfs_realtime_pb2
 from yarl import URL
 
 from aiomobilitydatabase.feeds import _redirects as redirects_module
+from aiomobilitydatabase.feeds._freshness import FreshnessCache
 from aiomobilitydatabase.feeds._redirects import _origin
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
@@ -423,6 +425,53 @@ async def test_an_unsolicited_304_is_a_connection_error(mock_api: MockApi) -> No
     with pytest.raises(SourceConnectionError, match="unconditional") as excinfo:
         await _fetch(mock_api)
     assert excinfo.value.status == 304
+
+
+async def test_a_query_auth_feed_is_revalidated_conditionally(
+    mock_api: MockApi,
+) -> None:
+    """The validators belong to the URL with its query (the key included):
+    the request asking for it carries them, so an unchanged feed is a 304."""
+    url = mock_api.url("/rt")
+    fresh = {"ETag": '"v1"', "Cache-Control": "no-cache"}
+    mock_api.get("/rt", body=VEHICLE_POSITIONS, content_type=PB, headers=fresh)
+    mock_api.get("/rt", status=304, headers=fresh)
+    cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
+    async with aiohttp.ClientSession() as session:
+        fetch = partial(
+            fetch_feed_message, session, url, auth_type=1, api_key_name="k", api_key="v"
+        )
+        first = await cache.get(url, fetch)
+        assert await cache.get(url, fetch) is first
+    assert [r.headers.get("If-None-Match") for r in mock_api.requests] == [
+        None,
+        '"v1"',
+    ]
+    assert all(r.query["k"] == "v" for r in mock_api.requests)
+
+
+async def test_a_credentialed_session_revalidates_across_origins_unconditionally(
+    mock_api: MockApi,
+) -> None:
+    """Without a header key, a redirect away that a hand-made request can't
+    strip the session's credentials from is asked again unconditionally:
+    aiohttp follows it and drops them itself -- never a failure."""
+    url = mock_api.url("/rt")
+    away = _elsewhere(mock_api.url("/rt/away"))
+    for _ in range(3):
+        mock_api.get("/rt", status=302, headers={"Location": away})
+    fresh = {"ETag": '"v1"', "Cache-Control": "no-cache"}
+    for _ in range(2):
+        mock_api.get("/rt/away", body=VEHICLE_POSITIONS, content_type=PB, headers=fresh)
+    cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
+    async with aiohttp.ClientSession(headers={"Authorization": "Bearer s"}) as session:
+        fetch = partial(fetch_feed_message, session, url)
+        await cache.get(url, fetch)
+        assert len((await cache.get(url, fetch)).entity) == 2
+    away_hits = [r.headers for r in mock_api.requests if r.path == "/rt/away"]
+    assert len(away_hits) == 2
+    assert not any("Authorization" in hit for hit in away_hits)
+    assert not any("If-None-Match" in hit for hit in away_hits)
 
 
 def test_vehicles_from_message() -> None:

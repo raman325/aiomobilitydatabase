@@ -331,10 +331,12 @@ def _directives(values: Sequence[str]) -> tuple[dict[str, list[str | None]], boo
     """Parse Cache-Control fields into directives; also report malformation.
 
     Each field is split on its own, so one field's dangling quote can't
-    swallow the next field. A field that breaks the grammar -- a stray
+    swallow the next field. An element that breaks the grammar -- a stray
     quote, a missing comma (``no-cache;no-store``) -- contributes nothing
     and is reported, so the caller treats the freshness as invalid: stale
-    now (RFC 9111 section 4.2.1), stored but revalidated on every use.
+    now (RFC 9111 section 4.2.1). The field's well-formed elements still
+    count (``no-store, max-age=60 x`` is no-store); one with an unterminated
+    quote has no elements to tell apart.
     """
     directives: dict[str, list[str | None]] = {}
     malformed = False
@@ -346,7 +348,6 @@ def _directives(values: Sequence[str]) -> tuple[dict[str, list[str | None]], boo
             for directive, part in zip(parsed, parts, strict=True)
         ):
             malformed = True
-            continue
         for directive in parsed:
             if directive is not None:
                 name, arg = directive
@@ -444,11 +445,11 @@ def request_fields(
     prediction for the request that drew it against the one for the next
     request. Pass ``headers`` without the cache's validators.
 
-    None (unknown) when the session has client middlewares (aiohttp 3.12+):
-    those can add a header the prediction can't see, so any response with
-    a Vary is revalidated rather than matched.
+    None (unknown) when the session has client middlewares (aiohttp 3.12+)
+    or trace configs: those can add a header the prediction can't see, so
+    any response with a Vary is revalidated rather than matched.
     """
-    if getattr(session, "_middlewares", ()):
+    if getattr(session, "_middlewares", ()) or getattr(session, "trace_configs", ()):
         return None
     fields: dict[str, list[str]] = {
         name: list(values) for name, values in header_fields(session.headers).items()
@@ -851,6 +852,10 @@ class FreshnessCache[T]:
         self._min_interval = min_interval
         self._entries: dict[str, _Entry[T]] = {}
         self._in_flight: dict[_Slot, asyncio.Task[T]] = {}
+        # Fetches whose request has been sent: never joinable (RFC 9111
+        # sections 5.2.2.4, 5.2.2.5), even when an eager task factory ran
+        # them that far before ``get`` could register them.
+        self._sent: set[asyncio.Task[T]] = set()
         self._locks: dict[str, asyncio.Lock] = {}
 
     def _fresh(self, entry: _Entry[T], upcoming: Fields | None) -> bool:
@@ -877,9 +882,9 @@ class FreshnessCache[T]:
         task = self._in_flight.get(slot)
         if task is None:
             task = asyncio.ensure_future(self._refresh(slot, fetch, request_fields))
-            # An eager task factory can run the whole request inside
-            # ensure_future; a finished one must never be joined.
-            if not task.done():
+            # An eager task factory can run the request -- or all of it --
+            # inside ensure_future: one already sent must never be joined.
+            if not task.done() and task not in self._sent:
                 self._in_flight[slot] = task
             task.add_done_callback(lambda done: self._finished(slot, done))
         # A caller cancelling its own wait must not cancel the request every
@@ -894,6 +899,7 @@ class FreshnessCache[T]:
         # cancelled before it ever ran.
         if self._in_flight.get(slot) is task:
             del self._in_flight[slot]
+        self._sent.discard(task)
         if not task.cancelled():
             task.exception()  # retrieved: every waiter may have gone away
 
@@ -936,7 +942,10 @@ class FreshnessCache[T]:
                 # Sent now: a caller arriving from here on is another request,
                 # which may not be handed this one's response (RFC 9111
                 # sections 5.2.2.4, 5.2.2.5); it waits for the lock instead.
-                if self._in_flight.get(slot) is asyncio.current_task():
+                current = asyncio.current_task()
+                if current is not None:
+                    self._sent.add(current)
+                if self._in_flight.get(slot) is current:
                     del self._in_flight[slot]
                 return await self._revalidate(key, fetch, upcoming)
         finally:

@@ -499,14 +499,29 @@ def test_no_store_and_no_cache_always_win(prefix: list[str], directive: str) -> 
     [
         'max-age=60, foo"bar, no-store"',
         'max-age=60, private", no-store, x"',
-        'max-age=60, ext="a"b, no-store',
     ],
 )
 def test_a_stray_quote_makes_the_field_invalid(header: str) -> None:
     """A quoted string may only be a directive's argument; a stray quote
-    makes the field malformed: stale now, whatever it holds.
+    makes the field malformed: stale now, and an element it swallowed
+    (``no-store`` inside the quotes) is no directive.
     """
     assert _fresh({"Cache-Control": header}) == Freshness(0.0)
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        'max-age=60, ext="a"b, no-store',
+        "no-store, max-age=60 x",
+        "max-age=60 x, no-store",
+        "no-store, foo;bar",
+    ],
+)
+def test_a_malformed_element_never_hides_a_well_formed_no_store(header: str) -> None:
+    """RFC 9111 section 5.2.2.5: commas mark the elements, so a no-store of
+    its own is a directive whatever its neighbours are -- never stored."""
+    assert _fresh({"Cache-Control": header}) == Freshness(None, storable=False)
 
 
 @pytest.mark.parametrize(
@@ -2155,6 +2170,29 @@ async def test_a_caller_arriving_after_the_request_was_sent_never_shares_it(
     assert len(producer.seen) == 2
 
 
+async def test_a_sent_request_is_never_joined_under_an_eager_task_factory() -> None:
+    """An eager task factory sends the request inside ensure_future, before
+    ``get`` could register it: it must not become joinable afterwards."""
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)
+    try:
+        cache: FreshnessCache[str] = FreshnessCache(_Clock())
+        gate = asyncio.Event()
+        producer = _Producer(
+            [_raw("a", {"Cache-Control": "no-store"}), _raw("b", {})], gate=gate
+        )
+        first = asyncio.ensure_future(cache.get("u", producer))
+        assert len(producer.seen) == 1  # already sent
+        after = asyncio.ensure_future(cache.get("u", producer))
+        await _until_waiting()
+        gate.set()
+        assert await asyncio.gather(first, after) == ["a", "b"]
+        assert len(producer.seen) == 2
+        assert not cache._sent
+    finally:
+        loop.set_task_factory(None)
+
+
 async def test_a_session_with_middlewares_predicts_unknown_fields() -> None:
     """A middleware may add a header the prediction can't see: any Vary
     then goes unmatched (revalidated), not matched on a guess.
@@ -2162,6 +2200,9 @@ async def test_a_session_with_middlewares_predicts_unknown_fields() -> None:
     async with aiohttp.ClientSession() as session:
         assert freshness_module.request_fields(session, "http://p/", {}) == {}
         session._middlewares = (object(),)  # type: ignore[attr-defined]
+        assert freshness_module.request_fields(session, "http://p/", {}) is None
+    # A trace hook can add headers too, on every aiohttp version.
+    async with aiohttp.ClientSession(trace_configs=[aiohttp.TraceConfig()]) as session:
         assert freshness_module.request_fields(session, "http://p/", {}) is None
 
 
