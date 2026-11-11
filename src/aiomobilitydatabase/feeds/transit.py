@@ -196,15 +196,15 @@ def _rt_key_for_row(
     A key WITH a start_date matches only the row whose service day equals
     it -- AND-ed with the start_time rules, which are unchanged: frequency
     rows need an aligned start_secs, plain rows need start_secs None. A
-    key WITHOUT a start_date follows the spec's "assume the trip is
-    running on the current service day": it matches only the identity's
-    CURRENT run, ``current_dates[identity]`` (see
-    :meth:`StaticIndex.current_service_dates`). That is decided from the
-    whole trip and the feed's own time (see ``_realtime_now``), never from
-    which runs happen to fall in the window -- so a long or open-ended
-    window can't move a date-less update onto tomorrow's run. An
-    identity with no current run -- including one with two runs under
-    way at once, which collide -- takes no date-less update at all. When a
+    key WITHOUT a start_date matches only the run the identity's trip_id
+    alone names, ``current_dates[identity]`` (see
+    :meth:`StaticIndex.current_service_dates`): the spec requires a
+    start_date for a frequency trip or one longer than a day, which so
+    have none. That is decided from the whole trip and the feed's own time
+    (see ``_realtime_now``), never from which runs happen to fall in the
+    window -- so a long or open-ended window can't move a date-less update
+    onto tomorrow's run. An identity with no such run takes no date-less
+    update at all. When a
     dated and a date-less key both exist for one row, the dated key wins
     (it is strictly more specific). A garbage start_date parses to None
     (see ``rt._trip_start_date``), so it behaves exactly like an absent one.
@@ -524,8 +524,8 @@ _INITIAL_HORIZON = timedelta(hours=2)
 def _realtime_now(updates: TripUpdates, start: datetime) -> datetime:
     """Return the instant realtime describes: the feed's time, else the present.
 
-    "The current service day" of a date-less update is judged at the
-    producer's header timestamp, not at the query's ``start`` -- a board
+    The run a date-less update means is judged at the producer's header
+    timestamp, not at the query's ``start`` -- a board
     for tomorrow morning must not move today's cancellation onto
     tomorrow's run. A feed without a timestamp (the spec requires one)
     falls back to now, but never later than ``start``: realtime describes
@@ -1499,7 +1499,9 @@ class TransitFeedHandle:
         a dated prediction or cancellation affects only the instance whose
         service day it names — an early-posted "trip X canceled tomorrow"
         never cancels today's departure — while a date-less one affects
-        only the trip's current run, judged at the feed's own timestamp
+        only the run it means as of the feed's own timestamp: the latest
+        that has started, else today's next, and none for a frequency trip
+        or one longer than a day, which the spec requires to carry a date
         (see :meth:`StaticIndex.current_service_dates`), so a board for
         tomorrow morning never moves today's update onto tomorrow's run.
 
@@ -1557,7 +1559,7 @@ class TransitFeedHandle:
                 dep
                 for dep in await self._index_read(
                     self._index.instance_departures,
-                    await self._addressed_runs(updates, realtime_now, grace),
+                    await self._addressed_runs(updates, realtime_now),
                     batch_stops,
                     batch_routes,
                     batch_headsigns,
@@ -1607,7 +1609,6 @@ class TransitFeedHandle:
                     all_stop_ids,
                     start=start,
                     realtime_now=realtime_now,
-                    grace=grace,
                     updates=updates,
                     modified_rows=modified_rows,
                     modified_instances=modified_instances,
@@ -1633,20 +1634,20 @@ class TransitFeedHandle:
             return [board or [] for board in boards]
 
     async def _addressed_runs(
-        self, updates: TripUpdates, now: datetime, grace: timedelta
+        self, updates: TripUpdates, now: datetime
     ) -> list[_TripInstance]:
         """Return the runs TripUpdates address, resolved as the merge does.
 
-        Dated keys name their day; date-less ones the current run as of
-        ``now``, keeping one that ended within ``grace``. These are the
-        only scheduled runs realtime can move (detours aside), so they are
-        read whole before any scan. Caller holds the reader guard.
+        Dated keys name their day; date-less ones the run they mean as of
+        ``now`` (see :meth:`StaticIndex.current_service_dates`). These are
+        the only scheduled runs realtime can move (detours aside), so they
+        are read whole before any scan. Caller holds the reader guard.
         """
         return sorted(
             {
                 instance
                 for instance, _key in await self._index_read(
-                    self._index.rt_instances, list(updates.trips), now, grace
+                    self._index.rt_instances, list(updates.trips), now
                 )
             }
         )
@@ -1657,7 +1658,6 @@ class TransitFeedHandle:
         updates: TripUpdates,
         vehicles: _Vehicles,
         now: datetime,
-        grace: timedelta,
     ) -> dict[_RtIdentity, date]:
         """Current-run service days for the identities that need one.
 
@@ -1679,7 +1679,7 @@ class TransitFeedHandle:
         if not wanted:
             return {}
         dates = await self._index_read(
-            self._index.current_service_dates, sorted(wanted), now, grace
+            self._index.current_service_dates, sorted(wanted), now
         )
         return {
             wanted[trip_id]: service_date for trip_id, service_date in dates.items()
@@ -1692,7 +1692,6 @@ class TransitFeedHandle:
         *,
         start: datetime,
         realtime_now: datetime,
-        grace: timedelta,
         updates: TripUpdates,
         modified_rows: Sequence[StopArrival],
         modified_instances: Collection[tuple[str, date]],
@@ -1729,7 +1728,6 @@ class TransitFeedHandle:
             updates,
             vehicles,
             realtime_now,
-            grace,
         )
         resolved = await self._resolve_predictions(
             updates,
@@ -1914,7 +1912,7 @@ class TransitFeedHandle:
         including the open-ended default: with ``end=None`` each query's
         result fills to its ``limit`` however far ahead the next journeys
         are, and ``end=None`` with a ``limit=None`` query raises
-        ``ValueError``, as does a naive or unrepresentable ``start``/``end``
+        ``ValueError``, as does a naive or unrepresentable ``start``/``end``,
         a ``start - grace`` outside 0001-01-03 to 9999-12-01 UTC, or a
         negative ``grace``.
         Each query's ``limit`` caps its merged result,
@@ -1969,7 +1967,7 @@ class TransitFeedHandle:
             realtime_now = _realtime_now(updates, start)
             # As in get_arrivals: the runs realtime addresses are read whole
             # up front, so the scan only adds rows at their scheduled time.
-            addressed = await self._addressed_runs(updates, realtime_now, grace)
+            addressed = await self._addressed_runs(updates, realtime_now)
             memo = _PredictionMemo()
             results: list[list[UpcomingTrip]] = []
             for query in queries:
@@ -2015,7 +2013,6 @@ class TransitFeedHandle:
                             list(scheduled.values()),
                             start=start,
                             realtime_now=realtime_now,
-                            grace=grace,
                             updates=updates,
                             stops_by_id=stops_by_id,
                             routes_by_id=routes_by_id,
@@ -2038,7 +2035,6 @@ class TransitFeedHandle:
         *,
         start: datetime,
         realtime_now: datetime,
-        grace: timedelta,
         updates: TripUpdates,
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
@@ -2063,7 +2059,6 @@ class TransitFeedHandle:
             updates,
             vehicles,
             realtime_now,
-            grace,
         )
         resolved = await self._resolve_predictions(
             updates,

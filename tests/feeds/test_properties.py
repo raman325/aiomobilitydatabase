@@ -4237,6 +4237,9 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
     entity = msg.entity.add()
     entity.id = "tu-gen"
     entity.trip_update.trip.trip_id = "F1"
+    # A frequency trip's update needs its start_date (GTFS-RT); this
+    # property is about start_time.
+    entity.trip_update.trip.start_date = "20260730"
     if mode == "aligned":
         entity.trip_update.trip.start_time = _format_gtfs_time(rep)
     elif mode == "misaligned":
@@ -5006,8 +5009,9 @@ def test_two_instance_start_date_disambiguation_oracle(
     in a >=27h window, a drawn prediction or cancellation affects exactly
     one instance and never its 24h-apart sibling. A date naming day A or
     day B affects that day's instance; an absent date affects the
-    currently-active (earliest in-window) instance -- day A; a garbage
-    date parses to None and behaves exactly as absent. Every other trip
+    run nearest the feed's time -- day A -- for a plain trip, and nothing
+    for a frequency repetition (the spec requires its start_date); a
+    garbage date parses to None and behaves exactly as absent. Every other trip
     instance -- the sibling day AND the sibling repetition/plain trip --
     stays schedule-only, in both the arrivals merge and the
     origin->destination overlay.
@@ -5020,6 +5024,11 @@ def test_two_instance_start_date_disambiguation_oracle(
     }[date_mode]
     target_id = "TP" if variant == "plain" else f"FQ#{rep}"
     affected_day = _TWO_DAY_B if date_mode == "day_b" else _TWO_DAY_A
+    undated = date_mode in ("absent", "garbage")
+    # A frequency trip's update needs its start_date to name any run.
+    affected = (
+        set() if variant == "frequency" and undated else {(target_id, affected_day)}
+    )
     msg = _two_instance_message(
         variant=variant,
         kind=kind,
@@ -5051,7 +5060,7 @@ def test_two_instance_start_date_disambiguation_oracle(
         # Exactly the affected instance's rows disappear; nothing else is
         # touched (all survivors schedule-only).
         assert got_rows == all_rows - {
-            (target_id, affected_day, stop) for stop in ("S0", "S1")
+            (trip_id, day, stop) for trip_id, day in affected for stop in ("S0", "S1")
         }
         assert all(a.realtime is False for a in arrivals)
     else:
@@ -5064,7 +5073,7 @@ def test_two_instance_start_date_disambiguation_oracle(
             assert row.trip_id is not None
             assert row.scheduled_departure is not None
             inst_day = _instance_day(row.scheduled_departure)
-            is_target = row.trip_id == target_id and inst_day == affected_day
+            is_target = (row.trip_id, inst_day) in affected
             assert row.realtime is is_target
             if is_target:
                 # S0 carries the STU's own delay; S1 the propagated one.
@@ -5085,13 +5094,13 @@ def test_two_instance_start_date_disambiguation_oracle(
         for day in (_TWO_DAY_A, _TWO_DAY_B)
     }
     if kind == "cancellation":
-        assert got_journeys == all_journeys - {(target_id, affected_day)}
+        assert got_journeys == all_journeys - affected
         assert all(t.realtime is False for t in journeys)
     else:
         assert got_journeys == all_journeys
         for journey in journeys:
             inst_day = _instance_day(journey.scheduled_departure)
-            is_target = journey.trip_id == target_id and inst_day == affected_day
+            is_target = (journey.trip_id, inst_day) in affected
             assert journey.realtime is is_target
             if is_target:
                 assert journey.delay_seconds == delay

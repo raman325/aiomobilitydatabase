@@ -501,7 +501,9 @@ async def test_arrival_only_added_row_is_dropped_once_past(
     assert [a.trip_id for a in arrivals] == ["T1", "T2"]
 
 
-def _bundled_message(*, extra_vehicles: tuple[tuple[str, str], ...] = ()) -> bytes:
+def _bundled_message(
+    *, extra_vehicles: tuple[tuple[str, str], ...] = (), stamped: datetime = NOW
+) -> bytes:
     """One FeedMessage carrying both TripUpdates and VehiclePositions.
 
     The shape the canonical RT fixture declares (``entity_types`` lists vp,
@@ -513,7 +515,7 @@ def _bundled_message(*, extra_vehicles: tuple[tuple[str, str], ...] = ()) -> byt
     # Served as a live feed: stamped at the tests' "now" (the fixture's own
     # timestamp is an arbitrary parsing-test epoch, a day later), since a
     # date-less update addresses the run current at the feed's time.
-    message.header.timestamp = int(NOW.timestamp())
+    message.header.timestamp = int(stamped.timestamp())
     vehicles = gtfs_realtime_pb2.FeedMessage()
     vehicles.ParseFromString(VEHICLE_POSITIONS)
     message.entity.extend(vehicles.entity)
@@ -531,7 +533,13 @@ async def test_with_vehicles_attaches_the_matching_position(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
     _mock_catalog(mock_api, rt=True)
-    mock_api.get("/rt/all", body=_bundled_message(), content_type=PB)
+    # Stamped 19:45 PDT: V2's date-less T3 means the run nearest that time,
+    # tonight's 25:30 (in 5h45), not last night's (ended 18h ago).
+    mock_api.get(
+        "/rt/all",
+        body=_bundled_message(stamped=NOW + timedelta(hours=12)),
+        content_type=PB,
+    )
     handle = await feeds_client.get_transit_feed("mdb-100")
     # 18h reaches T3's 25:30 spillover departure, which V2 claims.
     [arrivals] = await handle.get_arrivals(

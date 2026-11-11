@@ -758,7 +758,7 @@ def test_a_dateless_update_reaches_the_run_under_way(
         "T,00:10:00,00:10:00,A,1\nT,00:40:00,00:40:00,B,2\n", timezone=timezone
     )
     index = _index_from_zip_bytes(feed)
-    assert index.current_service_dates(["T"], now, timedelta(hours=1)) == {"T": day}
+    assert index.current_service_dates(["T"], now) == {"T": day}
 
     async def body(handle: TransitFeedHandle) -> None:
         [board] = await handle.get_arrivals(
@@ -904,10 +904,12 @@ def test_a_long_reach_from_a_skipped_date_is_placed() -> None:
     _run(index, body)
 
 
-def test_a_dateless_update_before_its_days_start_on_fall_back_is_unbound() -> None:
+def test_a_dateless_update_before_its_days_start_on_fall_back_keeps_today() -> None:
     """New York, 2026-11-01 00:30 EDT: the fall-back day starts only at
-    01:00 EST (noon EST minus 12h), so it is still 10-31's service day --
-    whose run is over. The 11-01 run hasn't begun: nothing is current.
+    01:00 EST (noon EST minus 12h), so it is still 10-31's service day.
+    The 11-01 run belongs to a later day and is never meant; 10-31's,
+    though over, is the nearest run up to today. Once 11-01 has started,
+    its run is under way and is the one meant.
     """
     feed = _feed(
         "T,00:10:00,00:10:00,A,1\nT,00:40:00,00:40:00,B,2\n",
@@ -916,30 +918,34 @@ def test_a_dateless_update_before_its_days_start_on_fall_back_is_unbound() -> No
     index = _index_from_zip_bytes(feed)
     now = datetime(2026, 11, 1, 4, 30, tzinfo=UTC)
     assert index._service_day_of(now) == date(2026, 10, 31)
-    assert index.current_service_dates(["T"], now) == {}
-    # Once the day has started, its run is the current one.
+    assert index.current_service_dates(["T"], now) == {"T": date(2026, 10, 31)}
     later = datetime(2026, 11, 1, 5, 20, tzinfo=UTC)
     assert index.current_service_dates(["T"], later) == {"T": date(2026, 11, 1)}
     index.close()
 
 
-def test_the_current_run_with_unbounded_grace_or_garbage_time() -> None:
-    """Grace past the start of datetime keeps every run that ever ended:
-    none is under way at midnight, so the latest ended one is current. A
-    feed time outside the range days can be dated in has none; a negative
-    grace is an error.
+def test_the_nearest_run_is_meant_and_a_garbage_time_means_none() -> None:
+    """At midnight, today's 08:00 run (8h ahead) is nearer than yesterday's
+    (16h ago); at 21:00 today's (13h ago) is the only one up to today worth
+    meaning -- tomorrow's is never. A feed time outside the range days can
+    be dated in means no run.
     """
     index = _index_from_zip_bytes(_feed("T,08:00:00,08:00:00,A,1\n"))
-    now = datetime(2026, 6, 10, tzinfo=UTC)
-    for grace in (timedelta.max, timedelta(days=3)):
-        assert index.current_service_dates(["T"], now, grace) == {"T": date(2026, 6, 9)}
-    # Without grace, nothing has ended "within" it: today's run is to come.
-    assert index.current_service_dates(["T"], now) == {"T": date(2026, 6, 10)}
+    midnight = datetime(2026, 6, 10, tzinfo=UTC)
+    assert index.current_service_dates(["T"], midnight) == {"T": date(2026, 6, 10)}
+    evening = datetime(2026, 6, 10, 21, tzinfo=UTC)
+    assert index.current_service_dates(["T"], evening) == {"T": date(2026, 6, 10)}
     assert index.current_service_dates(["T"], datetime(1, 1, 1, tzinfo=UTC)) == {}
-    with pytest.raises(ValueError, match="grace"):
-        index.current_service_dates(["T"], now, timedelta(seconds=-1))
-    with pytest.raises(ValueError, match="grace"):
-        index.rt_instances([("T", None, None)], now, timedelta(seconds=-1))
+    index.close()
+
+
+def test_a_run_equidistant_from_two_others_names_neither() -> None:
+    """A daily 12:00 run: at midnight yesterday's ended 12h ago and today's
+    starts in 12h -- equally near, so a date-less update names neither.
+    """
+    index = _index_from_zip_bytes(_feed("T,12:00:00,12:00:00,A,1\n"))
+    midnight = datetime(2026, 6, 10, tzinfo=UTC)
+    assert index.current_service_dates(["T"], midnight) == {}
     index.close()
 
 
@@ -951,9 +957,7 @@ def test_a_run_under_way_beats_one_that_ended_within_grace() -> None:
     feed = _feed("T,08:00:00,08:00:00,A,1\nT,31:30:00,31:30:00,B,2\n")
     index = _index_from_zip_bytes(feed)
     now = datetime(2026, 6, 10, 8, 5, tzinfo=UTC)
-    assert index.current_service_dates(["T"], now, timedelta(hours=1)) == {
-        "T": date(2026, 6, 10)
-    }
+    assert index.current_service_dates(["T"], now) == {"T": date(2026, 6, 10)}
 
     async def body(handle: TransitFeedHandle) -> None:
         [board] = await handle.get_arrivals(
@@ -989,15 +993,16 @@ def _cancellation(
     return message
 
 
-def test_two_runs_under_way_collide_and_take_no_dateless_update() -> None:
-    """At 09:00 yesterday's run (due at B at 10:00) and today's (left A at
-    08:00) are both under way: a date-less delay or vehicle could mean
-    either, so it applies to neither -- both rows stay schedule-only.
+def test_a_trip_longer_than_a_day_takes_no_dateless_update() -> None:
+    """A 26-hour trip needs start_date (GTFS-RT). At 09:00 yesterday's run
+    (due at B at 10:00) and today's (left A at 08:00) are both under way;
+    a date-less delay or vehicle applies to neither -- both rows stay
+    schedule-only.
     """
     index = _index_from_zip_bytes(_feed(_LONG_DAILY))
     now = datetime(2026, 6, 10, 9, tzinfo=UTC)
-    assert index.current_service_dates(["T"], now, timedelta(hours=1)) == {}
-    assert index.rt_instances([("T", None, None)], now, timedelta(hours=1)) == []
+    assert index.current_service_dates(["T"], now) == {}
+    assert index.rt_instances([("T", None, None)], now) == []
 
     async def body(handle: TransitFeedHandle) -> None:
         [board] = await handle.get_arrivals(
@@ -1059,21 +1064,20 @@ def test_a_dateless_cancellation_of_colliding_runs_cancels_neither() -> None:
         _run(_index_from_zip_bytes(_feed(_LONG_DAILY)), body, message)
 
 
-def test_one_run_under_way_again_takes_the_dateless_update() -> None:
-    """At 10:30 yesterday's run has reached B; only today's is under way,
-    so it is current and takes the date-less delay.
+def test_a_trip_longer_than_a_day_stays_undated_with_one_run_under_way() -> None:
+    """At 10:30 yesterday's run has reached B and only today's is under
+    way -- still, a trip longer than a day needs start_date: the date-less
+    delay applies to no run.
     """
     index = _index_from_zip_bytes(_feed(_LONG_DAILY))
     now = datetime(2026, 6, 10, 10, 30, tzinfo=UTC)
-    assert index.current_service_dates(["T"], now, timedelta(hours=1)) == {
-        "T": date(2026, 6, 10)
-    }
+    assert index.current_service_dates(["T"], now) == {}
 
     async def body(handle: TransitFeedHandle) -> None:
         [board] = await handle.get_arrivals([ArrivalsQuery(["B"], limit=1)], start=now)
         [row] = board
         assert row.scheduled_departure == datetime(2026, 6, 11, 10, tzinfo=UTC)
-        assert row.predicted_departure == datetime(2026, 6, 11, 10, 5, tzinfo=UTC)
+        assert row.predicted_departure is None
 
     _run(index, body, _dateless_message(now))
 
@@ -1199,3 +1203,70 @@ def test_detour_times_past_the_end_of_datetime_are_untimed() -> None:
         assert datetime(9999, 12, 31, 1, tzinfo=UTC) not in times
 
     _run(_index_from_zip_bytes(_forever_feed()), body, message)
+
+
+def test_a_year_one_calendar_west_of_utc_crashes_nothing() -> None:
+    """UTC, a calendar from 0001-01-01, and a trip whose only stop time is
+    garbage (30,000,000 hours): every run is still to come, the earliest
+    -- 0001-01-01's -- nearest. Finding it subtracts nothing from that
+    date, and a date-less update for it leaves the rest of the board alone.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\nG,30000000:00:00,30000000:00:00,X,1\n",
+        trips="R,DAILY,T\nR,DAILY,G\n",
+        calendar="DAILY,1,1,1,1,1,1,1,00010101,20991231",
+    )
+    index = _index_from_zip_bytes(feed)
+    now = datetime(2026, 6, 10, 7, tzinfo=UTC)
+    assert index.current_service_dates(["G"], now) == {"G": date(1, 1, 1)}
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals([ArrivalsQuery(["A"], limit=1)], start=now)
+        assert _times(board) == [datetime(2026, 6, 10, 8, tzinfo=UTC)]
+
+    _run(index, body, _dateless_message(now, "G"))
+
+
+def test_a_scan_starting_on_year_one_places_long_reach_rows() -> None:
+    """UTC, service from 0001-01-01 with a 95-hour (scanned) and a
+    100-hour (placed) departure: a board from 0001-01-03 scans from
+    0001-01-01 itself, and placing rows before that day must not reach
+    for a day before year 1.
+    """
+    feed = _feed(
+        "L,95:00:00,95:00:00,A,1\nL,100:00:00,100:00:00,B,2\n",
+        trips="R,DAILY,L\n",
+        calendar="DAILY,1,1,1,1,1,1,1,00010101,00010131",
+    )
+    start = datetime(1, 1, 3, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["A", "B"], limit=2)], start=start
+        )
+        assert _times(board) == [
+            datetime(1, 1, 4, 23, tzinfo=UTC),  # 0001-01-01 + 95h
+            datetime(1, 1, 5, 4, tzinfo=UTC),  # 0001-01-01 + 100h
+        ]
+
+    _run(_index_from_zip_bytes(feed), body)
+
+
+def test_two_runs_under_way_across_a_short_day_name_neither() -> None:
+    """New York's 2026-03-07 lasts 23 hours (03-08 starts at 23:00 EST). A
+    23.5-hour trip's 03-07 run is still under way when 03-08's begins:
+    between 04:00 and 04:30 UTC two runs are under way, equally near, so a
+    date-less update names neither -- before and after, exactly one.
+    """
+    feed = _feed(
+        "T,00:00:00,00:00:00,A,1\nT,23:30:00,23:30:00,B,2\n",
+        timezone="America/New_York",
+    )
+    index = _index_from_zip_bytes(feed)
+    both = datetime(2026, 3, 8, 4, 15, tzinfo=UTC)
+    assert index.current_service_dates(["T"], both) == {}
+    before = datetime(2026, 3, 8, 3, 55, tzinfo=UTC)
+    assert index.current_service_dates(["T"], before) == {"T": date(2026, 3, 7)}
+    after = datetime(2026, 3, 8, 4, 35, tzinfo=UTC)
+    assert index.current_service_dates(["T"], after) == {"T": date(2026, 3, 8)}
+    index.close()

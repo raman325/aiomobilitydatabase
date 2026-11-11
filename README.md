@@ -260,16 +260,17 @@ Notes on direct mode:
   `end` bounds scheduled times; a delayed trip predicted past it, and
   RT-added trips, still show.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
-  or vehicle with no `start_date` applies only to the trip's current run,
-  judged at the feed's header timestamp: the run scheduled to be under way
-  (including last night's past-midnight run, and one already under way
-  when a spring-forward day starts the evening before its date); else the
-  run that ended within `grace`, so a late-running run keeps its updates;
-  else the run still to come today — never tomorrow's, however wide the
-  window or late the board's `start`. When two runs are under way at once
-  (a trip longer than a day, running on consecutive days), they collide
-  and the update applies to neither: the spec requires `start_date`
-  wherever runs can collide. A dated
+  or vehicle with no `start_date` applies to one run, judged at the feed's
+  header timestamp alone (never a query setting): the run scheduled to be
+  under way (including last night's past-midnight run, and one already
+  under way when a spring-forward day starts the evening before its date);
+  else the run nearest in time, up to today — a morning update reaches
+  the afternoon's run, and a late-running run keeps its updates past
+  midnight — never tomorrow's, however wide the window or late the board's
+  `start`. Two runs equally near (two under way at once) take neither.
+  GTFS-RT requires `start_date` for a trip lasting more than a day and for
+  a frequencies.txt trip, so a date-less update for either applies to no
+  run. A dated
   one applies to exactly its day, including an RT-added trip's vehicle.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic

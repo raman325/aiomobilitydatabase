@@ -159,9 +159,10 @@ def test_current_service_dates_edges(tmp_path: Path) -> None:
     at = datetime(2026, 7, 30, 7, tzinfo=UTC)
     assert index.current_service_dates([], at) == {}
     assert index.current_service_dates(["T1", "T2"], at) == {"T1": date(2026, 7, 30)}
-    # After today's run finished, there is no current run -- not tomorrow's.
-    later = datetime(2026, 7, 30, 9, tzinfo=UTC)
-    assert index.current_service_dates(["T1"], later) == {}
+    # After today's run finished it is still the nearest run up to today:
+    # a date-less update never moves onto tomorrow's.
+    later = datetime(2026, 7, 30, 23, tzinfo=UTC)
+    assert index.current_service_dates(["T1"], later) == {"T1": date(2026, 7, 30)}
 
 
 @pytest.mark.parametrize("end_date", ["20991231", "99991231"])
@@ -220,11 +221,10 @@ def test_detour_index_helpers_accept_empty_input(tmp_path: Path) -> None:
     assert index.run_days([]) == []
 
 
-def test_a_stop_time_no_date_can_carry_is_still_under_way(tmp_path: Path) -> None:
-    """A garbage stop time (300000:00:00, decades past its day) on service
-    that runs only on 9999-01-01: that run's last call falls past the end
-    of datetime, so it is still under way -- found, not an OverflowError.
-    (Running daily, every run since would be under way too: ambiguous.)
+def test_a_trip_longer_than_a_day_names_no_dateless_run(tmp_path: Path) -> None:
+    """GTFS-RT requires start_date for a trip lasting more than 24 hours:
+    without one, a date-less update names none of its runs -- even a
+    garbage-length one whose last call falls past the end of datetime.
     """
     index = _index(
         tmp_path,
@@ -232,4 +232,18 @@ def test_a_stop_time_no_date_can_carry_is_still_under_way(tmp_path: Path) -> Non
         stop_times="T1,08:00:00,08:00:00,S1,1\nT1,300000:00:00,300000:00:00,S2,2\n",
     )
     at = datetime(9999, 11, 1, tzinfo=UTC)
-    assert index.current_service_dates(["T1"], at) == {"T1": date(9999, 1, 1)}
+    assert index.current_service_dates(["T1"], at) == {}
+
+
+def test_a_run_whose_day_cannot_be_dated_is_no_current_run(tmp_path: Path) -> None:
+    """Tokyo, service only on 0001-01-01: that day's start lies before
+    datetime itself, so its run can't be placed -- no current run, no error.
+    """
+    index = _index(
+        tmp_path,
+        calendar="ALL,1,1,1,1,1,1,1,00010101,00010101\n",
+        stop_times=_TWO_STOPS,
+        timezone="Asia/Tokyo",
+    )
+    at = datetime(1, 1, 5, tzinfo=UTC)
+    assert index.current_service_dates(["T1"], at) == {}

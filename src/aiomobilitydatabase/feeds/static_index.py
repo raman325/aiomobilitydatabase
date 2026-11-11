@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import csv
 import io
-import itertools
 import sqlite3
 import zipfile
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -123,6 +122,8 @@ _EARLIEST_INSTANT = datetime(1, 1, 3, tzinfo=UTC)
 # four days keeps real night and multi-day services in the scan.
 _LONG_REACH = 4 * 86_400
 _EXCEPTION_SERVICE_REMOVED = 2
+# GTFS-RT requires start_date for a trip lasting longer than this.
+_ONE_DAY = 86_400
 
 _WEEKDAY_COLUMNS = (
     "monday",
@@ -493,6 +494,7 @@ class StaticIndex:
         self.timezone_name = timezone_name
         self._tz = ZoneInfo(timezone_name)
         self._last_dates: dict[str, date] | None = None
+        self._first_dates: dict[str, date] | None = None
         self._first_date: date | None = None
         self._first_date_known = False
         self._reach: tuple[int, tuple[int, ...]] | None = None
@@ -1580,8 +1582,9 @@ class StaticIndex:
             day = (
                 max(first, earliest - timedelta(days=1)) if earliest > first else first
             )
-            stop = min(before - timedelta(days=1), latest + timedelta(days=1))
-            while day <= stop:
+            last = latest + timedelta(days=1)
+            # ``day < before``, never ``before - 1``: before may be 0001-01-01.
+            while day < before and day <= last:
                 days.add(day)
                 day += timedelta(days=1)
         return days
@@ -1716,7 +1719,7 @@ class StaticIndex:
         return self._ceiling_from(rows)
 
     def rt_instances[K: tuple[str, date | None, int | None]](
-        self, keys: Iterable[K], now: datetime, grace: timedelta = timedelta(0)
+        self, keys: Iterable[K], now: datetime
     ) -> list[tuple[tuple[str, date], K]]:
         """Resolve TripUpdate keys to the concrete runs they address.
 
@@ -1725,11 +1728,9 @@ class StaticIndex:
         trip only by a key without start_secs, a frequency repetition only
         by its own start. A dated key addresses that day's run if the
         trip's service runs that day; a date-less key its current run as of
-        ``now`` (:meth:`current_service_dates`, with ``grace``). Returns
+        ``now`` (:meth:`current_service_dates`). Returns
         ``((concrete trip id, service date), key)`` pairs.
         """
-        if grace < timedelta(0):
-            raise ValueError(f"grace must not be negative, got {grace!r}")
         keys = list(keys)
         if not keys:
             return []
@@ -1750,7 +1751,7 @@ class StaticIndex:
             for source, day, secs in keys
             if day is None and (trip_id := by_identity.get((source, secs)))
         ]
-        current = self.current_service_dates(dateless, now, grace)
+        current = self.current_service_dates(dateless, now)
         active: dict[date, set[str]] = {}
         found: list[tuple[tuple[str, date], K]] = []
         for key in keys:
@@ -1769,114 +1770,150 @@ class StaticIndex:
         return found
 
     def current_service_dates(
-        self, trip_ids: Sequence[str], now: datetime, grace: timedelta = timedelta(0)
+        self, trip_ids: Sequence[str], now: datetime
     ) -> dict[str, date]:
-        """Map each trip to the service day of its CURRENT run, as of ``now``.
+        """Map each trip to the service day of the run a date-less update means.
 
-        GTFS-RT addresses a trip without ``start_date`` as its run "on the
-        current service day". Among the days up to today -- the service day
-        ``now`` falls in, which on a spring-forward eve is already the next
-        date from 23:00 local (see :meth:`_service_day_of`) -- on which the
-        trip's service runs, that is, in order of preference:
+        GTFS-RT's TripDescriptor: a ``trip_id`` alone identifies a trip's
+        run, but ``start_date`` is required for a trip lasting more than 24
+        hours, and ``start_date`` with ``start_time`` for a frequencies.txt
+        trip. So a date-less key for a frequency repetition, or for a trip
+        whose stop times span more than a day, names no run.
 
-        1. the run scheduled to be under way at ``now`` (its first stop time
-           at or before ``now``, its last at or after);
-        2. else the latest run that ended within ``grace`` before ``now`` (a
-           run finishing late keeps its updates: at 00:45 the run that ended
-           at 00:30 beats tonight's 23:00 one);
-        3. else the earliest run still to come (at 00:30, last night's
-           25:30 run, not tonight's).
-
-        Two runs under way at once -- a trip longer than a day, running on
-        consecutive days -- collide: which one the update means is
-        unknowable, so the trip has no current run and the update applies
-        to neither, rather than to a guessed one (the spec requires
-        ``start_date`` wherever runs can collide). Rules 2 and 3 never
-        collide this way: they pick the run nearest ``now``.
-
-        Stop times span the whole trip, not just the stops a query asked
-        about. A later day's run is never "current", so a date-less update
-        can't leak onto tomorrow; a trip whose runs today are over (past the
-        grace) or that doesn't run today has none. ``grace`` must not be
-        negative (ValueError).
+        For any other trip it means, among its runs on service days up to
+        today -- the service day ``now`` falls in, which on a spring-forward
+        eve is already the next date from 23:00 local (see
+        :meth:`_service_day_of`) -- the run under way at ``now``, else the
+        run nearest in time: to its first stop time if still to come, its
+        last if ended. A morning update reaches the afternoon's run, not
+        yesterday's; a run running late keeps its updates past midnight.
+        Two runs equally near -- two under way at once -- collide (the spec
+        requires ``start_date`` there): no run. A later day's run is never
+        meant. Nothing but the feed's own time decides it, so one snapshot
+        binds each update to one run whatever a query asks. Stop times span
+        the whole trip, not just the stops a query asked about.
 
         A ``now`` outside the range service days can be dated in (a
         garbage but representable feed timestamp) has no current run.
         """
-        if grace < timedelta(0):
-            raise ValueError(f"grace must not be negative, got {grace!r}")
         if not trip_ids or not _EARLIEST_INSTANT <= now < _LATEST_INSTANT:
             return {}
-        try:
-            ended_by = now - grace
-        except OverflowError:
-            ended_by = datetime.min.replace(tzinfo=UTC)  # every run counts
         marks = ",".join("?" * len(trip_ids))
         span = (
             "COALESCE(st.arrival_secs, st.departure_secs)",
             "COALESCE(st.departure_secs, st.arrival_secs)",
         )
         trips = self._conn.execute(
-            f"SELECT t.id, t.service_id, MIN(MIN({span[0]}, {span[1]})), "
+            f"SELECT t.id, t.service_id, t.start_secs, MIN(MIN({span[0]}, {span[1]})), "
             f"MAX(MAX({span[0]}, {span[1]})) "
             "FROM trips t JOIN stop_times st ON st.trip_id = t.id "
             f"WHERE t.id IN ({marks}) GROUP BY t.id",
             list(trip_ids),
         ).fetchall()
         today = self._service_day_of(now)
-        first = self._first_service_date()
-        if first is None or first > today:
-            return {}
+        first_dates = self._service_first_dates()
+        last_dates = self._service_last_dates()
         active_by_day: dict[date, set[str]] = {}
 
-        def runs(service_id: str, day: date) -> bool:
-            active = active_by_day.get(day)
-            if active is None:
-                active = active_by_day[day] = self.active_service_ids(day)
-            return service_id in active
-
         def running(service_id: str, days: Iterable[date], most: int) -> list[date]:
-            # At most ``most`` days, so a garbage-length trip or a huge grace
-            # never walks every day back.
-            return list(
-                itertools.islice((day for day in days if runs(service_id, day)), most)
-            )
+            found: list[date] = []
+            for day in days:
+                active = active_by_day.get(day)
+                if active is None:
+                    active = active_by_day[day] = self.active_service_ids(day)
+                if service_id in active:
+                    found.append(day)
+                    if len(found) == most:
+                        break
+            return found
 
         current: dict[str, date] = {}
-        for trip_id, service_id, start_secs, end_secs in trips:
-            if start_secs is None or start_secs < 0:
+        for trip_id, service_id, repetition, start_secs, end_secs in trips:
+            if start_secs is None or repetition is not None:
+                continue  # untimed, or a frequency repetition: start_time needed
+            if end_secs - start_secs > _ONE_DAY:
+                continue  # longer than a day: start_date required
+            # Only the days its own service can run: a walk never crosses
+            # years of a calendar the trip has no part in.
+            lower, upper = first_dates.get(service_id), last_dates.get(service_id)
+            if lower is None or upper is None:
                 continue
-            # Day starts only increase, so each condition on "day start plus
-            # a stop time" holds from some day on: binary searches from the
-            # feed's first service day give the boundaries exactly, for any
-            # grace, and a garbage stop time can't send them past datetime.
-            counted = self._first_reaching_day(first, today, end_secs, ended_by)
-            if counted is None:
-                continue  # every run up to today ended before the grace
-            ongoing = self._first_reaching_day(counted, today, end_secs, now)
-            upcoming = self._first_reaching_day(
-                counted, today, start_secs, now + timedelta(microseconds=1)
+            upper = min(upper, today)
+            if lower > upper:
+                continue
+            # Day starts only increase, so the days whose run hasn't started
+            # by ``now`` are a suffix (binary search); nothing is ever
+            # subtracted from a date before it, so year 1 is safe.
+            to_come = self._first_reaching_day(
+                lower, upper, start_secs, now + timedelta(microseconds=1)
             )
-            started_to = today if upcoming is None else upcoming - timedelta(days=1)
-            ended_to = today if ongoing is None else ongoing - timedelta(days=1)
-            if ongoing is not None and (
-                under_way := running(service_id, _days(ongoing, started_to), 2)
-            ):
-                # Two under way collide: neither is current, and the update
-                # must not fall through to a run that isn't under way.
-                if len(under_way) == 1:
-                    current[trip_id] = under_way[0]
-                continue
-            nearest = running(
-                service_id, _days(counted, ended_to, backward=True), 1
-            ) or (
-                running(service_id, _days(upcoming, today), 1)
-                if upcoming is not None
+            started: list[date] = []
+            if to_come is None or to_come > lower:
+                last_started = upper if to_come is None else to_come - timedelta(days=1)
+                # The latest started run is the nearest of those (later runs
+                # end later); the one before it matters only if it is under
+                # way too.
+                started = running(
+                    service_id, _days(lower, last_started, backward=True), 2
+                )
+            coming = (
+                running(service_id, _days(to_come, upper), 1)
+                if to_come is not None
                 else []
             )
-            if nearest:
-                current[trip_id] = nearest[0]
+            distances: list[tuple[timedelta, date]] = []
+            for day in started:
+                run = self._run_span(day, start_secs, end_secs)
+                if run is not None:
+                    distances.append((max(now - run[1], timedelta(0)), day))
+            for day in coming:
+                run = self._run_span(day, start_secs, end_secs)
+                if run is not None:
+                    distances.append((run[0] - now, day))
+            distances.sort()
+            if distances and (len(distances) == 1 or distances[0][0] < distances[1][0]):
+                current[trip_id] = distances[0][1]
         return current
+
+    def _run_span(
+        self, day: date, start_secs: int, end_secs: int
+    ) -> tuple[datetime, datetime] | None:
+        """Return a run's first and last stop instants; None if undatable."""
+        try:
+            day_start = self._service_day_start(day)
+            return (
+                day_start + timedelta(seconds=start_secs),
+                day_start + timedelta(seconds=end_secs),
+            )
+        except OverflowError:
+            return None
+
+    def _service_first_dates(self) -> dict[str, date]:
+        """Map each service id to the first service date it can be active on.
+
+        The mirror of :meth:`_service_last_dates`: from ``calendar`` rows that
+        can run at all and ``calendar_dates`` ADDED dates, the earlier
+        winning -- a lower bound. Computed once; the index never changes.
+        """
+        if self._first_dates is not None:
+            return self._first_dates
+        weekday_any = " OR ".join(f"{day} = 1" for day in _WEEKDAY_COLUMNS)
+        first: dict[str, date] = {}
+        rows = self._conn.execute(
+            "SELECT service_id, start_date FROM calendar "
+            f"WHERE ({weekday_any}) AND start_date <= end_date "
+            "UNION ALL SELECT service_id, MIN(date) FROM calendar_dates "
+            "WHERE exception_type = ? GROUP BY service_id",
+            (_EXCEPTION_SERVICE_ADDED,),
+        )
+        for service_id, raw in rows:
+            parsed = _lenient_date(raw)
+            if parsed is not None and (
+                service_id not in first or parsed < first[service_id]
+            ):
+                first[service_id] = parsed
+        self._first_dates = first
+        return first
 
     def _service_day_of(self, at: datetime) -> date:
         """Return the service day ``at`` falls in: the latest day started by then.
@@ -1975,10 +2012,10 @@ class StaticIndex:
         lookahead`` (the handle layer defaults ``grace`` to one hour);
         ``grace`` lets callers that overlay realtime
         predictions keep rows whose scheduled time has passed but whose
-        vehicle may still be coming. Considers every local service day
-        from one day before the window start through one day after its
-        local end date, so past-midnight trips (>24:00:00 times) surface
-        on the correct clock day and long lookaheads are never truncated.
+        vehicle may still be coming. Considers every service day whose
+        runs can reach the window (see :meth:`_service_day_windows`), so
+        past-midnight trips (>24:00:00 times) surface on the correct clock
+        day and long lookaheads are never truncated.
         Results are sorted by departure and, when ``per_stop_limit`` is
         given, truncated to that many rows per stop.
 

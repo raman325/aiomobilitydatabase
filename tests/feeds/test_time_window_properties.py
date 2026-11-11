@@ -998,27 +998,49 @@ _NEAR_DAY_START = st.tuples(
 )
 
 
-def _expected_current(
-    under_way: list[date], ended: list[date], to_come: list[date]
-) -> date | None:
-    """The definition's choice among a trip's runs, by class.
+def _active_days(
+    index: StaticIndex,
+    service_id: str,
+    first: date,
+    last: date,
+    active: dict[date, set[str]],
+) -> list[date]:
+    """Every day from ``first`` to ``last`` on which ``service_id`` runs."""
+    days = []
+    for offset in range((last - first).days + 1):
+        day = first + timedelta(days=offset)
+        if day not in active:
+            active[day] = index.active_service_ids(day)
+        if service_id in active[day]:
+            days.append(day)
+    return days
 
-    Under way first -- none when two or more are, as they collide; else
-    the latest that ended within grace; else the earliest still to come.
+
+def _expected_current(
+    runs: list[tuple[date, datetime, datetime]], now: datetime
+) -> date | None:
+    """The definition's choice among a trip's runs: the nearest to ``now``.
+
+    A run's distance is zero while under way, else the gap to its first
+    stop (still to come) or from its last (ended); two equally near -- two
+    under way at once -- collide, and none is meant.
     """
-    if len(under_way) > 1:
-        event("runs under way collide: none current")
+    distances = sorted(
+        (max(first - now, now - last, timedelta(0)), day, first > now)
+        for day, first, last in runs
+    )
+    if not distances:
         return None
-    if under_way:
-        event("current: under way")
-        return under_way[0]
-    if ended:
-        event("current: ended within grace")
-        return max(ended)
-    if to_come:
-        event("current: still to come")
-        return min(to_come)
-    return None
+    if len(distances) > 1 and distances[0][0] == distances[1][0]:
+        event("equally near runs collide: none meant")
+        return None
+    distance, day, to_come = distances[0]
+    event(
+        "meant: under way"
+        if not distance
+        else ("meant: still to come" if to_come else "meant: ended")
+    )
+    return day
 
 
 @settings(_SETTINGS, max_examples=300)
@@ -1027,29 +1049,26 @@ def _expected_current(
     now=_STARTS,
     near=st.one_of(_NEAR_DAY_START, st.none()),
     timezone=_TIMEZONES,
-    grace_minutes=st.sampled_from([60, 0, 180, 4320]),
 )
 def test_current_service_dates_match_their_definition(
     zip_bytes: bytes,
     now: datetime,
     near: tuple[date, int] | None,
     timezone: str,
-    grace_minutes: int,
 ) -> None:
     """The run a date-less update addresses, from the raw files.
 
-    Definition: "today" is the service day ``now`` falls in -- the latest
-    day whose start (local noon minus 12 elapsed hours) is at or before
-    ``now``, found by trying every date around ``now``. Among the runs up
-    to today on which the trip's service runs (every day back to the
-    trip's own length plus the grace is tried), the current one is the run
-    scheduled to be under way at ``now`` -- none when two or more are, as
-    they collide; else the latest that ended within ``grace``; else the
-    earliest still to come. Computed from the zip's own CSV with an
-    independent time parser and anchor; only service activity (tested
-    elsewhere) comes from the index.
+    Definition: a trip whose stop times span more than a day names no run
+    (GTFS-RT requires start_date). Otherwise "today" is the service day
+    ``now`` falls in -- the latest day whose start (local noon minus 12
+    elapsed hours) is at or before ``now``, found by trying every date
+    around ``now`` -- and among the trip's runs on every day from the
+    feed's first service day to today on which its service runs, the one
+    meant is the nearest to ``now`` (see :func:`_expected_current`).
+    Computed from the zip's own CSV with an independent time parser and
+    anchor, by brute force over the days; only service activity and the
+    feed's first day (tested elsewhere) come from the index.
     """
-    grace = timedelta(minutes=grace_minutes)
     restamped = _restamp(zip_bytes, timezone, frequencies=False)
     index = _build(restamped)
     try:
@@ -1075,7 +1094,7 @@ def test_current_service_dates_match_their_definition(
 
         if near is not None:
             now = anchor(near[0]) + timedelta(minutes=near[1])
-        got = index.current_service_dates(sorted(service_of), now, grace)
+        got = index.current_service_dates(sorted(service_of), now)
         local = now.astimezone(tz).date()
         today = max(
             day
@@ -1084,29 +1103,26 @@ def test_current_service_dates_match_their_definition(
         )
         if today != local:
             event("today is not the local date")
+        first = index._first_service_date()
+        active: dict[date, set[str]] = {}
         for trip_id, service_id in service_of.items():
             expected = None
-            if trip_id in spans:
+            if trip_id in spans and first is not None:
                 low, high = spans[trip_id]
-                longest = high // 86_400 + grace.days + 3
-                runs = [
-                    (
-                        day,
-                        anchor(day) + timedelta(seconds=low),
-                        anchor(day) + timedelta(seconds=high),
-                    )
-                    for day in (
-                        today - timedelta(days=back) for back in range(longest, -1, -1)
-                    )
-                    if service_id in index.active_service_ids(day)
-                ]
-                under_way = [day for day, first, last in runs if first <= now <= last]
-                ended = [day for day, _, last in runs if now - grace <= last < now]
-                to_come = [day for day, first, _ in runs if first > now]
-                expected = _expected_current(under_way, ended, to_come)
-                if under_way and ended:
-                    event("an ended run in grace loses to one under way")
+                if high - low > 86_400:
+                    event("longer than a day: names no run")
+                else:
+                    days = _active_days(index, service_id, first, today, active)
+                    runs = [
+                        (
+                            day,
+                            anchor(day) + timedelta(seconds=low),
+                            anchor(day) + timedelta(seconds=high),
+                        )
+                        for day in days
+                    ]
+                    expected = _expected_current(runs, now)
             assert got.get(trip_id) == expected, trip_id
-        event(f"has a current run: {bool(got)}")
+        event(f"has a run meant: {bool(got)}")
     finally:
         index.close()
