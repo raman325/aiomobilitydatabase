@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import math
-import time
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
+from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import aiohttp
 
+from ._freshness import (
+    FreshnessCache,
+    Response,
+    Validators,
+    first_hop_fields,
+    header_fields,
+    request_fields,
+    sent_fields,
+)
+from ._freshness import (
+    hops as _hops,
+)
 from ._frozen import FrozenDict
 from ._urls import _require_http_url  # deliberate friend access: shared URL guard
 from .const import GBFS_LANGUAGE_PREFERENCE
@@ -257,23 +269,52 @@ def _as_bool(value: Any) -> bool | None:
     return None
 
 
-def _ttl_seconds(value: Any) -> float:
-    """Micro-cache lifetime from a document's ``ttl``, leniently.
+def _ttl_seconds(value: Any) -> float | None:
+    """Read a document's ``ttl`` in seconds; None when it is unusable.
 
-    A ttl that isn't a usable, finite, non-negative number degrades to 0
-    (no caching) like every other malformed scalar at this boundary: a
-    bad cache HINT must not fail a document that otherwise parsed. Plain
-    numeric strings are accepted because producers do ship them, and an
-    integer literal too large for a float degrades like any other
-    unusable ttl.
+    A ttl that isn't a finite, non-negative number is unusable (None)
+    rather than failing a document that otherwise parsed; ``0`` is a real
+    declaration ("always refresh"). Plain numeric strings are accepted
+    because producers do ship them, and an integer literal too large for a
+    float is unusable like any other.
     """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
-        return 0.0
+        return None
     try:
         ttl = float(value)
     except (OverflowError, ValueError):
-        return 0.0
-    return ttl if math.isfinite(ttl) and ttl > 0 else 0.0
+        return None
+    return ttl if math.isfinite(ttl) and ttl >= 0 else None
+
+
+def _document_lifetime(
+    document: Mapping[str, Any], header_lifetime: float | None, requested_at: datetime
+) -> float | None:
+    """How long a GBFS document stays fresh, in seconds from ``requested_at``.
+
+    The document's ``ttl`` counts from its own ``last_updated`` (GBFS: the
+    data will be updated again ``ttl`` seconds after it last was), so a
+    document already ``n`` seconds old when requested has ``ttl - n`` left;
+    a missing or unparseable ``last_updated`` counts from the request, and
+    the result never exceeds ``ttl`` (a ``last_updated`` in the future is
+    clock skew, not extra freshness). A ``ttl`` that is present but
+    unusable declares 0, just as an invalid ``max-age`` would. When the
+    HTTP headers declare a lifetime too (``header_lifetime``, also counted
+    from the request), the shorter one wins; neither declaring anything is
+    None. Runs on every response, a 304's included (with the stored
+    document and the stored headers merged with the 304's), so a CDN's
+    long ``max-age`` can never outlast the document's own ttl.
+    """
+    declared = [header_lifetime] if header_lifetime is not None else []
+    if "ttl" in document:
+        ttl = _ttl_seconds(document["ttl"])
+        if ttl is None:
+            declared.append(0.0)
+        else:
+            updated = _reported_at(document.get("last_updated")) or requested_at
+            elapsed = max(0.0, (requested_at - updated).total_seconds())
+            declared.append(max(0.0, ttl - elapsed))
+    return min(declared, default=None)
 
 
 def _endpoints_from_discovery(document: Any) -> dict[str, str]:
@@ -339,7 +380,12 @@ class GbfsFeedHandle:
         self._feed = feed
         self._endpoints = endpoints
         self._headers = headers
-        self._doc_cache: dict[str, tuple[float, float, dict[str, Any]]] = {}
+        # Per-url parsed documents, reused only as the producer allows: its
+        # ttl (from last_updated) and HTTP freshness, the shorter winning,
+        # or after a 304. Shared between concurrent calls.
+        self._docs: FreshnessCache[dict[str, Any]] = FreshnessCache(
+            lifetime=_document_lifetime
+        )
 
     @classmethod
     async def create(cls, client: MobilityFeedsClient, feed_id: str) -> GbfsFeedHandle:
@@ -374,9 +420,11 @@ class GbfsFeedHandle:
         ``headers`` apply to the discovery fetch and every subsequent
         document fetch made through this handle.
         """
-        document = await cls._fetch_json_document(
+        response = await cls._fetch_json_document(
             client, discovery_url, headers, "GBFS discovery URL"
         )
+        # Unconditional request, so never a 304: the value is always there.
+        document = cast("dict[str, Any]", response.value)
         return cls(client, None, _endpoints_from_discovery(document), headers=headers)
 
     @staticmethod
@@ -385,45 +433,102 @@ class GbfsFeedHandle:
         url: str,
         headers: Mapping[str, str] | None,
         context: str,
-    ) -> dict[str, Any]:
-        """GET one GBFS JSON document and validate its data envelope."""
+        validators: Validators | None = None,
+    ) -> Response[dict[str, Any]]:
+        """GET one GBFS JSON document and validate its data envelope.
+
+        With ``validators`` the request is conditional and a ``304`` comes
+        back with no value; a 304 to an unconditional request raises. The
+        cache derives the document's freshness from it (see
+        :func:`_document_lifetime`).
+        """
         _require_http_url(url, context)
         session = client._get_session()  # deliberate friend access
+        request_headers = dict(headers) if headers else {}
+        # Before the validators: they are the cache's, not the request's own.
+        controlled = request_fields(session, url, request_headers)
+        if validators is not None:
+            request_headers.update(validators.request_headers())
+        requested_at = datetime.now(UTC)
         try:
             async with session.get(
                 url,
-                headers=dict(headers) if headers else None,
+                headers=request_headers or None,
                 timeout=aiohttp.ClientTimeout(total=client.timeout_seconds),
             ) as resp:
+                received_at = datetime.now(UTC)
+                fields = header_fields(resp.headers)
+                if resp.status == HTTPStatus.NOT_MODIFIED:
+                    if validators is None:
+                        raise SourceConnectionError(
+                            f"GBFS endpoint answered 304 to an unconditional "
+                            f"request: {url}",
+                            status=int(HTTPStatus.NOT_MODIFIED),
+                        )
+                    return Response(
+                        value=None,
+                        fields=fields,
+                        requested_at=requested_at,
+                        received_at=received_at,
+                        request_fields=sent_fields(controlled, resp),
+                        hops=_hops(resp),
+                        url=str(resp.url),
+                        first_hop_request_fields=first_hop_fields(controlled, resp),
+                    )
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
                         f"GBFS endpoint error {resp.status}: {url}", status=resp.status
+                    )
+                if resp.status not in (
+                    HTTPStatus.OK,
+                    HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
+                ):
+                    raise SourceConnectionError(
+                        f"GBFS endpoint answered {resp.status} without a document: "
+                        f"{url}",
+                        status=resp.status,
                     )
                 try:
                     document = await resp.json(content_type=None)
                 except ValueError as err:
                     raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
+                sent, hops = sent_fields(controlled, resp), _hops(resp)
+                answered = str(resp.url)
+                first = first_hop_fields(controlled, resp)
         except (TimeoutError, aiohttp.ClientError) as err:
             raise SourceConnectionError(f"Error fetching {url}: {err}") from err
         if not isinstance(document, dict) or "data" not in document:
             raise FeedParseError(f"GBFS document missing data envelope: {url}")
-        return document
+        return Response(
+            value=document,
+            fields=fields,
+            requested_at=requested_at,
+            received_at=received_at,
+            request_fields=sent,
+            hops=hops,
+            url=answered,
+            first_hop_request_fields=first,
+        )
 
     async def _document(self, name: str) -> dict[str, Any]:
-        cached = self._doc_cache.get(name)
-        if cached is not None:
-            fetched_at, ttl, data = cached
-            if time.monotonic() - fetched_at < ttl:
-                return data
         url = self._endpoints.get(name)
         if url is None:
             raise SourceConnectionError(f"GBFS endpoint not published: {name}")
-        document = await self._fetch_json_document(
-            self._client, url, self._headers, f"GBFS {name} endpoint URL"
+        return await self._docs.get(
+            url,
+            partial(
+                self._fetch_json_document,
+                self._client,
+                url,
+                self._headers,
+                f"GBFS {name} endpoint URL",
+            ),
+            request_fields=request_fields(
+                self._client._get_session(),  # deliberate friend access
+                url,
+                self._headers or {},
+            ),
         )
-        ttl = _ttl_seconds(document.get("ttl"))
-        self._doc_cache[name] = (time.monotonic(), ttl, document)
-        return document
 
     async def get_system_info(self) -> GbfsSystemInfo:
         """GBFS system information.

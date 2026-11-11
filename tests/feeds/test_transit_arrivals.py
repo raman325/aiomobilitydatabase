@@ -638,8 +638,9 @@ async def test_revalidated_bundled_feed_still_costs_one_request_per_call(
     _mock_catalog(mock_api, rt=True)
     body = _bundled_message()
     mock_api.get("/rt/all", body=body, content_type=PB, headers={"ETag": '"v1"'})
-    mock_api.get("/rt/all", status=304)
-    mock_api.get("/rt/all", status=304)  # spare: a 2nd GET here would be the bug
+    mock_api.get("/rt/all", status=304, headers={"ETag": '"v1"'})
+    # spare: a 2nd GET here would be the bug
+    mock_api.get("/rt/all", status=304, headers={"ETag": '"v1"'})
     handle = await feeds_client.get_transit_feed("mdb-100")
 
     for _ in range(2):

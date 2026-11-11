@@ -17,6 +17,7 @@ from collections.abc import (
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,6 +33,7 @@ from ..models import (
     LatestDataset,
     SourceInfo,
 )
+from ._freshness import FreshnessCache
 from ._urls import (
     _require_http_url,  # deliberate friend access: shared data-origin URL guard
 )
@@ -58,13 +60,13 @@ from .models import (
     VehiclePosition,
 )
 from .rt import (
-    FeedValidators,
     Modification,
     TripModifications,
     TripPredictions,
     TripUpdateKey,
     TripUpdates,
     alerts_from_message,
+    feed_request_fields,
     fetch_feed_message,
     resolve_trip_predictions,
     stops_from_message,
@@ -91,6 +93,12 @@ _CACHE_KEY_HASH_CHARS = 16
 # Direct-URL RT feeds advertise every entity type: capabilities are unknown
 # without a catalog record, so every fetch tries all parsers and absent
 # types simply yield nothing.
+
+
+def _require_interval(rt_min_interval: timedelta) -> None:
+    """Reject a negative budget before any download or index build."""
+    if rt_min_interval < timedelta(0):
+        raise ValueError(f"rt_min_interval must not be negative: {rt_min_interval}")
 
 
 def _direct_cache_key(static_url: str) -> str:
@@ -966,6 +974,7 @@ class TransitFeedHandle:
         api_key: str | None,
         *,
         direct: _DirectUrls | None = None,
+        rt_min_interval: timedelta = timedelta(0),
     ) -> None:
         """Construct via ``MobilityFeedsClient.get_transit_feed()`` instead."""
         self._client = client
@@ -984,10 +993,13 @@ class TransitFeedHandle:
         self._api_key = api_key
         self._guard = _IndexGuard()
         self._refresh_lock = asyncio.Lock()
-        # Per-url HTTP validators plus the parse they belong to. Only ever
-        # reused on a 304, i.e. when the producer itself states the bytes
-        # are unchanged -- this is revalidation, not a TTL cache.
-        self._rt_validators: dict[str, tuple[FeedValidators, Any]] = {}
+        # Per-url parsed messages, reused only as the producer allows: within
+        # its declared freshness (RFC 9111), after a 304, or -- opted into
+        # by the caller, and only when the producer declared nothing --
+        # within rt_min_interval. Shared between concurrent calls; see
+        # FreshnessCache.
+        self._rt_cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
+        self._rt_min_interval = rt_min_interval.total_seconds()
         self._stops: tuple[Stop, ...] = tuple(index.stops())
         self._routes: tuple[Route, ...] = tuple(index.routes())
         self._agencies: tuple[Agency, ...] = tuple(index.agencies())
@@ -1060,8 +1072,11 @@ class TransitFeedHandle:
         feed_id: str,
         api_key: str | None,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
+        *,
+        rt_min_interval: timedelta = timedelta(0),
     ) -> TransitFeedHandle:
         """Resolve siblings via the catalog and ensure the static index."""
+        _require_interval(rt_min_interval)
         catalog = client.catalog
         feed = await catalog.get_feed(feed_id)
         if feed.data_type is DataType.GTFS:
@@ -1081,7 +1096,14 @@ class TransitFeedHandle:
         else:
             raise ValueError(f"Feed {feed_id} is {feed.data_type}; use get_gbfs_feed()")
         index = await cls._ensure_index(client, static_feed, on_progress)
-        return cls(client, static_feed, rt_feeds, index, api_key)
+        return cls(
+            client,
+            static_feed,
+            rt_feeds,
+            index,
+            api_key,
+            rt_min_interval=rt_min_interval,
+        )
 
     @classmethod
     async def create_from_urls(
@@ -1094,6 +1116,7 @@ class TransitFeedHandle:
         service_alerts_urls: Sequence[str] | None = None,
         headers: Mapping[str, str] | None = None,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
+        rt_min_interval: timedelta = timedelta(0),
     ) -> TransitFeedHandle:
         """Build a handle from user-supplied URLs, bypassing the catalog.
 
@@ -1109,6 +1132,7 @@ class TransitFeedHandle:
         to the static download and every RT fetch made through this
         handle.
         """
+        _require_interval(rt_min_interval)
         _require_http_url(static_url, "static GTFS dataset URL")
         url_types: dict[str, list[EntityType]] = {}
         for urls, entity_type in (
@@ -1139,7 +1163,15 @@ class TransitFeedHandle:
             headers=headers,
         )
         index = await cls._ensure_index_from_source(client, source, on_progress)
-        return cls(client, None, rt_feeds, index, None, direct=direct)
+        return cls(
+            client,
+            None,
+            rt_feeds,
+            index,
+            None,
+            direct=direct,
+            rt_min_interval=rt_min_interval,
+        )
 
     @staticmethod
     async def _probe_direct_dataset_id(
@@ -1367,9 +1399,11 @@ class TransitFeedHandle:
         single producer_url is selected once per declared type. ``memo``
         (a per-call dict keyed by url) makes a call that needs two entity
         types off one bundled feed fetch it once; every consumer already
-        filters the parsed message for its own field. Across calls the url
-        is revalidated with its stored ETag/Last-Modified, so an unchanged
-        feed costs a 304 rather than a re-download and re-parse.
+        filters the parsed message for its own field. Across calls the
+        handle's :class:`FreshnessCache` decides: a parse still within the
+        producer's declared freshness costs no request, an expired one is
+        revalidated with its ETag/Last-Modified (an unchanged feed costs a
+        304, not a re-download), and concurrent calls share one request.
         """
         session = self._client._get_session()
         messages = []
@@ -1384,37 +1418,28 @@ class TransitFeedHandle:
             if memo is not None and (memoed := memo.get(url)) is not None:
                 messages.append(memoed)
                 continue
-            known = self._rt_validators.get(url)
-            message, fresh = await fetch_feed_message(
-                session,
+            message = await self._rt_cache.get(
                 url,
-                auth_type=source.authentication_type,
-                api_key_name=source.api_key_parameter_name,
-                api_key=self._api_key,
-                headers=self._headers,
-                timeout_seconds=self._client.timeout_seconds,
-                validators=known[0] if known else None,
+                partial(
+                    fetch_feed_message,
+                    session,
+                    url,
+                    auth_type=source.authentication_type,
+                    api_key_name=source.api_key_parameter_name,
+                    api_key=self._api_key,
+                    headers=self._headers,
+                    timeout_seconds=self._client.timeout_seconds,
+                ),
+                request_fields=feed_request_fields(
+                    session,
+                    url,
+                    auth_type=source.authentication_type,
+                    api_key_name=source.api_key_parameter_name,
+                    api_key=self._api_key,
+                    headers=self._headers,
+                ),
+                min_interval=self._rt_min_interval,
             )
-            if message is None:
-                # 304: the producer confirmed our copy is current. It still
-                # goes in the memo -- a second entity type off this same
-                # url must not re-ask within the one call.
-                if known is None:
-                    # Unsolicited: nothing was revalidated, so there is no
-                    # previous parse to reuse. A misbehaving proxy must
-                    # raise the library's own error, not AssertionError --
-                    # which `python -O` would strip into a TypeError.
-                    raise SourceConnectionError(
-                        f"Producer answered 304 to an unconditional request: {url}",
-                        status=int(HTTPStatus.NOT_MODIFIED),
-                    )
-                message = known[1]
-            elif fresh is not None:
-                self._rt_validators[url] = (fresh, message)
-            else:
-                # A producer that stops offering validators must not leave a
-                # stale entry behind to be revalidated against forever.
-                self._rt_validators.pop(url, None)
             if memo is not None:
                 memo[url] = message
             messages.append(message)
