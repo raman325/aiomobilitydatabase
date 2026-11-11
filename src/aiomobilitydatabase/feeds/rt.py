@@ -42,6 +42,8 @@ from .models import (
 )
 from .static_index import parse_gtfs_time
 
+# Only these carry the requested representation (RFC 9110 sections 15.3.1, 15.3.4).
+_FEED_STATUSES = frozenset({HTTPStatus.OK, HTTPStatus.NON_AUTHORITATIVE_INFORMATION})
 _AUTH_STATUSES = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
 
 _AUTH_TYPE_QUERY_PARAM = 1
@@ -210,13 +212,22 @@ async def fetch_feed_message(
                     received_at=received_at,
                     request_fields=sent_fields(controlled, resp),
                     hops=_hops(resp),
+                    url=str(resp.url),
                 )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
                     f"Producer error {resp.status}: {url}", status=resp.status
                 )
+            if resp.status not in _FEED_STATUSES:
+                # A 204, a 300, a 3xx left unfollowed: no feed to parse (an
+                # empty body parses as an empty FeedMessage).
+                raise SourceConnectionError(
+                    f"Producer answered {resp.status} without a feed: {url}",
+                    status=resp.status,
+                )
             raw = await resp.read()
             sent, hops = sent_fields(controlled, resp), _hops(resp)
+            answered = str(resp.url)
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
     message = gtfs_realtime_pb2.FeedMessage()
@@ -231,6 +242,7 @@ async def fetch_feed_message(
         received_at=received_at,
         request_fields=sent,
         hops=hops,
+        url=answered,
     )
 
 

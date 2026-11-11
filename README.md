@@ -281,7 +281,12 @@ Notes on direct mode:
   can't be predicted, so a `Vary` naming it always asks. A redirected
   response answers its original URL only while every redirect may be
   reused too: the shortest lifetime of the chain, none when a redirect
-  declares none.
+  declares none (and a 302, 303 or 307 without freshness of its own is
+  asked every time, even under `rt_min_interval`), and a redirect's own
+  `Vary` counts. A `304` from the redirect's target speaks for that
+  resource, not the stored one, so it is asked again unconditionally.
+  Only a `200` (or `203`) carries a feed: any other status below 400 is a
+  `SourceConnectionError`, never an empty feed stored in its place.
   A bare `no-cache` revalidates every time (one naming fields only bars
   passing those fields on, which this cache never does), `no-store` is
   never stored, invalid freshness (including a

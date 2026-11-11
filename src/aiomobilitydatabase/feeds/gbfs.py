@@ -480,16 +480,27 @@ class GbfsFeedHandle:
                         received_at=received_at,
                         request_fields=sent_fields(controlled, resp),
                         hops=_hops(resp),
+                        url=str(resp.url),
                     )
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
                         f"GBFS endpoint error {resp.status}: {url}", status=resp.status
+                    )
+                if resp.status not in (
+                    HTTPStatus.OK,
+                    HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
+                ):
+                    raise SourceConnectionError(
+                        f"GBFS endpoint answered {resp.status} without a document: "
+                        f"{url}",
+                        status=resp.status,
                     )
                 try:
                     document = await resp.json(content_type=None)
                 except ValueError as err:
                     raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
                 sent, hops = sent_fields(controlled, resp), _hops(resp)
+                answered = str(resp.url)
         except (TimeoutError, aiohttp.ClientError) as err:
             raise SourceConnectionError(f"Error fetching {url}: {err}") from err
         if not isinstance(document, dict) or "data" not in document:
@@ -501,6 +512,7 @@ class GbfsFeedHandle:
             received_at=received_at,
             request_fields=sent,
             hops=hops,
+            url=answered,
         )
 
     async def _document(self, name: str) -> dict[str, Any]:

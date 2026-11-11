@@ -441,22 +441,29 @@ _AUTOMATIC = frozenset({"host", "accept", "accept-encoding", "user-agent"})
 _CONDITIONAL = frozenset({"if-none-match", "if-modified-since"})
 
 
-def _cookie_pairs(values: Iterable[str]) -> tuple[str, ...]:
+def _cookie_pairs(values: Iterable[str], *, merge: bool = False) -> tuple[str, ...]:
     """Return Cookie field values as canonical ``name=value`` pairs.
 
-    By name, the last value winning, sorted -- so a header sent verbatim
-    and the one aiohttp rebuilds from it and the jar (``SimpleCookie``:
-    jar cookies replace same-named explicit ones, output sorted) compare
-    equal when they carry the same cookies. A header aiohttp would parse
-    differently (``k=v w``) can only fail to match, never match falsely.
+    Sorted by name, stably -- a repeated name keeps its values in the order
+    sent, since a server may read either. ``merge`` keeps only the last
+    value of a name, as aiohttp does when it rebuilds the header from the
+    jar (``SimpleCookie``: jar cookies replace same-named explicit ones,
+    output sorted); with an empty jar it sends the header verbatim. So the
+    header predicted and the one sent compare equal when they carry the
+    same cookies. A header aiohttp would parse differently (``k=v w``) can
+    only fail to match, never match falsely.
     """
-    cookies: dict[str, str] = {}
+    cookies: list[tuple[str, str]] = []
     for value in values:
         for part in value.split(";"):
             if pair := part.strip(_OWS):
                 name, _, cookie = pair.partition("=")
-                cookies[name.strip(_OWS)] = cookie.strip(_OWS)
-    return tuple(f"{name}={cookie}" for name, cookie in sorted(cookies.items()))
+                cookies.append((name.strip(_OWS), cookie.strip(_OWS)))
+    if merge:
+        cookies = list(dict(cookies).items())
+    return tuple(
+        f"{name}={cookie}" for name, cookie in sorted(cookies, key=lambda c: c[0])
+    )
 
 
 def request_fields(
@@ -468,10 +475,12 @@ def request_fields(
     them (a request header replaces the defaults' same-named one, whatever
     its case; a later spelling of one name replaces an earlier one), and
     the cookies sent: explicit Cookie headers, then the session jar's for
-    ``url``, canonical (see :func:`_cookie_pairs`). aiohttp's automatic
-    headers are left out: unless set here, they are fixed for the process.
-    These are what a stored response's Vary is matched against (see
-    :func:`sent_fields`). Pass ``headers`` without the cache's validators.
+    ``url``, canonical (see :func:`_cookie_pairs`), and the session's
+    ``auth`` as the Authorization it sends when nothing sets one. aiohttp's
+    automatic headers are left out: unless set here, they are fixed for the
+    process. These are what a stored response's Vary is matched against
+    (see :func:`sent_fields`). Pass ``headers`` without the cache's
+    validators.
     """
     fields: dict[str, list[str]] = {
         name: list(values) for name, values in header_fields(session.headers).items()
@@ -486,8 +495,13 @@ def request_fields(
     explicit = fields.pop("cookie", [])
     jar = session.cookie_jar.filter_cookies(URL(url))
     pairs = _cookie_pairs(
-        [*explicit, *(f"{morsel.key}={morsel.coded_value}" for morsel in jar.values())]
+        [*explicit, *(f"{morsel.key}={morsel.coded_value}" for morsel in jar.values())],
+        merge=bool(jar),
     )
+    # Deprecated in aiohttp 3.14 (and gone in 4), but still sent while set.
+    auth = getattr(session, "auth", None)
+    if auth is not None and "authorization" not in fields:
+        fields["authorization"] = [auth.encode()]
     result = {name: tuple(values) for name, values in fields.items()}
     if pairs:
         result["cookie"] = pairs
@@ -502,9 +516,11 @@ def sent_fields(
     Every field on the wire (``response.request_info``), Cookie canonical,
     except what no later request can differ in: aiohttp's automatic
     headers and the cache's own validators, unless ``controlled`` (the
-    :func:`request_fields` taken before sending) set them. So a header a
-    middleware or trace hook added counts -- it can't be predicted, and a
-    Vary naming it never matches. A redirected request's final hop carried
+    :func:`request_fields` taken before sending) set them. So any other
+    header a middleware or trace hook added counts -- it can't be
+    predicted, and a Vary naming it never matches (one of the automatic
+    names is the exception: it is taken to be aiohttp's fixed value). A
+    redirected request's final hop carried
     headers no later request can be checked against in advance: None.
     """
     if response.history:
@@ -521,9 +537,28 @@ def sent_fields(
     return fields
 
 
-def hops(response: aiohttp.ClientResponse) -> tuple[dict[str, tuple[str, ...]], ...]:
-    """Return the header fields of the redirects a response was reached through."""
-    return tuple(header_fields(hop.headers) for hop in response.history)
+@dataclass(frozen=True)
+class Hop:
+    """One redirect a response was reached through: its status and fields."""
+
+    status: int
+    fields: Fields
+
+
+def hops(response: aiohttp.ClientResponse) -> tuple[Hop, ...]:
+    """Return the redirects a response was reached through, in order."""
+    return tuple(
+        Hop(status=hop.status, fields=header_fields(hop.headers))
+        for hop in response.history
+    )
+
+
+# RFC 9110 section 15.1: the statuses a cache may reuse without explicit
+# freshness (heuristically). A redirect with any other status (302, 303,
+# 307) and no freshness of its own may not be reused at all.
+_HEURISTICALLY_CACHEABLE = frozenset(
+    {200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501}
+)
 
 
 def freshness_of(
@@ -690,9 +725,10 @@ class Response[T]:
     ``request_fields`` are the request header fields it was drawn by, as
     sent (see :func:`sent_fields`; None when unknown): what a stored
     response's Vary is checked against before it is reused. ``hops`` are
-    the header fields of the redirects followed to reach it, in order: the
-    response answers the ORIGINAL URL only for as long as every hop may be
-    reused too.
+    the redirects followed to reach it, in order: the response answers the
+    ORIGINAL URL only for as long as every hop may be reused too. ``url``
+    is the URL that answered (the last hop's target): a 304 from any other
+    resource says nothing about the stored one (RFC 9110 section 8.8.3).
     """
 
     value: T | None
@@ -700,7 +736,8 @@ class Response[T]:
     requested_at: datetime
     received_at: datetime
     request_fields: Fields | None = field(default_factory=dict)
-    hops: Sequence[Fields] = ()
+    hops: Sequence[Hop] = ()
+    url: str | None = None
 
 
 class Fetch[T](Protocol):
@@ -724,16 +761,51 @@ class _Entry[T]:
     received_at: datetime  # wall clock when ``value`` itself arrived
     # The controlled fields of the request it answers (None: unknown).
     request_fields: Fields | None = field(default_factory=dict)
+    url: str | None = None  # the resource that answered (after redirects)
+    # Through a redirect declaring nothing: ``lifetime`` is None, and an
+    # opt-in ``min_interval`` may reuse it no longer than this.
+    cap: float | None = None
 
 
 def _hop_freshness(response: Response[object]) -> list[Freshness]:
-    """Freshness of each redirect a response was reached through."""
-    return [
-        freshness_of(
-            hop, requested_at=response.requested_at, received_at=response.received_at
+    """Freshness of each redirect a response was reached through.
+
+    Read against the whole fetch's request and receipt instants (aiohttp
+    keeps no per-hop timing): exact when a hop carries Date, otherwise a
+    hop's age can count up to the later hops' time too.
+
+    One that declares nothing on a status that may not be reused without
+    explicit freshness (302, 303, 307) is stale now: the original URL must
+    be asked every time.
+    """
+    found = []
+    for hop in response.hops:
+        hop_freshness = freshness_of(
+            hop.fields,
+            requested_at=response.requested_at,
+            received_at=response.received_at,
         )
-        for hop in response.hops
-    ]
+        if (
+            hop_freshness.storable
+            and hop_freshness.lifetime is None
+            and hop.status not in _HEURISTICALLY_CACHEABLE
+        ):
+            hop_freshness = Freshness(lifetime=0.0)
+        found.append(hop_freshness)
+    return found
+
+
+def _with_hop_vary(fields: Fields, response: Response[object]) -> Fields:
+    """Return the fields to store, their Vary including every hop's.
+
+    A redirect varying by request fields answers only requests that match
+    (RFC 9111 section 4.1) -- and a redirected request's fields are
+    unknown, so none does.
+    """
+    hop_vary = [value for hop in response.hops for value in hop.fields.get("vary", ())]
+    if not hop_vary:
+        return fields
+    return {**fields, "vary": (*fields.get("vary", ()), *hop_vary)}
 
 
 def _storable(freshness: Freshness, response: Response[object]) -> bool:
@@ -834,8 +906,9 @@ class FreshnessCache[T]:
         if entry.lifetime is not None:
             # A declared lifetime (0 included: revalidate) is binding.
             return age < entry.lifetime
-        # Declared nothing: only the caller's opt-in interval applies.
-        return age < min_interval
+        # Declared nothing: only the caller's opt-in interval applies, and
+        # never past a lifetime some redirect or the target did declare.
+        return age < min_interval and (entry.cap is None or age < entry.cap)
 
     async def get(
         self,
@@ -870,9 +943,12 @@ class FreshnessCache[T]:
             if not task.done():
                 self._in_flight[slot] = task
             task.add_done_callback(lambda done: self._finished(slot, done))
-        # Shielded: a caller cancelling its own wait must not cancel the
-        # request every other waiter is sharing.
-        return await asyncio.shield(task)
+        # A caller cancelling its own wait must not cancel the request every
+        # other waiter is sharing: asyncio.wait never cancels what it waits
+        # on (and unlike shield leaves no handler that would log a failure
+        # every waiter abandoned).
+        await asyncio.wait((task,))
+        return task.result()
 
     def _finished(self, slot: _Slot, task: asyncio.Task[T]) -> None:
         # Normally _refresh already left _in_flight; this covers a task
@@ -884,19 +960,26 @@ class FreshnessCache[T]:
 
     def _lifetime_of(
         self, value: T, freshness: Freshness, response: Response[T]
-    ) -> float | None:
+    ) -> tuple[float | None, float | None]:
+        """Return (lifetime, cap) for a response and the redirects to it.
+
+        The shortest declared lifetime of the chain binds. When a link
+        declares nothing (no heuristics, so a bare 301 too) the chain
+        declares nothing either -- None, for an opt-in ``min_interval`` --
+        but never more than the shortest lifetime another link declared,
+        returned as the cap (a declared 0, ``no-cache``, stays 0).
+        """
         declared = freshness.lifetime
         if self._lifetime is not None:
             declared = self._lifetime(value, declared, response.requested_at)
         if declared is not None and not math.isfinite(declared):
-            return 0.0
-        # Through redirects: no longer than any hop, nothing if one declares
-        # nothing (no heuristics, so a bare 301 too).
-        for hop in _hop_freshness(response):
-            if declared is None or hop.lifetime is None:
-                return None
-            declared = min(declared, hop.lifetime)
-        return declared
+            declared = 0.0
+        lifetimes = [declared, *(hop.lifetime for hop in _hop_freshness(response))]
+        known = [lifetime for lifetime in lifetimes if lifetime is not None]
+        shortest = min(known) if known else None
+        if len(known) < len(lifetimes):
+            return None, shortest
+        return shortest, None
 
     def _rejects(self, entry: _Entry[T], fetched: T) -> bool:
         if self._timestamp is None:
@@ -916,9 +999,14 @@ class FreshnessCache[T]:
     ) -> T:
         key = slot[0]
         try:
-            async with self._locks.setdefault(key, asyncio.Lock()):
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = self._locks[key] = asyncio.Lock()
+            async with lock:
                 # Another fetch for this key (other fields) may have stored
-                # what this request needs while it waited.
+                # what this request needs while it waited. (Judged with the
+                # min_interval of the call that started this fetch; each
+                # cache passes one value.)
                 entry = self._entries.get(key)
                 if entry is not None and self._fresh(entry, min_interval, upcoming):
                     return entry.value
@@ -938,11 +1026,15 @@ class FreshnessCache[T]:
             response.value is None
             and entry is not None
             and validators is not None
-            and not _selects(
-                entry.fields, _received(response.fields, response.received_at)
+            and (
+                response.url != entry.url
+                or not _selects(
+                    entry.fields, _received(response.fields, response.received_at)
+                )
             )
         ):
-            # A 304 that doesn't identify the stored response can't update
+            # A 304 that doesn't identify the stored response -- or comes
+            # from another resource, a redirect having moved -- can't update
             # it (RFC 9111 section 4.3.4): ask again, unconditionally.
             validators = None
             requested = self._clock()
@@ -956,10 +1048,17 @@ class FreshnessCache[T]:
             # RFC 9111 section 3.2: the 304's fields replace the stored ones
             # of the same name, except Content-Length (which describes the
             # 304 itself); a field it lacks -- Age included -- stays.
-            merged = {
-                **entry.fields,
-                **{name: v for name, v in fields.items() if name != "content-length"},
-            }
+            merged = _with_hop_vary(
+                {
+                    **entry.fields,
+                    **{
+                        name: v
+                        for name, v in fields.items()
+                        if name != "content-length"
+                    },
+                },
+                response,
+            )
             freshness = freshness_of(
                 merged,
                 requested_at=response.requested_at,
@@ -971,7 +1070,9 @@ class FreshnessCache[T]:
             entry.fields = merged
             entry.request_fields = response.request_fields
             entry.stored_at = requested
-            entry.lifetime = self._lifetime_of(entry.value, freshness, response)
+            entry.lifetime, entry.cap = self._lifetime_of(
+                entry.value, freshness, response
+            )
             return entry.value
         if (
             entry is not None
@@ -989,12 +1090,15 @@ class FreshnessCache[T]:
         if not _storable(freshness, response):
             self._entries.pop(key, None)
             return response.value
+        lifetime, cap = self._lifetime_of(response.value, freshness, response)
         self._entries[key] = _Entry(
             value=response.value,
-            fields=fields,
+            fields=_with_hop_vary(fields, response),
             stored_at=requested,
-            lifetime=self._lifetime_of(response.value, freshness, response),
+            lifetime=lifetime,
             received_at=response.received_at,
             request_fields=response.request_fields,
+            url=response.url,
+            cap=cap,
         )
         return response.value

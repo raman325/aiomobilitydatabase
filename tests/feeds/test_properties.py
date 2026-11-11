@@ -1466,9 +1466,10 @@ def test_rt_fetch_total_over_status_and_body(
 ) -> None:
     """Every servable status maps to its DOCUMENTED classification: 401 and
     403 are authentication failures, any other status at or above 400 is a
-    connection failure carrying that status, and a sub-400 response either
-    parses or raises FeedParseError -- never anything else, and never a
-    crash.
+    connection failure carrying that status, and so is any other status
+    that carries no feed (anything but 200 and 203: a 204, a 3xx left
+    unfollowed, an unsolicited 304); a 200 or 203 either parses or raises
+    FeedParseError -- never anything else, and never a crash.
     """
     kind, raw = body
     outcome = _run_fetch_probe(status, raw)
@@ -1481,14 +1482,10 @@ def test_rt_fetch_total_over_status_and_body(
         # no previous parse to reuse, so it is a connection failure. 204
         # carries no body on the wire, so the parser sees b"" and succeeds
         # whatever was queued; a pristine message always parses.
-        if status == HTTPStatus.NOT_MODIFIED:
-            assert outcome == "connection:304"
+        if status not in (HTTPStatus.OK, HTTPStatus.NON_AUTHORITATIVE_INFORMATION):
+            assert outcome == f"connection:{status}"
             return
-        allowed = (
-            {"success"}
-            if kind == "valid" or status == HTTPStatus.NO_CONTENT
-            else {"success", "parse"}
-        )
+        allowed = {"success"} if kind == "valid" else {"success", "parse"}
         assert outcome in allowed
 
 
@@ -3682,7 +3679,9 @@ def _gbfs_handle(documents: dict[str, object]) -> GbfsFeedHandle:
     handle._endpoints = {name: f"https://gbfs.invalid/{name}" for name in documents}
     # Never fetches (all cached); only asked what a request would carry.
     session = SimpleNamespace(
-        headers={}, cookie_jar=SimpleNamespace(filter_cookies=lambda _url: {})
+        headers={},
+        cookie_jar=SimpleNamespace(filter_cookies=lambda _url: {}),
+        auth=None,
     )
     handle._client = SimpleNamespace(_get_session=lambda: session)  # type: ignore[assignment]
     handle._headers = None

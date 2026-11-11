@@ -582,3 +582,101 @@ async def test_a_redirect_that_may_not_be_stored_is_asked_every_time(
     assert await _t1_delay(handle) == 60
     assert await _t1_delay(handle) == 60
     assert len(_rt_hits(mock_api)) == 2
+
+
+async def test_a_redirect_targets_304_never_revalidates_the_original(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """/rt/all answered with ETag "1"; then it redirects to /rt/moved, whose
+    own "1" matches the forwarded If-None-Match. That 304 is about another
+    resource: the cache asks again, unconditionally, and gets /rt/moved's
+    feed.
+    """
+    _mock_transit(mock_api)
+    moved = mock_api.url("/rt/moved")
+    tag = {"ETag": '"1"', "Cache-Control": "no-cache"}
+    mock_api.get(RT, body=_t1_delayed(60, timestamp=100), content_type=PB, headers=tag)
+    for status in (304, 200):
+        mock_api.get(RT, status=301, headers={"Location": moved})
+        mock_api.get(
+            "/rt/moved",
+            status=status,
+            body=_t1_delayed(120, timestamp=200) if status == 200 else None,
+            content_type=PB,
+            headers=tag,
+        )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    assert await _t1_delay(handle) == 60
+    assert await _t1_delay(handle) == 120
+    moved_hits = [r.headers for r in mock_api.requests if r.path == "/rt/moved"]
+    assert [hit.get("If-None-Match") for hit in moved_hits] == ['"1"', None]
+
+
+async def test_a_redirect_varying_by_cookie_is_asked_again(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A cacheable 302 varying by Cookie: the next call can't be shown to
+    carry the same cookies through the redirect, so it asks."""
+    _mock_transit(mock_api)
+    for timestamp, target in ((100, "/rt/east"), (200, "/rt/west")):
+        mock_api.get(
+            RT,
+            status=302,
+            headers={
+                "Location": mock_api.url(target),
+                "Cache-Control": "max-age=600",
+                "Vary": "Cookie",
+            },
+        )
+        mock_api.get(
+            target,
+            body=_t1_delayed(timestamp - 40, timestamp=timestamp),
+            content_type=PB,
+            headers={"Cache-Control": "max-age=600"},
+        )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    assert await _t1_delay(handle) == 60
+    assert await _t1_delay(handle) == 160
+
+
+async def test_rt_min_interval_never_reuses_a_302_without_freshness(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A 302 (or 303, 307) may not be reused without explicit freshness,
+    not even heuristically -- so the opt-in budget can't reuse it either."""
+    _mock_transit(mock_api)
+    moved = mock_api.url("/rt/moved")
+    for delay in (60, 120):
+        mock_api.get(RT, status=302, headers={"Location": moved})
+        mock_api.get(
+            "/rt/moved", body=_t1_delayed(delay, timestamp=delay), content_type=PB
+        )
+    handle = await feeds_client.get_transit_feed(
+        "mdb-100", rt_min_interval=timedelta(seconds=30)
+    )
+    assert await _t1_delay(handle) == 60
+    assert await _t1_delay(handle) == 120
+    assert len(_rt_hits(mock_api)) == 2
+
+
+@pytest.mark.parametrize("status", [204, 300])
+async def test_a_status_without_a_feed_is_a_connection_error(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient, status: int
+) -> None:
+    """Only 200 and 203 carry the feed: a 204's empty body is not an empty
+    FeedMessage to store, and a 300 isn't a feed either."""
+    _mock_transit(mock_api)
+    mock_api.get(RT, status=status, body=b"", content_type=PB)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    with pytest.raises(SourceConnectionError, match=f"answered {status}"):
+        await _t1_delay(handle)
+
+
+async def test_gbfs_a_status_without_a_document_is_a_connection_error(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_gbfs(mock_api)
+    mock_api.get(INFO, status=204)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    with pytest.raises(SourceConnectionError, match="answered 204"):
+        await handle.get_system_info()

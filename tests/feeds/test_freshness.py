@@ -5,6 +5,7 @@ import locale
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime, parsedate_to_datetime
+from http import HTTPStatus
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,7 @@ from aiomobilitydatabase.feeds import _freshness as freshness_module
 from aiomobilitydatabase.feeds._freshness import (
     Freshness,
     FreshnessCache,
+    Hop,
     Response,
     Validators,
     freshness_from_headers,
@@ -1555,6 +1557,42 @@ def _model_lifetime(
     return True, max(0.0, max_age - initial)
 
 
+def _model_hop(
+    hop: tuple[int, str | None], received: float
+) -> tuple[bool, float | None]:
+    """(storable, lifetime) of a redirect the fake producer answers through.
+
+    It carries no Date or Age: dated at its (whole-second) receipt, like
+    any response without Date. One declaring nothing is reusable only
+    heuristically, which a 302 never is.
+    """
+    status, cache_control = hop
+    if cache_control is None:
+        return True, (0.0 if status == HTTPStatus.FOUND else None)
+    return _model_lifetime(cache_control, None, None, received)
+
+
+def _model_chain(
+    final: tuple[bool, float | None],
+    hop: tuple[int, str | None] | None,
+    received: float,
+) -> tuple[bool, float | None, float | None]:
+    """(storable, lifetime, cap) of a response and the redirect to it.
+
+    The shortest declared lifetime binds; a link declaring nothing makes
+    the chain declare nothing, capped by the shortest that was declared.
+    """
+    if hop is None:
+        return final[0], final[1], None
+    hop_storable, hop_lifetime = _model_hop(hop, received)
+    lifetimes = [final[1], hop_lifetime]
+    known = [lifetime for lifetime in lifetimes if lifetime is not None]
+    shortest = min(known) if known else None
+    if len(known) < len(lifetimes):
+        return final[0] and hop_storable, None, shortest
+    return final[0] and hop_storable, shortest, None
+
+
 _SHORT_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _LONG_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
               "Sunday")  # fmt: skip
@@ -1637,7 +1675,10 @@ class FreshnessMachine(RuleBasedStateMachine):
     nothing, or names another representation -- the last two select
     nothing and must be re-asked. A producer may answer ``Vary: X-Region``
     while the client's region changes: a stored copy answers only the
-    region it was drawn (or last revalidated) for.
+    region it was drawn (or last revalidated) for. And it may answer through
+    a 301 or 302 carrying its own Cache-Control, moving the feed to another
+    URL: the chain is reused only as long as every link, and a 304 from the
+    other URL selects nothing.
     """
 
     def __init__(self) -> None:
@@ -1658,6 +1699,7 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.date_mode = "now"
         self.age: int | None = None
         self.vary_offered = False
+        self.hop: tuple[int, str | None] | None = None
         self.style_304 = "full"
         self.fail_next = False
         self.stale_next = False
@@ -1675,6 +1717,9 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.stored_age: int | None = None
         self.stored_vary: str | None = None
         self.stored_region = "east"
+        self.stored_url = "direct"
+        self.stored_unknown = False  # drawn by a redirected request
+        self.stored_cap: float | None = None
         self.stored_received = 0
         self.stored_at = 0.0
         self.stored_lifetime: float | None = None
@@ -1721,6 +1766,38 @@ class FreshnessMachine(RuleBasedStateMachine):
     def _request_fields(self) -> dict[str, tuple[str, ...]]:
         return {"x-region": (self.region,)}
 
+    def _url(self) -> str:
+        return "direct" if self.hop is None else "moved"
+
+    def _response(
+        self, value: _Doc | None, headers: dict[str, str], now: datetime
+    ) -> Response[_Doc]:
+        """What the fetcher reports: through the redirect, if there is one
+        (whose request fields are then unknown)."""
+        if self.hop is None:
+            return Response(
+                value,
+                header_fields(headers),
+                now,
+                now,
+                self._request_fields(),
+                (),
+                "direct",
+            )
+        status, cache_control = self.hop
+        hop_fields = header_fields(
+            {"Cache-Control": cache_control} if cache_control else {}
+        )
+        return Response(
+            value,
+            header_fields(headers),
+            now,
+            now,
+            None,
+            [Hop(status, hop_fields)],
+            "moved",
+        )
+
     async def _fetch(self, *, validators: Validators | None) -> Response[_Doc]:
         await asyncio.sleep(0)  # let a burst pile up on the in-flight task
         if self.fail_next:
@@ -1757,9 +1834,7 @@ class FreshnessMachine(RuleBasedStateMachine):
             if self.style_304 == "ageless":
                 headers.pop("Age", None)
             self.log.append((validators, headers, None))
-            return Response(
-                None, header_fields(headers), now, now, self._request_fields()
-            )
+            return self._response(None, headers, now)
         if unchanged:
             assert etag is not None
             headers = {
@@ -1789,22 +1864,24 @@ class FreshnessMachine(RuleBasedStateMachine):
                 "another": {"ETag": '"another"', "Cache-Control": "max-age=600"},
             }[self.style_304]
             self.log.append((validators, headers, None))
-            return Response(
-                None, header_fields(headers), now, now, self._request_fields()
-            )
+            return self._response(None, headers, now)
         headers = self._headers(etag, lm)
         self.log.append((validators, headers, doc))
-        return Response(doc, header_fields(headers), now, now, self._request_fields())
+        return self._response(doc, headers, now)
 
     def _expect_fresh(self) -> bool:
         if self.stored is None:
             return False
-        if self.stored_vary is not None and self.stored_region != self.region:
-            return False  # drawn for another region: Vary doesn't match
+        if self.stored_vary is not None and (
+            self.stored_unknown or self.stored_region != self.region
+        ):
+            return False  # drawn for another region (or unknown): no match
         age = self.clock.now - self.stored_at
         if self.stored_lifetime is not None:
             return age < self.stored_lifetime
-        return age < self.min_interval
+        return age < self.min_interval and (
+            self.stored_cap is None or age < self.stored_cap
+        )
 
     async def _call(self, count: int) -> list[_Doc | BaseException]:
         return await asyncio.gather(
@@ -1903,6 +1980,23 @@ class FreshnessMachine(RuleBasedStateMachine):
         """The producer answers ``Vary: X-Region`` (or stops)."""
         self.vary_offered = vary
 
+    @rule(
+        hop=st.sampled_from(
+            [
+                None,
+                (301, None),
+                (302, None),
+                (301, "max-age=5"),
+                (302, "max-age=30"),
+                (301, "no-store"),
+                (301, "no-cache"),
+            ]
+        )
+    )
+    def set_redirect(self, hop: tuple[int, str | None] | None) -> None:
+        """The feed moves behind a redirect (or back): its own URL changes."""
+        self.hop = hop
+
     @rule(region=st.sampled_from(["east", "west"]))
     def set_region(self, region: str) -> None:
         """The client's requests carry another region from now on."""
@@ -1957,11 +2051,12 @@ class FreshnessMachine(RuleBasedStateMachine):
         """
         self.date_mode, self.age = "now", 5
         self.publish_cacheable()
-        self.vary_offered = False
+        self.vary_offered, self.hop = False, None
         self.call(count=1)
         if self.stored is not None and self.stored_lifetime:
             self.lapse_then_call_twice(style="ageless")
-            self.probe_the_lifetime_edge()
+            if self.stored is not None and self.stored_lifetime:
+                self.probe_the_lifetime_edge()
 
     @precondition(lambda self: self.stored is not None and self.vary_offered)
     @rule(style=_STYLES_304)
@@ -2015,11 +2110,17 @@ class FreshnessMachine(RuleBasedStateMachine):
                 if "Last-Modified" in headers
                 else "304 with no validator"
             )
-        if served is None and not _model_selects(
-            self.stored_etag, self.stored_lm, headers
+        if served is None and (
+            self._url() != self.stored_url
+            or not _model_selects(self.stored_etag, self.stored_lm, headers)
         ):
-            # A 304 that identifies nothing: asked again, unconditionally.
-            event(f"304 ({self.style_304}) selects nothing: re-asked")
+            # A 304 that identifies nothing -- or speaks for another URL:
+            # asked again, unconditionally.
+            event(
+                "304 from another URL: re-asked"
+                if self._url() != self.stored_url
+                else f"304 ({self.style_304}) selects nothing: re-asked"
+            )
             assert len(self.log) == 2
             assert self.log[1][0] is None and self.log[1][2] is not None
             _, headers, served = self.log[1]
@@ -2056,17 +2157,29 @@ class FreshnessMachine(RuleBasedStateMachine):
                 self.stored_vary = headers["Vary"]
             # It now answers the request that drew it.
             self.stored_region = self.region
+            self.stored_unknown = self.hop is not None
             self.stored_date = date
-            storable, lifetime = _model_lifetime(
-                self.stored_cc, self.stored_date, self.stored_age, received
+            storable, lifetime, cap = _model_chain(
+                _model_lifetime(
+                    self.stored_cc, self.stored_date, self.stored_age, received
+                ),
+                self.hop,
+                received,
             )
             if storable:
                 self.stored_at, self.stored_lifetime = self.clock.now, lifetime
+                self.stored_cap = cap
             else:
                 self.stored = None
             return answer
+        served_unknown = self.hop is not None
         if self.stored is not None and (
-            self.stored_vary is None or self.stored_region == self.region
+            self.stored_vary is None
+            or (
+                not served_unknown
+                and not self.stored_unknown
+                and self.stored_region == self.region
+            )
         ):
             # The newest thing we know of is the stored copy, as of its stamp
             # -- but no later than the second it actually reached us. An
@@ -2077,13 +2190,20 @@ class FreshnessMachine(RuleBasedStateMachine):
                 event("stale edge rejected")
                 self.stored_at, self.stored_lifetime = self.clock.now, 0.0
                 return self.stored
-        storable, lifetime = _model_lifetime(
-            headers.get("Cache-Control"), date, age, received
+        storable, lifetime, cap = _model_chain(
+            _model_lifetime(headers.get("Cache-Control"), date, age, received),
+            self.hop,
+            received,
         )
         if not storable:
             self.stored = None
             return served
+        if self.hop is not None:
+            event(f"stored through a {self.hop[0]} ({self.hop[1]})")
         self.stored = served
+        self.stored_cap = cap
+        self.stored_url = self._url()
+        self.stored_unknown = served_unknown
         self.stored_vary = headers.get("Vary")
         self.stored_region = self.region
         self.stored_cc = headers.get("Cache-Control")
@@ -2184,29 +2304,62 @@ async def test_each_set_of_request_fields_shares_its_own_fetch() -> None:
     assert len(producer.seen) == 2
 
 
+def _hop(status: int = 301, **headers: str) -> Hop:
+    """A redirect with these response headers (``_`` for ``-`` in names)."""
+    return Hop(
+        status, header_fields({k.replace("_", "-"): v for k, v in headers.items()})
+    )
+
+
 @pytest.mark.parametrize(
-    ("hops", "lifetime"),
+    ("hops", "final", "lifetime", "cap"),
     [
-        ([{"cache-control": ("max-age=60",)}], 60.0),  # the shortest wins
-        ([{"cache-control": ("max-age=6000",)}], 600.0),
-        ([{}], None),  # a hop declaring nothing: the chain declares nothing
-        ([{"cache-control": ("max-age=60",)}, {}], None),
+        ([_hop(Cache_Control="max-age=60")], "max-age=600", 60.0, None),  # shortest
+        ([_hop(Cache_Control="max-age=6000")], "max-age=600", 600.0, None),
+        # A 301 declaring nothing: the chain declares nothing, capped by the
+        # lifetime the target did declare.
+        ([_hop()], "max-age=600", None, 600.0),
+        ([_hop(Cache_Control="max-age=60"), _hop()], "max-age=600", None, 60.0),
+        # A declared 0 (no-cache) survives a hop declaring nothing.
+        ([_hop()], "no-cache", None, 0.0),
+        # A 302 or 307 with no freshness of its own may not be reused.
+        ([_hop(302)], "max-age=600", 0.0, None),
+        ([_hop(307)], "max-age=600", 0.0, None),
+        ([_hop(302, Cache_Control="max-age=60")], "max-age=600", 60.0, None),
     ],
 )
 async def test_a_redirect_chain_is_reused_only_as_long_as_every_hop(
-    hops: list[dict[str, tuple[str, ...]]], lifetime: float | None
+    hops: list[Hop], final: str, lifetime: float | None, cap: float | None
 ) -> None:
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
-    fields = header_fields({"Cache-Control": "max-age=600"})
+    fields = header_fields({"Cache-Control": final})
     response = Response("a", fields, T0, T0, None, hops)
     await cache.get("u", _Producer([response]))
-    assert cache._entries["u"].lifetime == lifetime
+    entry = cache._entries["u"]
+    assert (entry.lifetime, entry.cap) == (lifetime, cap)
+
+
+async def test_min_interval_never_reuses_past_a_lifetime_the_chain_declared() -> None:
+    """A bare 301 to a no-cache feed declares nothing as a chain, but the
+    target's no-cache still binds: min_interval doesn't reuse it."""
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    fields = header_fields({"Cache-Control": "no-cache"})
+    producer = _Producer(
+        [
+            Response("a", fields, T0, T0, None, [_hop()]),
+            Response("b", fields, T0, T0, None, [_hop()]),
+        ]
+    )
+    assert await cache.get("u", producer, min_interval=30) == "a"
+    clock.now = 1.0
+    assert await cache.get("u", producer, min_interval=30) == "b"
 
 
 async def test_a_redirect_that_may_not_be_stored_keeps_nothing() -> None:
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
     fields = header_fields({"Cache-Control": "max-age=600"})
-    hops = [header_fields({"Cache-Control": "no-store"})]
+    hops = [_hop(Cache_Control="no-store")]
     producer = _Producer(
         [
             Response("a", fields, T0, T0, None, hops),
@@ -2282,6 +2435,7 @@ async def test_request_fields_merge_as_aiohttp_sends() -> None:
     [
         # Field lines combine with ", "; nothing inside a line is touched.
         ({"accept": ("a, b",)}, {"accept": ("a", "b")}, True),
+        ({"accept": ("a,b",)}, {"accept": ("a", "b")}, False),
         ({"accept": ('"x  y"',)}, {"accept": ('"x y"',)}, False),
     ],
 )
@@ -2296,4 +2450,126 @@ async def test_vary_normalization(
     await cache.get("u", producer, request_fields=sent)
     assert await cache.get("u", producer, request_fields=upcoming) == (
         "a" if reused else "b"
+    )
+
+
+async def test_a_304_from_another_resource_selects_nothing() -> None:
+    """The stored copy came from /u; a redirect now lands on /v, whose 304
+    matches the forwarded ETag by coincidence. Entity tags identify one
+    resource's representations (RFC 9110 section 8.8.3): the cache asks
+    again, unconditionally, and stores what /v sends.
+    """
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    tag = header_fields({"ETag": '"1"', "Cache-Control": "max-age=0"})
+    producer = _Producer(
+        [
+            Response("old", tag, T0, T0, url="https://p/u"),
+            Response(None, tag, T0, T0, None, [_hop()], url="https://p/v"),
+            Response("new", tag, T0, T0, None, [_hop()], url="https://p/v"),
+        ]
+    )
+    assert await cache.get("u", producer) == "old"
+    assert await cache.get("u", producer) == "new"
+    assert producer.seen == [None, Validators('"1"', None), None]
+
+
+async def test_a_redirects_vary_counts_like_the_targets() -> None:
+    """A 302 varying by Cookie answers only matching requests -- and a
+    redirected request's fields are unknown, so the next call asks."""
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    fields = header_fields({"Cache-Control": "max-age=600"})
+    hops = [_hop(302, Cache_Control="max-age=600", Vary="Cookie")]
+    producer = _Producer(
+        [
+            Response("east", fields, T0, T0, None, hops),
+            Response("west", fields, T0, T0, None, hops),
+        ]
+    )
+    assert await cache.get("u", producer) == "east"
+    assert await cache.get("u", producer) == "west"
+
+
+async def test_an_unknown_request_meets_the_never_older_rule_only_without_vary() -> (
+    None
+):
+    """A redirected 200 (its request fields unknown) is compared with the
+    stored copy only when that copy varies by nothing."""
+    now = int(T0.timestamp())
+    for vary, expected in (({}, now), ({"Vary": "X-Region"}, now - 60)):
+        cache: FreshnessCache[int] = FreshnessCache(
+            _Clock(), timestamp=lambda v: datetime.fromtimestamp(v, UTC)
+        )
+        stored = header_fields({"Cache-Control": "max-age=0", **vary})
+        older = header_fields({"Cache-Control": "max-age=0"})
+        producer = _Producer(  # type: ignore[arg-type]
+            [Response(now, stored, T0, T0), Response(now - 60, older, T0, T0, None)]
+        )
+        await cache.get("u", producer)  # type: ignore[arg-type]
+        assert await cache.get("u", producer) == expected  # type: ignore[arg-type]
+
+
+async def test_an_abandoned_shared_failure_is_never_logged() -> None:
+    """Every caller timed out, then the shared fetch failed: nobody can be
+    told, and the loop's exception handler hears nothing either."""
+    reports: list[str] = []
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(
+        lambda _loop, context: reports.append(context["message"])
+    )
+    try:
+        cache: FreshnessCache[str] = FreshnessCache(_Clock())
+        gate = asyncio.Event()
+        producer = _Producer([ConnectionError("down")], gate=gate)
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await cache.get("u", producer)
+        gate.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(None)
+    assert reports == []
+
+
+async def test_cookie_duplicates_are_kept_unless_aiohttp_merges_them() -> None:
+    """Sent verbatim (an empty jar), ``a=1; a=2`` is not ``a=2``: a server
+    reads either. Once the jar has a cookie for the URL, aiohttp rebuilds
+    the header and the last value of a name wins -- as predicted."""
+    url = "http://feed.example/rt"
+    async with aiohttp.ClientSession(
+        headers={"Cookie": "a=1; b=0; a=2"},
+        cookie_jar=aiohttp.CookieJar(unsafe=True),
+    ) as session:
+        verbatim = freshness_module.request_fields(session, url, {})
+        session.cookie_jar.update_cookies({"c": "3"}, URL(url))
+        rebuilt = freshness_module.request_fields(session, url, {})
+    assert verbatim["cookie"] == ("a=1", "a=2", "b=0")
+    assert rebuilt["cookie"] == ("a=2", "b=0", "c=3")
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_request_fields_predict_session_auth() -> None:
+    async with aiohttp.ClientSession(auth=aiohttp.BasicAuth("u", "p")) as session:
+        fields = freshness_module.request_fields(session, "http://feed.example/", {})
+        explicit = freshness_module.request_fields(
+            session, "http://feed.example/", {"Authorization": "Bearer x"}
+        )
+    assert fields["authorization"] == (aiohttp.BasicAuth("u", "p").encode(),)
+    assert explicit["authorization"] == ("Bearer x",)
+
+
+async def test_a_wire_cookie_with_duplicates_never_matches_a_merged_one() -> None:
+    """A request sent ``a=1; a=2`` verbatim; the next would send ``a=2``:
+    under Vary: Cookie they differ, so the cache asks."""
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    vary = header_fields({"Cache-Control": "max-age=600", "Vary": "Cookie"})
+    producer = _Producer(
+        [
+            Response("first", vary, T0, T0, {"cookie": ("a=1", "a=2")}),
+            Response("second", vary, T0, T0, {"cookie": ("a=2",)}),
+        ]
+    )
+    await cache.get("u", producer, request_fields={"cookie": ("a=1", "a=2")})
+    assert (
+        await cache.get("u", producer, request_fields={"cookie": ("a=2",)}) == "second"
     )
