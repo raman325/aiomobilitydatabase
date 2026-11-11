@@ -192,9 +192,8 @@ class MobilityFeedsClient:
         opt-in request budget for producers that declare no freshness at
         all: a parse from such a response is reused while younger than the
         interval. It never extends a declared lifetime (``no-cache``,
-        ``max-age=0``, an expired ``max-age``/``Expires``), a copy kept
-        after rejecting an older response, or ``no-store``. A negative
-        interval raises ``ValueError``.
+        ``max-age=0``, an expired ``max-age``/``Expires``) or ``no-store``.
+        A negative interval raises ``ValueError``.
 
         ``on_progress``, if given, must not raise: it is called inline and
         is NOT wrapped in a try/except, so a raising callback aborts this

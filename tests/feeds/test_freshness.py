@@ -1059,27 +1059,6 @@ async def test_a_request_with_other_fields_never_joins_one_in_flight() -> None:
     assert len(producer.seen) == 2
 
 
-async def test_an_older_copy_loses_even_when_it_cannot_be_stored() -> None:
-    """A stale edge copy marked Vary: * (or no-store) is still older than
-    the stored copy: the stored copy answers, and stays.
-    """
-    cache: FreshnessCache[int] = FreshnessCache(
-        _Clock(), timestamp=lambda v: datetime.fromtimestamp(v, UTC)
-    )
-    now = int(T0.timestamp())
-    producer = _Producer(  # type: ignore[arg-type]
-        [
-            _raw(now, {"Cache-Control": "max-age=0"}),
-            _raw(now - 60, {"Cache-Control": "max-age=600", "Vary": "*"}),
-            _raw(now - 60, {"Cache-Control": "no-store"}),
-        ]
-    )
-    assert await cache.get("u", producer) == now  # type: ignore[arg-type]
-    assert await cache.get("u", producer) == now  # type: ignore[arg-type]
-    assert await cache.get("u", producer) == now  # type: ignore[arg-type]
-    assert cache._entries["u"].value == now
-
-
 async def test_a_vary_star_response_is_never_reused() -> None:
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
     producer = _Producer(
@@ -1369,57 +1348,6 @@ def _dated(value: int) -> datetime:
     return datetime.fromtimestamp(value, UTC)
 
 
-async def test_older_responses_never_replace_newer_ones() -> None:
-    cache: FreshnessCache[int] = FreshnessCache(_Clock(), timestamp=_dated)
-    queue: list[Response[int]] = [
-        _r(500, V1, 60.0),
-        _r(400, None, 60.0),
-        _r(600, None, 60.0),
-    ]
-
-    async def fetch(*, validators: Validators | None) -> Response[int]:
-        return queue.pop(0)
-
-    assert await cache.get("u", fetch) == 500
-    cache._entries["u"].lifetime = 0.0  # force a refresh
-    # The stale copy is rejected AND the entry marked stale: next call asks.
-    assert await cache.get("u", fetch) == 500
-    assert await cache.get("u", fetch) == 600
-
-
-async def test_a_future_dated_copy_cannot_pin_the_cache() -> None:
-    """A producer clock bug stamps one snapshot years ahead, then recovers.
-
-    A stamp later than its own receipt counts as the receipt time, so any
-    snapshot stamped after we received the bad one replaces it; a CDN copy
-    stamped before that receipt is still an older copy.
-    """
-    now = int(T0.timestamp())
-    future = now + 10 * 365 * 86_400
-    cache: FreshnessCache[int] = FreshnessCache(_Clock(), timestamp=_dated)
-    queue = [_r(future, None, 0.0), _r(now - 5, None, 0.0), _r(now + 5, None, 0.0)]
-
-    async def fetch(*, validators: Validators | None) -> Response[int]:
-        return queue.pop(0)
-
-    assert await cache.get("u", fetch) == future
-    assert await cache.get("u", fetch) == future  # older than the receipt
-    assert await cache.get("u", fetch) == now + 5
-
-
-async def test_a_slightly_fast_producer_clock_keeps_the_rule() -> None:
-    """Stamped 2s after we received it (no NTP), then a 60s-older edge copy."""
-    now = int(T0.timestamp())
-    cache: FreshnessCache[int] = FreshnessCache(_Clock(), timestamp=_dated)
-    queue = [_r(now + 2, None, 0.0), _r(now - 58, None, 0.0)]
-
-    async def fetch(*, validators: Validators | None) -> Response[int]:
-        return queue.pop(0)
-
-    assert await cache.get("u", fetch) == now + 2
-    assert await cache.get("u", fetch) == now + 2
-
-
 async def test_concurrent_callers_share_one_request_and_its_error() -> None:
     cache: FreshnessCache[str] = FreshnessCache(_Clock())
     producer = _Producer([RuntimeError("boom")], gate=asyncio.Event())
@@ -1459,22 +1387,6 @@ async def test_an_abandoned_failure_is_not_reported_as_unretrieved() -> None:
     for _ in range(3):
         await asyncio.sleep(0)
     assert not cache._in_flight
-
-
-async def test_the_receipt_clamp_works_in_whole_seconds() -> None:
-    """Stamps are whole seconds: one stamped in the second the stored copy
-    arrived (half a second in) is not older than that copy.
-    """
-    now = int(T0.timestamp())
-    arrived = T0 + timedelta(milliseconds=500)
-    cache: FreshnessCache[int] = FreshnessCache(_Clock(), timestamp=_dated)
-    queue = [Response(now + 2, {}, arrived, arrived), _r(now, None, 0.0)]
-
-    async def fetch(*, validators: Validators | None) -> Response[int]:
-        return queue.pop(0)
-
-    assert await cache.get("u", fetch) == now + 2
-    assert await cache.get("u", fetch) == now
 
 
 async def test_a_finished_request_is_never_joined() -> None:
@@ -1530,10 +1442,6 @@ class _Doc:
     version: int
     timestamp: int
     region: str = ""  # the variant, when the producer answers Vary: X-Region
-
-
-def _doc_time(doc: _Doc) -> datetime:
-    return datetime.fromtimestamp(doc.timestamp, UTC)
 
 
 def _model_lifetime(
@@ -1662,7 +1570,7 @@ _STYLES_304 = st.sampled_from(
 
 
 class FreshnessMachine(RuleBasedStateMachine):
-    """Random clocks, publishes, failures, stale edges, calls and bursts.
+    """Random clocks, publishes, failures, older edge copies, calls and bursts.
 
     The fake producer records exactly what it served, header by header; a
     reference model applies the cache's documented rules to that record,
@@ -1684,9 +1592,7 @@ class FreshnessMachine(RuleBasedStateMachine):
     def __init__(self) -> None:
         super().__init__()
         self.clock = _Clock()
-        self.cache: FreshnessCache[_Doc] = FreshnessCache(
-            self.clock, timestamp=_doc_time
-        )
+        self.cache: FreshnessCache[_Doc] = FreshnessCache(self.clock)
         self.min_interval = 0.0
         # Producer state.
         self.version = 1
@@ -1720,7 +1626,6 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.stored_url = "direct"
         self.stored_unknown = False  # drawn by a redirected request
         self.stored_cap: float | None = None
-        self.stored_received = 0
         self.stored_at = 0.0
         self.stored_lifetime: float | None = None
         self.last_kind = "none"
@@ -2173,23 +2078,10 @@ class FreshnessMachine(RuleBasedStateMachine):
                 self.stored = None
             return answer
         served_unknown = self.hop is not None
-        if self.stored is not None and (
-            self.stored_vary is None
-            or (
-                not served_unknown
-                and not self.stored_unknown
-                and self.stored_region == self.region
-            )
-        ):
-            # The newest thing we know of is the stored copy, as of its stamp
-            # -- but no later than the second it actually reached us. An
-            # older copy loses even when it couldn't be stored; another
-            # region's variant is no answer to compare it with.
-            known = min(self.stored.timestamp, self.stored_received)
-            if served.timestamp < known:
-                event("stale edge rejected")
-                self.stored_at, self.stored_lifetime = self.clock.now, 0.0
-                return self.stored
+        # RFC 9111 section 4.3.3: a full response replaces the stored one,
+        # an older edge copy included.
+        if self.stored is not None and served.timestamp < self.stored.timestamp:
+            event("older edge copy replaces the stored one")
         storable, lifetime, cap = _model_chain(
             _model_lifetime(headers.get("Cache-Control"), date, age, received),
             self.hop,
@@ -2210,30 +2102,12 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.stored_etag = headers.get("ETag")
         self.stored_lm = _canonical(headers.get("Last-Modified"))
         self.stored_date, self.stored_age = date, age
-        self.stored_received = self._wall()
         self.stored_at, self.stored_lifetime = self.clock.now, lifetime
         return served
 
 
 FreshnessMachine.TestCase.settings = settings(max_examples=600, deadline=None)
 TestFreshnessMachine = FreshnessMachine.TestCase
-
-
-async def test_another_variant_is_never_the_older_copys_answer() -> None:
-    """Vary: X-Region. East's copy is stored; west's 200 is stamped earlier,
-    but it answers a request east's copy doesn't match -- so it wins.
-    """
-    cache: FreshnessCache[int] = FreshnessCache(
-        _Clock(), timestamp=lambda v: datetime.fromtimestamp(v, UTC)
-    )
-    now = int(T0.timestamp())
-    vary = header_fields({"Cache-Control": "max-age=600", "Vary": "X-Region"})
-    east, west = {"x-region": ("east",)}, {"x-region": ("west",)}
-    producer = _Producer(  # type: ignore[arg-type]
-        [Response(now, vary, T0, T0, east), Response(now - 60, vary, T0, T0, west)]
-    )
-    assert await cache.get("u", producer, request_fields=east) == now  # type: ignore[arg-type]
-    assert await cache.get("u", producer, request_fields=west) == now - 60  # type: ignore[arg-type]
 
 
 async def _until_waiting() -> None:
@@ -2257,32 +2131,6 @@ async def test_fetches_with_other_fields_run_one_at_a_time() -> None:
     gate.set()
     assert await asyncio.gather(first, other) == ["a", "a"]
     assert len(producer.seen) == 1
-
-
-async def test_a_slower_older_copy_never_overwrites_a_newer_one() -> None:
-    """Concurrent requests with different fields are ordered: the second
-    one's older 200 is judged against what the first stored, not against
-    the entry both started from.
-    """
-    now = int(T0.timestamp())
-    cache: FreshnessCache[int] = FreshnessCache(
-        _Clock(), timestamp=lambda v: datetime.fromtimestamp(v, UTC)
-    )
-    stale = {"Cache-Control": "max-age=0"}
-    seed = _Producer([_raw(now - 600, stale)])  # type: ignore[list-item]
-    await cache.get("u", seed)  # type: ignore[arg-type]
-    gate = asyncio.Event()
-    producer = _Producer(  # type: ignore[arg-type]
-        [_raw(now - 120, stale), _raw(now - 300, stale)], gate=gate
-    )
-    fast = asyncio.ensure_future(cache.get("u", producer, request_fields={}))  # type: ignore[arg-type]
-    slow = asyncio.ensure_future(
-        cache.get("u", producer, request_fields={"x": ("1",)})  # type: ignore[arg-type]
-    )
-    await _until_waiting()
-    gate.set()
-    assert await asyncio.gather(fast, slow) == [now - 120, now - 120]
-    assert cache._entries["u"].value == now - 120
 
 
 async def test_each_set_of_request_fields_shares_its_own_fetch() -> None:
@@ -2490,25 +2338,6 @@ async def test_a_redirects_vary_counts_like_the_targets() -> None:
     )
     assert await cache.get("u", producer) == "east"
     assert await cache.get("u", producer) == "west"
-
-
-async def test_an_unknown_request_meets_the_never_older_rule_only_without_vary() -> (
-    None
-):
-    """A redirected 200 (its request fields unknown) is compared with the
-    stored copy only when that copy varies by nothing."""
-    now = int(T0.timestamp())
-    for vary, expected in (({}, now), ({"Vary": "X-Region"}, now - 60)):
-        cache: FreshnessCache[int] = FreshnessCache(
-            _Clock(), timestamp=lambda v: datetime.fromtimestamp(v, UTC)
-        )
-        stored = header_fields({"Cache-Control": "max-age=0", **vary})
-        older = header_fields({"Cache-Control": "max-age=0"})
-        producer = _Producer(  # type: ignore[arg-type]
-            [Response(now, stored, T0, T0), Response(now - 60, older, T0, T0, None)]
-        )
-        await cache.get("u", producer)  # type: ignore[arg-type]
-        assert await cache.get("u", producer) == expected  # type: ignore[arg-type]
 
 
 async def test_an_abandoned_shared_failure_is_never_logged() -> None:
@@ -2833,3 +2662,19 @@ async def test_the_first_redirects_vary_matches_the_original_request() -> None:
     await cache.get("u", producer, request_fields=east)
     assert await cache.get("u", producer, request_fields=east) == "a"
     assert await cache.get("u", producer, request_fields={"x-region": ("west",)}) == "b"
+
+
+async def test_a_full_response_always_replaces_the_stored_one() -> None:
+    """RFC 9111 section 4.3.3: after a conditional request the cache MUST
+    use the full response -- even an older edge copy replaces a newer
+    stored one."""
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    producer = _Producer(
+        [
+            _raw("newer", {"Cache-Control": "max-age=0", "ETag": '"2"'}),
+            _raw("older", {"Cache-Control": "max-age=600", "ETag": '"1"'}),
+        ]
+    )
+    assert await cache.get("u", producer) == "newer"
+    assert await cache.get("u", producer) == "older"
+    assert cache._entries["u"].value == "older"

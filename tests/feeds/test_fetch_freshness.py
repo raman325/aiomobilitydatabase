@@ -126,21 +126,18 @@ async def test_no_cache_revalidates_every_call(
     assert hits[1].get("If-None-Match") == '"v1"'
 
 
-async def test_a_stale_cdn_copy_never_replaces_a_newer_message(
+async def test_an_older_cdn_copy_replaces_the_stored_message(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
+    """RFC 9111 section 4.3.3: a full response is used as served, even an
+    edge's older snapshot (by header timestamp)."""
     _mock_transit(mock_api)
     mock_api.get(RT, body=_t1_delayed(60, timestamp=200), content_type=PB)
-    # An edge that has not caught up serves an older snapshot...
     mock_api.get(RT, body=_t1_delayed(600, timestamp=100), content_type=PB)
-    # ...and the next request (the stored copy was kept but marked stale)
-    # reaches a current one.
-    mock_api.get(RT, body=_t1_delayed(120, timestamp=300), content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
     assert await _t1_delay(handle) == 60
-    assert await _t1_delay(handle) == 60
-    assert await _t1_delay(handle) == 120
-    assert len(_rt_hits(mock_api)) == 3
+    assert await _t1_delay(handle) == 600
+    assert len(_rt_hits(mock_api)) == 2
 
 
 async def test_rt_min_interval_is_an_opt_in_request_budget(
@@ -413,15 +410,17 @@ async def test_gbfs_the_shorter_declared_lifetime_wins(
     assert (await handle.get_system_info()).name == "Renamed"
 
 
-async def test_gbfs_never_goes_back_to_an_older_document(
+async def test_gbfs_an_older_document_replaces_the_stored_one(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
+    """RFC 9111 section 4.3.3, as for realtime: an older ``last_updated``
+    doesn't keep the stored document."""
     _mock_gbfs(mock_api)
     mock_api.get(INFO, payload=_info(ttl=0, age=0, name="Current"))
     mock_api.get(INFO, payload=_info(ttl=0, age=600, name="Stale edge"))
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     assert (await handle.get_system_info()).name == "Current"
-    assert (await handle.get_system_info()).name == "Current"
+    assert (await handle.get_system_info()).name == "Stale edge"
 
 
 async def test_gbfs_unsolicited_304_is_a_connection_error(

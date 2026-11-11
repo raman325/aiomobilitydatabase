@@ -67,7 +67,6 @@ from .rt import (
     TripUpdates,
     alerts_from_message,
     feed_request_fields,
-    feed_timestamp,
     fetch_feed_message,
     resolve_trip_predictions,
     stops_from_message,
@@ -999,9 +998,7 @@ class TransitFeedHandle:
         # by the caller, and only when the producer declared nothing --
         # within rt_min_interval. Shared between concurrent calls; see
         # FreshnessCache.
-        self._rt_cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache(
-            timestamp=feed_timestamp
-        )
+        self._rt_cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
         self._rt_min_interval = rt_min_interval.total_seconds()
         self._stops: tuple[Stop, ...] = tuple(index.stops())
         self._routes: tuple[Route, ...] = tuple(index.routes())
@@ -1406,8 +1403,7 @@ class TransitFeedHandle:
         handle's :class:`FreshnessCache` decides: a parse still within the
         producer's declared freshness costs no request, an expired one is
         revalidated with its ETag/Last-Modified (an unchanged feed costs a
-        304, not a re-download), concurrent calls share one request, and a
-        stale CDN copy older than the stored message never replaces it.
+        304, not a re-download), and concurrent calls share one request.
         """
         session = self._client._get_session()
         messages = []

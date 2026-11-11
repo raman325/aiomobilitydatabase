@@ -2,8 +2,8 @@
 
 Both realtime (GTFS-RT) and GBFS fetches go through :class:`FreshnessCache`.
 It answers from a stored parse while it is fresh, revalidates with
-ETag/Last-Modified once it lapses, shares one request between concurrent
-callers, and never replaces a stored copy with an older one. Semantics are
+ETag/Last-Modified once it lapses, and shares one request between
+concurrent callers. Semantics are
 a strict private cache (RFC 9111): no heuristic freshness, invalid
 freshness information counts as stale.
 """
@@ -340,8 +340,7 @@ def _directives(values: Sequence[str]) -> tuple[dict[str, list[str | None]], boo
     still read as a directive name, so a ``no-store`` or ``no-cache`` never
     hides, whatever it is glued to (``;``, ``/``, a quote, a space). That
     can also read one out of an argument (``ext="no-store"`` in a broken
-    field): conservative -- not storing beats a stale-now copy -- though
-    such a response then skips the "never older" comparison.
+    field): conservative -- not storing beats a stale-now copy.
     """
     directives: dict[str, list[str | None]] = {}
     malformed = False
@@ -812,7 +811,6 @@ class _Entry[T]:
     fields: Fields  # the stored response's header fields, 304s merged in
     stored_at: float  # monotonic, taken when the request was sent
     lifetime: float | None  # None: the producer declared nothing
-    received_at: datetime  # wall clock when ``value`` itself arrived
     # The controlled fields of the request it answers (None: unknown).
     request_fields: Fields | None = field(default_factory=dict)
     url: str | None = None  # the resource that answered (after redirects)
@@ -905,19 +903,6 @@ def _entry_matches(
     ) and _vary_matches(later, entry.request_fields, final, redirected=redirected)
 
 
-def _answers(entry: _Entry[Any], response: Response[Any]) -> bool:
-    """Whether a stored response answers the request a new response drew."""
-    original = (
-        response.first_hop_request_fields if response.hops else response.request_fields
-    )
-    return _entry_matches(
-        entry,
-        original,
-        response.request_fields,
-        redirected=entry.redirected or bool(response.hops),
-    )
-
-
 def _request_accepts(
     request_fields: Fields, current_age: float, remaining: float | None
 ) -> bool:
@@ -989,20 +974,9 @@ class FreshnessCache[T]:
     ``requested_at`` like ``header_lifetime``; it runs on every 200 AND
     every 304 -- against the stored value, the only body a 304 has.
 
-    ``timestamp(value)`` dates a body for the "never older" rule: a 200
-    dated before the stored copy is a stale CDN edge, so the stored copy is
-    kept and marked stale (the next call asks again). A stored timestamp
-    later than the stored copy's own receipt (a producer clock running
-    ahead, or a clock bug) counts as that receipt time, to the second: a
-    far-future stamp can't pin the cache, and a slightly fast clock doesn't
-    switch the rule off. The price of the clamp: under a fast producer
-    clock, an edge copy stamped between the stored copy's receipt and its
-    (future) stamp is accepted, as is one stamped within the receipt
-    second when stamps carry fractions (GBFS 3.0). An older copy is
-    rejected even when it couldn't be stored (``no-store``, ``Vary: *``):
-    it must not replace a newer stored one. Only a stored copy the new
-    response's request would match is compared: another variant (Vary) is
-    no answer to it, older or not.
+    A full response always replaces the stored one (RFC 9111 section
+    4.3.3: after a conditional request, the cache "MUST use the full
+    response"), whatever its body says about when it was built.
     """
 
     def __init__(
@@ -1010,12 +984,10 @@ class FreshnessCache[T]:
         clock: Callable[[], float] = time.monotonic,
         *,
         lifetime: Callable[[T, float | None, datetime], float | None] | None = None,
-        timestamp: Callable[[T], datetime | None] | None = None,
     ) -> None:
         """Create an empty cache reading ages from ``clock`` (monotonic)."""
         self._clock = clock
         self._lifetime = lifetime
-        self._timestamp = timestamp
         self._entries: dict[str, _Entry[T]] = {}
         self._in_flight: dict[_Slot, asyncio.Task[T]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -1055,8 +1027,8 @@ class FreshnessCache[T]:
         request will carry (see :func:`request_fields`; None: none), which
         a stored response's Vary must match. ``min_interval`` (seconds)
         lets a caller reuse a parse the producer declared NO freshness for;
-        it never extends a declared lifetime, ``no-cache``, ``max-age=0``, a
-        stale-edge rejection, ``no-store`` or a Vary mismatch.
+        it never extends a declared lifetime, ``no-cache``, ``max-age=0``,
+        ``no-store`` or a Vary mismatch.
         """
         upcoming: Fields = request_fields or {}
         entry = self._entries.get(key)
@@ -1111,19 +1083,6 @@ class FreshnessCache[T]:
         if len(known) < len(lifetimes):
             return None, shortest
         return shortest, None
-
-    def _rejects(self, entry: _Entry[T], fetched: T) -> bool:
-        if self._timestamp is None:
-            return False
-        stored_at = self._timestamp(entry.value)
-        fetched_at = self._timestamp(fetched)
-        if stored_at is None or fetched_at is None:
-            return False
-        # Body timestamps have whole-second precision (GTFS-RT, GBFS), so
-        # the receipt clamp does too: a snapshot stamped within the second
-        # the stored copy arrived is not older than it.
-        received = entry.received_at.replace(microsecond=0)
-        return fetched_at < min(stored_at, received)
 
     async def _refresh(
         self, slot: _Slot, fetch: Fetch[T], upcoming: Fields, min_interval: float
@@ -1210,14 +1169,6 @@ class FreshnessCache[T]:
                 entry.value, freshness, response
             )
             return entry.value
-        if (
-            entry is not None
-            and _answers(entry, response)
-            and self._rejects(entry, response.value)
-        ):
-            entry.stored_at = requested
-            entry.lifetime = 0.0  # declared stale: the next call asks again
-            return entry.value
         freshness = freshness_of(
             fields,
             requested_at=response.requested_at,
@@ -1233,7 +1184,6 @@ class FreshnessCache[T]:
             fields=fields,
             stored_at=requested,
             lifetime=lifetime,
-            received_at=response.received_at,
             request_fields=response.request_fields,
             url=response.url,
             cap=cap,

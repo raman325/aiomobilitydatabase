@@ -250,17 +250,6 @@ async def fetch_feed_message(
     )
 
 
-def feed_timestamp(message: gtfs_realtime_pb2.FeedMessage) -> datetime | None:
-    """When the producer built this snapshot (``header.timestamp``), if stated.
-
-    GTFS-RT header timestamps only move forward, so the freshness cache
-    uses this to recognise a CDN edge serving an older snapshot.
-    """
-    if message.header.HasField("timestamp") and message.header.timestamp:
-        return _epoch_to_utc(message.header.timestamp)
-    return None
-
-
 # GTFS-RT's WheelchairAccessible is NOT the static wheelchair_accessible
 # vocabulary: it numbers NO_VALUE/UNKNOWN/ACCESSIBLE/INACCESSIBLE 0-3, while
 # the static cell numbers no-info/possible/not-possible 0-2. The concept is

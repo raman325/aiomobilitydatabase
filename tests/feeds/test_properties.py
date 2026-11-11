@@ -3692,7 +3692,6 @@ def _gbfs_handle(documents: dict[str, object]) -> GbfsFeedHandle:
             fields={},
             stored_at=0.0,
             lifetime=float("inf"),
-            received_at=datetime.now(UTC),
         )
     return handle
 

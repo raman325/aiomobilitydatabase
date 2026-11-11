@@ -307,18 +307,13 @@ Notes on direct mode:
   reused. Concurrent calls share one in-flight request per URL and
   request headers (a cancelled caller cancels neither it nor the other
   waiters); requests for one URL with different headers run one at a
-  time, each checking the store first. A
-  response older than the stored copy (a CDN edge behind, by GTFS-RT
-  header timestamp or GBFS `last_updated`) never replaces it; the stored
-  copy is kept but asked about again on the next call. A stored timestamp
-  later than when we received it (a producer clock running ahead) counts
-  as that receipt time, so a far-future stamp can't pin the cache and a
-  slightly fast clock doesn't switch the rule off — even an older copy that
-  couldn't be stored (`no-store`) loses to the stored one. `rt_min_interval=` on
+  time, each checking the store first. A full response always replaces
+  the stored one, as RFC 9111 requires — even an edge's older snapshot (by
+  GTFS-RT header timestamp or GBFS `last_updated`). `rt_min_interval=` on
   `get_transit_feed*` is an opt-in request budget for producers that
   declare no freshness at all: it reuses a realtime parse younger than the
   interval, and never extends `no-cache`, `max-age=0`, an expired
-  lifetime, a rejected older copy, `no-store` or a `Vary` mismatch.
+  lifetime, `no-store` or a `Vary` mismatch.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
   or vehicle with no `start_date` applies to one run, judged at the feed's
   header timestamp alone (never a query setting): the run scheduled to be

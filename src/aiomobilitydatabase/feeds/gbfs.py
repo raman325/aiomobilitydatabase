@@ -317,15 +317,6 @@ def _document_lifetime(
     return min(declared, default=None)
 
 
-def _document_timestamp(document: Mapping[str, Any]) -> datetime | None:
-    """When the producer last updated a document (``last_updated``), if stated.
-
-    The freshness cache uses this to recognise a CDN edge serving an older
-    document after a newer one.
-    """
-    return _reported_at(document.get("last_updated"))
-
-
 def _endpoints_from_discovery(document: Any) -> dict[str, str]:
     """Resolve the name->url endpoint table from a GBFS discovery document.
 
@@ -393,7 +384,7 @@ class GbfsFeedHandle:
         # ttl (from last_updated) and HTTP freshness, the shorter winning,
         # or after a 304. Shared between concurrent calls.
         self._docs: FreshnessCache[dict[str, Any]] = FreshnessCache(
-            lifetime=_document_lifetime, timestamp=_document_timestamp
+            lifetime=_document_lifetime
         )
 
     @classmethod
