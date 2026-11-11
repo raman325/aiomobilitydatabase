@@ -251,6 +251,188 @@ async def test_session_credentials_never_follow_a_header_auth_hop_to_another_ori
     assert mock_api.requests[1].headers.get("Cookie") == "own=away"
 
 
+async def test_session_shared_cookies_never_follow_a_header_auth_hop_away(
+    mock_api: MockApi,
+) -> None:
+    """A session's ``cookies=`` go to every host -- but not past the first
+    hop to another origin: there only the target's own cookies go, and
+    cookies the hops set still land in the session's jar.
+    """
+    away = _elsewhere(mock_api.url("/rt/away"))
+    mock_api.get("/rt", status=302, headers={"Location": away})
+    mock_api.get(
+        "/rt/away",
+        status=302,
+        headers={"Location": mock_api.url("/rt/back"), "Set-Cookie": "set=1"},
+    )
+    mock_api.get("/rt/back", body=VEHICLE_POSITIONS, content_type=PB)
+    jar = aiohttp.CookieJar(unsafe=True)
+    jar.update_cookies({"own": "away"}, URL(away))
+    async with aiohttp.ClientSession(cookie_jar=jar, cookies={"sid": "S"}) as session:
+        await fetch_feed_message(
+            session,
+            mock_api.url("/rt"),
+            auth_type=2,
+            api_key_name="X-Api-Key",
+            api_key="secret123",
+        )
+        # The session's shared cookie is still there for its next request.
+        assert jar.filter_cookies(URL(away))["sid"].value == "S"
+        assert jar.filter_cookies(URL(away))["set"].value == "1"
+    cookies = [r.headers.get("Cookie") for r in mock_api.requests]
+    assert cookies == ["sid=S", "own=away", None]
+
+
+async def test_the_own_cookies_view_delegates_everything_but_shared_cookies() -> None:
+    """Whatever aiohttp version reads or writes it, the view is the jar."""
+    jar = aiohttp.CookieJar(unsafe=True, quote_cookie=False)
+    jar.update_cookies({"sid": "S"})
+    view = redirects_module._OwnCookiesOnly(jar)
+    here = URL("http://h.example/")
+    view.update_cookies({"a": "1"}, here)
+    if hasattr(jar, "update_cookies_from_headers"):
+        view.update_cookies_from_headers(["b=2"], here)
+    else:
+        jar.update_cookies({"b": "2"}, here)
+    assert sorted(view.filter_cookies(here)) == ["a", "b"]
+    assert sorted(jar.filter_cookies(here)) == ["a", "b", "sid"]
+    assert (view.unsafe, view.quote_cookie) == (True, False)
+    assert view.treat_as_secure_origin == getattr(
+        jar, "treat_as_secure_origin", frozenset()
+    )
+    assert len(view) == len(jar) == 3
+    assert sorted(m.key for m in view) == ["a", "b", "sid"]
+    if hasattr(jar, "cookies"):
+        assert view.cookies == jar.cookies
+        assert view.host_only_cookies == jar.host_only_cookies
+    view.clear_domain("h.example")
+    assert len(jar) == 1
+    view.clear()
+    assert len(jar) == 0
+
+
+async def test_a_dummy_cookie_jar_session_is_stripped_on_a_header_auth_hop_away(
+    mock_api: MockApi,
+) -> None:
+    mock_api.get(
+        "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
+    )
+    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
+    async with aiohttp.ClientSession(
+        cookie_jar=aiohttp.DummyCookieJar(), headers={"Authorization": "s"}
+    ) as session:
+        await fetch_feed_message(
+            session,
+            mock_api.url("/rt"),
+            auth_type=2,
+            api_key_name="X-Api-Key",
+            api_key="secret123",
+        )
+    assert mock_api.requests[0].headers["Authorization"] == "s"
+    assert "Authorization" not in mock_api.requests[1].headers
+
+
+async def test_an_opaque_cookie_jar_fails_a_header_auth_hop_away(
+    mock_api: MockApi,
+) -> None:
+    """A jar type whose shared cookies can't be told apart isn't trusted."""
+
+    class _Jar(aiohttp.CookieJar):
+        pass
+
+    mock_api.get(
+        "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
+    )
+    async with aiohttp.ClientSession(cookie_jar=_Jar()) as session:
+        with pytest.raises(SourceConnectionError, match="cookie jar"):
+            await fetch_feed_message(
+                session,
+                mock_api.url("/rt"),
+                auth_type=2,
+                api_key_name="X-Api-Key",
+                api_key="secret123",
+            )
+    assert [r.path for r in mock_api.requests] == ["/rt"]
+
+
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_url_credentials_follow_hops_within_their_origin_only(
+    mock_api: MockApi, auth_type: int | None
+) -> None:
+    """As on aiohttp's own redirects: kept within the origin, never sent
+    past the first hop away -- not even back at their origin -- and a
+    Location's own credentials apply to its origin.
+    """
+    mock_api.get("/rt", status=302, headers={"Location": "/rt/same"})
+    away = _elsewhere(mock_api.url("/rt/away"))
+    mock_api.get("/rt/same", status=302, headers={"Location": away})
+    mock_api.get("/rt/away", status=302, headers={"Location": mock_api.url("/rt/back")})
+    back = URL(mock_api.url("/rt/next")).with_user("v").with_password("w")
+    mock_api.get("/rt/back", status=302, headers={"Location": str(back)})
+    mock_api.get("/rt/next", body=VEHICLE_POSITIONS, content_type=PB)
+    url = URL(mock_api.url("/rt")).with_user("u").with_password("p")
+    async with aiohttp.ClientSession() as session:
+        await fetch_feed_message(
+            session, str(url), auth_type=auth_type, api_key_name="K", api_key="k"
+        )
+    sent = [(r.path, r.headers.get("Authorization")) for r in mock_api.requests]
+    assert sent == [
+        ("/rt", "Basic dTpw"),
+        ("/rt/same", "Basic dTpw"),
+        ("/rt/away", None),
+        ("/rt/back", None),
+        ("/rt/next", "Basic djp3"),
+    ]
+
+
+@pytest.mark.parametrize("timeout_seconds", [0, -1, None])
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_a_timeout_of_none_or_less_is_no_bound_with_or_without_header_auth(
+    mock_api: MockApi, auth_type: int | None, timeout_seconds: float | None
+) -> None:
+    """As aiohttp's own ``total``: None, zero or less sets no bound."""
+    mock_api.get("/rt", status=302, headers={"Location": "/rt/x"})
+    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
+    msg = await _fetch(
+        mock_api,
+        auth_type=auth_type,
+        api_key_name="K",
+        api_key="v",
+        timeout_seconds=timeout_seconds,
+    )
+    assert len(msg.entity) == 2
+
+
+async def test_the_credential_free_hop_keeps_every_value_of_a_repeated_default() -> (
+    None
+):
+    seen: list[tuple[str, list[str]]] = []
+    away: list[str] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        seen.append((request.path, request.headers.getall("X-Multi", [])))
+        if request.path == "/rt":
+            return web.Response(status=302, headers={"Location": away[0]})
+        return web.Response(body=VEHICLE_POSITIONS, content_type=PB)
+
+    app = web.Application()
+    app.router.add_get("/{tail:.*}", handler)
+    defaults = [("X-Multi", "a"), ("X-Multi", "b"), ("Authorization", "s")]
+    async with (
+        TestServer(app) as server,
+        aiohttp.ClientSession(headers=defaults) as session,
+    ):
+        away.append(_elsewhere(str(server.make_url("/away"))))
+        await fetch_feed_message(
+            session,
+            str(server.make_url("/rt")),
+            auth_type=2,
+            api_key_name="K",
+            api_key="v",
+        )
+    assert seen == [("/rt", ["a", "b"]), ("/away", ["a", "b"])]
+
+
 async def test_a_session_setting_that_cant_be_carried_over_fails_the_hop(
     mock_api: MockApi, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -397,7 +579,7 @@ async def test_the_timeout_bounds_the_whole_redirect_chain(
     app = web.Application()
     app.router.add_get("/hop/{step}", hop)
     async with TestServer(app) as server, aiohttp.ClientSession() as session:
-        with pytest.raises(SourceConnectionError):
+        with pytest.raises(SourceConnectionError) as excinfo:
             await fetch_feed_message(
                 session,
                 str(server.make_url("/hop/0")),
@@ -406,6 +588,7 @@ async def test_the_timeout_bounds_the_whole_redirect_chain(
                 api_key="v",
                 timeout_seconds=1.0,
             )
+    assert isinstance(excinfo.value.__cause__, TimeoutError)
 
 
 async def test_a_deadline_spent_between_hops_sends_no_further_request(

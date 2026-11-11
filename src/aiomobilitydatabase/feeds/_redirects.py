@@ -15,6 +15,7 @@ from time import monotonic
 from typing import Any
 
 import aiohttp
+from aiohttp.abc import AbstractCookieJar
 from yarl import URL
 
 from .exceptions import SourceConnectionError
@@ -24,6 +25,7 @@ _MAX_REDIRECTS = 10
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 # Credentials aiohttp itself drops when a redirect leaves the origin.
 _ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization"})
+_NO_URL = URL()
 
 # ClientSession settings a credential-free sibling copies, by the private
 # attribute each is kept in (aiohttp exposes only some of them publicly).
@@ -79,6 +81,79 @@ def _origin(url: URL) -> tuple[str, str | None, int | None]:
     return url.scheme, url.host, url.port
 
 
+def _shared_cookie_keys(jar: aiohttp.CookieJar) -> list[tuple[str, str]]:
+    """Return the jar keys of its shared cookies (no domain: every host).
+
+    aiohttp keeps the session's ``cookies=`` there, keyed ``("", path)``.
+    """
+    return [key for key, cookies in jar._cookies.items() if not key[0] and cookies]
+
+
+class _OwnCookiesOnly(AbstractCookieJar):
+    """A view of a session's jar that never sends its shared cookies.
+
+    Everything else -- including cookies set by the hops -- goes to and
+    comes from the session's own jar.
+    """
+
+    def __init__(self, jar: aiohttp.CookieJar) -> None:
+        super().__init__()
+        self._jar = jar
+
+    @property
+    def unsafe(self) -> bool:
+        value = getattr(self._jar, "unsafe", None)  # public from aiohttp 3.10
+        return bool(self._jar._unsafe if value is None else value)
+
+    @property
+    def quote_cookie(self) -> bool:
+        value = getattr(self._jar, "quote_cookie", None)  # public from aiohttp 3.10
+        return bool(self._jar._quote_cookie if value is None else value)
+
+    @property
+    def treat_as_secure_origin(self) -> Any:
+        return getattr(self._jar, "treat_as_secure_origin", frozenset())
+
+    # Newer aiohttp versions only: read through getattr.
+    @property
+    def cookies(self) -> Any:
+        return getattr(self._jar, "cookies")  # noqa: B009
+
+    @property
+    def host_only_cookies(self) -> Any:
+        return getattr(self._jar, "host_only_cookies")  # noqa: B009
+
+    def clear(self, predicate: Any = None) -> None:
+        self._jar.clear(predicate)
+
+    def clear_domain(self, domain: str) -> None:
+        self._jar.clear_domain(domain)
+
+    def update_cookies(self, cookies: Any, response_url: URL = _NO_URL) -> None:
+        self._jar.update_cookies(cookies, response_url)
+
+    def update_cookies_from_headers(self, headers: Any, response_url: URL) -> None:
+        getattr(self._jar, "update_cookies_from_headers")(headers, response_url)  # noqa: B009
+
+    def filter_cookies(self, request_url: URL = _NO_URL) -> Any:
+        # The full filter first, so expired cookies are purged as usual;
+        # then again with the shared ones hidden. No await in between:
+        # nothing else can observe the jar without them.
+        self._jar.filter_cookies(request_url)
+        stored = self._jar._cookies
+        hidden = {key: stored.pop(key) for key in _shared_cookie_keys(self._jar)}
+        try:
+            return self._jar.filter_cookies(request_url)
+        finally:
+            stored.update(hidden)
+
+    def __iter__(self) -> Any:
+        return iter(self._jar)
+
+    def __len__(self) -> int:
+        return len(self._jar)
+
+
 def _without_credentials(
     session: aiohttp.ClientSession, withheld: frozenset[str]
 ) -> aiohttp.ClientSession:
@@ -90,6 +165,17 @@ def _without_credentials(
     made without it might go somewhere, or carry something, the caller's
     session never would.
     """
+    jar = session.cookie_jar
+    sibling_jar: AbstractCookieJar
+    if isinstance(jar, aiohttp.DummyCookieJar):
+        sibling_jar = jar
+    elif type(jar) is aiohttp.CookieJar and hasattr(jar, "_cookies"):
+        sibling_jar = _OwnCookiesOnly(jar)
+    else:
+        raise SourceConnectionError(
+            "Can't withhold the session's credentials from another origin: "
+            f"its cookie jar ({type(jar).__name__}) can't be inspected"
+        )
     kwargs: dict[str, Any] = {}
     for name in inspect.signature(aiohttp.ClientSession.__init__).parameters:
         if name in _NOT_COPIED:
@@ -101,12 +187,50 @@ def _without_credentials(
                 f"its {name!r} setting can't be carried over"
             )
         kwargs[name] = getattr(session, attribute)
+    # A multidict copy: a repeated default keeps every value.
+    headers = session.headers.copy()
+    for name in withheld:
+        headers.popall(name, None)
     return aiohttp.ClientSession(
         connector=session.connector,
         connector_owner=False,
-        cookie_jar=session.cookie_jar,
-        headers={k: v for k, v in session.headers.items() if k.lower() not in withheld},
+        cookie_jar=sibling_jar,
+        headers=headers,
         **kwargs,
+    )
+
+
+def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str) -> URL:
+    """Resolve a Location as aiohttp does; only an HTTP(S) URL is followed."""
+    try:
+        following = base.join(URL(location, encoded=not session.requote_redirect_url))
+        _origin(following)
+    except ValueError as err:
+        raise SourceConnectionError(
+            f"Producer redirected to an invalid URL ({location!r}): {url}"
+        ) from err
+    if following.scheme not in ("http", "https"):
+        raise SourceConnectionError(
+            f"Producer redirected to a non-HTTP URL ({following}): {url}"
+        )
+    return following
+
+
+def _carries_credentials(
+    session: aiohttp.ClientSession, withheld: frozenset[str]
+) -> bool:
+    """Tell whether a request ``session`` makes carries a withheld default."""
+    jar = session.cookie_jar
+    if isinstance(jar, aiohttp.DummyCookieJar):
+        shared = False
+    elif type(jar) is aiohttp.CookieJar and hasattr(jar, "_cookies"):
+        shared = bool(_shared_cookie_keys(jar))
+    else:
+        shared = True  # can't tell: assume it might
+    return (
+        shared
+        or session.auth is not None
+        or any(name.lower() in withheld for name in session.headers)
     )
 
 
@@ -117,7 +241,7 @@ async def get_withholding(
     *,
     params: Mapping[str, str],
     headers: Mapping[str, str],
-    total: float,
+    total: float | None,
     secret: str | None,
 ) -> AsyncIterator[tuple[aiohttp.ClientResponse, Sequence[aiohttp.ClientResponse]]]:
     """GET ``url``; yield the final response and the redirects followed.
@@ -125,15 +249,18 @@ async def get_withholding(
     Without a ``secret`` header aiohttp follows redirects itself. With one
     they are followed here: from the first hop to another origin on, the
     secret is never sent again, nor are the Authorization, Cookie and
-    Proxy-Authorization headers aiohttp drops there. A session's own
-    defaults among those (or its ``auth``) can't be left off a request it
-    makes, so those hops go through a sibling session without them
-    (:func:`_without_credentials`).
+    Proxy-Authorization headers aiohttp drops there, nor credentials in
+    the URL (which, as on aiohttp's redirects, follow hops within their
+    origin). A session's own defaults among those (its ``auth``, or the
+    shared cookies its ``cookies=`` put in the jar) can't be left off a
+    request it makes, so those hops go through a sibling session without
+    them (:func:`_without_credentials`).
 
     The redirects followed, their limit and how a Location resolves are
     aiohttp's; a Location that isn't an HTTP(S) URL fails
     (:class:`SourceConnectionError`). ``total`` seconds bound the whole
-    fetch, every hop and the body read, as aiohttp's own ``total`` does.
+    fetch, every hop and the body read, as aiohttp's own ``total`` does
+    (``None``, zero or less: no bound).
     """
     if secret is None:
         async with session.get(
@@ -144,17 +271,21 @@ async def get_withholding(
         ) as response:
             yield response, response.history
         return
-    deadline = monotonic() + total
+    deadline = monotonic() + total if total is not None and total > 0 else None
     history: list[aiohttp.ClientResponse] = []
     target = URL(url)
+    # Credentials in the URL: aiohttp sends them for the first hop, and its
+    # own redirects keep sending them while the chain stays in their origin.
+    userinfo = (target.user, target.password) if target.user is not None else None
+    userinfo_origin = _origin(target)
     sent = dict(headers)
     query = params or None
     hop_session = session
     sibling: aiohttp.ClientSession | None = None
     try:
         while True:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
+            remaining = None if deadline is None else deadline - monotonic()
+            if remaining is not None and remaining <= 0:
                 raise TimeoutError
             response = await hop_session.get(
                 target,
@@ -174,27 +305,20 @@ async def get_withholding(
             history.append(response)
             if len(history) >= _MAX_REDIRECTS:
                 raise SourceConnectionError(f"Too many redirects fetching {url}")
-            try:
-                following = response.url.join(
-                    URL(location, encoded=not session.requote_redirect_url)
-                )
-                origin = _origin(following)
-            except ValueError as err:
-                raise SourceConnectionError(
-                    f"Producer redirected to an invalid URL ({location!r}): {url}"
-                ) from err
-            if following.scheme not in ("http", "https"):
-                raise SourceConnectionError(
-                    f"Producer redirected to a non-HTTP URL ({following}): {url}"
-                )
+            following = _resolve(response.url, location, session, url)
+            origin = _origin(following)
             if origin != _origin(response.url):
                 withheld = _ORIGIN_CREDENTIALS | {secret.lower()}
                 sent = {k: v for k, v in sent.items() if k.lower() not in withheld}
-                if sibling is None and (
-                    session.auth is not None
-                    or any(name.lower() in withheld for name in session.headers)
-                ):
+                userinfo = None
+                if sibling is None and _carries_credentials(session, withheld):
                     sibling = hop_session = _without_credentials(session, withheld)
+            if following.user is not None:
+                # Credentials the Location gives are addressed to its origin.
+                userinfo = (following.user, following.password)
+                userinfo_origin = origin
+            elif userinfo is not None and origin == userinfo_origin:
+                following = following.with_user(userinfo[0]).with_password(userinfo[1])
             target, query = following, None
     finally:
         if sibling is not None:
