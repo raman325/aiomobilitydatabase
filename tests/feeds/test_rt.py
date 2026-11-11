@@ -131,6 +131,165 @@ async def test_fetch_rejects_non_http_scheme() -> None:
             await fetch_feed_message(session, "file:///etc/passwd")
 
 
+def _elsewhere(url: str) -> str:
+    """The same mock server under another origin (another host name)."""
+    assert "127.0.0.1" in url
+    return url.replace("127.0.0.1", "localhost")
+
+
+async def test_header_auth_key_never_follows_a_redirect_to_another_origin(
+    mock_api: MockApi,
+) -> None:
+    """RFC 9110 section 15.4: the producer key is withheld from the first
+    hop to another origin on, even when a later hop comes back; a
+    same-origin hop keeps it. Authorization goes too, as aiohttp drops it.
+    """
+    mock_api.get("/rt", status=302, headers={"Location": "/rt/same"})
+    mock_api.get(
+        "/rt/same",
+        status=307,
+        headers={"Location": _elsewhere(mock_api.url("/rt/away"))},
+    )
+    mock_api.get("/rt/away", status=301, headers={"Location": mock_api.url("/rt/back")})
+    mock_api.get("/rt/back", body=VEHICLE_POSITIONS, content_type=PB)
+    async with aiohttp.ClientSession() as session:
+        response = await fetch_feed_message(
+            session,
+            mock_api.url("/rt"),
+            auth_type=2,
+            api_key_name="X-Api-Key",
+            api_key="secret123",
+            headers={"Authorization": "Bearer user", "X-Other": "kept"},
+        )
+    assert response.value is not None and len(response.value.entity) == 2
+    assert [hop.status for hop in response.hops] == [302, 307, 301]
+    assert response.url == mock_api.url("/rt/back")
+    seen = {r.path: r.headers for r in mock_api.requests}
+    for path in ("/rt", "/rt/same"):
+        assert seen[path]["X-Api-Key"] == "secret123"
+        assert seen[path]["Authorization"] == "Bearer user"
+    for path in ("/rt/away", "/rt/back"):
+        assert "X-Api-Key" not in seen[path]
+        assert "Authorization" not in seen[path]
+    assert all(r.headers["X-Other"] == "kept" for r in mock_api.requests)
+
+
+async def test_header_auth_key_is_withheld_whatever_its_case(
+    mock_api: MockApi,
+) -> None:
+    mock_api.get(
+        "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
+    )
+    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
+    async with aiohttp.ClientSession() as session:
+        await fetch_feed_message(
+            session,
+            mock_api.url("/rt"),
+            auth_type=2,
+            api_key_name="x-api-key",
+            api_key="secret123",
+            headers={"X-API-KEY": "custom"},
+        )
+    assert mock_api.requests[0].headers["x-api-key"] == "secret123"
+    assert not any(k.lower() == "x-api-key" for k in mock_api.requests[1].headers)
+
+
+@pytest.mark.parametrize(
+    "credential", ["Authorization", "cookie", "Proxy-Authorization", "auth"]
+)
+# aiohttp 3.14 deprecates session ``auth``; older floors still have it.
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_session_credentials_fail_a_header_auth_hop_to_another_origin(
+    mock_api: MockApi, credential: str
+) -> None:
+    """A hand-made request can't shed a session's default credentials,
+    so it is never sent: the fetch fails instead.
+    """
+    mock_api.get(
+        "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
+    )
+    options: dict[str, object] = (
+        {"auth": aiohttp.BasicAuth("user", "pass")}
+        if credential == "auth"
+        else {"headers": {credential: "secret"}}
+    )
+    async with aiohttp.ClientSession(**options) as session:  # type: ignore[arg-type]
+        with pytest.raises(SourceConnectionError, match="credentials"):
+            await fetch_feed_message(
+                session,
+                mock_api.url("/rt"),
+                auth_type=2,
+                api_key_name="X-Api-Key",
+                api_key="secret123",
+            )
+    assert [r.path for r in mock_api.requests] == ["/rt"]
+
+
+async def test_session_credentials_follow_a_header_auth_hop_within_the_origin(
+    mock_api: MockApi,
+) -> None:
+    mock_api.get("/rt", status=308, headers={"Location": "/rt/x"})
+    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
+    async with aiohttp.ClientSession(headers={"Authorization": "Bearer s"}) as session:
+        await fetch_feed_message(
+            session,
+            mock_api.url("/rt"),
+            auth_type=2,
+            api_key_name="X-Api-Key",
+            api_key="secret123",
+        )
+    assert mock_api.requests[1].headers["X-Api-Key"] == "secret123"
+    assert mock_api.requests[1].headers["Authorization"] == "Bearer s"
+
+
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_the_tenth_redirect_fails_with_or_without_header_auth(
+    mock_api: MockApi, auth_type: int | None
+) -> None:
+    """Followed by hand or by aiohttp, a chain stops at the same hop."""
+    for hop in range(10):
+        mock_api.get(f"/rt/{hop}", status=302, headers={"Location": f"/rt/{hop + 1}"})
+    mock_api.get("/rt/10", body=VEHICLE_POSITIONS, content_type=PB)
+    with pytest.raises(SourceConnectionError):
+        await _fetch(
+            mock_api, "/rt/0", auth_type=auth_type, api_key_name="K", api_key="v"
+        )
+    assert len(mock_api.requests) == 10
+
+
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_nine_redirects_are_followed_with_or_without_header_auth(
+    mock_api: MockApi, auth_type: int | None
+) -> None:
+    for hop in range(9):
+        mock_api.get(f"/rt/{hop}", status=302, headers={"Location": f"/rt/{hop + 1}"})
+    mock_api.get("/rt/9", body=VEHICLE_POSITIONS, content_type=PB)
+    msg = await _fetch(
+        mock_api, "/rt/0", auth_type=auth_type, api_key_name="K", api_key="v"
+    )
+    assert len(msg.entity) == 2
+
+
+@pytest.mark.parametrize("location", ["ftp://127.0.0.1/rt", "http://[::1/rt"])
+async def test_a_header_auth_redirect_to_a_non_http_url_fails(
+    mock_api: MockApi, location: str
+) -> None:
+    mock_api.get("/rt", status=302, headers={"Location": location})
+    with pytest.raises(SourceConnectionError, match="redirected"):
+        await _fetch(mock_api, auth_type=2, api_key_name="K", api_key="v")
+    assert len(mock_api.requests) == 1
+
+
+async def test_a_header_auth_redirect_without_location_is_the_answer(
+    mock_api: MockApi,
+) -> None:
+    """As with aiohttp: a 3xx with no Location is the response itself."""
+    mock_api.get("/rt", status=302)
+    with pytest.raises(SourceConnectionError, match="without a feed") as excinfo:
+        await _fetch(mock_api, auth_type=2, api_key_name="K", api_key="v")
+    assert excinfo.value.status == 302
+
+
 def test_vehicles_from_message() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(VEHICLE_POSITIONS)

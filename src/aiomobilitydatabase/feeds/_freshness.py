@@ -515,7 +515,9 @@ def request_fields(
 
 
 def sent_fields(
-    controlled: Fields, response: aiohttp.ClientResponse
+    controlled: Fields,
+    response: aiohttp.ClientResponse,
+    history: Sequence[aiohttp.ClientResponse] | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """Return the request fields that reached the response's target, as sent.
 
@@ -524,9 +526,10 @@ def sent_fields(
     no later request can be checked against in advance, all but the
     automatic ones: those the client set are kept, the rest are aiohttp's
     own on every hop. (The original request's fields, which the first
-    redirect answered, are :func:`first_hop_fields`.)
+    redirect answered, are :func:`first_hop_fields`.) ``history`` is the
+    redirects followed, when not ``response.history`` (followed by hand).
     """
-    if response.history:
+    if response.history if history is None else history:
         return {
             name: tuple(controlled[name]) for name in controlled if name in _AUTOMATIC
         }
@@ -534,16 +537,19 @@ def sent_fields(
 
 
 def first_hop_fields(
-    controlled: Fields, response: aiohttp.ClientResponse
+    controlled: Fields,
+    response: aiohttp.ClientResponse,
+    history: Sequence[aiohttp.ClientResponse] | None = None,
 ) -> dict[str, tuple[str, ...]] | None:
     """Return the original request's fields when a response was redirected.
 
     The first redirect answered exactly that request, as sent (see
     :func:`_wire_fields`); None for a response that wasn't redirected.
     """
-    if not response.history:
+    followed = response.history if history is None else history
+    if not followed:
         return None
-    return _wire_fields(controlled, response.history[0].request_info.headers)
+    return _wire_fields(controlled, followed[0].request_info.headers)
 
 
 def _wire_fields(
@@ -578,11 +584,17 @@ class Hop:
     fields: Fields
 
 
-def hops(response: aiohttp.ClientResponse) -> tuple[Hop, ...]:
-    """Return the redirects a response was reached through, in order."""
+def hops(
+    response: aiohttp.ClientResponse,
+    history: Sequence[aiohttp.ClientResponse] | None = None,
+) -> tuple[Hop, ...]:
+    """Return the redirects a response was reached through, in order.
+
+    ``history`` overrides ``response.history`` for redirects followed by hand.
+    """
     return tuple(
         Hop(status=hop.status, fields=header_fields(hop.headers))
-        for hop in response.history
+        for hop in (response.history if history is None else history)
     )
 
 
