@@ -268,9 +268,10 @@ Notes on direct mode:
   the afternoon's run, and a late-running run keeps its updates past
   midnight — never tomorrow's, however wide the window or late the board's
   `start`. Two runs equally near (two under way at once) take neither.
-  GTFS-RT requires `start_date` for a trip lasting more than a day and for
-  a frequencies.txt trip, so a date-less update for either applies to no
-  run. A dated
+  GTFS-RT requires `start_date` for a trip lasting more than a day (first
+  departure to last arrival) and both `start_date` and `start_time` for a
+  frequencies.txt trip, so a date-less update or vehicle for either applies
+  to no run — nor does a frequency vehicle missing its `start_time`. A dated
   one applies to exactly its day, including an RT-added trip's vehicle.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic

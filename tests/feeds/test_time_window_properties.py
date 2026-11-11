@@ -21,7 +21,7 @@ import asyncio
 import csv
 import io
 import zipfile
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterator, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -998,6 +998,45 @@ _NEAR_DAY_START = st.tuples(
 )
 
 
+def _trip_spans(
+    stop_times_csv: str, trips: Collection[str]
+) -> dict[str, tuple[int, int]]:
+    """Each trip's (first departure, last arrival), from the raw CSV.
+
+    The first and last TIMED calls by stop_sequence; a call's departure
+    stands in for a missing arrival and vice versa; repeated sequences
+    take the earliest departure and the latest arrival; a trip of one call
+    lasts from its arrival to its departure.
+    """
+    calls: dict[str, list[tuple[int, int | None, int | None]]] = {}
+    for row in csv.DictReader(io.StringIO(stop_times_csv)):
+        arrival, departure = _secs(row["arrival_time"]), _secs(row["departure_time"])
+        if row["trip_id"] not in trips or (arrival is None and departure is None):
+            continue
+        try:
+            sequence = int(row["stop_sequence"])
+        except ValueError:
+            continue
+        calls.setdefault(row["trip_id"], []).append((sequence, arrival, departure))
+    spans: dict[str, tuple[int, int]] = {}
+    for trip_id, rows in calls.items():
+        first = min(sequence for sequence, _, _ in rows)
+        last = max(sequence for sequence, _, _ in rows)
+        # Each row has a time (untimed rows were skipped), so neither is None;
+        # a trip of one call lasts its own dwell, arrival to departure.
+        arrives = [(q, a if a is not None else d) for q, a, d in rows]
+        departs = [(q, d if d is not None else a) for q, a, d in rows]
+        if first == last:
+            start = min(t for q, t in arrives if q == first)
+            end = max(t for q, t in departs if q == last)
+        else:
+            start = min(t for q, t in departs if q == first)
+            end = max(t for q, t in arrives if q == last)
+        assert start is not None and end is not None
+        spans[trip_id] = (start, end)
+    return spans
+
+
 def _active_days(
     index: StaticIndex,
     service_id: str,
@@ -1058,8 +1097,9 @@ def test_current_service_dates_match_their_definition(
 ) -> None:
     """The run a date-less update addresses, from the raw files.
 
-    Definition: a trip whose stop times span more than a day names no run
-    (GTFS-RT requires start_date). Otherwise "today" is the service day
+    Definition: a trip lasting more than a day from its first departure to
+    its last arrival names no run (GTFS-RT requires start_date), nor one
+    arriving before it departs. Otherwise "today" is the service day
     ``now`` falls in -- the latest day whose start (local noon minus 12
     elapsed hours) is at or before ``now``, found by trying every date
     around ``now`` -- and among the trip's runs on every day from the
@@ -1079,13 +1119,7 @@ def test_current_service_dates_match_their_definition(
             row["trip_id"]: row["service_id"]
             for row in csv.DictReader(io.StringIO(trips_csv))
         }
-        spans: dict[str, tuple[int, int]] = {}
-        for row in csv.DictReader(io.StringIO(stop_times_csv)):
-            for cell in (row["arrival_time"], row["departure_time"]):
-                secs = _secs(cell)
-                if secs is not None and row["trip_id"] in service_of:
-                    low, high = spans.get(row["trip_id"], (secs, secs))
-                    spans[row["trip_id"]] = (min(low, secs), max(high, secs))
+        spans = _trip_spans(stop_times_csv, service_of)
         tz = ZoneInfo(timezone)
 
         def anchor(day: date) -> datetime:
@@ -1111,6 +1145,8 @@ def test_current_service_dates_match_their_definition(
                 low, high = spans[trip_id]
                 if high - low > 86_400:
                     event("longer than a day: names no run")
+                elif high < low:
+                    event("arrives before it departs: names no run")
                 else:
                     days = _active_days(index, service_id, first, today, active)
                     runs = [

@@ -271,3 +271,31 @@ async def test_concurrent_repetitions_match_their_own_vehicle(
     assert matched["F1#22800"] == "VB"
     # Siblings the producer said nothing about stay unattached.
     assert "F1#21600" not in matched
+
+
+async def test_a_dated_vehicle_without_start_time_matches_no_repetition(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """start_date alone doesn't say which repetition a frequency vehicle
+    runs (the spec requires start_time too): no repetition takes it --
+    exactly as for a TripUpdate with the same descriptor.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "v"
+    entity.vehicle.vehicle.id = "VF1"
+    entity.vehicle.trip.trip_id = "F1"
+    entity.vehicle.trip.start_date = "20260730"
+    entity.vehicle.position.latitude = 34.1
+    entity.vehicle.position.longitude = -118.3
+    _mock_catalog_with_rt(mock_api, message.SerializeToString())
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])],
+        start=NOW,
+        end=NOW + timedelta(hours=6),
+        with_vehicles=True,
+    )
+    assert arrivals
+    assert all(a.vehicle is None for a in arrivals)

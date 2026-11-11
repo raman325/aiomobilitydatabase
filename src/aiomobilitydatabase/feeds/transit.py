@@ -294,11 +294,10 @@ def _match_vehicle(
 
     ``plain_trip_id`` must be the PRODUCER-facing trip id (a repetition's
     template id, not its synthetic ``{trip_id}#{start_secs}`` id). A
-    repetition is addressed by (template id, its start); a vehicle that
-    names no start_time has not said which repetition it means, so it
-    serves whichever repetition of the current run asks. (This is more
-    lenient than TripUpdates, where an update without start_time matches
-    no repetition: a position is display-only, a prediction is not.)
+    repetition is addressed by (template id, its start) -- and its day:
+    GTFS-RT requires both start_time and start_date for a frequencies.txt
+    trip, so a vehicle lacking either names no repetition, exactly as a
+    TripUpdate lacking either does.
     ``scheduled=False`` is an RT-added row: it matches a vehicle naming
     its ``service_date`` (the added trip's own start_date, possibly None)
     or naming no day at all.
@@ -312,15 +311,14 @@ def _match_vehicle(
     is_current = (
         not scheduled or current_dates.get((plain_trip_id, start_secs)) == service_date
     )
-    for secs in (start_secs, None) if start_secs is not None else (None,):
-        if service_date is not None and (
-            dated := vehicles.by_instance.get((plain_trip_id, secs, service_date))
-        ):
-            return dated
-        if is_current and (
-            dateless := vehicles.by_instance.get((plain_trip_id, secs, None))
-        ):
-            return dateless
+    if service_date is not None and (
+        dated := vehicles.by_instance.get((plain_trip_id, start_secs, service_date))
+    ):
+        return dated
+    if is_current and (
+        dateless := vehicles.by_instance.get((plain_trip_id, start_secs, None))
+    ):
+        return dateless
     return None
 
 
@@ -1499,9 +1497,9 @@ class TransitFeedHandle:
         a dated prediction or cancellation affects only the instance whose
         service day it names — an early-posted "trip X canceled tomorrow"
         never cancels today's departure — while a date-less one affects
-        only the run it means as of the feed's own timestamp: the latest
-        that has started, else today's next, and none for a frequency trip
-        or one longer than a day, which the spec requires to carry a date
+        only the run it means as of the feed's own timestamp: the run
+        under way, else the nearest up to today, and none for a frequency
+        trip or one longer than a day, which the spec requires to carry a date
         (see :meth:`StaticIndex.current_service_dates`), so a board for
         tomorrow morning never moves today's update onto tomorrow's run.
 

@@ -1270,3 +1270,111 @@ def test_two_runs_under_way_across_a_short_day_name_neither() -> None:
     after = datetime(2026, 3, 8, 4, 35, tzinfo=UTC)
     assert index.current_service_dates(["T"], after) == {"T": date(2026, 3, 8)}
     index.close()
+
+
+def test_two_runs_to_come_on_a_skipped_date_name_neither() -> None:
+    """Apia skipped 2011-12-30: that day and 12-31 start at the same
+    instant, so a 12:00 run on each is equally near -- still to come at
+    11:00 UTC on the 30th, 11 hours away. Neither is meant.
+    """
+    feed = _feed(
+        "T,12:00:00,12:00:00,A,1\nT,13:00:00,13:00:00,B,2\n",
+        timezone="Pacific/Apia",
+        calendar="DAILY,1,1,1,1,1,1,1,20111229,20120102",
+    )
+    index = _index_from_zip_bytes(feed)
+    now = datetime(2011, 12, 30, 11, tzinfo=UTC)
+    assert index._service_day_start(date(2011, 12, 30)) == index._service_day_start(
+        date(2011, 12, 31)
+    )
+    assert index.current_service_dates(["T"], now) == {}
+    index.close()
+
+
+def test_the_search_for_a_tying_run_never_crosses_a_long_gap() -> None:
+    """A week of service in 2016 and one added date on 2026-11-09: the
+    second run worth comparing with 11-09's is a day or two back at most,
+    so the search reads a handful of days, not ten years of them.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\nT,09:00:00,09:00:00,B,2\n",
+        calendar="DAILY,1,1,1,1,1,1,1,20160101,20160107",
+        extra={
+            "calendar_dates.txt": "service_id,date,exception_type\nDAILY,20261109,1\n"
+        },
+    )
+    index = _index_from_zip_bytes(feed)
+    reads: list[date] = []
+    active = index.active_service_ids
+
+    def counted(day: date) -> set[str]:
+        reads.append(day)
+        return active(day)
+
+    index.active_service_ids = counted  # type: ignore[method-assign]
+    now = datetime(2026, 11, 10, 7, tzinfo=UTC)
+    assert index.current_service_dates(["T"], now) == {"T": date(2026, 11, 9)}
+    assert len(reads) < 10
+    index.close()
+
+
+@pytest.mark.parametrize(
+    ("stop_times", "names_a_run"),
+    [
+        # Dwell at either end doesn't count: departs 00:30, arrives 24:20 --
+        # 23h50, a day or less.
+        ("T,00:00:00,00:30:00,A,1\nT,24:20:00,24:40:00,B,2\n", True),
+        # Departs 00:00, arrives 24:00:01: just over a day.
+        ("T,00:00:00,00:00:00,A,1\nT,24:00:01,24:00:01,B,2\n", False),
+        # Arrives before it departs (times decreasing): no run.
+        ("T,10:00:00,10:00:00,A,1\nT,09:00:00,09:00:00,B,2\n", False),
+        # One call: it lasts its own dwell.
+        ("T,10:00:00,10:05:00,A,1\n", True),
+    ],
+)
+def test_a_trip_lasts_from_its_first_departure_to_its_last_arrival(
+    stop_times: str, names_a_run: bool
+) -> None:
+    index = _index_from_zip_bytes(_feed(stop_times))
+    now = datetime(2026, 6, 10, 12, tzinfo=UTC)
+    assert bool(index.current_service_dates(["T"], now)) is names_a_run
+    index.close()
+
+
+@pytest.mark.parametrize(
+    ("calendar", "dates"),
+    [
+        # A service only in calendar_dates: its first date is its earliest.
+        ("OTHER,1,1,1,1,1,1,1,20260101,20261231", "SVC,20261109,1\nSVC,20261120,1\n"),
+        # An added date before its calendar starts comes first.
+        ("SVC,1,1,1,1,1,1,1,20261115,20261231", "SVC,20261109,1\n"),
+    ],
+)
+def test_a_services_first_date_counts_every_source(calendar: str, dates: str) -> None:
+    feed = _feed(
+        "T,14:00:00,14:00:00,A,1\nT,15:00:00,15:00:00,B,2\n",
+        calendar=calendar,
+        trips="R,SVC,T\n",
+        extra={"calendar_dates.txt": "service_id,date,exception_type\n" + dates},
+    )
+    index = _index_from_zip_bytes(feed)
+    now = datetime(2026, 11, 10, 9, tzinfo=UTC)
+    assert index.current_service_dates(["T"], now) == {"T": date(2026, 11, 9)}
+    index.close()
+
+
+def test_two_ended_runs_on_a_skipped_date_name_neither() -> None:
+    """Apia's 2011-12-30 and 12-31 runs share one start, so they also end
+    at the same instant: at 19:00 local on the 31st both ended six hours
+    ago, equally near, and 2012-01-01's run belongs to a later day.
+    """
+    feed = _feed(
+        "T,12:00:00,12:00:00,A,1\nT,13:00:00,13:00:00,B,2\n",
+        timezone="Pacific/Apia",
+        calendar="DAILY,1,1,1,1,1,1,1,20111229,20120102",
+    )
+    index = _index_from_zip_bytes(feed)
+    now = datetime(2011, 12, 31, 5, tzinfo=UTC)
+    assert index._service_day_of(now) == date(2011, 12, 31)
+    assert index.current_service_dates(["T"], now) == {}
+    index.close()

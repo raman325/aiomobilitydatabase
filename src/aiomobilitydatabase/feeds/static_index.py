@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .exceptions import FeedParseError
@@ -480,6 +480,15 @@ def _days(first: date, last: date, *, backward: bool = False) -> Iterator[date]:
             if backward
             else first + timedelta(days=offset)
         )
+
+
+class _RunQuery(NamedTuple):
+    """One trip's runs to choose among: its service, span, and the instant."""
+
+    service_id: str
+    start_secs: int
+    end_secs: int
+    now: datetime
 
 
 class StaticIndex:
@@ -1778,7 +1787,9 @@ class StaticIndex:
         run, but ``start_date`` is required for a trip lasting more than 24
         hours, and ``start_date`` with ``start_time`` for a frequencies.txt
         trip. So a date-less key for a frequency repetition, or for a trip
-        whose stop times span more than a day, names no run.
+        lasting more than a day from its first departure to its last
+        arrival, names no run -- nor does one whose last arrival precedes
+        its first departure (GTFS requires times not to decrease).
 
         For any other trip it means, among its runs on service days up to
         today -- the service day ``now`` falls in, which on a spring-forward
@@ -1790,32 +1801,105 @@ class StaticIndex:
         Two runs equally near -- two under way at once -- collide (the spec
         requires ``start_date`` there): no run. A later day's run is never
         meant. Nothing but the feed's own time decides it, so one snapshot
-        binds each update to one run whatever a query asks. Stop times span
-        the whole trip, not just the stops a query asked about.
+        binds each update to one run whatever a query asks. A run lasts
+        from its first departure to its last arrival, over the whole trip,
+        not just the stops a query asked about; a run whose day starts
+        before datetime can hold is no run (as in the window scans).
 
         A ``now`` outside the range service days can be dated in (a
         garbage but representable feed timestamp) has no current run.
         """
         if not trip_ids or not _EARLIEST_INSTANT <= now < _LATEST_INSTANT:
             return {}
-        marks = ",".join("?" * len(trip_ids))
-        span = (
-            "COALESCE(st.arrival_secs, st.departure_secs)",
-            "COALESCE(st.departure_secs, st.arrival_secs)",
-        )
-        trips = self._conn.execute(
-            f"SELECT t.id, t.service_id, t.start_secs, MIN(MIN({span[0]}, {span[1]})), "
-            f"MAX(MAX({span[0]}, {span[1]})) "
-            "FROM trips t JOIN stop_times st ON st.trip_id = t.id "
-            f"WHERE t.id IN ({marks}) GROUP BY t.id",
-            list(trip_ids),
-        ).fetchall()
+        trips = self._trip_spans(trip_ids)
         today = self._service_day_of(now)
         first_dates = self._service_first_dates()
         last_dates = self._service_last_dates()
         active_by_day: dict[date, set[str]] = {}
+        current: dict[str, date] = {}
+        for trip_id, service_id, repetition, start_secs, end_secs in trips:
+            if start_secs is None or end_secs is None or repetition is not None:
+                continue  # untimed, or a frequency repetition: start_time needed
+            if end_secs - start_secs > _ONE_DAY:
+                continue  # longer than a day: start_date required
+            if end_secs < start_secs:
+                continue  # arriving before it departs: times that name no run
+            # Only the days its own service can run: a walk never crosses
+            # years of a calendar the trip has no part in.
+            lower, upper = first_dates.get(service_id), last_dates.get(service_id)
+            if lower is None or upper is None:
+                continue
+            day = self._nearest_run(
+                _RunQuery(service_id, start_secs, end_secs, now),
+                lower,
+                min(upper, today),
+                active_by_day,
+            )
+            if day is not None:
+                current[trip_id] = day
+        return current
 
-        def running(service_id: str, days: Iterable[date], most: int) -> list[date]:
+    def _trip_spans(
+        self, trip_ids: Sequence[str]
+    ) -> list[tuple[str, str, int | None, int | None, int | None]]:
+        """Return (trip, service, repetition start, first, last) per trip.
+
+        A trip lasts from its first departure to its last arrival: the first
+        and last TIMED calls by stop_sequence, a departure standing in for a
+        missing arrival and vice versa (GTFS-RT reads a trip's start as its
+        first departure). A trip of one call lasts that call's own dwell,
+        arrival to departure. Repeated sequences take the earliest departure
+        and the latest arrival. No timed call: first and last are None.
+        """
+        marks = ",".join("?" * len(trip_ids))
+        trips = self._conn.execute(
+            f"SELECT id, service_id, start_secs FROM trips WHERE id IN ({marks})",
+            list(trip_ids),
+        ).fetchall()
+        calls: dict[str, list[tuple[int, int, int]]] = {}
+        for trip_id, sequence, arrival, departure in self._conn.execute(
+            "SELECT trip_id, stop_sequence, arrival_secs, departure_secs "
+            f"FROM stop_times WHERE trip_id IN ({marks}) "
+            "AND (arrival_secs IS NOT NULL OR departure_secs IS NOT NULL) "
+            "AND stop_sequence IS NOT NULL",
+            list(trip_ids),
+        ):
+            arrives = arrival if arrival is not None else departure
+            departs = departure if departure is not None else arrival
+            calls.setdefault(trip_id, []).append((sequence, arrives, departs))
+        spans: list[tuple[str, str, int | None, int | None, int | None]] = []
+        for trip_id, service_id, repetition in trips:
+            rows = calls.get(trip_id)
+            if not rows:
+                spans.append((trip_id, service_id, repetition, None, None))
+                continue
+            first = min(sequence for sequence, _, _ in rows)
+            last = max(sequence for sequence, _, _ in rows)
+            if first == last:  # one call: its own dwell, arrival to departure
+                start = min(arrives for seq, arrives, _ in rows if seq == first)
+                end = max(departs for seq, _, departs in rows if seq == last)
+            else:
+                start = min(departs for seq, _, departs in rows if seq == first)
+                end = max(arrives for seq, arrives, _ in rows if seq == last)
+            spans.append((trip_id, service_id, repetition, start, end))
+        return spans
+
+    def _nearest_run(
+        self,
+        query: _RunQuery,
+        lower: date,
+        upper: date,
+        active_by_day: dict[date, set[str]],
+    ) -> date | None:
+        """Return the day of the run nearest ``query.now`` in [lower, upper].
+
+        Under way is distance zero; otherwise the gap to a run's first
+        departure (to come) or from its last arrival (ended). Two equally
+        near: None.
+        """
+        service_id, start_secs, end_secs, now = query
+
+        def running(days: Iterable[date], most: int) -> list[date]:
             found: list[date] = []
             for day in days:
                 active = active_by_day.get(day)
@@ -1827,53 +1911,46 @@ class StaticIndex:
                         break
             return found
 
-        current: dict[str, date] = {}
-        for trip_id, service_id, repetition, start_secs, end_secs in trips:
-            if start_secs is None or repetition is not None:
-                continue  # untimed, or a frequency repetition: start_time needed
-            if end_secs - start_secs > _ONE_DAY:
-                continue  # longer than a day: start_date required
-            # Only the days its own service can run: a walk never crosses
-            # years of a calendar the trip has no part in.
-            lower, upper = first_dates.get(service_id), last_dates.get(service_id)
-            if lower is None or upper is None:
-                continue
-            upper = min(upper, today)
-            if lower > upper:
-                continue
-            # Day starts only increase, so the days whose run hasn't started
-            # by ``now`` are a suffix (binary search); nothing is ever
-            # subtracted from a date before it, so year 1 is safe.
-            to_come = self._first_reaching_day(
-                lower, upper, start_secs, now + timedelta(microseconds=1)
-            )
-            started: list[date] = []
-            if to_come is None or to_come > lower:
-                last_started = upper if to_come is None else to_come - timedelta(days=1)
-                # The latest started run is the nearest of those (later runs
-                # end later); the one before it matters only if it is under
-                # way too.
-                started = running(
-                    service_id, _days(lower, last_started, backward=True), 2
+        if lower > upper:
+            return None
+        # Day starts only increase, so the days whose run hasn't started by
+        # ``now`` are a suffix (binary search); nothing is ever subtracted
+        # from a date before it, so year 1 is safe.
+        to_come = self._first_reaching_day(
+            lower, upper, start_secs, now + timedelta(microseconds=1)
+        )
+        started: list[date] = []
+        if to_come is None or to_come > lower:
+            last_started = upper if to_come is None else to_come - timedelta(days=1)
+            # The latest started run is the nearest of those (later runs end
+            # later).
+            started = running(_days(lower, last_started, backward=True), 1)
+            latest = started[0] if started else None
+            run = self._run_span(latest, start_secs, end_secs) if latest else None
+            if latest is not None and run is not None and latest > lower:
+                # An earlier run can only tie with it if it ends no earlier:
+                # under way too, or ended at the same instant (two dates
+                # sharing one start, a skipped date). Those days are a suffix
+                # ending just before it -- never a walk across a long gap.
+                before = latest - timedelta(days=1)
+                tie_from = self._first_reaching_day(
+                    lower, before, end_secs, min(now, run[1])
                 )
-            coming = (
-                running(service_id, _days(to_come, upper), 1)
-                if to_come is not None
-                else []
-            )
-            distances: list[tuple[timedelta, date]] = []
-            for day in started:
-                run = self._run_span(day, start_secs, end_secs)
-                if run is not None:
-                    distances.append((max(now - run[1], timedelta(0)), day))
-            for day in coming:
-                run = self._run_span(day, start_secs, end_secs)
-                if run is not None:
-                    distances.append((run[0] - now, day))
-            distances.sort()
-            if distances and (len(distances) == 1 or distances[0][0] < distances[1][0]):
-                current[trip_id] = distances[0][1]
-        return current
+                if tie_from is not None:
+                    started += running(_days(tie_from, before, backward=True), 1)
+        # Two runs to come can tie too: two dates sharing one start.
+        coming = running(_days(to_come, upper), 2) if to_come is not None else []
+        distances: list[tuple[timedelta, date]] = []
+        for day in started:
+            if (span := self._run_span(day, start_secs, end_secs)) is not None:
+                distances.append((max(now - span[1], timedelta(0)), day))
+        for day in coming:
+            if (span := self._run_span(day, start_secs, end_secs)) is not None:
+                distances.append((span[0] - now, day))
+        distances.sort()
+        if distances and (len(distances) == 1 or distances[0][0] < distances[1][0]):
+            return distances[0][1]
+        return None
 
     def _run_span(
         self, day: date, start_secs: int, end_secs: int
