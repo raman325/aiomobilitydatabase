@@ -259,6 +259,61 @@ Notes on direct mode:
   be dated, and a negative `grace`.
   `end` bounds scheduled times; a delayed trip predicted past it, and
   RT-added trips, still show.
+- **Producers decide how fresh is fresh**: realtime and GBFS fetches
+  follow HTTP caching strictly (RFC 9111, as a private cache). Inside a
+  response's declared lifetime (`Cache-Control: max-age`, or
+  `Expires`/`Date`, less its `Age`) the stored parse is reused with no
+  request; afterwards the request is conditional (`ETag`/`Last-Modified`),
+  so an unchanged feed costs a `304`. A `304` counts only if its validator
+  identifies the stored copy; one naming another `ETag`, or none at all,
+  changes nothing and is asked again unconditionally. Validators must be
+  well-formed: an unquoted `ETag` (`abc123`, a common misconfiguration),
+  `*` or a list, and a `Last-Modified` that isn't an HTTP-date, validate
+  nothing — such a producer gets unconditional requests. A counting `304`
+  updates only the headers it carries — one with just its `ETag` after
+  `no-cache` is still `no-cache`; one without `Date` is dated on arrival;
+  one without `Age` keeps the stored `Age` — and freshness is recomputed
+  from the merged headers. A stored copy answers only requests matching
+  the request headers its `Vary` names: a cookie the producer set since,
+  or a changed session default header, means asking again (a `304` then
+  makes it the answer for the new request); `Vary: *` is never stored, and
+  a header added outside the session's and handle's own (a middleware's)
+  can't be predicted, so a `Vary` naming it always asks. A redirected
+  response answers its original URL only while every redirect may be
+  reused too: the shortest lifetime of the chain, none when a redirect
+  declares none. A 302, 303 or 307 that has neither freshness of its own
+  nor a `public` marking is asked every time, even under
+  `rt_min_interval`. A redirect's own `Vary` counts: the first redirect's
+  is matched against the original request, while later hops and the
+  target can only be shown to match on aiohttp's automatic headers — so a
+  `Vary: Accept-Encoding` still lets a redirected feed be reused. A `304`
+  from the redirect's target speaks for that resource, not the stored
+  one, so it is asked again unconditionally. Only a `200` (or `203`)
+  carries a feed: any other status below 400 is a `SourceConnectionError`,
+  never an empty feed stored in its place. A handle's own `Cache-Control`
+  request header is honoured, read as strictly as a response's: `no-cache`
+  revalidates, `max-age=N` accepts a response at most N seconds old (its
+  own age included), `min-fresh=N` one fresh for N more seconds, `no-store`
+  keeps responses out of the cache, and an invalid or malformed one
+  accepts nothing stored.
+  A bare `no-cache` revalidates every time (one naming fields only bars
+  passing those fields on, which this cache never does), `no-store` is
+  never stored, invalid freshness (including a
+  malformed `Cache-Control`) counts as stale, and a response declaring
+  nothing is revalidated on every call — no heuristic lifetimes. A GBFS
+  document's `ttl` counts from its own `last_updated`, and the shorter of
+  `ttl` and the HTTP lifetime wins — on a `304` too, so a renewal never
+  outlives the document; an unusable `ttl` means the document isn't
+  reused. Concurrent calls share one in-flight request per URL and
+  request headers (a cancelled caller cancels neither it nor the other
+  waiters); requests for one URL with different headers run one at a
+  time, each checking the store first. A full response always replaces
+  the stored one, as RFC 9111 requires — even an edge's older snapshot (by
+  GTFS-RT header timestamp or GBFS `last_updated`). `rt_min_interval=` on
+  `get_transit_feed*` is an opt-in request budget for producers that
+  declare no freshness at all: it reuses a realtime parse younger than the
+  interval, and never extends `no-cache`, `max-age=0`, an expired
+  lifetime, `no-store` or a `Vary` mismatch.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
   or vehicle with no `start_date` applies to one run, judged at the feed's
   header timestamp alone (never a query setting): the run scheduled to be

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 from collections.abc import Callable, Mapping, Sequence
+from datetime import timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Self
@@ -179,10 +180,20 @@ class MobilityFeedsClient:
     async def get_transit_feed(
         self,
         feed_id: str,
+        *,
         api_key: str | None = None,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
+        rt_min_interval: timedelta = timedelta(0),
     ) -> TransitFeedHandle:
         """Resolve a GTFS or GTFS-RT feed ID into a TransitFeedHandle.
+
+        Realtime responses are reused only as the producer allows (its
+        declared HTTP freshness, or a 304). ``rt_min_interval`` is an
+        opt-in request budget for producers that declare no freshness at
+        all: a parse from such a response is reused while younger than the
+        interval. It never extends a declared lifetime (``no-cache``,
+        ``max-age=0``, an expired ``max-age``/``Expires``) or ``no-store``.
+        A negative interval raises ``ValueError``.
 
         ``on_progress``, if given, must not raise: it is called inline and
         is NOT wrapped in a try/except, so a raising callback aborts this
@@ -197,7 +208,13 @@ class MobilityFeedsClient:
         callback's own scheduling, so it cannot abort a build already in
         progress.
         """
-        return await load_transit_handle().create(self, feed_id, api_key, on_progress)
+        return await load_transit_handle().create(
+            self,
+            feed_id,
+            api_key,
+            on_progress,
+            rt_min_interval=rt_min_interval,
+        )
 
     async def get_transit_feed_from_urls(
         self,
@@ -208,6 +225,7 @@ class MobilityFeedsClient:
         service_alerts_urls: Sequence[str] | None = None,
         headers: Mapping[str, str] | None = None,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
+        rt_min_interval: timedelta = timedelta(0),
     ) -> TransitFeedHandle:
         """Build a TransitFeedHandle from user-supplied URLs (no catalog).
 
@@ -225,8 +243,8 @@ class MobilityFeedsClient:
         offering neither fall back to a sha256 of the downloaded bytes.
         The on-disk cache key is ``url-<sha256(static_url)[:16]>`` (also
         exposed as the handle's ``static_feed_id``, accepted by
-        :meth:`purge_cache`). ``on_progress`` follows the same contract as
-        :meth:`get_transit_feed`.
+        :meth:`purge_cache`). ``on_progress`` and ``rt_min_interval``
+        follow the same contracts as :meth:`get_transit_feed`.
         """
         return await load_transit_handle().create_from_urls(
             self,
@@ -236,6 +254,7 @@ class MobilityFeedsClient:
             service_alerts_urls=service_alerts_urls,
             headers=headers,
             on_progress=on_progress,
+            rt_min_interval=rt_min_interval,
         )
 
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeedHandle:

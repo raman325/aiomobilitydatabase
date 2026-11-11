@@ -96,12 +96,23 @@ async def test_stations_zone_filter(
     assert [station.id for station in zoned] == ["st1"]
 
 
+def _just_updated(document: dict[str, object]) -> dict[str, object]:
+    """The document as if its producer had just updated it.
+
+    A GBFS ttl counts from ``last_updated``; the fixtures' fixed timestamps
+    are long past, so those documents are already stale by design.
+    """
+    return {**document, "last_updated": int(datetime.now(UTC).timestamp())}
+
+
 async def test_ttl_micro_cache(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
     _mock_catalog(mock_api)
-    mock_api.get("/gbfs/station_information.json", payload=STATION_INFO_23)
-    mock_api.get("/gbfs/station_status.json", payload=STATION_STATUS_23)
+    mock_api.get(
+        "/gbfs/station_information.json", payload=_just_updated(STATION_INFO_23)
+    )
+    mock_api.get("/gbfs/station_status.json", payload=_just_updated(STATION_STATUS_23))
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     await handle.get_stations()
     await handle.get_stations()  # within ttl: NO second fetch of either doc
@@ -296,16 +307,28 @@ def test_endpoints_from_discovery_bad_feeds_still_tries_language_blocks() -> Non
         pytest.param(-5, id="negative"),
     ],
 )
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({}, id="no-http-freshness"),
+        pytest.param({"Cache-Control": "max-age=300"}, id="http-max-age"),
+    ],
+)
 async def test_malformed_ttl_degrades_to_no_caching(
-    mock_api: MockApi, feeds_client: MobilityFeedsClient, ttl: object
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    ttl: object,
+    headers: dict[str, str],
 ) -> None:
     """A ttl that isn't a usable number must not escape as ValueError or
-    TypeError: the document still parses and simply isn't cached.
+    TypeError: the document still parses and simply isn't cached -- not
+    even under a longer HTTP lifetime, since the document did declare one
+    and we can't tell how short it meant.
     """
     _mock_catalog(mock_api)
-    payload = {**SYSTEM_INFO_23, "ttl": ttl}
-    mock_api.get("/gbfs/system_information.json", payload=payload)
-    mock_api.get("/gbfs/system_information.json", payload=payload)
+    payload = {**_just_updated(SYSTEM_INFO_23), "ttl": ttl}
+    for _ in range(2):
+        mock_api.get("/gbfs/system_information.json", payload=payload, headers=headers)
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     assert (await handle.get_system_info()).system_id == "test-bikes"
     await handle.get_system_info()
@@ -319,7 +342,8 @@ async def test_numeric_string_ttl_still_caches(
     """Producers do ship ttl as a string; a parseable one keeps caching."""
     _mock_catalog(mock_api)
     mock_api.get(
-        "/gbfs/system_information.json", payload={**SYSTEM_INFO_23, "ttl": "60"}
+        "/gbfs/system_information.json",
+        payload={**_just_updated(SYSTEM_INFO_23), "ttl": "60"},
     )
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     await handle.get_system_info()
