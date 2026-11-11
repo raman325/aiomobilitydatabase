@@ -29,7 +29,7 @@ class MobilityDatabaseRateLimitError(MobilityDatabaseError):
 
 
 class MobilityDatabaseApiError(MobilityDatabaseError):
-    """The API returned an unexpected 4xx/5xx error."""
+    """The API answered with an unexpected status (a 4xx/5xx error, or no answer)."""
 
     def __init__(self, status: int, body: str) -> None:
         """Initialize with the HTTP status and raw response body."""

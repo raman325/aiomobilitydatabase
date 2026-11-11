@@ -205,10 +205,11 @@ Notes on direct mode:
   fetches sources that can serve it. A combined feed listed under several
   layers is deduplicated and fetched once per operation; if you don't know
   a producer's layer split, pass the same URL to every layer.
-- Dataset identity comes from HTTP validators (`ETag`, then
-  `Last-Modified`, via a `HEAD` probe) instead of catalog dataset IDs;
-  servers offering neither fall back to hashing the downloaded bytes, so
-  `refresh_static()` still only rebuilds on real changes. The cache key is
+- Dataset identity comes from the download's own strong `ETag` instead of
+  catalog dataset IDs (a `HEAD` reporting the same one skips the
+  download); a weak `ETag`, a `Last-Modified` (never exact) or none at all
+  falls back to hashing the downloaded bytes, so `refresh_static()` still
+  only rebuilds on real changes. Only a `200` or `203` is a dataset. The cache key is
   derived from the static URL (`url-<hash>`, exposed as
   `transit.static_feed_id` and accepted by `purge_cache()`), and
   `transit.static_dataset` is `None` (there is no catalog metadata).
@@ -279,25 +280,22 @@ Notes on direct mode:
   the request headers its `Vary` names: a cookie the producer set since,
   or a changed session default header, means asking again (a `304` then
   makes it the answer for the new request); `Vary: *` is never stored, and
-  a header added outside the session's and handle's own (a middleware's)
-  can't be predicted, so a `Vary` naming it always asks. A redirected
+  a session with client middlewares can add headers no prediction sees, so
+  for such a session every response with a `Vary` is revalidated. A redirected
   response answers its original URL only while every redirect may be
   reused too: the shortest lifetime of the chain, none when a redirect
-  declares none. A 302, 303 or 307 that has neither freshness of its own
-  nor a `public` marking is asked every time, even under
-  `rt_min_interval`. A redirect's own `Vary` counts: the first redirect's
+  declares none. A 302, 303 or 307 without freshness of its own is asked
+  every time, even under `rt_min_interval`. A redirect's own `Vary` counts: the first redirect's
   is matched against the original request, while later hops and the
   target can only be shown to match on aiohttp's automatic headers — so a
-  `Vary: Accept-Encoding` still lets a redirected feed be reused. A `304`
-  from the redirect's target speaks for that resource, not the stored
-  one, so it is asked again unconditionally. Only a `200` (or `203`)
+  `Vary: Accept-Encoding` still lets a redirected feed be reused.
+  Validators go only to the resource they came from: a redirected feed's
+  original URL is asked plainly and its target conditionally, and a `304`
+  from any other resource is asked again unconditionally. Only a `200` (or `203`)
   carries a feed: any other status below 400 is a `SourceConnectionError`,
-  never an empty feed stored in its place. A handle's own `Cache-Control`
-  request header is honoured, read as strictly as a response's: `no-cache`
-  revalidates, `max-age=N` accepts a response at most N seconds old (its
-  own age included), `min-fresh=N` one fresh for N more seconds, `no-store`
-  keeps responses out of the cache, and an invalid or malformed one
-  accepts nothing stored.
+  never an empty feed stored in its place. A handle's own `Cache-Control:
+  no-store` request header keeps responses out of the cache; the other
+  request directives are advisory (RFC 9111 section 5.2.1) and ignored.
   A bare `no-cache` revalidates every time (one naming fields only bars
   passing those fields on, which this cache never does), `no-store` is
   never stored, invalid freshness (including a
@@ -307,9 +305,10 @@ Notes on direct mode:
   `ttl` and the HTTP lifetime wins — on a `304` too, so a renewal never
   outlives the document; an unusable `ttl` means the document isn't
   reused. Concurrent calls share one in-flight request per URL and
-  request headers (a cancelled caller cancels neither it nor the other
-  waiters); requests for one URL with different headers run one at a
-  time, each checking the store first. A full response always replaces
+  request headers until it is sent (a cancelled caller cancels neither it
+  nor the other waiters); a call arriving later waits for it and checks
+  the store, so it never gets a response it may not reuse. Requests for
+  one URL run one at a time, each checking the store first. A full response always replaces
   the stored one, as RFC 9111 requires — even an edge's older snapshot (by
   GTFS-RT header timestamp or GBFS `last_updated`). `rt_min_interval=` on
   `get_transit_feed*` is an opt-in request budget for producers that

@@ -1,9 +1,11 @@
-"""GET with redirects followed by hand, withholding a secret header.
+"""GET with redirects followed by hand, withholding headers they mustn't carry.
 
 aiohttp drops Authorization, Cookie and Proxy-Authorization when a
 redirect leaves the origin, but forwards every other header -- including
-a header-auth API key. RFC 9110 section 15.4 says to remove fields with
-security implications there, so a secret header is fetched through here.
+a header-auth API key, and the cache's own validators. RFC 9110 section
+15.4 says to remove both: fields with security implications when the
+origin changes, and validators the cache added on any redirect. A
+request carrying either is fetched through here.
 """
 
 from __future__ import annotations
@@ -58,15 +60,24 @@ async def get_withholding(
     headers: Mapping[str, str],
     total: float | None,
     secret: str | None,
+    conditional: Mapping[str, str] | None = None,
+    conditional_url: str | None = None,
 ) -> AsyncIterator[tuple[aiohttp.ClientResponse, Sequence[aiohttp.ClientResponse]]]:
     """GET ``url``; yield the final response and the redirects followed.
 
-    Without a ``secret`` header aiohttp follows redirects itself. With one
-    they are followed here: from the first hop to another origin on, the
-    secret is never sent again, nor are the Authorization, Cookie and
-    Proxy-Authorization headers aiohttp drops there, nor credentials in
-    the URL (which, as on aiohttp's redirects, follow hops within their
-    origin).
+    ``conditional`` are the cache's validators (If-None-Match and
+    If-Modified-Since), for the resource at ``conditional_url`` (None:
+    ``url``): sent only on a hop asking for exactly that resource. Never
+    carried along a redirect to another (RFC 9110 section 15.4 step 2.4),
+    and never sent to a URL that redirected to the one they came from
+    (RFC 9111 section 4.3.1) -- whose own request then gets them.
+
+    Without a ``secret`` header or ``conditional`` aiohttp follows
+    redirects itself. Otherwise they are followed here: from the first hop
+    to another origin on, the secret is never sent again, nor are the
+    Authorization, Cookie and Proxy-Authorization headers aiohttp drops
+    there, nor credentials in the URL (which, as on aiohttp's redirects,
+    follow hops within their origin).
 
     A session's own defaults among those (its ``auth`` or such default
     headers) ride on every request it makes, so a hop to another origin
@@ -78,7 +89,7 @@ async def get_withholding(
     body read, as aiohttp's own ``total`` does (``None``, zero or less:
     no bound).
     """
-    if secret is None:
+    if secret is None and not conditional:
         async with session.get(
             url,
             params=params or None,
@@ -88,10 +99,11 @@ async def get_withholding(
             yield response, response.history
         return
     deadline = monotonic() + total if total is not None and total > 0 else None
-    withheld = _ORIGIN_CREDENTIALS | {secret.lower()}
+    withheld = _ORIGIN_CREDENTIALS | ({secret.lower()} if secret else set())
     history: list[aiohttp.ClientResponse] = []
     target = URL(url)
     sent = dict(headers)
+    validated = URL(conditional_url) if conditional_url is not None else target
     query = params or None
     # Credentials in the URL: aiohttp sends them for the first hop, and its
     # own redirects keep sending them while the chain stays in their origin.
@@ -101,10 +113,13 @@ async def get_withholding(
         remaining = None if deadline is None else deadline - monotonic()
         if remaining is not None and remaining <= 0:
             raise TimeoutError
+        # The validators go to the resource they came from, and only to it.
+        asked = target.with_user(None) == validated.with_user(None)
+        hop_headers = {**sent, **conditional} if conditional and asked else sent
         response = await session.get(
             target,
             params=query,
-            headers=sent or None,
+            headers=hop_headers or None,
             timeout=aiohttp.ClientTimeout(total=remaining),
             allow_redirects=False,
         )

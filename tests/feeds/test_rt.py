@@ -401,6 +401,30 @@ async def test_a_deadline_spent_between_hops_sends_no_further_request(
     assert [r.path for r in mock_api.requests] == ["/rt"]
 
 
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_a_redirect_loop_fails_with_or_without_header_auth(
+    mock_api: MockApi, auth_type: int | None
+) -> None:
+    """RFC 9110 section 15.4: a client SHOULD detect and intervene in
+    cyclical redirections -- the redirect limit ends the loop."""
+    for _ in range(5):
+        mock_api.get("/rt/a", status=302, headers={"Location": "/rt/b"})
+        mock_api.get("/rt/b", status=302, headers={"Location": "/rt/a"})
+    with pytest.raises(SourceConnectionError):
+        await _fetch(
+            mock_api, "/rt/a", auth_type=auth_type, api_key_name="K", api_key="v"
+        )
+    assert len(mock_api.requests) == 10
+
+
+async def test_an_unsolicited_304_is_a_connection_error(mock_api: MockApi) -> None:
+    """A 304 answers only a conditional request; there is no stored parse."""
+    mock_api.get("/rt", status=304)
+    with pytest.raises(SourceConnectionError, match="unconditional") as excinfo:
+        await _fetch(mock_api)
+    assert excinfo.value.status == 304
+
+
 def test_vehicles_from_message() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(VEHICLE_POSITIONS)
@@ -1094,6 +1118,12 @@ def test_alert_text_detail_and_images_are_surfaced() -> None:
         pytest.param("2026-07-30", None, id="dashed"),
         pytest.param("20261345", None, id="impossible"),
         pytest.param("", None, id="empty"),
+        # strptime would read these as real days.
+        pytest.param("2026111", None, id="seven-digits"),
+        pytest.param("2026 111", None, id="space"),
+        pytest.param(
+            "\uff12\uff10\uff12\uff16\uff10\uff17\uff13\uff10", None, id="fullwidth"
+        ),
     ],
 )
 def test_lenient_service_date(raw: str, expected: date | None) -> None:

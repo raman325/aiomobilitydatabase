@@ -33,7 +33,7 @@ from ..models import (
     LatestDataset,
     SourceInfo,
 )
-from ._freshness import FreshnessCache
+from ._freshness import FreshnessCache, _etag, header_fields
 from ._urls import (
     _require_http_url,  # deliberate friend access: shared data-origin URL guard
 )
@@ -124,16 +124,27 @@ def _sha256_of_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Only these statuses carry a dataset (RFC 9110 section 15.3).
+_DATASET_STATUSES = frozenset({HTTPStatus.OK, HTTPStatus.NON_AUTHORITATIVE_INFORMATION})
+
+
+def _strong_etag(headers: Mapping[str, str]) -> str | None:
+    """Return a response's ETag if it is exactly one strong entity-tag."""
+    etag = _etag(header_fields(headers))
+    return None if etag is None or etag.startswith("W/") else etag
+
+
 @dataclass(frozen=True)
 class _StaticSource:
     """Where a static GTFS zip comes from and how its dataset is identified.
 
     One shape for both acquisition paths so the download+build core never
     forks: the catalog path fills ``dataset_id`` from latest-dataset
-    metadata, while the direct-URL path fills it from HTTP validators
-    (``etag:``/``lastmod:`` prefixed) -- or leaves it None, meaning
-    "identify by sha256 of the downloaded bytes" (which requires the
-    download to happen before the cache can be consulted).
+    metadata. The direct-URL path (``direct``) fills it from a HEAD's
+    strong ETag (``etag:``), only to find a cached index without
+    downloading -- or leaves it None. Either way a direct dataset is
+    identified by the GET that delivered it: that response's own strong
+    ETag, else the sha256 of its bytes.
     """
 
     url: str
@@ -141,6 +152,7 @@ class _StaticSource:
     dataset_id: str | None
     timezone_name: str | None
     headers: Mapping[str, str] | None
+    direct: bool = False
 
 
 @dataclass(frozen=True)
@@ -998,8 +1010,9 @@ class TransitFeedHandle:
         # by the caller, and only when the producer declared nothing --
         # within rt_min_interval. Shared between concurrent calls; see
         # FreshnessCache.
-        self._rt_cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
-        self._rt_min_interval = rt_min_interval.total_seconds()
+        self._rt_cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache(
+            min_interval=rt_min_interval.total_seconds()
+        )
         self._stops: tuple[Stop, ...] = tuple(index.stops())
         self._routes: tuple[Route, ...] = tuple(index.routes())
         self._agencies: tuple[Agency, ...] = tuple(index.agencies())
@@ -1161,6 +1174,7 @@ class TransitFeedHandle:
             dataset_id=await cls._probe_direct_dataset_id(client, direct),
             timezone_name=None,  # always sourced from agency.txt at build
             headers=headers,
+            direct=True,
         )
         index = await cls._ensure_index_from_source(client, source, on_progress)
         return cls(
@@ -1177,16 +1191,17 @@ class TransitFeedHandle:
     async def _probe_direct_dataset_id(
         client: MobilityFeedsClient, direct: _DirectUrls
     ) -> str | None:
-        """HEAD the static URL and derive a dataset id from HTTP validators.
+        """HEAD the static URL for a strong ETag naming its dataset.
 
         Catalog datasets carry a stable dataset id for cache comparisons; a
-        bare URL doesn't, so ETag (preferred: content-derived) or
-        Last-Modified stand in, cheaply checked without downloading.
-        Returns None when the server offers neither validator or rejects
-        HEAD outright (e.g. 405) — callers then fall back to hashing the
-        downloaded bytes. Connection failures raise instead of silently
-        degrading to the hash path: the GET would fail identically, so
-        failing here is both earlier and cheaper.
+        bare URL doesn't, so a strong ETag stands in, cheaply checked
+        without downloading. Only a strong one identifies exact bytes (RFC
+        9110 section 8.8.1): a weak ETag or a Last-Modified (implicitly
+        weak, section 8.8.2.2) doesn't, nor does ``*`` or a malformed tag.
+        Returns None when there is no such ETag or HEAD fails (e.g. 405) —
+        the download then identifies the dataset itself. Connection failures
+        raise instead: the GET would fail identically, so failing here is
+        both earlier and cheaper.
         """
         session = client._get_session()  # deliberate friend access
         try:
@@ -1196,11 +1211,10 @@ class TransitFeedHandle:
                 allow_redirects=True,  # match GET semantics: probe the final URL
                 timeout=aiohttp.ClientTimeout(total=client.timeout_seconds),
             ) as resp:
-                if resp.status < HTTPStatus.BAD_REQUEST:
-                    if etag := resp.headers.get("ETag"):
-                        return f"etag:{etag}"
-                    if last_modified := resp.headers.get("Last-Modified"):
-                        return f"lastmod:{last_modified}"
+                if resp.status in _DATASET_STATUSES and (
+                    etag := _strong_etag(resp.headers)
+                ):
+                    return f"etag:{etag}"
         except (TimeoutError, aiohttp.ClientError) as err:
             raise SourceConnectionError(
                 f"Error probing {direct.static_url}: {err}"
@@ -1240,10 +1254,11 @@ class TransitFeedHandle:
         """Shared download+build core behind both acquisition strategies.
 
         With a known ``dataset_id`` the cache is consulted before any
-        network I/O; a None id (direct URL without HTTP validators) forces
-        the download first, then retries the cache with the computed
-        ``sha256:`` id — an unchanged validator-less dataset still avoids
-        an index rebuild, just not the transfer.
+        network I/O. Otherwise -- and for a direct URL, whatever a HEAD
+        said -- the download identifies the dataset (its strong ETag, else
+        the ``sha256:`` of its bytes) and the cache is retried with that:
+        an unchanged dataset still avoids an index rebuild, just not the
+        transfer.
         """
         db_path: Path | None = None
         if client.cache_dir is not None:
@@ -1273,17 +1288,19 @@ class TransitFeedHandle:
         tmp_dir = await asyncio.to_thread(tempfile.mkdtemp)
         try:
             zip_path = Path(tmp_dir) / "dataset.zip"
-            await cls._download_zip(client, source, zip_path, on_progress)
+            etag = await cls._download_zip(client, source, zip_path, on_progress)
             dataset_id = source.dataset_id
+            if source.direct:
+                dataset_id = None if etag is None else f"etag:{etag}"
             if dataset_id is None:
                 sha = await asyncio.to_thread(_sha256_of_file, zip_path)
                 dataset_id = f"sha256:{sha}"
-                if db_path is not None:
-                    cached = await asyncio.to_thread(
-                        StaticIndex.open_cached, db_path, dataset_id
-                    )
-                    if cached is not None:
-                        return cached
+            if dataset_id != source.dataset_id and db_path is not None:
+                cached = await asyncio.to_thread(
+                    StaticIndex.open_cached, db_path, dataset_id
+                )
+                if cached is not None:
+                    return cached
             return await cls._build_index(
                 zip_path, db_path, dataset_id, source.timezone_name, on_progress
             )
@@ -1296,8 +1313,13 @@ class TransitFeedHandle:
         source: _StaticSource,
         zip_path: Path,
         on_progress: Callable[[StaticBuildProgress], None] | None,
-    ) -> None:
-        """Stream the dataset zip to disk, emitting download progress."""
+    ) -> str | None:
+        """Stream the dataset zip to disk, emitting download progress.
+
+        Returns the response's strong ETag, if it carries one. Only a 200
+        or 203 carries the dataset: a 204, a 206 nobody asked for, a 3xx
+        left unfollowed raise :class:`SourceConnectionError`.
+        """
         session = client._get_session()  # deliberate friend access
         try:
             async with session.get(
@@ -1312,6 +1334,13 @@ class TransitFeedHandle:
                         f"Dataset fetch failed ({resp.status}) for {source.url}",
                         status=resp.status,
                     )
+                if resp.status not in _DATASET_STATUSES:
+                    raise SourceConnectionError(
+                        f"Dataset URL answered {resp.status} without a dataset: "
+                        f"{source.url}",
+                        status=resp.status,
+                    )
+                etag = _strong_etag(resp.headers)
                 total_bytes = resp.content_length
                 done_bytes = 0
                 last_emitted = 0
@@ -1349,6 +1378,7 @@ class TransitFeedHandle:
                     )
         except (TimeoutError, aiohttp.ClientError) as err:
             raise SourceConnectionError(f"Error downloading dataset: {err}") from err
+        return etag
 
     @staticmethod
     async def _build_index(
@@ -1438,7 +1468,6 @@ class TransitFeedHandle:
                     api_key=self._api_key,
                     headers=self._headers,
                 ),
-                min_interval=self._rt_min_interval,
             )
             if memo is not None:
                 memo[url] = message
@@ -2630,14 +2659,14 @@ class TransitFeedHandle:
         return True
 
     async def _refresh_static_direct(self, direct: _DirectUrls) -> bool:
-        """Direct strategy: HTTP validators stand in for the catalog compare.
+        """Direct strategy: a strong ETag stands in for the catalog compare.
 
-        A HEAD-derived id (``etag:``/``lastmod:``) that matches the current
-        index short-circuits with no download. A validator-less server
-        forces a re-download so the bytes can be hashed — the resulting
-        ``sha256:`` id may then match the current index after all, in which
-        case the freshly acquired candidate is discarded and False is
-        returned (the transfer was the unavoidable cost of identification).
+        A HEAD-derived ``etag:`` id that matches the current index
+        short-circuits with no download. Otherwise the download identifies
+        the dataset -- its id may then match the current index after all,
+        in which case the freshly acquired candidate is discarded and False
+        is returned (the transfer was the unavoidable cost of
+        identification).
         """
         probed = await self._probe_direct_dataset_id(self._client, direct)
         if probed is not None and probed == self._index.dataset_id:
@@ -2648,6 +2677,7 @@ class TransitFeedHandle:
             dataset_id=probed,
             timezone_name=None,
             headers=direct.headers,
+            direct=True,
         )
         new_index = await self._ensure_index_from_source(self._client, source)
         if new_index.dataset_id == self._index.dataset_id:

@@ -106,7 +106,10 @@ async def test_direct_transit_cache_hit_skips_download(
 ) -> None:
     mock_api.head(STATIC_PATH, headers={"ETag": '"v1"'})
     mock_api.get(
-        STATIC_PATH, body=build_gtfs_zip_bytes(), content_type="application/zip"
+        STATIC_PATH,
+        body=build_gtfs_zip_bytes(),
+        content_type="application/zip",
+        headers={"ETag": '"v1"'},
     )
     await direct_client_cached.get_transit_feed_from_urls(mock_api.url(STATIC_PATH))
     # Second acquisition: HEAD reports the same ETag, so the cached index is
@@ -125,7 +128,10 @@ async def test_direct_refresh_static_etag(
 ) -> None:
     mock_api.head(STATIC_PATH, headers={"ETag": '"v1"'})
     mock_api.get(
-        STATIC_PATH, body=build_gtfs_zip_bytes(), content_type="application/zip"
+        STATIC_PATH,
+        body=build_gtfs_zip_bytes(),
+        content_type="application/zip",
+        headers={"ETag": '"v1"'},
     )
     handle = await direct_client_cached.get_transit_feed_from_urls(
         mock_api.url(STATIC_PATH)
@@ -137,28 +143,35 @@ async def test_direct_refresh_static_etag(
     # Changed ETag: re-download, rebuild, and the new data becomes visible.
     mock_api.head(STATIC_PATH, headers={"ETag": '"v2"'})
     mock_api.get(
-        STATIC_PATH, body=_zip_with_extra_stop(), content_type="application/zip"
+        STATIC_PATH,
+        body=_zip_with_extra_stop(),
+        content_type="application/zip",
+        headers={"ETag": '"v2"'},
     )
     assert await handle.refresh_static() is True
     assert "S9" in {stop.id for stop in handle.stops}
     assert len(_requests_for(mock_api, "GET", STATIC_PATH)) == 2
 
 
-async def test_direct_refresh_static_last_modified(
+async def test_direct_refresh_static_last_modified_is_no_identity(
     mock_api: MockApi, direct_client: MobilityFeedsClient
 ) -> None:
-    # No ETag anywhere: Last-Modified is the second-choice validator.
-    mock_api.head(
-        STATIC_PATH, headers={"Last-Modified": "Thu, 30 Jul 2026 00:00:00 GMT"}
-    )
+    """Last-Modified is implicitly weak (RFC 9110 section 8.8.2.2): it never
+    names exact bytes, so the download identifies the dataset -- an
+    unchanged one by its hash, without a rebuild.
+    """
+    unchanged = {"Last-Modified": "Thu, 30 Jul 2026 00:00:00 GMT"}
+    mock_api.head(STATIC_PATH, headers=unchanged)
     mock_api.get(
         STATIC_PATH, body=build_gtfs_zip_bytes(), content_type="application/zip"
     )
     handle = await direct_client.get_transit_feed_from_urls(mock_api.url(STATIC_PATH))
-    mock_api.head(
-        STATIC_PATH, headers={"Last-Modified": "Thu, 30 Jul 2026 00:00:00 GMT"}
+    mock_api.head(STATIC_PATH, headers=unchanged)
+    mock_api.get(
+        STATIC_PATH, body=build_gtfs_zip_bytes(), content_type="application/zip"
     )
     assert await handle.refresh_static() is False
+    assert len(_requests_for(mock_api, "GET", STATIC_PATH)) == 2
     mock_api.head(
         STATIC_PATH, headers={"Last-Modified": "Fri, 31 Jul 2026 00:00:00 GMT"}
     )
@@ -397,3 +410,56 @@ async def test_direct_gbfs_discovery_without_feeds_raises(
     mock_api.get("/gbfs/gbfs.json", payload={"data": {}})
     with pytest.raises(FeedParseError, match="no usable feeds"):
         await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+
+
+@pytest.mark.parametrize("etag", ['W/"v1"', "*", "v1", '"v1", "v2"'])
+async def test_only_a_strong_etag_names_a_dataset(
+    mock_api: MockApi, direct_client_cached: MobilityFeedsClient, etag: str
+) -> None:
+    """A weak, wildcard or malformed ETag (RFC 9110 section 8.8.3) names no
+    exact bytes: each acquisition downloads, and the hash finds the cached
+    index.
+    """
+    for _ in range(2):
+        mock_api.head(STATIC_PATH, headers={"ETag": etag})
+        mock_api.get(
+            STATIC_PATH,
+            body=build_gtfs_zip_bytes(),
+            content_type="application/zip",
+            headers={"ETag": etag},
+        )
+        handle = await direct_client_cached.get_transit_feed_from_urls(
+            mock_api.url(STATIC_PATH)
+        )
+    assert handle._index.dataset_id.startswith("sha256:")
+    assert len(_requests_for(mock_api, "GET", STATIC_PATH)) == 2
+
+
+async def test_the_download_names_its_own_dataset(
+    mock_api: MockApi, direct_client: MobilityFeedsClient
+) -> None:
+    """RFC 9110 section 9.3.2: a HEAD only SHOULD match the GET. The index
+    is named by the GET that delivered it, not by the HEAD before it.
+    """
+    mock_api.head(STATIC_PATH, headers={"ETag": '"v1"'})
+    mock_api.get(
+        STATIC_PATH,
+        body=build_gtfs_zip_bytes(),
+        content_type="application/zip",
+        headers={"ETag": '"v2"'},
+    )
+    handle = await direct_client.get_transit_feed_from_urls(mock_api.url(STATIC_PATH))
+    assert handle._index.dataset_id == 'etag:"v2"'
+
+
+@pytest.mark.parametrize("status", [204, 206, 300, 302])
+async def test_only_a_200_or_203_is_a_dataset(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, status: int
+) -> None:
+    """RFC 9110 section 15.3: a 204 has no content, a 206 nobody asked for
+    is part of one, a 3xx left unfollowed is no dataset."""
+    mock_api.head(STATIC_PATH, status=405)
+    mock_api.get(STATIC_PATH, status=status, body=b"x", content_type="application/zip")
+    with pytest.raises(SourceConnectionError, match="without a dataset") as excinfo:
+        await direct_client.get_transit_feed_from_urls(mock_api.url(STATIC_PATH))
+    assert excinfo.value.status == status

@@ -15,15 +15,12 @@ from ._freshness import (
     FreshnessCache,
     Response,
     Validators,
-    first_hop_fields,
     header_fields,
     request_fields,
-    sent_fields,
 )
-from ._freshness import (
-    hops as _hops,
-)
+from ._freshness import hops as _hops
 from ._frozen import FrozenDict
+from ._redirects import get_withholding
 from ._urls import _require_http_url  # deliberate friend access: shared URL guard
 from .const import GBFS_LANGUAGE_PREFERENCE
 from .exceptions import FeedParseError, SourceConnectionError
@@ -444,18 +441,20 @@ class GbfsFeedHandle:
         """
         _require_http_url(url, context)
         session = client._get_session()  # deliberate friend access
-        request_headers = dict(headers) if headers else {}
-        # Before the validators: they are the cache's, not the request's own.
-        controlled = request_fields(session, url, request_headers)
-        if validators is not None:
-            request_headers.update(validators.request_headers())
         requested_at = datetime.now(UTC)
         try:
-            async with session.get(
+            async with get_withholding(
+                session,
                 url,
-                headers=request_headers or None,
-                timeout=aiohttp.ClientTimeout(total=client.timeout_seconds),
-            ) as resp:
+                params={},
+                headers=dict(headers) if headers else {},
+                total=client.timeout_seconds,
+                secret=None,
+                conditional=(
+                    None if validators is None else validators.request_headers()
+                ),
+                conditional_url=None if validators is None else validators.url,
+            ) as (resp, history):
                 received_at = datetime.now(UTC)
                 fields = header_fields(resp.headers)
                 if resp.status == HTTPStatus.NOT_MODIFIED:
@@ -470,10 +469,8 @@ class GbfsFeedHandle:
                         fields=fields,
                         requested_at=requested_at,
                         received_at=received_at,
-                        request_fields=sent_fields(controlled, resp),
-                        hops=_hops(resp),
+                        hops=_hops(resp, history),
                         url=str(resp.url),
-                        first_hop_request_fields=first_hop_fields(controlled, resp),
                     )
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
@@ -492,9 +489,8 @@ class GbfsFeedHandle:
                     document = await resp.json(content_type=None)
                 except ValueError as err:
                     raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
-                sent, hops = sent_fields(controlled, resp), _hops(resp)
+                hops = _hops(resp, history)
                 answered = str(resp.url)
-                first = first_hop_fields(controlled, resp)
         except (TimeoutError, aiohttp.ClientError) as err:
             raise SourceConnectionError(f"Error fetching {url}: {err}") from err
         if not isinstance(document, dict) or "data" not in document:
@@ -504,10 +500,8 @@ class GbfsFeedHandle:
             fields=fields,
             requested_at=requested_at,
             received_at=received_at,
-            request_fields=sent,
             hops=hops,
             url=answered,
-            first_hop_request_fields=first,
         )
 
     async def _document(self, name: str) -> dict[str, Any]:

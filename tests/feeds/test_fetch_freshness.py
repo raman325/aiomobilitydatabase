@@ -596,10 +596,11 @@ async def test_a_redirect_that_may_not_be_stored_is_asked_every_time(
 async def test_a_redirect_targets_304_never_revalidates_the_original(
     mock_api: MockApi, feeds_client: MobilityFeedsClient, api_key: str | None
 ) -> None:
-    """/rt/all answered with ETag "1"; then it redirects to /rt/moved, whose
-    own "1" matches the forwarded If-None-Match. That 304 is about another
-    resource: the cache asks again, unconditionally, and gets /rt/moved's
-    feed.
+    """/rt/all answered with ETag "1"; then it redirects to /rt/moved. The
+    validators belong to /rt/all, so they are never carried to /rt/moved
+    (RFC 9110 section 15.4 step 2.4) -- and a 304 it sends anyway is about
+    another resource: the cache asks again, unconditionally, and gets
+    /rt/moved's feed.
     """
     _mock_transit(mock_api)
     moved = mock_api.url("/rt/moved")
@@ -618,7 +619,12 @@ async def test_a_redirect_targets_304_never_revalidates_the_original(
     assert await _t1_delay(handle) == 60
     assert await _t1_delay(handle) == 120
     moved_hits = [r.headers for r in mock_api.requests if r.path == "/rt/moved"]
-    assert [hit.get("If-None-Match") for hit in moved_hits] == ['"1"', None]
+    assert [hit.get("If-None-Match") for hit in moved_hits] == [None, None]
+    assert [hit.get("If-None-Match") for hit in _rt_hits(mock_api)] == [
+        None,
+        '"1"',
+        None,
+    ]
 
 
 @WITH_AND_WITHOUT_KEY
@@ -749,6 +755,31 @@ async def test_gbfs_a_redirected_document_records_the_url_that_answered(
     assert entry.redirected
 
 
+async def test_gbfs_revalidates_a_redirected_document_at_its_own_url(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Validators come from the target, so only the target's request carries
+    them (RFC 9111 section 4.3.1): the original URL is asked plainly, and
+    the redirect's target answers 304.
+    """
+    _mock_gbfs(mock_api)
+    moved = mock_api.url("/gbfs/moved.json")
+    for status in (200, 304):
+        mock_api.get(INFO, status=301, headers={"Location": moved})
+        mock_api.get(
+            "/gbfs/moved.json",
+            status=status,
+            payload=_info(ttl=0) if status == 200 else None,
+            headers={"ETag": '"g1"'},
+        )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    assert (await handle.get_system_info()).name == "Test Bikes"
+    assert (await handle.get_system_info()).name == "Test Bikes"
+    assert all("If-None-Match" not in hit for hit in _info_hits(mock_api))
+    moved_hits = [r.headers for r in mock_api.requests if r.path == "/gbfs/moved.json"]
+    assert [hit.get("If-None-Match") for hit in moved_hits] == [None, '"g1"']
+
+
 async def test_a_header_auth_redirect_to_another_origin_is_cached_without_the_key(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
@@ -781,5 +812,7 @@ async def test_a_header_auth_redirect_to_another_origin_is_cached_without_the_ke
     assert await _t1_delay(handle) == 60
     away_hits = [r.headers for r in mock_api.requests if r.path == "/rt/away"]
     assert [hit.get("If-None-Match") for hit in away_hits] == [None, '"v1"']
+    # The original URL redirected: its request carries none of the target's.
+    assert all("If-None-Match" not in hit for hit in _rt_hits(mock_api))
     assert all(hit["X-Api-Key"] == "secret" for hit in _rt_hits(mock_api))
     assert not any("x-api-key" in {k.lower() for k in hit} for hit in away_hits)
