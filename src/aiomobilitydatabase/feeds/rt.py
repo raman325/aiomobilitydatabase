@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from http import HTTPStatus
-from time import monotonic
 from typing import Any
 
 import aiohttp
 from google.transit import gtfs_realtime_pb2
-from yarl import URL
 
 from ._freshness import (
     Response,
@@ -27,6 +24,7 @@ from ._freshness import (
 from ._freshness import (
     hops as _hops,
 )
+from ._redirects import get_withholding
 from ._urls import _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
@@ -150,109 +148,6 @@ def feed_request_fields(
     return request_fields(session, url, req_headers)
 
 
-# aiohttp's own redirect limit: the tenth redirect raises.
-_MAX_REDIRECTS = 10
-_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-# Credentials aiohttp itself drops when a redirect leaves the origin.
-_ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization"})
-
-
-def _origin(url: URL) -> tuple[str, str | None, int | None]:
-    """RFC 6454 origin: an explicit default port names the same origin.
-
-    (yarl's ``URL.origin()`` keeps an explicit ``:443``, so it can't be
-    compared directly.)
-    """
-    return url.scheme, url.host, url.port
-
-
-@asynccontextmanager
-async def _get(
-    session: aiohttp.ClientSession,
-    url: str,
-    *,
-    params: Mapping[str, str],
-    headers: Mapping[str, str],
-    total: float,
-    secret: str | None,
-) -> AsyncIterator[tuple[aiohttp.ClientResponse, Sequence[aiohttp.ClientResponse]]]:
-    """GET ``url``; yield the final response and the redirects followed.
-
-    Without a ``secret`` header aiohttp follows redirects itself. With one
-    (a header-auth API key) they are followed here, because aiohttp
-    forwards every custom header to wherever a redirect points: the
-    secret is dropped at the first hop to another origin, and never sent
-    again (RFC 9110 section 15.4: remove fields with security
-    implications). The Authorization, Cookie and Proxy-Authorization
-    headers aiohttp drops there are dropped too. Session defaults can't
-    be withheld from a hand-made request, so a session carrying such a
-    default header (or default ``auth``) fails such a hop instead
-    (:class:`SourceConnectionError`), as does a Location that isn't an
-    HTTP(S) URL or a chain of ten redirects. ``total`` seconds bound the
-    whole fetch, every hop and the body read, as aiohttp's own ``total``.
-    """
-    if secret is None:
-        async with session.get(
-            url,
-            params=params or None,
-            headers=headers or None,
-            timeout=aiohttp.ClientTimeout(total=total),
-        ) as response:
-            yield response, response.history
-        return
-    deadline = monotonic() + total
-    history: list[aiohttp.ClientResponse] = []
-    target = URL(url)
-    sent = dict(headers)
-    query = params or None
-    while True:
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise TimeoutError
-        response = await session.get(
-            target,
-            params=query,
-            headers=sent or None,
-            timeout=aiohttp.ClientTimeout(total=remaining),
-            allow_redirects=False,
-        )
-        location = response.headers.get("Location")
-        if response.status not in _REDIRECT_STATUSES or location is None:
-            try:
-                yield response, history
-            finally:
-                response.release()
-            return
-        response.release()
-        history.append(response)
-        if len(history) >= _MAX_REDIRECTS:
-            raise SourceConnectionError(f"Too many redirects fetching {url}")
-        try:
-            following = response.url.join(
-                URL(location, encoded=not session.requote_redirect_url)
-            )
-            origin = _origin(following)
-        except ValueError as err:
-            raise SourceConnectionError(
-                f"Producer redirected to an invalid URL ({location!r}): {url}"
-            ) from err
-        if following.scheme not in ("http", "https"):
-            raise SourceConnectionError(
-                f"Producer redirected to a non-HTTP URL ({following}): {url}"
-            )
-        if origin != _origin(response.url):
-            withheld = _ORIGIN_CREDENTIALS | {secret.lower()}
-            if session.auth is not None or any(
-                name.lower() in withheld for name in session.headers
-            ):
-                raise SourceConnectionError(
-                    f"Producer redirected to another origin ({following.origin()}) "
-                    f"and the session carries credentials that can't be withheld: {url}"
-                )
-            sent = {k: v for k, v in sent.items() if k.lower() not in withheld}
-        target, query = following, None
-
-
 async def fetch_feed_message(
     session: aiohttp.ClientSession,
     url: str,
@@ -291,7 +186,7 @@ async def fetch_feed_message(
     requested_at = datetime.now(UTC)
     secret = api_key_name if auth_type == _AUTH_TYPE_HEADER and api_key else None
     try:
-        async with _get(
+        async with get_withholding(
             session,
             url,
             params=params,

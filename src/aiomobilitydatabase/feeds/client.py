@@ -236,7 +236,9 @@ class MobilityFeedsClient:
         deduplicated and fetched once per operation. If you don't know a
         producer's layer split, pass the same URL to every layer.
         ``headers`` apply to the static download and every RT fetch for
-        the handle.
+        the handle. Like any aiohttp request headers they follow
+        redirects, to another origin too: aiohttp drops only
+        Authorization, Cookie and Proxy-Authorization there.
 
         Dataset identity without a catalog: the static URL is HEAD-probed
         for an ETag (preferred) or Last-Modified validator; servers
@@ -273,6 +275,8 @@ class MobilityFeedsClient:
         point; its published feed list replaces catalog endpoint
         resolution. Returns the same handle type as :meth:`get_gbfs_feed`.
         ``headers`` apply to the discovery fetch and every document fetch
-        for the handle.
+        for the handle. Like any aiohttp request headers they follow
+        redirects, to another origin too: aiohttp drops only
+        Authorization, Cookie and Proxy-Authorization there.
         """
         return await GbfsFeedHandle.create_from_url(self, discovery_url, headers)
