@@ -1511,3 +1511,45 @@ def test_plain_trip_starts_leave_out_what_is_not_a_plain_trip() -> None:
     assert index.plain_trip_starts(["NOPE"]) == {}
     assert index.plain_trip_starts(["T", "NOPE"]) == {"T": 8 * 3600}
     index.close()
+
+
+def test_a_bare_vehicle_claim_wins_over_its_start_time_equivalent() -> None:
+    """Two vehicles name T's run, one bare and one with T's own start time:
+    as for TripUpdates, the bare claim is kept, not both dropped."""
+    feed = _feed("T,08:00:00,08:00:00,A,1\nT,08:30:00,08:30:00,B,2\n")
+    now = datetime(2026, 6, 10, 7, tzinfo=UTC)
+    message = _dateless_message(now)
+    other = message.entity.add()
+    other.id = "vp2"
+    other.vehicle.trip.trip_id = "T"
+    other.vehicle.trip.start_time = "08:00:00"
+    other.vehicle.vehicle.id = "BUS2"
+    other.vehicle.position.latitude = 0
+    other.vehicle.position.longitude = 0
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=1)], start=now, with_vehicles=True
+        )
+        [row] = board
+        assert row.vehicle is not None and row.vehicle.vehicle_id == "BUS1"
+
+    _run(_index_from_zip_bytes(feed), body, message)
+
+
+def test_a_plain_trips_own_start_time_reaches_its_journey() -> None:
+    """The same rule through get_upcoming_trips: a delay naming T's first
+    departure lands on the journey."""
+    feed = _feed("T,08:00:00,08:00:00,A,1\nT,08:30:00,08:30:00,B,2\n")
+    now = datetime(2026, 6, 10, 7, tzinfo=UTC)
+    message = _dateless_message(now)
+    message.entity[0].trip_update.trip.start_time = "08:00:00"
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [trips] = await handle.get_upcoming_trips(
+            [TripQuery("A", "B", limit=1)], start=now
+        )
+        [trip] = trips
+        assert trip.delay_seconds == 300
+
+    _run(_index_from_zip_bytes(feed), body, message)

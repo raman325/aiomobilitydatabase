@@ -265,6 +265,10 @@ def _vehicle_index(
     by_vehicle_id: dict[str, VehiclePosition] = {}
     by_instance: dict[tuple[str, int | None, date | None], VehiclePosition | None] = {}
     dateless: set[str] = set()
+    # Claims as sent first, then those naming a plain trip by its own start
+    # time: as for TripUpdates, the bare form wins over the equivalent one
+    # rather than both poisoning each other.
+    claims: list[tuple[VehiclePosition, tuple[str, int | None, date | None], bool]] = []
     for vehicle in vehicles:
         if vehicle.vehicle_id:
             by_vehicle_id[vehicle.vehicle_id] = vehicle
@@ -273,11 +277,18 @@ def _vehicle_index(
                 (vehicle.trip_id, vehicle.trip_start_date, vehicle.trip_start_secs),
                 plain_starts,
             )
-            key = (trip_id, secs, vehicle.trip_start_date)
-            # A second claimant poisons the entry rather than overwriting it.
-            by_instance[key] = None if key in by_instance else vehicle
+            rewritten = secs != vehicle.trip_start_secs
+            claims.append(
+                (vehicle, (trip_id, secs, vehicle.trip_start_date), rewritten)
+            )
             if vehicle.trip_start_date is None:
                 dateless.add(vehicle.trip_id)
+    bare = {key for _, key, rewritten in claims if not rewritten}
+    for vehicle, key, rewritten in sorted(claims, key=lambda claim: claim[2]):
+        if rewritten and key in bare:
+            continue
+        # A second claimant poisons the entry rather than overwriting it.
+        by_instance[key] = None if key in by_instance else vehicle
     return _Vehicles(by_vehicle_id, by_instance, frozenset(dateless))
 
 
