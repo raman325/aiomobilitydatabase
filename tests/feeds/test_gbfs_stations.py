@@ -707,7 +707,12 @@ async def test_unpublished_lookup_documents_are_empty_not_an_error(
         pytest.param("2026-W31-5T12:13:20+02:00", None, id="week-date"),
         # The right shape, but no such instant.
         pytest.param("2026-13-01T00:00:00Z", None, id="month-13"),
+        # RFC 3339's own ranges, whatever a Python's fromisoformat accepts
+        # (3.14 reads 24:00 as the next midnight).
         pytest.param("2026-07-31T24:00:00Z", None, id="hour-24"),
+        pytest.param("2026-07-31T12:60:00Z", None, id="minute-60"),
+        pytest.param("2026-07-31T12:00:61Z", None, id="second-61"),
+        pytest.param("2026-07-31T12:00:00+24:00", None, id="offset-24"),
         pytest.param(True, None, id="bool-is-not-an-epoch"),
         pytest.param(10**20, None, id="epoch-out-of-range"),
         pytest.param("yesterday", None, id="unparseable-string"),

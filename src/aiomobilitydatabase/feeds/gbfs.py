@@ -42,10 +42,13 @@ if TYPE_CHECKING:
 
 
 # RFC 3339 section 5.6 date-time: the offset is REQUIRED; "T" may be "t"
-# or a space (its NOTE). ASCII digits only.
+# or a space (its NOTE). Its own ranges -- hour 00-23, minute 00-59, second
+# 00-60 -- not ISO 8601's (Python 3.14's fromisoformat takes 24:00). ASCII
+# digits only.
 _RFC3339 = re.compile(
-    r"([0-9]{4}-[0-9]{2}-[0-9]{2})[Tt ]([0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?"
-    r"([Zz]|[+-][0-9]{2}:[0-9]{2})"
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2})[Tt ]"
+    r"((?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60))(\.[0-9]+)?"
+    r"([Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
 )
 # GBFS Date: "ISO 8601 Complete Date Extended Format: YYYY-MM-DD".
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")

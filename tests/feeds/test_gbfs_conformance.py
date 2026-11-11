@@ -7,7 +7,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
-from aiomobilitydatabase.feeds.exceptions import SourceConnectionError
+from aiomobilitydatabase.feeds.exceptions import FeedParseError, SourceConnectionError
 from aiomobilitydatabase.feeds.gbfs import (
     _document_lifetime,
     _iso_date,
@@ -281,3 +281,17 @@ async def test_the_30_disabled_count_is_read(
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     [read] = await handle.get_stations()
     assert (read.bikes_available, read.bikes_disabled) == (3, 2)
+
+
+async def test_a_document_that_isnt_json_is_a_parse_error(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    _mock_catalog(mock_api)
+    mock_api.get(
+        "/gbfs/system_information.json",
+        body=b"<html>oops</html>",
+        content_type="text/html",
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    with pytest.raises(FeedParseError, match="Malformed GBFS JSON"):
+        await handle.get_system_info()
