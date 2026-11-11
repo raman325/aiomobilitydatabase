@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, date, datetime
+from functools import partial
 
 import aiohttp
 import pytest
@@ -11,6 +12,7 @@ from google.transit import gtfs_realtime_pb2
 from yarl import URL
 
 from aiomobilitydatabase.feeds import _redirects as redirects_module
+from aiomobilitydatabase.feeds._freshness import FreshnessCache
 from aiomobilitydatabase.feeds._redirects import _origin
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
@@ -399,6 +401,77 @@ async def test_a_deadline_spent_between_hops_sends_no_further_request(
     with pytest.raises(SourceConnectionError):
         await _fetch(mock_api, auth_type=2, api_key_name="K", api_key="v")
     assert [r.path for r in mock_api.requests] == ["/rt"]
+
+
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_a_redirect_loop_fails_with_or_without_header_auth(
+    mock_api: MockApi, auth_type: int | None
+) -> None:
+    """RFC 9110 section 15.4: a client SHOULD detect and intervene in
+    cyclical redirections -- the redirect limit ends the loop."""
+    for _ in range(5):
+        mock_api.get("/rt/a", status=302, headers={"Location": "/rt/b"})
+        mock_api.get("/rt/b", status=302, headers={"Location": "/rt/a"})
+    with pytest.raises(SourceConnectionError):
+        await _fetch(
+            mock_api, "/rt/a", auth_type=auth_type, api_key_name="K", api_key="v"
+        )
+    assert len(mock_api.requests) == 10
+
+
+async def test_an_unsolicited_304_is_a_connection_error(mock_api: MockApi) -> None:
+    """A 304 answers only a conditional request; there is no stored parse."""
+    mock_api.get("/rt", status=304)
+    with pytest.raises(SourceConnectionError, match="unconditional") as excinfo:
+        await _fetch(mock_api)
+    assert excinfo.value.status == 304
+
+
+async def test_a_query_auth_feed_is_revalidated_conditionally(
+    mock_api: MockApi,
+) -> None:
+    """The validators belong to the URL with its query (the key included):
+    the request asking for it carries them, so an unchanged feed is a 304."""
+    url = mock_api.url("/rt")
+    fresh = {"ETag": '"v1"', "Cache-Control": "no-cache"}
+    mock_api.get("/rt", body=VEHICLE_POSITIONS, content_type=PB, headers=fresh)
+    mock_api.get("/rt", status=304, headers=fresh)
+    cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
+    async with aiohttp.ClientSession() as session:
+        fetch = partial(
+            fetch_feed_message, session, url, auth_type=1, api_key_name="k", api_key="v"
+        )
+        first = await cache.get(url, fetch)
+        assert await cache.get(url, fetch) is first
+    assert [r.headers.get("If-None-Match") for r in mock_api.requests] == [
+        None,
+        '"v1"',
+    ]
+    assert all(r.query["k"] == "v" for r in mock_api.requests)
+
+
+async def test_a_credentialed_session_revalidates_across_origins_unconditionally(
+    mock_api: MockApi,
+) -> None:
+    """Without a header key, a redirect away that a hand-made request can't
+    strip the session's credentials from is asked again unconditionally:
+    aiohttp follows it and drops them itself -- never a failure."""
+    url = mock_api.url("/rt")
+    away = _elsewhere(mock_api.url("/rt/away"))
+    for _ in range(3):
+        mock_api.get("/rt", status=302, headers={"Location": away})
+    fresh = {"ETag": '"v1"', "Cache-Control": "no-cache"}
+    for _ in range(2):
+        mock_api.get("/rt/away", body=VEHICLE_POSITIONS, content_type=PB, headers=fresh)
+    cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
+    async with aiohttp.ClientSession(headers={"Authorization": "Bearer s"}) as session:
+        fetch = partial(fetch_feed_message, session, url)
+        await cache.get(url, fetch)
+        assert len((await cache.get(url, fetch)).entity) == 2
+    away_hits = [r.headers for r in mock_api.requests if r.path == "/rt/away"]
+    assert len(away_hits) == 2
+    assert not any("Authorization" in hit for hit in away_hits)
+    assert not any("If-None-Match" in hit for hit in away_hits)
 
 
 def test_vehicles_from_message() -> None:
@@ -1094,6 +1167,12 @@ def test_alert_text_detail_and_images_are_surfaced() -> None:
         pytest.param("2026-07-30", None, id="dashed"),
         pytest.param("20261345", None, id="impossible"),
         pytest.param("", None, id="empty"),
+        # strptime would read these as real days.
+        pytest.param("2026111", None, id="seven-digits"),
+        pytest.param("2026 111", None, id="space"),
+        pytest.param(
+            "\uff12\uff10\uff12\uff16\uff10\uff17\uff13\uff10", None, id="fullwidth"
+        ),
     ],
 )
 def test_lenient_service_date(raw: str, expected: date | None) -> None:

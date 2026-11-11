@@ -240,9 +240,10 @@ class MobilityFeedsClient:
         redirects, to another origin too: aiohttp drops only
         Authorization, Cookie and Proxy-Authorization there.
 
-        Dataset identity without a catalog: the static URL is HEAD-probed
-        for an ETag (preferred) or Last-Modified validator; servers
-        offering neither fall back to a sha256 of the downloaded bytes.
+        Dataset identity without a catalog: the download's own strong
+        ETag (a HEAD reporting the same one skips the download); without
+        one -- a weak ETag or a Last-Modified never names exact bytes -- a
+        sha256 of the downloaded bytes.
         The on-disk cache key is ``url-<sha256(static_url)[:16]>`` (also
         exposed as the handle's ``static_feed_id``, accepted by
         :meth:`purge_cache`). ``on_progress`` and ``rt_min_interval``

@@ -13,17 +13,8 @@ from typing import Any
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
-from ._freshness import (
-    Response,
-    Validators,
-    first_hop_fields,
-    header_fields,
-    request_fields,
-    sent_fields,
-)
-from ._freshness import (
-    hops as _hops,
-)
+from ._freshness import Response, Validators, header_fields, request_fields
+from ._freshness import hops as _hops
 from ._redirects import get_withholding
 from ._urls import _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
@@ -138,11 +129,11 @@ def feed_request_fields(
     api_key_name: str | None = None,
     api_key: str | None = None,
     headers: Mapping[str, str] | None = None,
-) -> dict[str, tuple[str, ...]]:
-    """Return the controlled header fields :func:`fetch_feed_message` sends now.
+) -> dict[str, tuple[str, ...]] | None:
+    """Return the header fields :func:`fetch_feed_message` would send now.
 
     Unconditional: what a stored response's Vary is matched against (see
-    :func:`~._freshness.request_fields`).
+    :func:`~._freshness.request_fields`; None when they can't be known).
     """
     _params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
     return request_fields(session, url, req_headers)
@@ -179,10 +170,6 @@ async def fetch_feed_message(
     """
     _require_http_url(url, "GTFS-RT producer URL")
     params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
-    # Before the validators: they are the cache's, not the request's own.
-    controlled = request_fields(session, url, req_headers)
-    if validators is not None:
-        req_headers.update(validators.request_headers())
     requested_at = datetime.now(UTC)
     secret = api_key_name if auth_type == _AUTH_TYPE_HEADER and api_key else None
     try:
@@ -193,6 +180,8 @@ async def fetch_feed_message(
             headers=req_headers,
             total=timeout_seconds,
             secret=secret,
+            conditional=None if validators is None else validators.request_headers(),
+            conditional_url=None if validators is None else validators.url,
         ) as (resp, history):
             received_at = datetime.now(UTC)
             if resp.status in _AUTH_STATUSES:
@@ -215,12 +204,8 @@ async def fetch_feed_message(
                     fields=fields,
                     requested_at=requested_at,
                     received_at=received_at,
-                    request_fields=sent_fields(controlled, resp, history),
                     hops=_hops(resp, history),
                     url=str(resp.url),
-                    first_hop_request_fields=first_hop_fields(
-                        controlled, resp, history
-                    ),
                 )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
@@ -234,10 +219,8 @@ async def fetch_feed_message(
                     status=resp.status,
                 )
             raw = await resp.read()
-            sent = sent_fields(controlled, resp, history)
             hops = _hops(resp, history)
             answered = str(resp.url)
-            first = first_hop_fields(controlled, resp, history)
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
     message = gtfs_realtime_pb2.FeedMessage()
@@ -250,10 +233,8 @@ async def fetch_feed_message(
         fields=fields,
         requested_at=requested_at,
         received_at=received_at,
-        request_fields=sent,
         hops=hops,
         url=answered,
-        first_hop_request_fields=first,
     )
 
 
@@ -429,9 +410,15 @@ def trip_modifications_from_message(
 
 
 def _lenient_service_date(raw: str) -> date | None:
-    """YYYYMMDD to a date; anything else is "not a day this applies to"."""
+    """YYYYMMDD to a date; anything else is "not a day this applies to".
+
+    Exactly eight ASCII digits naming a real day: ``strptime`` would read
+    ``2026111`` as 2026-11-01 and apply a detour to the wrong day.
+    """
+    if len(raw) != _START_DATE_LENGTH or not (raw.isascii() and raw.isdigit()):
+        return None
     try:
-        return datetime.strptime(raw, "%Y%m%d").date()
+        return date(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
     except ValueError:
         return None
 

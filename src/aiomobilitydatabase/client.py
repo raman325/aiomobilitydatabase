@@ -243,7 +243,13 @@ class MobilityDatabaseClient:
                     raise MobilityDatabaseNotFoundError(f"Not found: {path}")
                 if resp.status == HTTPStatus.TOO_MANY_REQUESTS:
                     raise MobilityDatabaseRateLimitError("API rate limit exceeded")
-                if resp.status >= HTTPStatus.BAD_REQUEST:
+                # Only a 200 or 203 carries the answer (RFC 9110 section
+                # 15.3): a 204 has none, and a 300 or a 3xx left unfollowed
+                # is not the resource asked for.
+                if resp.status not in (
+                    HTTPStatus.OK,
+                    HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
+                ):
                     raise MobilityDatabaseApiError(resp.status, await resp.text())
                 try:
                     return await resp.json()

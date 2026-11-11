@@ -46,6 +46,21 @@ async def test_500_maps_to_api_error(
     assert exc_info.value.status == 500
 
 
+@pytest.mark.parametrize("status", [204, 300, 302])
+async def test_a_status_without_an_answer_is_an_api_error(
+    mock_api: MockApi, client: MobilityDatabaseClient, status: int
+) -> None:
+    """RFC 9110 section 15.3: a 204 has no content, and a 300 or a 3xx left
+    unfollowed is not the resource asked for -- never decoded as one."""
+    _mock_token(mock_api)
+    mock_api.get(
+        "/v1/feeds/mdb-1", status=status, payload={"id": "decoy", "data_type": "gtfs"}
+    )
+    with pytest.raises(MobilityDatabaseApiError) as exc_info:
+        await client.get_feed("mdb-1")
+    assert exc_info.value.status == status
+
+
 async def test_network_error_maps_to_connection_error() -> None:
     """A transport-level connection failure maps to ConnectionError.
 
