@@ -197,7 +197,9 @@ Notes on direct mode:
 - Catalog static datasets are served from the Mobility Database's own
   storage; direct mode fetches **your** URL, with the optional `headers`
   applied to the static download and every GTFS-RT/GBFS fetch the handle
-  makes.
+  makes. Like any aiohttp request headers they follow redirects, to another
+  origin too (aiohttp drops only `Authorization`, `Cookie` and
+  `Proxy-Authorization` there).
 - RT URLs are declared per layer (`trip_updates_urls`,
   `vehicle_positions_urls`, `service_alerts_urls`), so each operation only
   fetches sources that can serve it. A combined feed listed under several
@@ -445,6 +447,9 @@ Notes on direct mode:
 - **Producer authentication**: pass `api_key=` to `get_transit_feed()`; it is
   applied per the catalog's `authentication_type` (query parameter or header) —
   distinct from the refresh token used to authenticate with the catalog itself.
+  A header key is never sent to another origin: from the first redirect that
+  leaves the producer's origin on, it is left off, along with the session's
+  own `Authorization`, `Cookie` and `Proxy-Authorization` defaults.
 - **Zones are circles** (matching Home Assistant zone entities); GBFS vehicle
   filtering happens client-side because GBFS feeds are full-system dumps by
   design, with no server-side geo-query.
