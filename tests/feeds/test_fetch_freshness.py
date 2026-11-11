@@ -490,8 +490,13 @@ async def test_gbfs_a_changed_session_header_that_vary_names_asks_again(
     assert [hit.get("X-Region") for hit in _info_hits(mock_api)] == ["east", "west"]
 
 
+# Header auth follows redirects by hand: every redirect test runs both ways.
+WITH_AND_WITHOUT_KEY = pytest.mark.parametrize("api_key", [None, "k"])
+
+
+@WITH_AND_WITHOUT_KEY
 async def test_a_redirected_response_with_vary_is_never_reused_unasked(
-    mock_api: MockApi, feeds_client: MobilityFeedsClient
+    mock_api: MockApi, feeds_client: MobilityFeedsClient, api_key: str | None
 ) -> None:
     """The final hop of a redirect carried headers no later request can be
     checked against in advance: under a Vary on anything but aiohttp's
@@ -510,7 +515,7 @@ async def test_a_redirected_response_with_vary_is_never_reused_unasked(
             content_type=PB,
             headers=vary,
         )
-    handle = await feeds_client.get_transit_feed("mdb-100")
+    handle = await feeds_client.get_transit_feed("mdb-100", api_key=api_key)
     assert await _t1_delay(handle) == 60
     assert await _t1_delay(handle) == 160
     assert len([r for r in mock_api.requests if r.path == "/rt/moved"]) == 2
@@ -564,8 +569,9 @@ async def test_vary_cookie_matches_the_cookie_aiohttp_sends(
     assert [hit.get("Cookie", "") for hit in hits] == sent
 
 
+@WITH_AND_WITHOUT_KEY
 async def test_a_redirect_that_may_not_be_stored_is_asked_every_time(
-    mock_api: MockApi, feeds_client: MobilityFeedsClient
+    mock_api: MockApi, feeds_client: MobilityFeedsClient, api_key: str | None
 ) -> None:
     """RFC 9111 section 4: the original URL is the key. Its redirect says
     no-store (or nothing at all), so the target's max-age can't skip it.
@@ -580,14 +586,15 @@ async def test_a_redirect_that_may_not_be_stored_is_asked_every_time(
             content_type=PB,
             headers={"Cache-Control": "max-age=600"},
         )
-    handle = await feeds_client.get_transit_feed("mdb-100")
+    handle = await feeds_client.get_transit_feed("mdb-100", api_key=api_key)
     assert await _t1_delay(handle) == 60
     assert await _t1_delay(handle) == 60
     assert len(_rt_hits(mock_api)) == 2
 
 
+@WITH_AND_WITHOUT_KEY
 async def test_a_redirect_targets_304_never_revalidates_the_original(
-    mock_api: MockApi, feeds_client: MobilityFeedsClient
+    mock_api: MockApi, feeds_client: MobilityFeedsClient, api_key: str | None
 ) -> None:
     """/rt/all answered with ETag "1"; then it redirects to /rt/moved, whose
     own "1" matches the forwarded If-None-Match. That 304 is about another
@@ -607,16 +614,17 @@ async def test_a_redirect_targets_304_never_revalidates_the_original(
             content_type=PB,
             headers=tag,
         )
-    handle = await feeds_client.get_transit_feed("mdb-100")
+    handle = await feeds_client.get_transit_feed("mdb-100", api_key=api_key)
     assert await _t1_delay(handle) == 60
     assert await _t1_delay(handle) == 120
     moved_hits = [r.headers for r in mock_api.requests if r.path == "/rt/moved"]
     assert [hit.get("If-None-Match") for hit in moved_hits] == ['"1"', None]
 
 
+@WITH_AND_WITHOUT_KEY
 @pytest.mark.parametrize(("sets_cookie", "requests"), [(False, 1), (True, 2)])
 async def test_a_redirect_varying_by_cookie_matches_the_original_request(
-    mock_api: MockApi, sets_cookie: bool, requests: int
+    mock_api: MockApi, sets_cookie: bool, requests: int, api_key: str | None
 ) -> None:
     """A cacheable 302 varying by Cookie answered the original request,
     whose fields are known: the same cookies next time reuse the chain; a
@@ -647,14 +655,15 @@ async def test_a_redirect_varying_by_cookie_matches_the_original_request(
             "test-refresh-token", session, base_url=mock_api.url()
         ) as client,
     ):
-        handle = await client.get_transit_feed("mdb-100")
+        handle = await client.get_transit_feed("mdb-100", api_key=api_key)
         assert await _t1_delay(handle) == 60
         assert await _t1_delay(handle) == (160 if sets_cookie else 60)
     assert len(_rt_hits(mock_api)) == requests
 
 
+@WITH_AND_WITHOUT_KEY
 async def test_rt_min_interval_never_reuses_a_302_without_freshness(
-    mock_api: MockApi, feeds_client: MobilityFeedsClient
+    mock_api: MockApi, feeds_client: MobilityFeedsClient, api_key: str | None
 ) -> None:
     """A 302 (or 303, 307) may not be reused without explicit freshness,
     not even heuristically -- so the opt-in budget can't reuse it either."""
@@ -666,7 +675,7 @@ async def test_rt_min_interval_never_reuses_a_302_without_freshness(
             "/rt/moved", body=_t1_delayed(delay, timestamp=delay), content_type=PB
         )
     handle = await feeds_client.get_transit_feed(
-        "mdb-100", rt_min_interval=timedelta(seconds=30)
+        "mdb-100", api_key=api_key, rt_min_interval=timedelta(seconds=30)
     )
     assert await _t1_delay(handle) == 60
     assert await _t1_delay(handle) == 120
@@ -738,3 +747,39 @@ async def test_gbfs_a_redirected_document_records_the_url_that_answered(
     [entry] = handle._docs._entries.values()
     assert entry.url == moved
     assert entry.redirected
+
+
+async def test_a_header_auth_redirect_to_another_origin_is_cached_without_the_key(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Followed by hand, a cacheable cross-origin chain is still reused
+    while fresh, then revalidated at the URL that answered -- and the key
+    only ever reaches the producer's own origin.
+    """
+    _mock_transit(mock_api)
+    away = mock_api.url("/rt/away").replace("127.0.0.1", "localhost")
+    fresh = {"Cache-Control": "max-age=30", "ETag": '"v1"'}
+    for status in (200, 304):
+        mock_api.get(
+            RT, status=301, headers={"Location": away, "Cache-Control": "max-age=600"}
+        )
+        mock_api.get(
+            "/rt/away",
+            status=status,
+            body=_t1_delayed(60, timestamp=100) if status == 200 else None,
+            content_type=PB,
+            headers=fresh,
+        )
+    handle = await feeds_client.get_transit_feed("mdb-100", api_key="secret")
+    clock = _Clock()
+    handle._rt_cache._clock = clock
+    assert await _t1_delay(handle) == 60
+    clock.now += 29
+    assert await _t1_delay(handle) == 60
+    assert len(_rt_hits(mock_api)) == 1  # the whole chain was fresh
+    clock.now += 2
+    assert await _t1_delay(handle) == 60
+    away_hits = [r.headers for r in mock_api.requests if r.path == "/rt/away"]
+    assert [hit.get("If-None-Match") for hit in away_hits] == [None, '"v1"']
+    assert all(hit["X-Api-Key"] == "secret" for hit in _rt_hits(mock_api))
+    assert not any("X-Api-Key" in hit for hit in away_hits)

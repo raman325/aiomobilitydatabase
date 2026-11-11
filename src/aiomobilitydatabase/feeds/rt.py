@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
@@ -12,6 +13,7 @@ from typing import Any
 
 import aiohttp
 from google.transit import gtfs_realtime_pb2
+from yarl import URL
 
 from ._freshness import (
     Response,
@@ -147,6 +149,92 @@ def feed_request_fields(
     return request_fields(session, url, req_headers)
 
 
+# aiohttp's own redirect limit: the tenth redirect raises.
+_MAX_REDIRECTS = 10
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+# Credentials aiohttp itself drops when a redirect leaves the origin.
+_ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization"})
+
+
+@asynccontextmanager
+async def _get(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    params: Mapping[str, str],
+    headers: Mapping[str, str],
+    client_timeout: aiohttp.ClientTimeout,
+    secret: str | None,
+) -> AsyncIterator[tuple[aiohttp.ClientResponse, Sequence[aiohttp.ClientResponse]]]:
+    """GET ``url``; yield the final response and the redirects followed.
+
+    Without a ``secret`` header aiohttp follows redirects itself. With one
+    (a header-auth API key) they are followed here, because aiohttp
+    forwards every custom header to wherever a redirect points: the
+    secret is dropped at the first hop to another origin, and never sent
+    again (RFC 9110 section 15.4: remove fields with security
+    implications). The Authorization, Cookie and Proxy-Authorization
+    headers aiohttp drops there are dropped too. Session defaults can't
+    be withheld from a hand-made request, so a session carrying such a
+    default header (or default ``auth``) fails such a hop instead
+    (:class:`SourceConnectionError`), as does a Location that isn't an
+    HTTP(S) URL or a chain of ten redirects.
+    """
+    if secret is None:
+        async with session.get(
+            url, params=params or None, headers=headers or None, timeout=client_timeout
+        ) as response:
+            yield response, response.history
+        return
+    history: list[aiohttp.ClientResponse] = []
+    target = URL(url)
+    sent = dict(headers)
+    query = params or None
+    while True:
+        response = await session.get(
+            target,
+            params=query,
+            headers=sent or None,
+            timeout=client_timeout,
+            allow_redirects=False,
+        )
+        location = response.headers.get("Location")
+        if response.status not in _REDIRECT_STATUSES or location is None:
+            try:
+                yield response, history
+            finally:
+                response.release()
+            return
+        response.release()
+        history.append(response)
+        if len(history) >= _MAX_REDIRECTS:
+            raise SourceConnectionError(f"Too many redirects fetching {url}")
+        try:
+            following = response.url.join(
+                URL(location, encoded=not session.requote_redirect_url)
+            )
+            origin = following.origin()
+        except ValueError as err:
+            raise SourceConnectionError(
+                f"Producer redirected to an invalid URL ({location!r}): {url}"
+            ) from err
+        if following.scheme not in ("http", "https"):
+            raise SourceConnectionError(
+                f"Producer redirected to a non-HTTP URL ({following}): {url}"
+            )
+        if origin != response.url.origin():
+            if session.auth is not None or any(
+                name in session.headers for name in _ORIGIN_CREDENTIALS
+            ):
+                raise SourceConnectionError(
+                    f"Producer redirected to another origin ({origin}) and the "
+                    f"session carries credentials that can't be withheld: {url}"
+                )
+            withheld = _ORIGIN_CREDENTIALS | {secret.lower()}
+            sent = {k: v for k, v in sent.items() if k.lower() not in withheld}
+        target, query = following, None
+
+
 async def fetch_feed_message(
     session: aiohttp.ClientSession,
     url: str,
@@ -183,13 +271,16 @@ async def fetch_feed_message(
     if validators is not None:
         req_headers.update(validators.request_headers())
     requested_at = datetime.now(UTC)
+    secret = api_key_name if auth_type == _AUTH_TYPE_HEADER and api_key else None
     try:
-        async with session.get(
+        async with _get(
+            session,
             url,
-            params=params or None,
-            headers=req_headers or None,
-            timeout=aiohttp.ClientTimeout(total=timeout_seconds),
-        ) as resp:
+            params=params,
+            headers=req_headers,
+            client_timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+            secret=secret,
+        ) as (resp, history):
             received_at = datetime.now(UTC)
             if resp.status in _AUTH_STATUSES:
                 raise SourceAuthenticationError(
@@ -211,10 +302,12 @@ async def fetch_feed_message(
                     fields=fields,
                     requested_at=requested_at,
                     received_at=received_at,
-                    request_fields=sent_fields(controlled, resp),
-                    hops=_hops(resp),
+                    request_fields=sent_fields(controlled, resp, history),
+                    hops=_hops(resp, history),
                     url=str(resp.url),
-                    first_hop_request_fields=first_hop_fields(controlled, resp),
+                    first_hop_request_fields=first_hop_fields(
+                        controlled, resp, history
+                    ),
                 )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
@@ -228,9 +321,10 @@ async def fetch_feed_message(
                     status=resp.status,
                 )
             raw = await resp.read()
-            sent, hops = sent_fields(controlled, resp), _hops(resp)
+            sent = sent_fields(controlled, resp, history)
+            hops = _hops(resp, history)
             answered = str(resp.url)
-            first = first_hop_fields(controlled, resp)
+            first = first_hop_fields(controlled, resp, history)
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
     message = gtfs_realtime_pb2.FeedMessage()
