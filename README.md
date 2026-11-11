@@ -449,9 +449,9 @@ Notes on direct mode:
   distinct from the refresh token used to authenticate with the catalog itself.
   A header key is never sent to another origin: from the first redirect that
   leaves the producer's origin on, it is left off, along with credentials in
-  the URL and the session's own `Authorization`, `Cookie` and
-  `Proxy-Authorization` defaults, its `auth` and the shared cookies its
-  `cookies=` set.
+  the URL. If your session itself carries `Authorization`, `Cookie` or
+  `Proxy-Authorization` defaults (or `auth`), which can't be left off, such a
+  redirect fails with `SourceConnectionError` instead of being followed.
 - **Zones are circles** (matching Home Assistant zone entities); GBFS vehicle
   filtering happens client-side because GBFS feeds are full-system dumps by
   design, with no server-side geo-query.
