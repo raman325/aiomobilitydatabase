@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -23,6 +24,7 @@ from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds import TripQuery
+from aiomobilitydatabase.feeds._freshness import FreshnessCache, _Entry
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
@@ -1028,20 +1030,12 @@ def test_station_merge_invariants(
             expected_bikes,
             None if renting is None else bool(renting),
         )
-    handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        "station_information": (
-            float("inf"),
-            float("inf"),
-            {"data": {"stations": info_rows}},
-        ),
-        "station_status": (
-            float("inf"),
-            float("inf"),
-            {"data": {"stations": status_rows}},
-        ),
-    }
-    handle._endpoints = {"station_information": "x", "station_status": "x"}
+    handle = _gbfs_handle(
+        {
+            "station_information": {"stations": info_rows},
+            "station_status": {"stations": status_rows},
+        }
+    )
     stations = asyncio.run(handle.get_stations())
     assert {s.id for s in stations} == {str(sid) for sid in info_ids}
     by_id = {s.id: s for s in stations}
@@ -1472,9 +1466,10 @@ def test_rt_fetch_total_over_status_and_body(
 ) -> None:
     """Every servable status maps to its DOCUMENTED classification: 401 and
     403 are authentication failures, any other status at or above 400 is a
-    connection failure carrying that status, and a sub-400 response either
-    parses or raises FeedParseError -- never anything else, and never a
-    crash.
+    connection failure carrying that status, and so is any other status
+    that carries no feed (anything but 200 and 203: a 204, a 3xx left
+    unfollowed, an unsolicited 304); a 200 or 203 either parses or raises
+    FeedParseError -- never anything else, and never a crash.
     """
     kind, raw = body
     outcome = _run_fetch_probe(status, raw)
@@ -1483,13 +1478,14 @@ def test_rt_fetch_total_over_status_and_body(
     elif status >= HTTPStatus.BAD_REQUEST:
         assert outcome == f"connection:{status}"
     else:
-        # 204/304 carry no body on the wire, so the parser sees b"" and
-        # succeeds whatever was queued; a pristine message always parses.
-        allowed = (
-            {"success"}
-            if kind == "valid" or status in (HTTPStatus.NO_CONTENT, 304)
-            else {"success", "parse"}
-        )
+        # A 304 to an unconditional request (no validators were sent) has
+        # no previous parse to reuse, so it is a connection failure. 204
+        # carries no body on the wire, so the parser sees b"" and succeeds
+        # whatever was queued; a pristine message always parses.
+        if status not in (HTTPStatus.OK, HTTPStatus.NON_AUTHORITATIVE_INFORMATION):
+            assert outcome == f"connection:{status}"
+            return
+        allowed = {"success"} if kind == "valid" else {"success", "parse"}
         assert outcome in allowed
 
 
@@ -3675,16 +3671,28 @@ def _zone_row(draw: st.DrawFn, id_key: str) -> dict[str, object]:
 def _gbfs_handle(documents: dict[str, object]) -> GbfsFeedHandle:
     """A detached handle whose named endpoints serve pre-cached documents.
 
-    The cache entries are built with an infinite ttl so no method of the
-    handle ever reaches the network; ``documents`` maps an endpoint name
-    to that document's ``data`` envelope.
+    The cache entries never expire, so no method of the handle ever reaches
+    the network; ``documents`` maps an endpoint name to that document's
+    ``data`` envelope.
     """
     handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
-    handle._doc_cache = {
-        name: (float("inf"), float("inf"), {"data": data})
-        for name, data in documents.items()
-    }
-    handle._endpoints = dict.fromkeys(documents, "x")
+    handle._endpoints = {name: f"https://gbfs.invalid/{name}" for name in documents}
+    # Never fetches (all cached); only asked what a request would carry.
+    session = SimpleNamespace(
+        headers={},
+        cookie_jar=SimpleNamespace(filter_cookies=lambda _url: {}),
+        auth=None,
+    )
+    handle._client = SimpleNamespace(_get_session=lambda: session)  # type: ignore[assignment]
+    handle._headers = None
+    handle._docs = FreshnessCache()
+    for name, data in documents.items():
+        handle._docs._entries[handle._endpoints[name]] = _Entry(
+            value={"data": data},
+            fields={},
+            stored_at=0.0,
+            lifetime=float("inf"),
+        )
     return handle
 
 
@@ -5926,10 +5934,10 @@ def test_numeric_helpers_treat_unrepresentable_numbers_as_unknown(
     """A number no float can hold is UNKNOWN, not an escaping OverflowError.
 
     Each helper answers with what it already answers for other malformed
-    input: no coordinate, no caching, and a dropped vehicle-type count.
+    input: no coordinate, no declared ttl, and a dropped vehicle-type count.
     """
     assert _coordinate(number) is None
-    assert _ttl_seconds(number) == 0.0
+    assert _ttl_seconds(number) is None
     assert _vehicle_types([{"vehicle_type_id": "v1", "count": count}]) is None
     assert _coordinate(1e308) == 1e308
     assert _ttl_seconds(1e308) == 1e308

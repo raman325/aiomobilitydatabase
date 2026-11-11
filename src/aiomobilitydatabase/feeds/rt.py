@@ -13,6 +13,17 @@ from typing import Any
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
+from ._freshness import (
+    Response,
+    Validators,
+    first_hop_fields,
+    header_fields,
+    request_fields,
+    sent_fields,
+)
+from ._freshness import (
+    hops as _hops,
+)
 from ._urls import _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
@@ -32,6 +43,8 @@ from .models import (
 )
 from .static_index import parse_gtfs_time
 
+# Only these carry the requested representation (RFC 9110 sections 15.3.1, 15.3.4).
+_FEED_STATUSES = frozenset({HTTPStatus.OK, HTTPStatus.NON_AUTHORITATIVE_INFORMATION})
 _AUTH_STATUSES = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
 
 _AUTH_TYPE_QUERY_PARAM = 1
@@ -96,12 +109,42 @@ def _vocab_or_none[StrEnumT: StrEnum](
         return None
 
 
-@dataclass(frozen=True)
-class FeedValidators:
-    """HTTP cache validators a producer offered for one RT url."""
+def _feed_request(
+    auth_type: int | None,
+    api_key_name: str | None,
+    api_key: str | None,
+    headers: Mapping[str, str] | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return the query parameters and headers of a GTFS-RT request.
 
-    etag: str | None
-    last_modified: str | None
+    See :func:`fetch_feed_message` for how auth and custom headers combine.
+    """
+    params: dict[str, str] = {}
+    req_headers: dict[str, str] = dict(headers) if headers else {}
+    if api_key is not None and api_key_name:
+        if auth_type == _AUTH_TYPE_QUERY_PARAM:
+            params[api_key_name] = api_key
+        elif auth_type == _AUTH_TYPE_HEADER:
+            req_headers[api_key_name] = api_key
+    return params, req_headers
+
+
+def feed_request_fields(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    auth_type: int | None = None,
+    api_key_name: str | None = None,
+    api_key: str | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Return the controlled header fields :func:`fetch_feed_message` sends now.
+
+    Unconditional: what a stored response's Vary is matched against (see
+    :func:`~._freshness.request_fields`).
+    """
+    _params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
+    return request_fields(session, url, req_headers)
 
 
 async def fetch_feed_message(
@@ -113,8 +156,8 @@ async def fetch_feed_message(
     api_key: str | None = None,
     headers: Mapping[str, str] | None = None,
     timeout_seconds: float = 30.0,
-    validators: FeedValidators | None = None,
-) -> tuple[gtfs_realtime_pb2.FeedMessage | None, FeedValidators | None]:
+    validators: Validators | None = None,
+) -> Response[gtfs_realtime_pb2.FeedMessage]:
     """GET a GTFS-RT producer URL and parse the protobuf FeedMessage.
 
     ``auth_type`` follows the catalog's ``source_info.authentication_type``:
@@ -127,20 +170,19 @@ async def fetch_feed_message(
     query auth the key never touches the headers, so a same-named custom
     header is a different namespace and passes through untouched. Parsing
     runs in a thread (CPU-bound for large feeds).
+
+    With ``validators`` the request is conditional, and a ``304`` comes
+    back as a :class:`Response` with no value. The response's header
+    fields and request/receipt instants ride along: the freshness cache
+    derives freshness and validators from them (RFC 9111).
     """
     _require_http_url(url, "GTFS-RT producer URL")
-    params: dict[str, str] = {}
-    req_headers: dict[str, str] = dict(headers) if headers else {}
-    if api_key is not None and api_key_name:
-        if auth_type == _AUTH_TYPE_QUERY_PARAM:
-            params[api_key_name] = api_key
-        elif auth_type == _AUTH_TYPE_HEADER:
-            req_headers[api_key_name] = api_key
+    params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
+    # Before the validators: they are the cache's, not the request's own.
+    controlled = request_fields(session, url, req_headers)
     if validators is not None:
-        if validators.etag:
-            req_headers["If-None-Match"] = validators.etag
-        if validators.last_modified:
-            req_headers["If-Modified-Since"] = validators.last_modified
+        req_headers.update(validators.request_headers())
+    requested_at = datetime.now(UTC)
     try:
         async with session.get(
             url,
@@ -148,24 +190,47 @@ async def fetch_feed_message(
             headers=req_headers or None,
             timeout=aiohttp.ClientTimeout(total=timeout_seconds),
         ) as resp:
+            received_at = datetime.now(UTC)
             if resp.status in _AUTH_STATUSES:
                 raise SourceAuthenticationError(
                     f"Producer rejected credentials ({resp.status}): {url}"
                 )
+            fields = header_fields(resp.headers)
             # 304 is the producer confirming the bytes are unchanged, so
-            # reusing the previous parse is not a staleness risk the way a
-            # TTL cache would be -- there is nothing newer to have missed.
+            # reusing the previous parse is not a staleness risk.
             if resp.status == HTTPStatus.NOT_MODIFIED:
-                return None, validators
+                if validators is None:
+                    # Unsolicited: there is no previous parse to reuse. A
+                    # misbehaving proxy must raise the library's own error.
+                    raise SourceConnectionError(
+                        f"Producer answered 304 to an unconditional request: {url}",
+                        status=int(HTTPStatus.NOT_MODIFIED),
+                    )
+                return Response(
+                    value=None,
+                    fields=fields,
+                    requested_at=requested_at,
+                    received_at=received_at,
+                    request_fields=sent_fields(controlled, resp),
+                    hops=_hops(resp),
+                    url=str(resp.url),
+                    first_hop_request_fields=first_hop_fields(controlled, resp),
+                )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
                     f"Producer error {resp.status}: {url}", status=resp.status
                 )
-            fresh = FeedValidators(
-                etag=resp.headers.get("ETag"),
-                last_modified=resp.headers.get("Last-Modified"),
-            )
+            if resp.status not in _FEED_STATUSES:
+                # A 204, a 300, a 3xx left unfollowed: no feed to parse (an
+                # empty body parses as an empty FeedMessage).
+                raise SourceConnectionError(
+                    f"Producer answered {resp.status} without a feed: {url}",
+                    status=resp.status,
+                )
             raw = await resp.read()
+            sent, hops = sent_fields(controlled, resp), _hops(resp)
+            answered = str(resp.url)
+            first = first_hop_fields(controlled, resp)
     except (TimeoutError, aiohttp.ClientError) as err:
         raise SourceConnectionError(f"Error fetching {url}: {err}") from err
     message = gtfs_realtime_pb2.FeedMessage()
@@ -173,7 +238,16 @@ async def fetch_feed_message(
         await asyncio.to_thread(message.ParseFromString, raw)
     except Exception as err:  # DecodeError subclasses Exception, not a shared base
         raise FeedParseError(f"Undecodable GTFS-RT protobuf from {url}") from err
-    return message, (fresh if fresh.etag or fresh.last_modified else None)
+    return Response(
+        value=message,
+        fields=fields,
+        requested_at=requested_at,
+        received_at=received_at,
+        request_fields=sent,
+        hops=hops,
+        url=answered,
+        first_hop_request_fields=first,
+    )
 
 
 # GTFS-RT's WheelchairAccessible is NOT the static wheelchair_accessible

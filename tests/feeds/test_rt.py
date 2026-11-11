@@ -66,7 +66,9 @@ async def _fetch(
     mock_api: MockApi, path: str = "/rt", **kwargs: object
 ) -> gtfs_realtime_pb2.FeedMessage:
     async with aiohttp.ClientSession() as session:
-        message, _ = await fetch_feed_message(session, mock_api.url(path), **kwargs)  # type: ignore[arg-type]
+        message = (
+            await fetch_feed_message(session, mock_api.url(path), **kwargs)
+        ).value  # type: ignore[arg-type]
         assert message is not None
         return message
 
