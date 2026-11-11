@@ -1,11 +1,16 @@
 """Tests for GTFS-RT fetching (auth, errors) and protobuf parsing."""
 
+import asyncio
 from datetime import UTC, date, datetime
 
 import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from google.transit import gtfs_realtime_pb2
+from yarl import URL
 
+from aiomobilitydatabase.feeds import rt as rt_module
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
     SourceAuthenticationError,
@@ -25,6 +30,7 @@ from aiomobilitydatabase.feeds.rt import (
     TripUpdateEntry,
     _lenient_service_date,
     _lenient_start_secs,
+    _origin,
     _pb_enum_name,
     _vocab_or_none,
     alerts_from_message,
@@ -169,8 +175,8 @@ async def test_header_auth_key_never_follows_a_redirect_to_another_origin(
         assert seen[path]["X-Api-Key"] == "secret123"
         assert seen[path]["Authorization"] == "Bearer user"
     for path in ("/rt/away", "/rt/back"):
-        assert "X-Api-Key" not in seen[path]
-        assert "Authorization" not in seen[path]
+        names = {name.lower() for name in seen[path]}
+        assert not names & {"x-api-key", "authorization"}
     assert all(r.headers["X-Other"] == "kept" for r in mock_api.requests)
 
 
@@ -195,7 +201,8 @@ async def test_header_auth_key_is_withheld_whatever_its_case(
 
 
 @pytest.mark.parametrize(
-    "credential", ["Authorization", "cookie", "Proxy-Authorization", "auth"]
+    "credential",
+    ["Authorization", "cookie", "Proxy-Authorization", "x-api-key", "auth"],
 )
 # aiohttp 3.14 deprecates session ``auth``; older floors still have it.
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -288,6 +295,61 @@ async def test_a_header_auth_redirect_without_location_is_the_answer(
     with pytest.raises(SourceConnectionError, match="without a feed") as excinfo:
         await _fetch(mock_api, auth_type=2, api_key_name="K", api_key="v")
     assert excinfo.value.status == 302
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "same"),
+    [
+        ("http://a.example/x", "http://a.example:80/y", True),
+        ("https://A.example/", "https://a.example:443/", True),
+        ("http://a.example/", "https://a.example/", False),
+        ("http://a.example/", "http://a.example:8080/", False),
+        ("https://a.example/", "https://b.a.example/", False),
+    ],
+)
+def test_origins_compare_as_rfc_6454_says(first: str, second: str, same: bool) -> None:
+    """An explicit default port is the same origin: the key isn't dropped."""
+    assert (_origin(URL(first)) == _origin(URL(second))) is same
+
+
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_the_timeout_bounds_the_whole_redirect_chain(
+    auth_type: int | None,
+) -> None:
+    """aiohttp's ``total`` covers every hop: so does the hand-made chain."""
+
+    async def hop(request: web.Request) -> web.Response:
+        await asyncio.sleep(0.4)
+        step = int(request.match_info["step"])
+        if step < 4:
+            return web.Response(status=302, headers={"Location": f"/hop/{step + 1}"})
+        return web.Response(body=VEHICLE_POSITIONS, content_type=PB)
+
+    app = web.Application()
+    app.router.add_get("/hop/{step}", hop)
+    async with TestServer(app) as server, aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError):
+            await fetch_feed_message(
+                session,
+                str(server.make_url("/hop/0")),
+                auth_type=auth_type,
+                api_key_name="K",
+                api_key="v",
+                timeout_seconds=1.0,
+            )
+
+
+async def test_a_deadline_spent_between_hops_sends_no_further_request(
+    mock_api: MockApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the deadline has passed, the next hop is never asked."""
+
+    readings = iter([0.0, 0.0, 31.0])  # the deadline passes after the first hop
+    monkeypatch.setattr(rt_module, "monotonic", lambda: next(readings))
+    mock_api.get("/rt", status=302, headers={"Location": "/rt/x"})
+    with pytest.raises(SourceConnectionError):
+        await _fetch(mock_api, auth_type=2, api_key_name="K", api_key="v")
+    assert [r.path for r in mock_api.requests] == ["/rt"]
 
 
 def test_vehicles_from_message() -> None:

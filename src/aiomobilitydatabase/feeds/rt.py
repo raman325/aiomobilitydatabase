@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from http import HTTPStatus
+from time import monotonic
 from typing import Any
 
 import aiohttp
@@ -156,6 +157,15 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization"})
 
 
+def _origin(url: URL) -> tuple[str, str | None, int | None]:
+    """RFC 6454 origin: an explicit default port names the same origin.
+
+    (yarl's ``URL.origin()`` keeps an explicit ``:443``, so it can't be
+    compared directly.)
+    """
+    return url.scheme, url.host, url.port
+
+
 @asynccontextmanager
 async def _get(
     session: aiohttp.ClientSession,
@@ -163,7 +173,7 @@ async def _get(
     *,
     params: Mapping[str, str],
     headers: Mapping[str, str],
-    client_timeout: aiohttp.ClientTimeout,
+    total: float,
     secret: str | None,
 ) -> AsyncIterator[tuple[aiohttp.ClientResponse, Sequence[aiohttp.ClientResponse]]]:
     """GET ``url``; yield the final response and the redirects followed.
@@ -178,24 +188,32 @@ async def _get(
     be withheld from a hand-made request, so a session carrying such a
     default header (or default ``auth``) fails such a hop instead
     (:class:`SourceConnectionError`), as does a Location that isn't an
-    HTTP(S) URL or a chain of ten redirects.
+    HTTP(S) URL or a chain of ten redirects. ``total`` seconds bound the
+    whole fetch, every hop and the body read, as aiohttp's own ``total``.
     """
     if secret is None:
         async with session.get(
-            url, params=params or None, headers=headers or None, timeout=client_timeout
+            url,
+            params=params or None,
+            headers=headers or None,
+            timeout=aiohttp.ClientTimeout(total=total),
         ) as response:
             yield response, response.history
         return
+    deadline = monotonic() + total
     history: list[aiohttp.ClientResponse] = []
     target = URL(url)
     sent = dict(headers)
     query = params or None
     while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError
         response = await session.get(
             target,
             params=query,
             headers=sent or None,
-            timeout=client_timeout,
+            timeout=aiohttp.ClientTimeout(total=remaining),
             allow_redirects=False,
         )
         location = response.headers.get("Location")
@@ -213,7 +231,7 @@ async def _get(
             following = response.url.join(
                 URL(location, encoded=not session.requote_redirect_url)
             )
-            origin = following.origin()
+            origin = _origin(following)
         except ValueError as err:
             raise SourceConnectionError(
                 f"Producer redirected to an invalid URL ({location!r}): {url}"
@@ -222,15 +240,15 @@ async def _get(
             raise SourceConnectionError(
                 f"Producer redirected to a non-HTTP URL ({following}): {url}"
             )
-        if origin != response.url.origin():
+        if origin != _origin(response.url):
+            withheld = _ORIGIN_CREDENTIALS | {secret.lower()}
             if session.auth is not None or any(
-                name in session.headers for name in _ORIGIN_CREDENTIALS
+                name.lower() in withheld for name in session.headers
             ):
                 raise SourceConnectionError(
-                    f"Producer redirected to another origin ({origin}) and the "
-                    f"session carries credentials that can't be withheld: {url}"
+                    f"Producer redirected to another origin ({following.origin()}) "
+                    f"and the session carries credentials that can't be withheld: {url}"
                 )
-            withheld = _ORIGIN_CREDENTIALS | {secret.lower()}
             sent = {k: v for k, v in sent.items() if k.lower() not in withheld}
         target, query = following, None
 
@@ -278,7 +296,7 @@ async def fetch_feed_message(
             url,
             params=params,
             headers=req_headers,
-            client_timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+            total=timeout_seconds,
             secret=secret,
         ) as (resp, history):
             received_at = datetime.now(UTC)

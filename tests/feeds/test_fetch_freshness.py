@@ -782,4 +782,4 @@ async def test_a_header_auth_redirect_to_another_origin_is_cached_without_the_ke
     away_hits = [r.headers for r in mock_api.requests if r.path == "/rt/away"]
     assert [hit.get("If-None-Match") for hit in away_hits] == [None, '"v1"']
     assert all(hit["X-Api-Key"] == "secret" for hit in _rt_hits(mock_api))
-    assert not any("X-Api-Key" in hit for hit in away_hits)
+    assert not any("x-api-key" in {k.lower() for k in hit} for hit in away_hits)
