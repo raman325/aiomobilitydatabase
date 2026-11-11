@@ -200,67 +200,76 @@ async def test_header_auth_key_is_withheld_whatever_its_case(
     assert not any(k.lower() == "x-api-key" for k in mock_api.requests[1].headers)
 
 
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_url_credentials_follow_hops_within_their_origin_only(
+    mock_api: MockApi, auth_type: int | None
+) -> None:
+    """As on aiohttp's own redirects: kept within the origin, never sent
+    past the first hop away -- not even back at their origin -- and a
+    Location's own credentials apply to its origin.
+    """
+    mock_api.get("/rt", status=302, headers={"Location": "/rt/same"})
+    away = _elsewhere(mock_api.url("/rt/away"))
+    mock_api.get("/rt/same", status=302, headers={"Location": away})
+    mock_api.get("/rt/away", status=302, headers={"Location": mock_api.url("/rt/back")})
+    back = URL(mock_api.url("/rt/next")).with_user("v").with_password("w")
+    mock_api.get("/rt/back", status=302, headers={"Location": str(back)})
+    mock_api.get("/rt/next", body=VEHICLE_POSITIONS, content_type=PB)
+    url = URL(mock_api.url("/rt")).with_user("u").with_password("p")
+    async with aiohttp.ClientSession() as session:
+        await fetch_feed_message(
+            session, str(url), auth_type=auth_type, api_key_name="K", api_key="k"
+        )
+    sent = [(r.path, r.headers.get("Authorization")) for r in mock_api.requests]
+    assert sent == [
+        ("/rt", "Basic dTpw"),
+        ("/rt/same", "Basic dTpw"),
+        ("/rt/away", None),
+        ("/rt/back", None),
+        ("/rt/next", "Basic djp3"),
+    ]
+
+
+@pytest.mark.parametrize("timeout_seconds", [0, -1, None])
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_a_timeout_of_none_or_less_is_no_bound_with_or_without_header_auth(
+    mock_api: MockApi, auth_type: int | None, timeout_seconds: float | None
+) -> None:
+    """As aiohttp's own ``total``: None, zero or less sets no bound."""
+    mock_api.get("/rt", status=302, headers={"Location": "/rt/x"})
+    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
+    msg = await _fetch(
+        mock_api,
+        auth_type=auth_type,
+        api_key_name="K",
+        api_key="v",
+        timeout_seconds=timeout_seconds,
+    )
+    assert len(msg.entity) == 2
+
+
 @pytest.mark.parametrize(
     "credential",
     ["Authorization", "cookie", "Proxy-Authorization", "x-api-key", "auth"],
 )
 # aiohttp 3.14 deprecates session ``auth``; older floors still have it.
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-async def test_session_credentials_never_follow_a_header_auth_hop_to_another_origin(
+async def test_session_credentials_fail_a_header_auth_hop_to_another_origin(
     mock_api: MockApi, credential: str
 ) -> None:
-    """A session's default credentials are left off from the first hop to
-    another origin on, as aiohttp's own redirects leave them off -- while
-    its other defaults still go, the target's own cookies still go, and
-    the session's pool outlives the hop.
+    """A request can't shed its session's default credentials, and
+    following a redirect is optional: such a hop is never sent.
     """
-    away = _elsewhere(mock_api.url("/rt/away"))
-    mock_api.get("/rt", status=302, headers={"Location": away})
-    mock_api.get("/rt/away", status=302, headers={"Location": mock_api.url("/rt/back")})
-    mock_api.get("/rt/back", body=VEHICLE_POSITIONS, content_type=PB)
-    mock_api.get("/rt/after", body=VEHICLE_POSITIONS, content_type=PB)
-    jar = aiohttp.CookieJar(unsafe=True)
-    jar.update_cookies({"own": "away"}, URL(away))
-    headers = {"X-Ua": "s"}
-    options: dict[str, object] = {"cookie_jar": jar, "headers": headers}
-    if credential == "auth":
-        options["auth"] = aiohttp.BasicAuth("user", "pass")
-    else:
-        headers[credential] = "secret"
-    async with aiohttp.ClientSession(**options) as session:  # type: ignore[arg-type]
-        response = await fetch_feed_message(
-            session,
-            mock_api.url("/rt"),
-            auth_type=2,
-            api_key_name="X-Api-Key",
-            api_key="secret123",
-        )
-        assert [hop.status for hop in response.hops] == [302, 302]
-        # The shared connector and jar are still open for the next fetch.
-        await fetch_feed_message(session, mock_api.url("/rt/after"))
-    name = "authorization" if credential == "auth" else credential.lower()
-    first, *rest = mock_api.requests[:3]
-    assert name in {k.lower() for k in first.headers}
-    for request in rest:
-        values = {k.lower(): v for k, v in request.headers.items()}
-        assert "secret" not in values.get(name, "")  # the jar's own cookie may go
-        assert "x-api-key" not in values
-        if credential == "auth":
-            assert "authorization" not in values
-        assert values["x-ua"] == "s"
-    assert mock_api.requests[1].headers.get("Cookie") == "own=away"
-
-
-async def test_a_session_setting_that_cant_be_carried_over_fails_the_hop(
-    mock_api: MockApi, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Rather than a request the caller's session would never make."""
-    monkeypatch.delitem(redirects_module._COPIED, "trust_env")
     mock_api.get(
         "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
     )
-    async with aiohttp.ClientSession(headers={"Authorization": "s"}) as session:
-        with pytest.raises(SourceConnectionError, match="trust_env"):
+    options: dict[str, object] = (
+        {"auth": aiohttp.BasicAuth("user", "pass")}
+        if credential == "auth"
+        else {"headers": {credential: "secret"}}
+    )
+    async with aiohttp.ClientSession(**options) as session:  # type: ignore[arg-type]
+        with pytest.raises(SourceConnectionError, match="credentials"):
             await fetch_feed_message(
                 session,
                 mock_api.url("/rt"),
@@ -269,36 +278,6 @@ async def test_a_session_setting_that_cant_be_carried_over_fails_the_hop(
                 api_key="secret123",
             )
     assert [r.path for r in mock_api.requests] == ["/rt"]
-
-
-async def test_the_credential_free_hop_keeps_the_sessions_trace_configs(
-    mock_api: MockApi,
-) -> None:
-    starts: list[str] = []
-
-    async def on_start(
-        _session: object, _ctx: object, params: aiohttp.TraceRequestStartParams
-    ) -> None:
-        starts.append(params.url.path)
-
-    trace = aiohttp.TraceConfig()
-    trace.on_request_start.append(on_start)
-    mock_api.get(
-        "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
-    )
-    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
-    async with aiohttp.ClientSession(
-        headers={"Authorization": "s"}, trace_configs=[trace]
-    ) as session:
-        await fetch_feed_message(
-            session,
-            mock_api.url("/rt"),
-            auth_type=2,
-            api_key_name="X-Api-Key",
-            api_key="secret123",
-        )
-    assert starts == ["/rt", "/rt/x"]
-    assert "Authorization" not in mock_api.requests[1].headers
 
 
 async def test_session_credentials_follow_a_header_auth_hop_within_the_origin(
@@ -397,7 +376,7 @@ async def test_the_timeout_bounds_the_whole_redirect_chain(
     app = web.Application()
     app.router.add_get("/hop/{step}", hop)
     async with TestServer(app) as server, aiohttp.ClientSession() as session:
-        with pytest.raises(SourceConnectionError):
+        with pytest.raises(SourceConnectionError) as excinfo:
             await fetch_feed_message(
                 session,
                 str(server.make_url("/hop/0")),
@@ -406,6 +385,7 @@ async def test_the_timeout_bounds_the_whole_redirect_chain(
                 api_key="v",
                 timeout_seconds=1.0,
             )
+    assert isinstance(excinfo.value.__cause__, TimeoutError)
 
 
 async def test_a_deadline_spent_between_hops_sends_no_further_request(
