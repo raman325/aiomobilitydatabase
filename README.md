@@ -303,8 +303,10 @@ Notes on direct mode:
   nothing is revalidated on every call — no heuristic lifetimes. A GBFS
   document's `ttl` counts from its own `last_updated`, and the shorter of
   `ttl` and the HTTP lifetime wins — on a `304` too, so a renewal never
-  outlives the document; an unusable `ttl` means the document isn't
-  reused. Concurrent calls share one in-flight request per URL and
+  outlives the document; an unusable `ttl`, or one without a usable
+  `last_updated` to count from, means the document isn't reused. A
+  direct-URL handle's `gbfs.json` is no exception: once its `ttl` lapses it
+  is read again, so endpoints the system moves are followed. Concurrent calls share one in-flight request per URL and
   request headers until it is sent (a cancelled caller cancels neither it
   nor the other waiters); a call arriving later waits for it and checks
   the store, so it never gets a response it may not reuse. Requests for
@@ -402,8 +404,9 @@ Notes on direct mode:
 - **GBFS ids resolve**: `get_vehicle_types()`, `get_pricing_plans()`,
   `get_regions()`, and `get_alerts()` turn the `vehicle_type_id`,
   `pricing_plan_id`, and `region_id` on stations and vehicles into records.
-  All four documents are optional in GBFS, so an unpublished one is `[]`
-  rather than an error.
+  These documents are optional in GBFS (`vehicle_types` only conditionally
+  required), so an unpublished one — or a listed one answering `404`,
+  which GBFS says is not an error — is `[]`.
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
   `get_headsigns_serving()` alongside the stop/route helpers.
@@ -416,11 +419,14 @@ Notes on direct mode:
 - **GBFS exposes what the documents carry**: the full station surface
   (`is_installed` alongside `is_renting`/`is_returning` — a station removed
   from the street is not "operational"; disabled counts, address, region,
-  virtual-station flag), free-floating vehicle docking and fuel state, and a
+  virtual-station flag), vehicle docking and fuel state (a vehicle docked
+  at a station need not report a position: its coordinates are `None`, and
+  a zone places it at its station), and a
   `GbfsSystemInfo` with the operator's contact, licensing, and terms URLs.
   `last_reported` is exposed on both stations and vehicles so you can tell
   fresh data from stale, and is parsed from either GBFS 2.x POSIX seconds or
-  3.0 RFC3339. Plus `rental_uris` deep links and TTL-based document caching.
+  3.0 RFC 3339 (whose offset is required: without one, a timestamp is
+  `None`). Plus `rental_uris` deep links and TTL-based document caching.
 - **`cache_dir` strongly recommended**: the static index is cached on disk
   keyed by feed, validated against the dataset ID, so restarts are instant and
   rebuilds only happen when the agency publishes a new dataset

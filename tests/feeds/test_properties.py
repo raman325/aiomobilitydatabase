@@ -3677,6 +3677,7 @@ def _gbfs_handle(documents: dict[str, object]) -> GbfsFeedHandle:
     """
     handle = GbfsFeedHandle.__new__(GbfsFeedHandle)
     handle._endpoints = {name: f"https://gbfs.invalid/{name}" for name in documents}
+    handle._discovery_url = None
     # Never fetches (all cached); only asked what a request would carry.
     session = SimpleNamespace(
         headers={},

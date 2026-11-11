@@ -624,7 +624,12 @@ class GbfsStation:
 
 @dataclass(frozen=True)
 class GbfsVehicle:
-    """A free-floating GBFS vehicle.
+    """A GBFS vehicle that is not in active rental.
+
+    A free-floating vehicle always has a position; a docked one (with a
+    ``station_id``) need not report one (GBFS 2.1+: ``lat``/``lon`` are
+    REQUIRED only without ``station_id``), so its ``latitude`` and
+    ``longitude`` may be None -- it is at its station.
 
     ``rental_uris`` passes through the vehicle's deep-link table as
     provided (keys ``android``/``ios``/``web`` per the spec, any string
@@ -632,8 +637,8 @@ class GbfsVehicle:
     """
 
     id: str
-    latitude: float
-    longitude: float
+    latitude: float | None
+    longitude: float | None
     is_reserved: bool | None
     is_disabled: bool | None
     vehicle_type_id: str | None
@@ -723,7 +728,8 @@ class GbfsAlert:
     Distinct from :class:`ServiceAlert`, which is GTFS-RT: this one scopes
     to GBFS stations and regions rather than routes and trips, and its
     ``type`` is a raw string for the same reason as
-    :attr:`GbfsVehicleType.form_factor`.
+    :attr:`GbfsVehicleType.form_factor`. Each active period has the start
+    GBFS requires; its end is None when it is open-ended.
     """
 
     id: str
@@ -734,7 +740,7 @@ class GbfsAlert:
     station_ids: tuple[str, ...]
     region_ids: tuple[str, ...]
     last_updated: datetime | None
-    active_periods: tuple[tuple[datetime | None, datetime | None], ...]
+    active_periods: tuple[tuple[datetime, datetime | None], ...]
 
 
 @dataclass(frozen=True)

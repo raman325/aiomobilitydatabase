@@ -5,6 +5,7 @@ import zipfile
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,6 +38,16 @@ TU_PATH = "/direct/rt/trip_updates"
 VP_PATH = "/direct/rt/vehicle_positions"
 HDRS = {"X-Custom-Token": "abc123"}
 NOW = datetime(2026, 7, 30, 14, 45, tzinfo=UTC)  # Thursday 07:45 PDT
+
+
+def _current(discovery: dict[str, Any]) -> dict[str, Any]:
+    """A discovery document updated just now: its ttl hasn't lapsed."""
+    now = datetime.now(UTC)
+    stamp = discovery.get("last_updated")
+    discovery["last_updated"] = (
+        now.isoformat() if isinstance(stamp, str) else int(now.timestamp())
+    )
+    return discovery
 
 
 @pytest.fixture
@@ -361,7 +372,7 @@ async def test_direct_gbfs_23_discovery_stations_and_headers(
     mock_api: MockApi, direct_client: MobilityFeedsClient
 ) -> None:
     base = mock_api.url()
-    mock_api.get("/gbfs/gbfs.json", payload=with_base(DISCOVERY_23, base))
+    mock_api.get("/gbfs/gbfs.json", payload=_current(with_base(DISCOVERY_23, base)))
     mock_api.get("/gbfs/station_information.json", payload=STATION_INFO_23)
     mock_api.get("/gbfs/station_status.json", payload=STATION_STATUS_23)
     handle = await direct_client.get_gbfs_feed_from_url(
@@ -381,7 +392,7 @@ async def test_direct_gbfs_30_discovery(
     mock_api: MockApi, direct_client: MobilityFeedsClient
 ) -> None:
     base = mock_api.url()
-    mock_api.get("/gbfs3/gbfs.json", payload=with_base(DISCOVERY_30, base))
+    mock_api.get("/gbfs3/gbfs.json", payload=_current(with_base(DISCOVERY_30, base)))
     mock_api.get("/gbfs3/system_information.json", payload=SYSTEM_INFO_30)
     handle = await direct_client.get_gbfs_feed_from_url(
         mock_api.url("/gbfs3/gbfs.json")
@@ -395,7 +406,7 @@ async def test_direct_gbfs_non_preferred_language_fallback(
     mock_api: MockApi, direct_client: MobilityFeedsClient
 ) -> None:
     base = mock_api.url()
-    discovery = with_base(DISCOVERY_23, base)
+    discovery = _current(with_base(DISCOVERY_23, base))
     discovery["data"] = {"fr": discovery["data"]["en"]}  # no "en" block at all
     mock_api.get("/gbfs/gbfs.json", payload=discovery)
     mock_api.get("/gbfs/station_information.json", payload=STATION_INFO_23)
