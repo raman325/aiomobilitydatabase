@@ -1378,3 +1378,136 @@ def test_two_ended_runs_on_a_skipped_date_name_neither() -> None:
     assert index._service_day_of(now) == date(2011, 12, 31)
     assert index.current_service_dates(["T"], now) == {}
     index.close()
+
+
+def test_the_tie_search_reaches_back_a_day_not_across_a_gap() -> None:
+    """A 24-hour trip read at the instant its 11-09 run departs: the run
+    before it would end right then, so a tie is possible and the search
+    runs -- reading the day before, not ten years back to 2016.
+    """
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\nT,32:00:00,32:00:00,B,2\n",
+        calendar="NEVER,0,0,0,0,0,0,0,20160101,20160101",
+        trips="R,S,T\n",
+        extra={
+            "calendar_dates.txt": "service_id,date,exception_type\n"
+            "S,20160101,1\nS,20261109,1\n"
+        },
+    )
+    index = _index_from_zip_bytes(feed)
+    reads: list[date] = []
+    active = index.active_service_ids
+
+    def counted(day: date) -> set[str]:
+        reads.append(day)
+        return active(day)
+
+    index.active_service_ids = counted  # type: ignore[method-assign]
+    now = datetime(2026, 11, 9, 8, tzinfo=UTC)
+    assert index.current_service_dates(["T"], now) == {"T": date(2026, 11, 9)}
+    assert len(reads) < 10
+    index.close()
+
+
+@pytest.mark.parametrize(
+    ("stop_times", "span"),
+    [
+        # A repeated first sequence: its earliest departure starts the trip.
+        (
+            "T,07:00:00,07:00:00,A,1\nT,08:00:00,08:00:00,A,1\nT,09:00:00,09:00:00,B,2\n",
+            (7 * 3600, 9 * 3600),
+        ),
+        # A repeated last sequence: its latest arrival ends the trip.
+        (
+            "T,08:00:00,08:00:00,A,1\nT,09:00:00,09:00:00,B,2\nT,11:00:00,11:00:00,B,2\n",
+            (8 * 3600, 11 * 3600),
+        ),
+    ],
+)
+def test_repeated_sequences_take_the_widest_span(
+    stop_times: str, span: tuple[int, int]
+) -> None:
+    index = _index_from_zip_bytes(_feed(stop_times))
+    assert tuple(index._trip_spans(["T"])[0][3:]) == span
+    index.close()
+
+
+@pytest.mark.parametrize(
+    ("start_time", "start_date", "applies"),
+    [
+        ("08:00:00", "20260610", True),  # its own start time, dated
+        ("08:00:00", "", True),  # its own start time, date-less: current run
+        ("08:05:00", "20260610", False),  # not its GTFS value: names no run
+        ("", "20260610", True),  # omitted, as before
+    ],
+)
+def test_a_plain_trip_named_with_its_own_start_time(
+    start_time: str, start_date: str, applies: bool
+) -> None:
+    """GTFS-RT: a non-frequency trip's start_time "should either be omitted
+    or be equal to the value in the GTFS feed" -- so naming T's first
+    departure addresses T exactly as naming none does: the delay, the
+    vehicle and the cancellation all land.
+    """
+    feed = _feed("T,08:00:00,08:00:00,A,1\nT,08:30:00,08:30:00,B,2\n")
+    now = datetime(2026, 6, 10, 7, tzinfo=UTC)
+    message = _dateless_message(now)
+    for holder in (message.entity[0].trip_update.trip, message.entity[1].vehicle.trip):
+        if start_time:
+            holder.start_time = start_time
+        if start_date:
+            holder.start_date = start_date
+
+    async def body(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=1)], start=now, with_vehicles=True
+        )
+        [row] = board
+        assert (row.delay_seconds == 300) is applies
+        assert (row.vehicle is not None) is applies
+
+    _run(_index_from_zip_bytes(feed), body, message)
+
+    cancel = _cancellation(now, start_date or None)
+    if start_time:
+        cancel.entity[0].trip_update.trip.start_time = start_time
+
+    async def cancelled(handle: TransitFeedHandle) -> None:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["B"], limit=None)], start=now, end=now + timedelta(hours=2)
+        )
+        assert (_times(board) == []) is applies
+
+    _run(_index_from_zip_bytes(feed), cancelled, cancel)
+
+
+def test_a_repeated_origin_call_is_two_journeys() -> None:
+    """A feed repeating an origin stop_sequence with another time has two
+    origin calls: two journeys, whichever read finds them."""
+    feed = _feed(
+        "T,08:00:00,08:00:00,A,1\nT,08:20:00,08:20:00,A,1\nT,09:00:00,09:00:00,B,2\n"
+    )
+    index = _index_from_zip_bytes(feed)
+    now = datetime(2026, 6, 10, 7, tzinfo=UTC)
+    journeys = index.upcoming_trips("A", "B", now, timedelta(hours=3))
+    assert [trip.departure for trip in journeys] == [
+        datetime(2026, 6, 10, 8, tzinfo=UTC),
+        datetime(2026, 6, 10, 8, 20, tzinfo=UTC),
+    ]
+    later = index.upcoming_trips(
+        "A", "B", now + timedelta(hours=1, minutes=10), timedelta(hours=1)
+    )
+    assert [trip.departure for trip in later] == [
+        datetime(2026, 6, 10, 8, 20, tzinfo=UTC)
+    ]
+    index.close()
+
+
+def test_plain_trip_starts_leave_out_what_is_not_a_plain_trip() -> None:
+    index = _index_from_zip_bytes(
+        _feed("T,08:00:00,08:00:00,A,1\nT,08:30:00,08:30:00,B,2\n")
+    )
+    assert index.plain_trip_starts([]) == {}
+    assert index.plain_trip_starts(["NOPE"]) == {}
+    assert index.plain_trip_starts(["T", "NOPE"]) == {"T": 8 * 3600}
+    index.close()

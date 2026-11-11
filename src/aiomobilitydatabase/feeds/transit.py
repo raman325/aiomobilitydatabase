@@ -251,12 +251,16 @@ class _Vehicles:
     dateless_trip_ids: frozenset[str]
 
 
-def _vehicle_index(vehicles: Sequence[VehiclePosition]) -> _Vehicles:
+def _vehicle_index(
+    vehicles: Sequence[VehiclePosition], plain_starts: Mapping[str, int]
+) -> _Vehicles:
     """Index live vehicles for matching, by vehicle id and by run.
 
     An instance entry holds None where two vehicles claim the same run:
     that is a genuinely ambiguous feed, not a resolvable one, and guessing
-    would put the wrong vehicle on the map.
+    would put the wrong vehicle on the map. A plain trip named with its own
+    start time (``plain_starts``) is indexed as named without one (see
+    :func:`_plain_start_key`); the vehicle itself keeps what it reported.
     """
     by_vehicle_id: dict[str, VehiclePosition] = {}
     by_instance: dict[tuple[str, int | None, date | None], VehiclePosition | None] = {}
@@ -265,12 +269,74 @@ def _vehicle_index(vehicles: Sequence[VehiclePosition]) -> _Vehicles:
         if vehicle.vehicle_id:
             by_vehicle_id[vehicle.vehicle_id] = vehicle
         if vehicle.trip_id:
-            key = (vehicle.trip_id, vehicle.trip_start_secs, vehicle.trip_start_date)
+            trip_id, _date, secs = _plain_start_key(
+                (vehicle.trip_id, vehicle.trip_start_date, vehicle.trip_start_secs),
+                plain_starts,
+            )
+            key = (trip_id, secs, vehicle.trip_start_date)
             # A second claimant poisons the entry rather than overwriting it.
             by_instance[key] = None if key in by_instance else vehicle
             if vehicle.trip_start_date is None:
                 dateless.add(vehicle.trip_id)
     return _Vehicles(by_vehicle_id, by_instance, frozenset(dateless))
+
+
+def _plain_start_key(
+    key: TripUpdateKey, plain_starts: Mapping[str, int]
+) -> TripUpdateKey:
+    """Return a realtime key with a plain trip's own start time dropped.
+
+    GTFS-RT: a non-frequency trip's ``start_time`` "should either be
+    omitted or be equal to the value in the GTFS feed", so one equal to the
+    trip's first departure names the same run as one omitting it. Any
+    other start time on a plain trip names no run (it is kept, and so
+    matches nothing); a frequency repetition's is its identity.
+    """
+    trip_id, start_date, start_secs = key
+    if start_secs is not None and plain_starts.get(trip_id) == start_secs:
+        return (trip_id, start_date, None)
+    return key
+
+
+def _with_plain_starts(
+    updates: TripUpdates, plain_starts: Mapping[str, int]
+) -> TripUpdates:
+    """Return ``updates`` with every key passed through :func:`_plain_start_key`.
+
+    A key already naming the same run without a start time wins: the spec
+    allows one update per run, and the bare form is the canonical one.
+    """
+    if not plain_starts:
+        return updates
+    trips = dict(updates.trips)
+    for key, entry in updates.trips.items():
+        bare = _plain_start_key(key, plain_starts)
+        if bare != key:
+            del trips[key]
+            trips.setdefault(bare, entry)
+    return TripUpdates(
+        trips=trips,
+        canceled_trips={
+            _plain_start_key(k, plain_starts) for k in updates.canceled_trips
+        },
+        added=updates.added,
+        feed_time=updates.feed_time,
+    )
+
+
+def _plain_start_candidates(
+    updates: TripUpdates, vehicles: Sequence[VehiclePosition]
+) -> set[str]:
+    """Trip ids some realtime key names WITH a start time."""
+    return {
+        trip_id
+        for trip_id, _date, secs in (*updates.trips, *updates.canceled_trips)
+        if secs is not None
+    } | {
+        vehicle.trip_id
+        for vehicle in vehicles
+        if vehicle.trip_id and vehicle.trip_start_secs is not None
+    }
 
 
 def _match_vehicle(
@@ -1542,9 +1608,15 @@ class TransitFeedHandle:
         async with self._guard.reader():
             stops_by_id = await self._index_read(self._index.stops_by_id)
             routes_by_id = await self._index_read(self._index.routes_by_id)
-            vehicles = _vehicle_index(
-                await self._vehicles_from(vehicle_messages, stops_by_id, routes_by_id)
+            positions = await self._vehicles_from(
+                vehicle_messages, stops_by_id, routes_by_id
             )
+            plain_starts = await self._index_read(
+                self._index.plain_trip_starts,
+                _plain_start_candidates(updates, positions),
+            )
+            updates = _with_plain_starts(updates, plain_starts)
+            vehicles = _vehicle_index(positions, plain_starts)
             realtime_now = _realtime_now(updates, start)
             # Realtime moves exactly the runs it names: those a TripUpdate
             # addresses and those a detour rebuilds. Both are read whole,
@@ -1959,9 +2031,15 @@ class TransitFeedHandle:
         async with self._guard.reader():
             routes_by_id = await self._index_read(self._index.routes_by_id)
             stops_by_id = await self._index_read(self._index.stops_by_id)
-            vehicles = _vehicle_index(
-                await self._vehicles_from(vehicle_messages, stops_by_id, routes_by_id)
+            positions = await self._vehicles_from(
+                vehicle_messages, stops_by_id, routes_by_id
             )
+            plain_starts = await self._index_read(
+                self._index.plain_trip_starts,
+                _plain_start_candidates(updates, positions),
+            )
+            updates = _with_plain_starts(updates, plain_starts)
+            vehicles = _vehicle_index(positions, plain_starts)
             realtime_now = _realtime_now(updates, start)
             # As in get_arrivals: the runs realtime addresses are read whole
             # up front, so the scan only adds rows at their scheduled time.

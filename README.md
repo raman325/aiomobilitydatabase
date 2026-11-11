@@ -271,7 +271,8 @@ Notes on direct mode:
   GTFS-RT requires `start_date` for a trip lasting more than a day (first
   departure to last arrival) and both `start_date` and `start_time` for a
   frequencies.txt trip, so a date-less update or vehicle for either applies
-  to no run — nor does a frequency vehicle missing its `start_time`. A dated
+  to no run — nor does a frequency vehicle missing its `start_time`, nor
+  an update for a trip whose times decrease (arriving before it departs). A dated
   one applies to exactly its day, including an RT-added trip's vehicle.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic
@@ -279,7 +280,9 @@ Notes on direct mode:
   origin→destination, routes-serving — sees them as ordinary trips.
 - **Spec-correct realtime matching**: GTFS-RT updates are matched by
   `(trip_id, start_date, start_time)`, so an update addresses exactly one
-  repetition of a frequency trip and exactly one service-day instance — a
+  repetition of a frequency trip and exactly one service-day instance (a
+  plain trip's `start_time`, when given, is its first departure, as GTFS-RT
+  requires; any other value names no run) — a
   "trip X is canceled tomorrow" posting never cancels today's run. A
   StopTimeUpdate's delay propagates to subsequent stops until newer
   information, `NO_DATA` makes a stop schedule-only, `SKIPPED` suppresses it

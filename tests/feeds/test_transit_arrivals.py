@@ -1039,7 +1039,7 @@ def test_match_vehicle_without_any_identity() -> None:
     trip_id: there is nothing to join on, and the first vehicle in the
     feed is not an answer.
     """
-    vehicles = _vehicle_index([])
+    vehicles = _vehicle_index([], {})
     assert (
         _match_vehicle(
             None, None, None, service_date=None, current_dates={}, vehicles=vehicles

@@ -1795,9 +1795,10 @@ class StaticIndex:
         today -- the service day ``now`` falls in, which on a spring-forward
         eve is already the next date from 23:00 local (see
         :meth:`_service_day_of`) -- the run under way at ``now``, else the
-        run nearest in time: to its first stop time if still to come, its
-        last if ended. A morning update reaches the afternoon's run, not
-        yesterday's; a run running late keeps its updates past midnight.
+        run nearest in time: to its first departure if still to come, from
+        its last arrival if ended. A morning update reaches the afternoon's
+        run, not yesterday's; a run running late keeps its updates past
+        midnight.
         Two runs equally near -- two under way at once -- collide (the spec
         requires ``start_date`` there): no run. A later day's run is never
         meant. Nothing but the feed's own time decides it, so one snapshot
@@ -1839,6 +1840,36 @@ class StaticIndex:
                 current[trip_id] = day
         return current
 
+    def plain_trip_starts(self, trip_ids: Iterable[str]) -> dict[str, int]:
+        """Map each plain (non-frequency) trip to its start time, in seconds.
+
+        GTFS-RT: a non-frequency trip's ``start_time``, if given, "should
+        either be omitted or be equal to the value in the GTFS feed" -- its
+        first departure (see :meth:`_trip_spans`). A realtime key naming
+        that value addresses the trip exactly as one naming none. Frequency
+        templates (whose calls moved to their repetitions) and trips with
+        no timed call are left out.
+        """
+        ids = sorted(set(trip_ids))
+        if not ids:
+            return {}
+        marks = ",".join("?" * len(ids))
+        plain = [
+            trip_id
+            for (trip_id,) in self._conn.execute(
+                f"SELECT id FROM trips WHERE id IN ({marks}) "
+                "AND start_secs IS NULL AND source_trip_id = id",
+                ids,
+            )
+        ]
+        if not plain:
+            return {}
+        return {
+            trip_id: start
+            for trip_id, _service, _repetition, start, _end in self._trip_spans(plain)
+            if start is not None
+        }
+
     def _trip_spans(
         self, trip_ids: Sequence[str]
     ) -> list[tuple[str, str, int | None, int | None, int | None]]:
@@ -1860,8 +1891,7 @@ class StaticIndex:
         for trip_id, sequence, arrival, departure in self._conn.execute(
             "SELECT trip_id, stop_sequence, arrival_secs, departure_secs "
             f"FROM stop_times WHERE trip_id IN ({marks}) "
-            "AND (arrival_secs IS NOT NULL OR departure_secs IS NOT NULL) "
-            "AND stop_sequence IS NOT NULL",
+            "AND (arrival_secs IS NOT NULL OR departure_secs IS NOT NULL)",
             list(trip_ids),
         ):
             arrives = arrival if arrival is not None else departure
@@ -2359,7 +2389,11 @@ class StaticIndex:
             "o.stop_sequence, d.stop_sequence, t.short_name, t.block_id "
             f"{candidates} "
             f"{window_sql} "
-            "GROUP BY o.trip_id, o.stop_sequence"
+            # A feed repeating an origin stop_sequence with another time has
+            # two origin calls: each is its own journey (as each is its own
+            # departure row), so no read -- windowed or not -- picks between
+            # them.
+            "GROUP BY o.trip_id, o.stop_sequence, o.departure_secs"
         )
         params: list[object] = [
             origin_stop_id,

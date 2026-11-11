@@ -5992,22 +5992,23 @@ def _pair_oracle(
     now: datetime,
     lookahead: timedelta,
     grace: timedelta,
-) -> dict[tuple[date, str, int], tuple[set[datetime], datetime, set[int]]]:
-    """Expected ``upcoming_trips`` rows keyed by ``(service day, trip, origin seq)``.
+) -> dict[tuple[date, str, int, datetime], tuple[set[datetime], datetime, set[int]]]:
+    """Expected ``upcoming_trips`` rows keyed by ``(day, trip, origin seq, departure)``.
 
     A row is expected iff the trip's service is active that day, the origin
     call has a departure inside the window, and SOME later-sequence call at
-    the destination has an arrival. The value is the set of departures the
-    grouped query may legitimately report (a messy feed can store the same
-    origin call twice with different times, which the ``GROUP BY`` collapses
-    into one row), the EARLIEST qualifying destination arrival, and the
-    destination sequences achieving it.
+    the destination has an arrival. A messy feed storing one origin
+    sequence twice with different times has two origin calls, each its own
+    journey. The value is the departure, the EARLIEST qualifying
+    destination arrival, and the destination sequences achieving it.
     """
     services: dict[str, str] = dict(
         index._conn.execute("SELECT id, service_id FROM trips")
     )
     trip_rows = _raw_trip_rows(index)
-    expected: dict[tuple[date, str, int], tuple[set[datetime], datetime, set[int]]] = {}
+    expected: dict[
+        tuple[date, str, int, datetime], tuple[set[datetime], datetime, set[int]]
+    ] = {}
     for service_date, anchor, active in _oracle_service_days(
         index, now, lookahead, grace
     ):
@@ -6028,7 +6029,7 @@ def _pair_oracle(
                 if not later:
                     continue
                 earliest = min(arrival for arrival, _ in later)
-                key = (service_date, trip_id, o_seq)
+                key = (service_date, trip_id, o_seq, departure)
                 departures = expected[key][0] if key in expected else set()
                 expected[key] = (
                     departures | {departure},
@@ -6110,10 +6111,15 @@ def test_upcoming_trips_matches_pair_semantics_oracle(
             index, origin, destination, now=now, lookahead=lookahead, grace=grace
         )
         event(f"pair oracle non-empty: {bool(expected)}")
-        got: dict[tuple[date, str, int], ScheduledTrip] = {}
+        got: dict[tuple[date, str, int, datetime], ScheduledTrip] = {}
         for trip in rows:
             assert trip.origin_stop_sequence < trip.destination_stop_sequence
-            key = (trip.service_date, trip.trip_id, trip.origin_stop_sequence)
+            key = (
+                trip.service_date,
+                trip.trip_id,
+                trip.origin_stop_sequence,
+                trip.departure,
+            )
             assert key not in got, "one row per (service day, trip, origin call)"
             got[key] = trip
         assert set(got) == set(expected)
@@ -6451,7 +6457,7 @@ def test_upcoming_trips_rides_to_the_earliest_destination_call(
         assert _pair_oracle(
             index, "S1", "S2", now=anchor, lookahead=lookahead, grace=timedelta(0)
         ) == {
-            (date(2026, 7, 30), "T1", trip.origin_stop_sequence): (
+            (date(2026, 7, 30), "T1", trip.origin_stop_sequence, trip.departure): (
                 {trip.departure},
                 trip.arrival,
                 {earliest_seq},
