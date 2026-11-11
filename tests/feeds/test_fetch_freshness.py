@@ -680,3 +680,47 @@ async def test_gbfs_a_status_without_a_document_is_a_connection_error(
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     with pytest.raises(SourceConnectionError, match="answered 204"):
         await handle.get_system_info()
+
+
+async def test_a_redirected_feed_varying_by_accept_encoding_is_reused(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """http->https style: a cacheable 301, then a feed fresh for 60s that
+    varies by Accept-Encoding (as nginx and Cloudflare send). aiohttp sends
+    the same Accept-Encoding on every request, so the second call is fresh.
+    """
+    _mock_transit(mock_api)
+    mock_api.get(
+        RT,
+        status=301,
+        headers={
+            "Location": mock_api.url("/rt/moved"),
+            "Cache-Control": "max-age=3600",
+        },
+    )
+    mock_api.get(
+        "/rt/moved",
+        body=_t1_delayed(60, timestamp=100),
+        content_type=PB,
+        headers={"Cache-Control": "max-age=60", "Vary": "Accept-Encoding"},
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    assert await _t1_delay(handle) == 60
+    assert await _t1_delay(handle) == 60
+    assert len(_rt_hits(mock_api)) == 1
+
+
+async def test_gbfs_a_redirected_document_records_the_url_that_answered(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """The stored document's URL is the redirect's target: a later 304 from
+    any other resource can't revalidate it."""
+    _mock_gbfs(mock_api)
+    moved = mock_api.url("/gbfs/moved.json")
+    mock_api.get(INFO, status=301, headers={"Location": moved})
+    mock_api.get("/gbfs/moved.json", payload=_info(ttl=0), headers={"ETag": '"g1"'})
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    assert (await handle.get_system_info()).name == "Test Bikes"
+    [entry] = handle._docs._entries.values()
+    assert entry.url == moved
+    assert entry.redirected

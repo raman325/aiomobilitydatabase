@@ -18,7 +18,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import format_datetime
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from yarl import URL
 
@@ -412,23 +412,30 @@ def _normalized(name: str, values: Sequence[str] | None) -> tuple[str, ...]:
     return (", ".join(value.strip(_OWS) for value in values),)
 
 
-def _vary_matches(stored: Fields, sent: Fields | None, upcoming: Fields) -> bool:
+def _vary_matches(
+    names: set[str],
+    sent: Fields | None,
+    upcoming: Fields | None,
+    *,
+    redirected: bool = False,
+) -> bool:
     """Whether a stored response may answer the upcoming request (RFC 9111 4.1).
 
-    Every request field the stored response's Vary nominates must carry the
-    same value, after normalization, in the request that produced it
-    (``sent``) and in the one it would now stand in for (``upcoming``); a
-    field absent from both matches. Unknown ``sent`` (a redirected
-    request) confirms nothing, so it matches only when Vary nominates
-    nothing.
+    Every request field its Vary ``names`` nominate must carry the same
+    value, after normalization, in the request that produced it (``sent``)
+    and in the one it would now stand in for (``upcoming``); a field absent
+    from both matches. Unknown fields (None) confirm nothing. Through a
+    redirect only aiohttp's automatic headers can be confirmed -- they are
+    the same on every hop and every request unless the client set them,
+    which both sides record -- so any other name fails to match.
     """
-    names = _vary_names(stored)
     if not names:
         return True
-    if sent is None:
+    if sent is None or upcoming is None:
         return False
     return all(
-        _normalized(name, sent.get(name)) == _normalized(name, upcoming.get(name))
+        (not redirected or name in _AUTOMATIC)
+        and _normalized(name, sent.get(name)) == _normalized(name, upcoming.get(name))
         for name in names
     )
 
@@ -520,11 +527,14 @@ def sent_fields(
     header a middleware or trace hook added counts -- it can't be
     predicted, and a Vary naming it never matches (one of the automatic
     names is the exception: it is taken to be aiohttp's fixed value). A
-    redirected request's final hop carried
-    headers no later request can be checked against in advance: None.
+    redirected request's hops carried headers no later request can be
+    checked against in advance, all but the automatic ones: those the
+    client set are kept, the rest are aiohttp's own on every hop.
     """
     if response.history:
-        return None
+        return {
+            name: tuple(controlled[name]) for name in controlled if name in _AUTOMATIC
+        }
     sent = header_fields(response.request_info.headers)
     fields = {
         name: values
@@ -762,6 +772,10 @@ class _Entry[T]:
     # The controlled fields of the request it answers (None: unknown).
     request_fields: Fields | None = field(default_factory=dict)
     url: str | None = None  # the resource that answered (after redirects)
+    redirected: bool = False  # reached through redirects
+    # The redirects' own Vary values: replaced whole by each response, never
+    # merged into ``fields`` (which a 304 updates).
+    hop_vary: tuple[str, ...] = ()
     # Through a redirect declaring nothing: ``lifetime`` is None, and an
     # opt-in ``min_interval`` may reuse it no longer than this.
     cap: float | None = None
@@ -775,8 +789,8 @@ def _hop_freshness(response: Response[object]) -> list[Freshness]:
     hop's age can count up to the later hops' time too.
 
     One that declares nothing on a status that may not be reused without
-    explicit freshness (302, 303, 307) is stale now: the original URL must
-    be asked every time.
+    explicit freshness (302, 303, 307), and isn't marked ``public``, is
+    stale now: the original URL must be asked every time.
     """
     found = []
     for hop in response.hops:
@@ -789,23 +803,22 @@ def _hop_freshness(response: Response[object]) -> list[Freshness]:
             hop_freshness.storable
             and hop_freshness.lifetime is None
             and hop.status not in _HEURISTICALLY_CACHEABLE
+            # RFC 9111 section 4.2.2: "public" makes any status heuristically
+            # reusable.
+            and "public" not in _directives(hop.fields.get("cache-control", ()))[0]
         ):
             hop_freshness = Freshness(lifetime=0.0)
         found.append(hop_freshness)
     return found
 
 
-def _with_hop_vary(fields: Fields, response: Response[object]) -> Fields:
-    """Return the fields to store, their Vary including every hop's.
+def _hop_vary(response: Response[object]) -> tuple[str, ...]:
+    """Return the Vary values of the redirects a response was reached through.
 
     A redirect varying by request fields answers only requests that match
-    (RFC 9111 section 4.1) -- and a redirected request's fields are
-    unknown, so none does.
+    (RFC 9111 section 4.1), just as the target does.
     """
-    hop_vary = [value for hop in response.hops for value in hop.fields.get("vary", ())]
-    if not hop_vary:
-        return fields
-    return {**fields, "vary": (*fields.get("vary", ()), *hop_vary)}
+    return tuple(value for hop in response.hops for value in hop.fields.get("vary", ()))
 
 
 def _storable(freshness: Freshness, response: Response[object]) -> bool:
@@ -813,15 +826,19 @@ def _storable(freshness: Freshness, response: Response[object]) -> bool:
     return freshness.storable and all(hop.storable for hop in _hop_freshness(response))
 
 
-def _answers(stored: Fields, sent: Fields | None, request: Fields | None) -> bool:
-    """Whether a stored response answers a request drawn with ``request`` fields.
+def _entry_vary(entry: _Entry[Any]) -> set[str]:
+    """Return the request fields a stored response's Vary, and its hops', name."""
+    return _vary_names({"vary": (*entry.fields.get("vary", ()), *entry.hop_vary)})
 
-    As :func:`_vary_matches`, where an unknown ``request`` (a redirected
-    one) is answered only by a response whose Vary nominates nothing.
-    """
-    if request is None:
-        return not _vary_names(stored)
-    return _vary_matches(stored, sent, request)
+
+def _answers(entry: _Entry[Any], response: Response[Any]) -> bool:
+    """Whether a stored response answers the request a new response drew."""
+    return _vary_matches(
+        _entry_vary(entry),
+        entry.request_fields,
+        response.request_fields,
+        redirected=entry.redirected or bool(response.hops),
+    )
 
 
 def _frozen(fields: Fields) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -900,9 +917,24 @@ class FreshnessCache[T]:
     def _fresh(
         self, entry: _Entry[T], min_interval: float, request_fields: Fields
     ) -> bool:
-        if not _vary_matches(entry.fields, entry.request_fields, request_fields):
+        if not _vary_matches(
+            _entry_vary(entry),
+            entry.request_fields,
+            request_fields,
+            redirected=entry.redirected,
+        ):
             return False  # it answers a different request (RFC 9111 4.1)
         age = self._clock() - entry.stored_at
+        # The request's own directives (RFC 9111 section 5.2.1), from the
+        # handle's headers: no-cache asks for validation, max-age bounds the
+        # age it accepts.
+        asked, _ = _directives(request_fields.get("cache-control", ()))
+        if "no-cache" in asked:
+            return False
+        if "max-age" in asked and len(asked["max-age"]) == 1:
+            limit = _delta_seconds(asked["max-age"][0], quoted=True)
+            if limit is not None and age > limit:
+                return False
         if entry.lifetime is not None:
             # A declared lifetime (0 included: revalidate) is binding.
             return age < entry.lifetime
@@ -1010,15 +1042,18 @@ class FreshnessCache[T]:
                 entry = self._entries.get(key)
                 if entry is not None and self._fresh(entry, min_interval, upcoming):
                     return entry.value
-                return await self._revalidate(key, fetch)
+                return await self._revalidate(key, fetch, upcoming)
         finally:
             # Leave _in_flight in the same step the result lands, so no
             # caller can join a request that has already answered.
             if self._in_flight.get(slot) is asyncio.current_task():
                 del self._in_flight[slot]
 
-    async def _revalidate(self, key: str, fetch: Fetch[T]) -> T:
+    async def _revalidate(self, key: str, fetch: Fetch[T], upcoming: Fields) -> T:
         entry = self._entries.get(key)
+        # A request carrying no-store: no part of any response to it may be
+        # stored (RFC 9111 section 5.2.1.5) -- a 304 updates nothing either.
+        keep = "no-store" not in _directives(upcoming.get("cache-control", ()))[0]
         validators = Validators.from_fields(entry.fields) if entry else None
         requested = self._clock()
         response = await fetch(validators=validators)
@@ -1048,27 +1083,22 @@ class FreshnessCache[T]:
             # RFC 9111 section 3.2: the 304's fields replace the stored ones
             # of the same name, except Content-Length (which describes the
             # 304 itself); a field it lacks -- Age included -- stays.
-            merged = _with_hop_vary(
-                {
-                    **entry.fields,
-                    **{
-                        name: v
-                        for name, v in fields.items()
-                        if name != "content-length"
-                    },
-                },
-                response,
-            )
+            merged = {
+                **entry.fields,
+                **{name: v for name, v in fields.items() if name != "content-length"},
+            }
             freshness = freshness_of(
                 merged,
                 requested_at=response.requested_at,
                 received_at=response.received_at,
             )
-            if not _storable(freshness, response):
-                self._entries.pop(key, None)
+            if not (keep and _storable(freshness, response)):
+                if keep:
+                    self._entries.pop(key, None)
                 return entry.value
             entry.fields = merged
             entry.request_fields = response.request_fields
+            entry.redirected, entry.hop_vary = bool(response.hops), _hop_vary(response)
             entry.stored_at = requested
             entry.lifetime, entry.cap = self._lifetime_of(
                 entry.value, freshness, response
@@ -1076,7 +1106,7 @@ class FreshnessCache[T]:
             return entry.value
         if (
             entry is not None
-            and _answers(entry.fields, entry.request_fields, response.request_fields)
+            and _answers(entry, response)
             and self._rejects(entry, response.value)
         ):
             entry.stored_at = requested
@@ -1087,18 +1117,21 @@ class FreshnessCache[T]:
             requested_at=response.requested_at,
             received_at=response.received_at,
         )
-        if not _storable(freshness, response):
-            self._entries.pop(key, None)
+        if not (keep and _storable(freshness, response)):
+            if keep:
+                self._entries.pop(key, None)
             return response.value
         lifetime, cap = self._lifetime_of(response.value, freshness, response)
         self._entries[key] = _Entry(
             value=response.value,
-            fields=_with_hop_vary(fields, response),
+            fields=fields,
             stored_at=requested,
             lifetime=lifetime,
             received_at=response.received_at,
             request_fields=response.request_fields,
             url=response.url,
             cap=cap,
+            redirected=bool(response.hops),
+            hop_vary=_hop_vary(response),
         )
         return response.value

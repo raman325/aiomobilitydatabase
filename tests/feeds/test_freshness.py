@@ -2404,7 +2404,10 @@ def test_sent_fields_keep_what_a_later_request_could_differ_in() -> None:
         "x-api-key": ("k",),
         "cookie": ("a=1", "b=2"),
     }
-    assert freshness_module.sent_fields({}, _wire([], redirected=True)) is None  # type: ignore[arg-type]
+    # Redirected: only the automatic headers the client set are known.
+    assert freshness_module.sent_fields(  # type: ignore[arg-type]
+        controlled, _wire([("X-Api-Key", "k")], redirected=True)
+    ) == {"user-agent": ("custom",)}
 
 
 async def test_request_fields_merge_as_aiohttp_sends() -> None:
@@ -2573,3 +2576,142 @@ async def test_a_wire_cookie_with_duplicates_never_matches_a_merged_one() -> Non
     assert (
         await cache.get("u", producer, request_fields={"cookie": ("a=2",)}) == "second"
     )
+
+
+async def test_a_redirects_vary_is_replaced_never_accumulated() -> None:
+    """Each 304 through a redirect varying by Accept-Encoding brings that
+    Vary again: it replaces the hops' Vary, never piles onto the stored
+    fields -- and a later direct response drops it entirely.
+    """
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    target = header_fields({"ETag": '"1"', "Cache-Control": "max-age=0"})
+    hops = [_hop(301, Cache_Control="max-age=3600", Vary="Accept-Encoding")]
+    responses = [Response("a", target, T0, T0, {}, hops, url="https://p/b")]
+    responses += [
+        Response(None, target, T0, T0, {}, hops, url="https://p/b") for _ in range(5)
+    ]
+    producer = _Producer(responses)
+    for _ in range(6):
+        assert await cache.get("u", producer) == "a"
+    entry = cache._entries["u"]
+    assert entry.hop_vary == ("Accept-Encoding",)
+    assert "vary" not in entry.fields
+    producer.queue.append(Response(None, target, T0, T0, {}, (), url="https://p/b"))
+    await cache.get("u", producer)
+    assert entry.hop_vary == ()
+    assert not entry.redirected
+
+
+async def test_a_304s_own_vary_replaces_the_stored_one() -> None:
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    producer = _Producer(
+        [
+            _raw("a", {"ETag": '"1"', "Cache-Control": "max-age=0", "Vary": "Accept"}),
+            _raw(
+                None,
+                {"ETag": '"1"', "Cache-Control": "max-age=600", "Vary": "X-Region"},
+            ),
+            _raw("b", {}),
+        ]
+    )
+    await cache.get("u", producer)
+    await cache.get("u", producer)
+    assert cache._entries["u"].fields["vary"] == ("X-Region",)
+    assert await cache.get("u", producer, request_fields={"x-region": ("w",)}) == "b"
+
+
+@pytest.mark.parametrize(
+    ("sent", "upcoming", "reused"),
+    [
+        # aiohttp's own Accept-Encoding on every hop: confirmed.
+        ({}, {}, True),
+        # The client set it -- the same on both sides, or not.
+        ({"accept-encoding": ("br",)}, {"accept-encoding": ("br",)}, True),
+        ({}, {"accept-encoding": ("br",)}, False),
+    ],
+)
+async def test_a_redirected_response_matches_vary_on_automatic_headers(
+    sent: dict[str, tuple[str, ...]], upcoming: dict[str, tuple[str, ...]], reused: bool
+) -> None:
+    """Through a redirect only the automatic headers can be confirmed: a
+    Vary: Accept-Encoding (nginx, Cloudflare) still lets a redirected feed
+    be reused, a Vary on anything else never does."""
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    fields = header_fields({"Cache-Control": "max-age=60", "Vary": "Accept-Encoding"})
+    hops = [_hop(301, Cache_Control="max-age=3600")]
+    producer = _Producer(
+        [
+            Response("a", fields, T0, T0, sent, hops),
+            Response("b", fields, T0, T0, sent, hops),
+        ]
+    )
+    await cache.get("u", producer, request_fields=sent)
+    assert await cache.get("u", producer, request_fields=upcoming) == (
+        "a" if reused else "b"
+    )
+    other = FreshnessCache[str](_Clock())
+    cookie = header_fields({"Cache-Control": "max-age=60", "Vary": "Cookie"})
+    second = _Producer(
+        [
+            Response("a", cookie, T0, T0, {}, hops),
+            Response("b", cookie, T0, T0, {}, hops),
+        ]
+    )
+    await other.get("u", second)
+    assert await other.get("u", second) == "b"
+
+
+async def test_a_public_302_may_be_reused_heuristically() -> None:
+    """RFC 9111 section 4.2.2: "public" makes a 302 heuristically
+    cacheable, so the chain declares nothing -- for the opt-in interval --
+    rather than revalidate-every-time."""
+    cache: FreshnessCache[str] = FreshnessCache(_Clock())
+    fields = header_fields({"Cache-Control": "max-age=600"})
+    response = Response("a", fields, T0, T0, None, [_hop(302, Cache_Control="public")])
+    await cache.get("u", _Producer([response]))
+    entry = cache._entries["u"]
+    assert (entry.lifetime, entry.cap) == (None, 600.0)
+
+
+async def test_request_directives_in_the_handles_headers() -> None:
+    """no-cache asks for validation, max-age bounds the acceptable age, and
+    no-store keeps the response out of the cache (a 304 updates nothing)."""
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    fresh = {"Cache-Control": "max-age=600", "ETag": '"1"'}
+    producer = _Producer([_raw("a", fresh), _raw("b", fresh), _raw("c", fresh)])
+    await cache.get("u", producer)
+    no_cache = {"cache-control": ("no-cache",)}
+    assert await cache.get("u", producer, request_fields=no_cache) == "b"
+    clock.now = 30.0
+    max_age = {"cache-control": ("max-age=10",)}
+    assert await cache.get("u", producer, request_fields=max_age) == "c"
+    assert await cache.get("u", producer, request_fields={}) == "c"  # fresh
+
+    store_none = FreshnessCache[str](_Clock())
+    no_store = {"cache-control": ("no-store",)}
+    plain = _Producer([_raw("a", fresh)])
+    assert await store_none.get("u", plain, request_fields=no_store) == "a"
+    assert "u" not in store_none._entries
+
+
+async def test_a_no_store_request_never_updates_the_stored_response() -> None:
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    producer = _Producer(
+        [
+            _raw("a", {"Cache-Control": "max-age=10", "ETag": '"1"'}),
+            _raw(None, {"Cache-Control": "max-age=600", "ETag": '"1"'}),
+        ]
+    )
+    await cache.get("u", producer)
+    clock.now = 20.0
+    no_store = {"cache-control": ("no-store",)}
+    assert await cache.get("u", producer, request_fields=no_store) == "a"
+    assert cache._entries["u"].fields["cache-control"] == ("max-age=10",)
+
+
+def test_repeated_cookie_names_keep_their_order() -> None:
+    """``a=2; a=1`` and ``a=1; a=2`` differ: a server may read the first."""
+    pairs = freshness_module._cookie_pairs
+    assert pairs(["a=2; a=1"]) != pairs(["a=1; a=2"])

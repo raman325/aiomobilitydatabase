@@ -281,9 +281,14 @@ Notes on direct mode:
   can't be predicted, so a `Vary` naming it always asks. A redirected
   response answers its original URL only while every redirect may be
   reused too: the shortest lifetime of the chain, none when a redirect
-  declares none (and a 302, 303 or 307 without freshness of its own is
-  asked every time, even under `rt_min_interval`), and a redirect's own
-  `Vary` counts. A `304` from the redirect's target speaks for that
+  declares none (and a 302, 303 or 307 without freshness of its own, or a
+  `public` marking, is asked every time, even under `rt_min_interval`),
+  and a redirect's own `Vary` counts. Through a redirect only aiohttp's
+  automatic headers can be shown to match, so a `Vary: Accept-Encoding`
+  still lets a redirected feed be reused and a `Vary` on anything else
+  doesn't. A handle's own `Cache-Control` request header is honoured:
+  `no-cache` revalidates, `max-age=N` bounds the age it accepts, and
+  `no-store` keeps responses out of the cache. A `304` from the redirect's target speaks for that
   resource, not the stored one, so it is asked again unconditionally.
   Only a `200` (or `203`) carries a feed: any other status below 400 is a
   `SourceConnectionError`, never an empty feed stored in its place.
