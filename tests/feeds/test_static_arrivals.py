@@ -226,15 +226,17 @@ def test_per_stop_limit(tmp_path: Path) -> None:
 
 def test_dst_spring_forward_uses_elapsed_seconds(tmp_path: Path) -> None:
     index = _index(tmp_path)
-    # 2027-03-14 (Sunday) is US spring-forward. NIGHT's T3 at 25:31:00 elapsed
-    # from that service day's noon-12h anchor (08:00 UTC) is 2027-03-15T09:31Z.
-    # Wall-clock arithmetic would wrongly yield 08:31Z.
+    # 2027-03-14 (Sunday) is US spring-forward. GTFS measures from "noon
+    # minus 12h" in ELAPSED time: noon PDT is 19:00 UTC, so the anchor is
+    # 07:00 UTC (not midnight PST, 08:00 UTC) and NIGHT's T3 at 25:31:00 is
+    # 2027-03-15T08:31Z -- 01:31 PDT, as the spec's "effectively midnight
+    # except on DST days" implies.
     now = datetime(2027, 3, 15, 7, 0, tzinfo=UTC)
     departures = index.upcoming_departures(
         ["S1"], ["R2"], now, timedelta(hours=4), per_stop_limit=10
     )
     assert [dep.trip_id for dep in departures] == ["T3"]
-    assert departures[0].departure == datetime(2027, 3, 15, 9, 31, tzinfo=UTC)
+    assert departures[0].departure == datetime(2027, 3, 15, 8, 31, tzinfo=UTC)
     index.close()
 
 
@@ -270,14 +272,15 @@ def test_long_lookahead_spans_all_service_days(tmp_path: Path) -> None:
 
 def test_dst_fall_back_uses_elapsed_seconds(tmp_path: Path) -> None:
     index = _index(tmp_path)
-    # 2027-11-07 (Sunday) is US fall-back. T3 elapsed from that day's anchor
-    # (07:00 UTC) is 2027-11-08T08:31Z; wall-clock would wrongly yield 09:31Z.
+    # 2027-11-07 (Sunday) is US fall-back: noon PST is 20:00 UTC, so the
+    # anchor is 08:00 UTC (not midnight PDT, 07:00 UTC) and T3 at 25:31:00
+    # is 2027-11-08T09:31Z.
     now = datetime(2027, 11, 8, 6, 0, tzinfo=UTC)
     departures = index.upcoming_departures(
         ["S1"], ["R2"], now, timedelta(hours=4), per_stop_limit=10
     )
     assert [dep.trip_id for dep in departures] == ["T3"]
-    assert departures[0].departure == datetime(2027, 11, 8, 8, 31, tzinfo=UTC)
+    assert departures[0].departure == datetime(2027, 11, 8, 9, 31, tzinfo=UTC)
     index.close()
 
 

@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import zipfile
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from google.transit import gtfs_realtime_pb2
@@ -14,7 +14,12 @@ from google.transit import gtfs_realtime_pb2
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import SourceConnectionError
 from aiomobilitydatabase.feeds.geo import Circle
-from aiomobilitydatabase.feeds.models import ArrivalsQuery, ServiceAlert, StationGroup
+from aiomobilitydatabase.feeds.models import (
+    ArrivalsQuery,
+    ServiceAlert,
+    StationGroup,
+    TripQuery,
+)
 from aiomobilitydatabase.feeds.rt import alerts_from_message
 from aiomobilitydatabase.feeds.static_index import StaticIndex
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle
@@ -351,7 +356,9 @@ async def test_in_flight_query_blocks_index_swap(
 
     monkeypatch.setattr(handle._index, "upcoming_departures", parked)
     query = asyncio.create_task(
-        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+        handle.get_arrivals(
+            [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
+        )
     )
     await asyncio.to_thread(entered.wait, 5)
     _mock_newer_dataset(mock_api)
@@ -371,7 +378,9 @@ async def test_in_flight_query_blocks_index_swap(
     [
         pytest.param(
             "upcoming_trips",
-            lambda handle: handle.get_upcoming_trips("S1", "S2", now_utc=NOW),
+            lambda handle: handle.get_upcoming_trips(
+                [TripQuery("S1", "S2")], start=NOW, end=NOW + timedelta(hours=2)
+            ),
             id="get_upcoming_trips",
         ),
         pytest.param(
@@ -453,7 +462,9 @@ async def test_index_swap_blocks_new_query_until_old_index_closed(
     refresh = asyncio.create_task(handle.refresh_static())
     await asyncio.to_thread(closing.wait, 5)
     query = asyncio.create_task(
-        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+        handle.get_arrivals(
+            [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
+        )
     )
     await asyncio.sleep(0.2)
     assert not query.done()
@@ -503,7 +514,9 @@ async def test_cancelled_swap_wait_releases_the_guard(
 
     monkeypatch.setattr(handle._index, "upcoming_departures", parked)
     query = asyncio.create_task(
-        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+        handle.get_arrivals(
+            [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
+        )
     )
     await asyncio.to_thread(entered.wait, 5)
     _mock_newer_dataset(mock_api)
@@ -519,7 +532,10 @@ async def test_cancelled_swap_wait_releases_the_guard(
     monkeypatch.undo()
     mock_api.get("/rt/all", body=_empty_trip_updates(), content_type=PB)
     [later] = await asyncio.wait_for(
-        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW), timeout=2
+        handle.get_arrivals(
+            [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
+        ),
+        timeout=2,
     )
     assert [a.trip_id for a in later] == ["T1", "T2"]
 
@@ -549,7 +565,9 @@ async def test_cancelled_query_holds_the_guard_until_its_thread_finishes(
 
     monkeypatch.setattr(old_index, "upcoming_departures", parked)
     query = asyncio.create_task(
-        handle.get_arrivals([ArrivalsQuery(["S1"])], now_utc=NOW)
+        handle.get_arrivals(
+            [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
+        )
     )
     await asyncio.to_thread(entered.wait, 5)
     query.cancel()

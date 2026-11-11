@@ -44,6 +44,7 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from aiomobilitydatabase.feeds import TripQuery
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.models import Agency, ArrivalsQuery, FeedInfo
 from aiomobilitydatabase.feeds.static_index import ScheduledDeparture, StaticIndex
@@ -498,8 +499,8 @@ async def test_handle_answers_from_canonical_feed(
     # 07:00 -- outside the window.
     [arrivals] = await handle.get_arrivals(
         [ArrivalsQuery(["STAGECOACH"])],
-        lookahead=timedelta(hours=1),
-        now_utc=datetime(2007, 6, 1, 12, 45, tzinfo=UTC),
+        start=datetime(2007, 6, 1, 12, 45, tzinfo=UTC),
+        end=datetime(2007, 6, 1, 12, 45, tzinfo=UTC) + timedelta(hours=1),
     )
     assert [(a.trip_id, a.scheduled_departure) for a in arrivals] == [
         ("CITY1#21600", datetime(2007, 6, 1, 13, 0, tzinfo=UTC)),
@@ -522,12 +523,13 @@ async def test_handle_answers_from_canonical_feed(
     assert city2.headsign is None  # CITY trips publish no headsign
     # Plain-trip answer: AB1 (BEATTY_AIRPORT 8:00 -> BULLFROG 8:10 local).
     # AB2 serves both stops in reverse order and must not appear.
-    trips = await handle.get_upcoming_trips(
-        "BEATTY_AIRPORT",
-        "BULLFROG",
-        lookahead=timedelta(hours=1),
-        now_utc=datetime(2007, 6, 1, 14, 45, tzinfo=UTC),
-    )
+    trips = (
+        await handle.get_upcoming_trips(
+            [TripQuery("BEATTY_AIRPORT", "BULLFROG")],
+            start=datetime(2007, 6, 1, 14, 45, tzinfo=UTC),
+            end=datetime(2007, 6, 1, 14, 45, tzinfo=UTC) + timedelta(hours=1),
+        )
+    )[0]
     assert [(t.trip_id, t.scheduled_departure, t.scheduled_arrival) for t in trips] == [
         (
             "AB1",

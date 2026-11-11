@@ -4,7 +4,6 @@ import io
 import os
 import sqlite3
 import zipfile
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -618,7 +617,7 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
     }
     built.close()
     assert (SCHEMA_VERSION, fingerprint) == (
-        4,
+        5,
         {
             "agencies": [
                 "email",
@@ -740,10 +739,5 @@ def test_trip_queries_with_no_ids_do_not_touch_the_database(tmp_path: Path) -> N
     """
     built = StaticIndex.build(_write_zip(tmp_path), ":memory:", DATASET, TZ)
     assert built.concrete_trip_ids([]) == {}
-    assert (
-        built.trip_instance_calls(
-            [], datetime(2026, 7, 30, 14, 45, tzinfo=UTC), timedelta(hours=2)
-        )
-        == []
-    )
+    assert built.instance_trip_calls([]) == []
     built.close()

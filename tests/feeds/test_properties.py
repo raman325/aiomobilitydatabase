@@ -22,6 +22,7 @@ from google.transit import gtfs_realtime_pb2
 from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds import TripQuery
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
@@ -159,9 +160,13 @@ def _index_from_zip_bytes(zip_bytes: bytes) -> StaticIndex:
 
 
 def _oracle_anchor_utc(service_date: date, tz: ZoneInfo) -> datetime:
-    """Independent restatement of the GTFS rule: noon minus 12h, in UTC."""
+    """Independent restatement of the GTFS rule: noon minus 12 ELAPSED hours.
+
+    Subtracting in the local zone would be wall-clock arithmetic and land on
+    local midnight, an hour off on DST days.
+    """
     noon = datetime.combine(service_date, time(12, 0), tzinfo=tz)
-    return (noon - timedelta(hours=12)).astimezone(UTC)
+    return noon.astimezone(UTC) - timedelta(hours=12)
 
 
 # DST-transition days (and their neighbors) for every DST-observing zone in
@@ -1695,7 +1700,20 @@ def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
         f"{draw(st.sampled_from(['Downtown', '終点🚌', '']))}"
         for t_idx, tid in enumerate(trip_ids)
     ]
-    times = ["00:00:00", "08:00:00", "24:00:00", "47:59:59", ""]
+    # 47:30:00 and 60:00:00: a night service and a multi-day trip, whose
+    # runs reach two and more days past their service day; 100:00:00 and
+    # 250:00:00 reach past four days, where rows are placed one by one.
+    times = [
+        "00:00:00",
+        "08:00:00",
+        "24:00:00",
+        "47:30:00",
+        "47:59:59",
+        "60:00:00",
+        "100:00:00",
+        "250:00:00",
+        "",
+    ]
     stop_times_rows = []
     for t_idx, tid in enumerate(trip_ids):
         n_rows = draw(st.integers(2, 3)) if t_idx == 0 else draw(st.integers(1, 3))
@@ -3183,7 +3201,7 @@ def _run_arrivals_merge_scenario(
                     before = _rt_fetch_count(api)
                     boards.append(
                         await handle.get_arrivals(
-                            queries, lookahead=lookahead, now_utc=now
+                            queries, start=now, end=now + lookahead
                         )
                     )
                     fetches.append(_rt_fetch_count(api) - before)
@@ -4168,8 +4186,8 @@ def _run_frequencies_rt_scenario(
                         ArrivalsQuery([stop_id], limit=10)
                         for stop_id in ("S1", "S2", "S3")
                     ],
-                    lookahead=timedelta(hours=2),
-                    now_utc=datetime(2026, 7, 30, 12, 45, tzinfo=UTC),
+                    start=datetime(2026, 7, 30, 12, 45, tzinfo=UTC),
+                    end=datetime(2026, 7, 30, 12, 45, tzinfo=UTC) + timedelta(hours=2),
                 )
                 return [row for rows in per_stop for row in rows]
         finally:
@@ -4219,6 +4237,9 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
     entity = msg.entity.add()
     entity.id = "tu-gen"
     entity.trip_update.trip.trip_id = "F1"
+    # A frequency trip's update needs its start_date (GTFS-RT); this
+    # property is about start_time.
+    entity.trip_update.trip.start_date = "20260730"
     if mode == "aligned":
         entity.trip_update.trip.start_time = _format_gtfs_time(rep)
     elif mode == "misaligned":
@@ -4382,18 +4403,17 @@ def _run_propagation_scenario(
             async with MobilityFeedsClient("t", base_url=base) as client:
                 handle = await client.get_transit_feed("mdb-100")
                 [arrivals] = await handle.get_arrivals(
-                    [ArrivalsQuery(stop_ids, limit=150)],
-                    lookahead=lookahead,
-                    now_utc=now,
+                    [ArrivalsQuery(stop_ids, limit=150)], start=now, end=now + lookahead
                 )
                 trips = {}
                 for origin, destination in pairs:
-                    trips[(origin, destination)] = await handle.get_upcoming_trips(
-                        origin,
-                        destination,
-                        lookahead=lookahead,
-                        now_utc=now,
-                    )
+                    trips[(origin, destination)] = (
+                        await handle.get_upcoming_trips(
+                            [TripQuery(origin, destination)],
+                            start=now,
+                            end=now + lookahead,
+                        )
+                    )[0]
                 return arrivals, trips
         finally:
             await api.stop()
@@ -4989,8 +5009,9 @@ def test_two_instance_start_date_disambiguation_oracle(
     in a >=27h window, a drawn prediction or cancellation affects exactly
     one instance and never its 24h-apart sibling. A date naming day A or
     day B affects that day's instance; an absent date affects the
-    currently-active (earliest in-window) instance -- day A; a garbage
-    date parses to None and behaves exactly as absent. Every other trip
+    run nearest the feed's time -- day A -- for a plain trip, and nothing
+    for a frequency repetition (the spec requires its start_date); a
+    garbage date parses to None and behaves exactly as absent. Every other trip
     instance -- the sibling day AND the sibling repetition/plain trip --
     stays schedule-only, in both the arrivals merge and the
     origin->destination overlay.
@@ -5003,6 +5024,11 @@ def test_two_instance_start_date_disambiguation_oracle(
     }[date_mode]
     target_id = "TP" if variant == "plain" else f"FQ#{rep}"
     affected_day = _TWO_DAY_B if date_mode == "day_b" else _TWO_DAY_A
+    undated = date_mode in ("absent", "garbage")
+    # A frequency trip's update needs its start_date to name any run.
+    affected = (
+        set() if variant == "frequency" and undated else {(target_id, affected_day)}
+    )
     msg = _two_instance_message(
         variant=variant,
         kind=kind,
@@ -5034,7 +5060,7 @@ def test_two_instance_start_date_disambiguation_oracle(
         # Exactly the affected instance's rows disappear; nothing else is
         # touched (all survivors schedule-only).
         assert got_rows == all_rows - {
-            (target_id, affected_day, stop) for stop in ("S0", "S1")
+            (trip_id, day, stop) for trip_id, day in affected for stop in ("S0", "S1")
         }
         assert all(a.realtime is False for a in arrivals)
     else:
@@ -5047,7 +5073,7 @@ def test_two_instance_start_date_disambiguation_oracle(
             assert row.trip_id is not None
             assert row.scheduled_departure is not None
             inst_day = _instance_day(row.scheduled_departure)
-            is_target = row.trip_id == target_id and inst_day == affected_day
+            is_target = (row.trip_id, inst_day) in affected
             assert row.realtime is is_target
             if is_target:
                 # S0 carries the STU's own delay; S1 the propagated one.
@@ -5068,13 +5094,13 @@ def test_two_instance_start_date_disambiguation_oracle(
         for day in (_TWO_DAY_A, _TWO_DAY_B)
     }
     if kind == "cancellation":
-        assert got_journeys == all_journeys - {(target_id, affected_day)}
+        assert got_journeys == all_journeys - affected
         assert all(t.realtime is False for t in journeys)
     else:
         assert got_journeys == all_journeys
         for journey in journeys:
             inst_day = _instance_day(journey.scheduled_departure)
-            is_target = journey.trip_id == target_id and inst_day == affected_day
+            is_target = (journey.trip_id, inst_day) in affected
             assert journey.realtime is is_target
             if is_target:
                 assert journey.delay_seconds == delay
@@ -5392,8 +5418,8 @@ def _run_multi_rt_scenario(
                 )
                 [arrivals] = await handle.get_arrivals(
                     [ArrivalsQuery(_MULTI_RT_STOPS, limit=150)],
-                    lookahead=timedelta(hours=6),
-                    now_utc=_MULTI_RT_NOW,
+                    start=_MULTI_RT_NOW,
+                    end=_MULTI_RT_NOW + timedelta(hours=6),
                 )
                 return arrivals
         finally:
@@ -5527,8 +5553,8 @@ def _run_route_filter_scenario(
                 handle = await client.get_transit_feed("mdb-100")
                 [unfiltered] = await handle.get_arrivals(
                     [ArrivalsQuery(["S0", "S1", "S2"], limit=_UNLIMITED)],
-                    lookahead=timedelta(hours=6),
-                    now_utc=_PROP_NOW,
+                    start=_PROP_NOW,
+                    end=_PROP_NOW + timedelta(hours=6),
                 )
                 [filtered] = await handle.get_arrivals(
                     [
@@ -5536,8 +5562,8 @@ def _run_route_filter_scenario(
                             ["S0", "S1", "S2"], route_ids, limit=_ROUTE_FILTER_LIMIT
                         )
                     ],
-                    lookahead=timedelta(hours=6),
-                    now_utc=_PROP_NOW,
+                    start=_PROP_NOW,
+                    end=_PROP_NOW + timedelta(hours=6),
                 )
                 return unfiltered, filtered
         finally:
@@ -5936,14 +5962,19 @@ def _oracle_service_days(
 ) -> list[tuple[date, datetime, set[str]]]:
     """``(service_date, anchor_utc, active_ids)`` for every day that can contribute.
 
-    Three days of margin before the window and one after: the generator's
-    largest GTFS time (47:59:59) spills at most two service days forward, so
-    a day outside this range can never land a departure in the window — which
-    makes the range a bound on the production scan, not a copy of it, and the
-    oracle therefore catches under-scanning.
+    Margin before the window of the feed's longest stored time in days plus
+    two, and one day after: a day outside this range can never land a
+    departure in the window whatever the clocks do — which makes the range a
+    bound on the production scan, not a copy of it, and the oracle therefore
+    catches under-scanning.
     """
     tz = ZoneInfo(index.timezone_name)
-    first = (now - grace).astimezone(tz).date() - timedelta(days=3)
+    longest = index._conn.execute(
+        "SELECT MAX(MAX(COALESCE(arrival_secs, 0), COALESCE(departure_secs, 0))) "
+        "FROM stop_times"
+    ).fetchone()[0]
+    margin = timedelta(days=(longest or 0) // 86_400 + 2)
+    first = (now - grace).astimezone(tz).date() - margin
     last = (now + lookahead).astimezone(tz).date() + timedelta(days=1)
     return [
         (service_date, _oracle_anchor_utc(service_date, tz), active)
@@ -5961,22 +5992,23 @@ def _pair_oracle(
     now: datetime,
     lookahead: timedelta,
     grace: timedelta,
-) -> dict[tuple[date, str, int], tuple[set[datetime], datetime, set[int]]]:
-    """Expected ``upcoming_trips`` rows keyed by ``(service day, trip, origin seq)``.
+) -> dict[tuple[date, str, int, datetime], tuple[set[datetime], datetime, set[int]]]:
+    """Expected ``upcoming_trips`` rows keyed by ``(day, trip, origin seq, departure)``.
 
     A row is expected iff the trip's service is active that day, the origin
     call has a departure inside the window, and SOME later-sequence call at
-    the destination has an arrival. The value is the set of departures the
-    grouped query may legitimately report (a messy feed can store the same
-    origin call twice with different times, which the ``GROUP BY`` collapses
-    into one row), the EARLIEST qualifying destination arrival, and the
-    destination sequences achieving it.
+    the destination has an arrival. A messy feed storing one origin
+    sequence twice with different times has two origin calls, each its own
+    journey. The value is the departure, the EARLIEST qualifying
+    destination arrival, and the destination sequences achieving it.
     """
     services: dict[str, str] = dict(
         index._conn.execute("SELECT id, service_id FROM trips")
     )
     trip_rows = _raw_trip_rows(index)
-    expected: dict[tuple[date, str, int], tuple[set[datetime], datetime, set[int]]] = {}
+    expected: dict[
+        tuple[date, str, int, datetime], tuple[set[datetime], datetime, set[int]]
+    ] = {}
     for service_date, anchor, active in _oracle_service_days(
         index, now, lookahead, grace
     ):
@@ -5997,7 +6029,7 @@ def _pair_oracle(
                 if not later:
                     continue
                 earliest = min(arrival for arrival, _ in later)
-                key = (service_date, trip_id, o_seq)
+                key = (service_date, trip_id, o_seq, departure)
                 departures = expected[key][0] if key in expected else set()
                 expected[key] = (
                     departures | {departure},
@@ -6079,10 +6111,15 @@ def test_upcoming_trips_matches_pair_semantics_oracle(
             index, origin, destination, now=now, lookahead=lookahead, grace=grace
         )
         event(f"pair oracle non-empty: {bool(expected)}")
-        got: dict[tuple[date, str, int], ScheduledTrip] = {}
+        got: dict[tuple[date, str, int, datetime], ScheduledTrip] = {}
         for trip in rows:
             assert trip.origin_stop_sequence < trip.destination_stop_sequence
-            key = (trip.service_date, trip.trip_id, trip.origin_stop_sequence)
+            key = (
+                trip.service_date,
+                trip.trip_id,
+                trip.origin_stop_sequence,
+                trip.departure,
+            )
             assert key not in got, "one row per (service day, trip, origin call)"
             got[key] = trip
         assert set(got) == set(expected)
@@ -6420,7 +6457,7 @@ def test_upcoming_trips_rides_to_the_earliest_destination_call(
         assert _pair_oracle(
             index, "S1", "S2", now=anchor, lookahead=lookahead, grace=timedelta(0)
         ) == {
-            (date(2026, 7, 30), "T1", trip.origin_stop_sequence): (
+            (date(2026, 7, 30), "T1", trip.origin_stop_sequence, trip.departure): (
                 {trip.departure},
                 trip.arrival,
                 {earliest_seq},

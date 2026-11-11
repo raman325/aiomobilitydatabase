@@ -20,6 +20,10 @@ _OUTPUT_DIR = Path(__file__).parent.parent / "tests" / "feeds" / "data" / "rt"
 
 # Matches test_transit_arrivals.py's NOW / T1_DEPARTURE_EPOCH constants.
 _NOW_EPOCH = int(datetime(2026, 7, 30, 14, 45, tzinfo=UTC).timestamp())
+# The frequency tests query two hours earlier (05:45 PDT): their feeds are
+# stamped at that moment, as a live feed would be -- a date-less update is
+# judged against the feed's own time.
+_FREQ_NOW_EPOCH = int(datetime(2026, 7, 30, 12, 45, tzinfo=UTC).timestamp())
 _T1_DEPARTURE_EPOCH = int(datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC).timestamp())
 # Matches test_transit_trips.py's T1_S3_ARRIVAL_EPOCH: T1 reaches S3 (the
 # trip-query variant zip's terminal call) at 08:20:00 PDT on the fixture
@@ -240,7 +244,7 @@ def _build_freq_trip_updates_matched() -> bytes:
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
-    msg.header.timestamp = _NOW_EPOCH
+    msg.header.timestamp = _FREQ_NOW_EPOCH
     e1 = msg.entity.add()
     e1.id = "tu-freq-rep"
     tu1 = e1.trip_update
@@ -268,7 +272,7 @@ def _build_freq_trip_updates_unmatched() -> bytes:
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
-    msg.header.timestamp = _NOW_EPOCH
+    msg.header.timestamp = _FREQ_NOW_EPOCH
     e1 = msg.entity.add()
     e1.id = "tu-freq-bare"
     tu1 = e1.trip_update
@@ -297,7 +301,7 @@ def _build_freq_trip_updates_bare_cancel() -> bytes:
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
-    msg.header.timestamp = _NOW_EPOCH
+    msg.header.timestamp = _FREQ_NOW_EPOCH
     entity = msg.entity.add()
     entity.id = "tu-freq-bare-cancel"
     trip_update = entity.trip_update
@@ -354,7 +358,7 @@ def _build_freq_trip_updates_canceled_tomorrow() -> bytes:
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
-    msg.header.timestamp = _NOW_EPOCH
+    msg.header.timestamp = _FREQ_NOW_EPOCH
     entity = msg.entity.add()
     entity.id = "tu-freq-cancel-tomorrow"
     trip_update = entity.trip_update

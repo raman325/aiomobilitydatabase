@@ -4,13 +4,15 @@ GTFS-RT addresses one repetition of a frequency-based trip via
 TripDescriptor.start_time. The merge matches (trip_id, start_secs) against
 each materialized repetition's (template id, repetition start): an aligned
 start_time affects exactly that repetition, while a missing or unmatched
-start_time affects no repetition at all.
+start_time affects no repetition at all. The spec requires start_date too
+for a frequency trip, so an update without one names no repetition.
 """
 
 from datetime import UTC, datetime, timedelta
 
 from google.transit import gtfs_realtime_pb2
 
+from aiomobilitydatabase.feeds import TripQuery
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.models import ArrivalsQuery
 
@@ -34,6 +36,17 @@ PB = "application/octet-stream"
 # repetition the matched fixture predicts and F1#22800 the one it cancels.
 F1_SYNTHETIC_IDS = ["F1#21600", "F1#22200", "F1#22800", "F1#25200", "F1#25800"]
 F1_22200_S1_DEPARTURE = datetime(2026, 7, 30, 13, 10, tzinfo=UTC)
+
+
+def _dated(message_bytes: bytes, start_date: str = "20260730") -> bytes:
+    """The message with ``start_date`` on every trip descriptor lacking one."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.ParseFromString(message_bytes)
+    for entity in message.entity:
+        for holder in (entity.trip_update, entity.vehicle):
+            if holder.HasField("trip") and not holder.trip.start_date:
+                holder.trip.start_date = start_date
+    return message.SerializeToString()
 
 
 def _mock_catalog_with_rt(mock_api: MockApi, message_bytes: bytes) -> None:
@@ -60,10 +73,10 @@ async def test_start_time_prediction_and_cancellation_hit_one_repetition(
     and cancels its 06:20:00 repetition: exactly F1#22200 turns realtime,
     exactly F1#22800 disappears, and every sibling stays schedule-only.
     """
-    _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_MATCHED)
+    _mock_catalog_with_rt(mock_api, _dated(TRIP_UPDATES_FREQ_MATCHED))
     handle = await feeds_client.get_transit_feed("mdb-100")
     [arrivals] = await handle.get_arrivals(
-        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=2), now_utc=NOW
+        [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
     )
     assert [a.trip_id for a in arrivals] == [
         "F1#21600",
@@ -87,6 +100,21 @@ async def test_start_time_prediction_and_cancellation_hit_one_repetition(
         assert sibling.delay_seconds is None
 
 
+async def test_a_frequency_update_without_start_date_names_no_repetition(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """GTFS-RT requires start_date with start_time for a frequency trip:
+    the same prediction and cancellation, undated, touch no repetition.
+    """
+    _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_MATCHED)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
+    )
+    assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
+    assert all(a.realtime is False for a in arrivals)
+
+
 async def test_start_time_matching_applies_to_upcoming_trips_overlay(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
@@ -94,11 +122,13 @@ async def test_start_time_matching_applies_to_upcoming_trips_overlay(
     the predicted repetition gains an origin prediction, the canceled one
     is dropped, and siblings stay schedule-only.
     """
-    _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_MATCHED)
+    _mock_catalog_with_rt(mock_api, _dated(TRIP_UPDATES_FREQ_MATCHED))
     handle = await feeds_client.get_transit_feed("mdb-100")
-    trips = await handle.get_upcoming_trips(
-        "S1", "S3", lookahead=timedelta(hours=2), now_utc=NOW
-    )
+    trips = (
+        await handle.get_upcoming_trips(
+            [TripQuery("S1", "S3")], start=NOW, end=NOW + timedelta(hours=2)
+        )
+    )[0]
     assert [t.trip_id for t in trips] == [
         "F1#21600",
         "F1#22200",
@@ -124,7 +154,7 @@ async def test_unmatched_predictions_attach_to_no_repetition(
     _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_UNMATCHED)
     handle = await feeds_client.get_transit_feed("mdb-100")
     [arrivals] = await handle.get_arrivals(
-        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=2), now_utc=NOW
+        [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
     )
     assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
     for arrival in arrivals:
@@ -145,12 +175,14 @@ async def test_bare_cancellation_cancels_no_repetition(
     mock_api.get("/rt/all", body=TRIP_UPDATES_FREQ_BARE_CANCEL, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
     [arrivals] = await handle.get_arrivals(
-        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=2), now_utc=NOW
+        [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
     )
     assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
-    trips = await handle.get_upcoming_trips(
-        "S1", "S3", lookahead=timedelta(hours=2), now_utc=NOW
-    )
+    trips = (
+        await handle.get_upcoming_trips(
+            [TripQuery("S1", "S3")], start=NOW, end=NOW + timedelta(hours=2)
+        )
+    )[0]
     assert [t.trip_id for t in trips] == F1_SYNTHETIC_IDS
 
 
@@ -165,20 +197,18 @@ async def test_tomorrow_repetition_cancellation_spares_todays(
     _mock_catalog_with_rt(mock_api, TRIP_UPDATES_FREQ_CANCELED_TOMORROW)
     handle = await feeds_client.get_transit_feed("mdb-100")
     [arrivals] = await handle.get_arrivals(
-        [ArrivalsQuery(["S1"])], lookahead=timedelta(hours=2), now_utc=NOW
+        [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
     )
     assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
     assert all(a.realtime is False for a in arrivals)
 
 
-async def test_vehicle_matches_a_repetition_on_the_template_trip_id(
+async def test_a_template_id_vehicle_matches_no_repetition(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
-    """A VehiclePosition names the PLAIN trip id, never a repetition.
-
-    Repetitions surface as synthetic ``F1#{start}`` ids, so matching an
-    arrival to a vehicle on ``trip_id`` would never hit for frequency-based
-    service. The join uses the template id the producer actually sent.
+    """A vehicle naming only the template trip id, with neither start_time
+    nor start_date (both required for a frequency trip), says which
+    repetition it runs no more than an undated prediction does: none.
     """
     message = gtfs_realtime_pb2.FeedMessage()
     message.header.gtfs_realtime_version = "2.0"
@@ -192,14 +222,12 @@ async def test_vehicle_matches_a_repetition_on_the_template_trip_id(
     handle = await feeds_client.get_transit_feed("mdb-100")
     [arrivals] = await handle.get_arrivals(
         [ArrivalsQuery(["S1"])],
-        lookahead=timedelta(hours=6),
-        now_utc=NOW,
+        start=NOW,
+        end=NOW + timedelta(hours=6),
         with_vehicles=True,
     )
-    matched = [a for a in arrivals if a.vehicle is not None]
-    assert matched, "no repetition matched the template-id vehicle"
-    assert all(a.trip_id.startswith("F1#") for a in matched if a.trip_id)
-    assert {a.vehicle.vehicle_id for a in matched if a.vehicle} == {"VF1"}
+    assert arrivals
+    assert all(a.vehicle is None for a in arrivals)
 
 
 async def test_concurrent_repetitions_match_their_own_vehicle(
@@ -223,14 +251,15 @@ async def test_concurrent_repetitions_match_their_own_vehicle(
         entity.vehicle.vehicle.id = vehicle_id
         entity.vehicle.trip.trip_id = "F1"
         entity.vehicle.trip.start_time = start_time
+        entity.vehicle.trip.start_date = "20260730"
         entity.vehicle.position.latitude = lat
         entity.vehicle.position.longitude = -118.0
     _mock_catalog_with_rt(mock_api, message.SerializeToString())
     handle = await feeds_client.get_transit_feed("mdb-100")
     [arrivals] = await handle.get_arrivals(
         [ArrivalsQuery(["S1"])],
-        lookahead=timedelta(hours=6),
-        now_utc=NOW,
+        start=NOW,
+        end=NOW + timedelta(hours=6),
         with_vehicles=True,
     )
     matched = {
@@ -242,3 +271,31 @@ async def test_concurrent_repetitions_match_their_own_vehicle(
     assert matched["F1#22800"] == "VB"
     # Siblings the producer said nothing about stay unattached.
     assert "F1#21600" not in matched
+
+
+async def test_a_dated_vehicle_without_start_time_matches_no_repetition(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """start_date alone doesn't say which repetition a frequency vehicle
+    runs (the spec requires start_time too): no repetition takes it --
+    exactly as for a TripUpdate with the same descriptor.
+    """
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "v"
+    entity.vehicle.vehicle.id = "VF1"
+    entity.vehicle.trip.trip_id = "F1"
+    entity.vehicle.trip.start_date = "20260730"
+    entity.vehicle.position.latitude = 34.1
+    entity.vehicle.position.longitude = -118.3
+    _mock_catalog_with_rt(mock_api, message.SerializeToString())
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["S1"])],
+        start=NOW,
+        end=NOW + timedelta(hours=6),
+        with_vehicles=True,
+    )
+    assert arrivals
+    assert all(a.vehicle is None for a in arrivals)

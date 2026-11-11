@@ -271,13 +271,14 @@ class ArrivalsQuery:
     :meth:`TransitFeedHandle.get_headsigns_serving` offers), so RT-added trips,
     which announce no headsign, never pass a headsign filter. ``limit``
     caps the merged, filtered result for this query as a whole,
-    nearest effective departure first; zero asks for an empty board.
+    nearest effective departure first; zero asks for an empty board and
+    ``None`` means unlimited (only allowed with an explicit ``end``).
     """
 
     stop_ids: Sequence[str]
     route_ids: Sequence[str] | None = None
     headsigns: Sequence[str] | None = None
-    limit: int = 10
+    limit: int | None = 10
 
     def __post_init__(self) -> None:
         """Validate, then copy each id sequence into a tuple.
@@ -293,7 +294,26 @@ class ArrivalsQuery:
             if value is not None:
                 object.__setattr__(self, name, tuple(value))
         # A negative limit would slice rows off the END of the board.
-        if self.limit < 0:
+        if self.limit is not None and self.limit < 0:
+            raise ValueError(f"limit must be non-negative, got {self.limit}")
+
+
+@dataclass(frozen=True)
+class TripQuery:
+    """One origin->destination request in a ``get_upcoming_trips`` batch.
+
+    ``limit`` caps this query's result, nearest effective origin departure
+    first; ``None`` means unlimited (only allowed with an explicit ``end``)
+    and zero asks for an empty result.
+    """
+
+    origin_stop_id: str
+    destination_stop_id: str
+    limit: int | None = 10
+
+    def __post_init__(self) -> None:
+        """Reject a negative limit, which would slice rows off the end."""
+        if self.limit is not None and self.limit < 0:
             raise ValueError(f"limit must be non-negative, got {self.limit}")
 
 
@@ -388,6 +408,11 @@ class UpcomingTrip:
     is flagged relative to the service day it belongs to, not the clock
     day it happens on, and frequency-materialized repetitions count as
     ordinary trips (the day's first repetition is the first departure).
+
+    ``vehicle_id``/``vehicle`` identify the vehicle running this trip, as
+    on :class:`StopArrival`: the id from the origin's realtime prediction,
+    and the live :class:`VehiclePosition` when the query asked for
+    vehicles and one could be pinned to this trip instance.
     """
 
     trip_id: str
@@ -405,6 +430,8 @@ class UpcomingTrip:
     predicted_arrival: datetime | None
     delay_seconds: int | None
     realtime: bool
+    vehicle_id: str | None
+    vehicle: VehiclePosition | None
     wheelchair_accessible: WheelchairAccess | None
     bikes_allowed: BikesAllowed | None
     direction_id: int | None
