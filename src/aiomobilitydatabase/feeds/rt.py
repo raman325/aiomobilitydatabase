@@ -802,11 +802,12 @@ def resolve_trip_predictions(
       propagated to all subsequent stops" until newer information. Every
       SCHEDULED update replaces the delay carried from earlier stops ("updates
       with schedule relationships of SCHEDULED ... or NO_DATA will" stop
-      propagation), so one stating none leaves later stops without one.
+      propagation): once any update has stated a delay or NO_DATA, one
+      stating none leaves later stops without one.
     - A SKIPPED update marks its stop skipped and leaves propagation alone.
       A NO_DATA update predicts nothing and cuts propagation: later stops
       are schedule-only until an update states a delay.
-    - The trip-level delay covers every event until the first update that
+    - The trip-level delay is the carried delay until the first update that
       states a delay or is NO_DATA: it "is only propagated until the next
       stop along the trip with a StopTimeUpdate delay value specified".
     - A stop no update reaches takes the carried delay at both events.
@@ -839,18 +840,9 @@ def resolve_trip_predictions(
                 own.departure, own.departure_delay, call.departure
             )
             stated = departure_delay if departure_delay is not None else arrival_delay
-            # Before any stated delay, the trip-level one still covers this
-            # stop's events the update leaves out; after one, nothing does.
-            fill = None if covered or stated is not None else entry.delay_seconds
-            arrival = own.arrival or _moved(
-                call.arrival,
-                own.arrival_delay if own.arrival_delay is not None else fill,
-            )
-            departure = own.departure or _moved(
-                call.departure,
-                own.departure_delay if own.departure_delay is not None else fill,
-            )
-            delay = stated if stated is not None else fill
+            arrival = own.arrival or _moved(call.arrival, own.arrival_delay)
+            departure = own.departure or _moved(call.departure, own.departure_delay)
+            delay = stated
             if stated is not None or covered:
                 covered, current = True, stated
         if arrival is None and departure is None and delay is None:

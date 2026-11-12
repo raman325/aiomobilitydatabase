@@ -4834,11 +4834,9 @@ def _propagation_oracle(
             dep_time, dep_delay, dep_given = _spec_event(
                 placed[i], "departure", sched_dep
             )
-            own = dep_delay if dep_delay is not None else arr_delay
-            fill = trip_delay if own is None and not covered_before else None
-            arrival = arr_time or at(sched_arr, arr_delay if arr_given else fill)
-            departure = dep_time or at(sched_dep, dep_delay if dep_given else fill)
-            delay = own if own is not None else fill
+            arrival = arr_time or at(sched_arr, arr_delay if arr_given else None)
+            departure = dep_time or at(sched_dep, dep_delay if dep_given else None)
+            delay = dep_delay if dep_delay is not None else arr_delay
         outcomes[i] = (
             None
             if arrival is None and departure is None and delay is None

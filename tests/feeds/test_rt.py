@@ -1085,6 +1085,26 @@ def test_resolve_a_delayless_update_does_not_end_the_trip_delay() -> None:
     assert resolved.predictions[3].departure == _at(20, 300)
 
 
+def test_resolve_an_update_predicts_only_its_own_events_under_a_trip_delay() -> None:
+    """A stop's own update decides that stop: under a trip-level 300 s, B's
+    update giving only a 600 s arrival delay predicts B's arrival, and no
+    departure -- neither the trip's 300 s nor anything else fills it."""
+    entry = _entry(_stu(stop_id="B", arrival_delay=600), trip_delay=300)
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.predictions[1].arrival == _at(0, 300)
+    b = resolved.predictions[2]
+    assert (b.arrival, b.departure, b.delay_seconds) == (_at(10, 600), None, 600)
+    assert resolved.predictions[3].arrival == _at(20, 600)
+
+
+def test_resolve_no_data_ends_the_trip_delay() -> None:
+    """NO_DATA before any stated delay ends the trip-level delay too: "no
+    realtime timing information" from there on."""
+    entry = _entry(_stu(stop_id="B", relationship=_NO_DATA), trip_delay=300)
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert set(resolved.predictions) == {1}
+
+
 def test_resolve_skipped_marks_stop_and_never_alters_propagation() -> None:
     entry = _entry(
         _stu(stop_id="A", delay=300),

@@ -231,14 +231,33 @@ def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
     terminal call announces only an arrival), else ``fallback`` for a row
     with no time at all. Ordering only: no predicted time is invented.
     """
-    if arrival.predicted_departure is not None:
-        return arrival.predicted_departure
+    return (
+        _effective_instant(
+            arrival.predicted_departure,
+            arrival.scheduled_departure,
+            arrival.predicted_arrival,
+        )
+        or fallback
+    )
+
+
+def _effective_instant(
+    predicted_departure: datetime | None,
+    scheduled_departure: datetime | None,
+    predicted_arrival: datetime | None,
+) -> datetime | None:
+    """When a call leaves, for ordering: never before its predicted arrival.
+
+    The predicted departure if any; else the later of the scheduled
+    departure and the predicted arrival -- a vehicle does not leave before
+    it arrives -- whichever exist. One rule for boards and journeys alike.
+    """
+    if predicted_departure is not None:
+        return predicted_departure
     known = [
-        when
-        for when in (arrival.scheduled_departure, arrival.predicted_arrival)
-        if when is not None
+        when for when in (scheduled_departure, predicted_arrival) if when is not None
     ]
-    return max(known) if known else fallback
+    return max(known) if known else None
 
 
 @dataclass(frozen=True)
@@ -594,8 +613,15 @@ def _detoured_rows(
 
 
 def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
-    """Predicted origin departure if any, else scheduled."""
-    return trip.predicted_departure or trip.scheduled_departure
+    """When the trip leaves its origin, by :func:`_effective_instant`."""
+    return (
+        _effective_instant(
+            trip.predicted_departure,
+            trip.scheduled_departure,
+            trip.origin_predicted_arrival,
+        )
+        or trip.scheduled_departure
+    )
 
 
 # Open-ended queries read the schedule over a growing horizon: the first
@@ -1624,7 +1650,8 @@ class TransitFeedHandle:
         their own delay -- an event it does not give is not predicted --
         and its delay (a time, when given, against the schedule) replaces
         the carried one and propagates to every subsequent stop until newer
-        information, so one stating none leaves later stops without one; a
+        information (one stating none, once any update has, leaves later
+        stops without one); a
         NO_DATA StopTimeUpdate cuts propagation (subsequent stops are
         schedule-only until a later update states a delay); a SKIPPED
         StopTimeUpdate suppresses its stop's row entirely (the vehicle will
@@ -2082,12 +2109,15 @@ class TransitFeedHandle:
         whether it serves the destination after the origin cannot be
         determined.
 
-        Delay propagation follows :meth:`get_arrivals` exactly: each end's
-        prediction comes from its own StopTimeUpdate, a propagated
-        last-known delay, or the trip-level fallback — so one early-stop
-        update predicts both ends. ``realtime`` is True whenever either
-        end carries any RT-derived prediction, propagated ones included;
-        ``delay_seconds`` reports the origin's effective delay.
+        Delay propagation follows :meth:`get_arrivals` exactly: an end with
+        its own StopTimeUpdate is predicted at the events that update gives;
+        an end without one takes the propagated or trip-level delay -- so
+        one update before both ends predicts both. ``realtime`` is True
+        whenever either end carries any RT-derived prediction, propagated
+        ones included; ``delay_seconds`` reports the origin's delay. A
+        journey whose origin departure realtime does not predict is ordered
+        and kept by the later of its scheduled departure and the origin's
+        predicted arrival, as boards are.
 
         Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
         ids) match RT via ``TripDescriptor.start_time`` exactly as in
@@ -2285,6 +2315,9 @@ class TransitFeedHandle:
                     destination_stop=stops_by_id.get(trip.destination_stop_id),
                     scheduled_departure=trip.departure,
                     predicted_departure=origin_pred.departure if origin_pred else None,
+                    origin_predicted_arrival=origin_pred.arrival
+                    if origin_pred
+                    else None,
                     scheduled_arrival=trip.arrival,
                     predicted_arrival=dest_pred.arrival if dest_pred else None,
                     delay_seconds=(origin_pred.delay_seconds if origin_pred else None),

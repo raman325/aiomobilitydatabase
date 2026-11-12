@@ -409,7 +409,12 @@ class UpcomingTrip:
     departure from an origin stop on a trip that later serves the
     destination stop. Scheduled times are non-optional because the
     producing query requires an origin departure time and a destination
-    arrival time; ``delay_seconds`` is the origin departure delay. A trip
+    arrival time. Realtime predicts the events its updates give:
+    ``predicted_departure``/``origin_predicted_arrival`` at the origin and
+    ``predicted_arrival`` at the destination, each None when realtime says
+    nothing about that event (a feed sending only arrivals predicts no
+    departure). ``delay_seconds`` is the origin's delay -- its update's
+    departure delay, else its arrival delay, else the carried one. A trip
     is offered only where the rider can board and alight: never from a call
     with no pickup (``pickup_type`` 1) or to one with no drop-off
     (``drop_off_type`` 1).
@@ -454,6 +459,7 @@ class UpcomingTrip:
     destination_stop: Stop | None
     scheduled_departure: datetime
     predicted_departure: datetime | None
+    origin_predicted_arrival: datetime | None
     scheduled_arrival: datetime
     predicted_arrival: datetime | None
     delay_seconds: int | None

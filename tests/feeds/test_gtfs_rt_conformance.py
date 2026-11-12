@@ -14,7 +14,7 @@ from google.transit import gtfs_realtime_pb2
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from aiomobilitydatabase.feeds.models import ArrivalsQuery
+from aiomobilitydatabase.feeds.models import ArrivalsQuery, TripQuery
 from aiomobilitydatabase.feeds.rt import (
     TripStopUpdate,
     TripUpdateEntry,
@@ -134,6 +134,36 @@ def test_each_run_resolves_against_its_own_days_schedule() -> None:
     assert _run(index, body, message) == [
         (_EIGHT + timedelta(minutes=20), 300),
         (_EIGHT + timedelta(days=1, minutes=20), 120),
+    ]
+
+
+def test_a_journey_from_a_late_origin_given_arrivals_only_is_kept() -> None:
+    """A feed sending only arrivals: S0 and S2 arrive 10 min late. At 08:01
+    the bus has not reached S0, so the journey S0 -> S2 is still ahead --
+    its departure is not predicted, but it is ordered and kept by S0's
+    predicted arrival, 08:10, exactly as the board keeps S0's row."""
+    message = _message(
+        {"sequence": 1, "arrival_delay": 600}, {"sequence": 3, "arrival_delay": 600}
+    )
+    index = _build_index_from_files(_THREE_STOPS)
+    now = _EIGHT + timedelta(minutes=1)
+
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        [trips] = await handle.get_upcoming_trips(
+            [TripQuery("S0", "S2")], start=now, end=now + timedelta(hours=1)
+        )
+        return [
+            (
+                trip.predicted_departure,
+                trip.origin_predicted_arrival,
+                trip.predicted_arrival,
+                trip.delay_seconds,
+            )
+            for trip in trips
+        ]
+
+    assert _run(index, body, message) == [
+        (None, _EIGHT + timedelta(minutes=10), _EIGHT + timedelta(minutes=30), 600)
     ]
 
 

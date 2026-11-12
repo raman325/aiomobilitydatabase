@@ -360,13 +360,15 @@ Notes on direct mode:
   own time, else their own delay — an event it does not give is not
   predicted — and its delay (a time, when given, against the schedule:
   "time will take precedence") propagates to subsequent stops until newer
-  information. Every update except a `SKIPPED` one replaces the delay
-  carried from earlier stops, so one stating none leaves later stops
-  without one. `NO_DATA` cuts propagation: that stop and every later one
-  are schedule-only until an update states a delay. `SKIPPED` suppresses
-  its stop (and any origin→destination row boarding or alighting there)
-  and leaves propagation alone. The trip-level delay covers stops until the
-  first update that states a delay or is `NO_DATA`. An update
+  information. The trip-level delay covers stops until the first update
+  that states a delay or is `NO_DATA`; after that, every update except a
+  `SKIPPED` one replaces the delay carried from earlier stops, so one
+  stating none leaves later stops without one. `NO_DATA` cuts
+  propagation: that stop and every later one are schedule-only until an
+  update states a delay. `SKIPPED` suppresses its stop (and any
+  origin→destination row boarding or alighting there) and leaves
+  propagation alone. A stop whose departure realtime does not predict
+  stays listed until its predicted arrival, if that is later. An update
   naming a stop by `stop_id` alone on a trip that visits it twice names no
   stop (the spec requires `stop_sequence` there), and one whose
   `stop_sequence` and `stop_id` disagree names none either, unless the
