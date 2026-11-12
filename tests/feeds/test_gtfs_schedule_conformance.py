@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from google.transit import gtfs_realtime_pb2
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -26,8 +27,9 @@ from aiomobilitydatabase.feeds.models import (
     StopLocationType,
     WheelchairAccess,
 )
+from aiomobilitydatabase.feeds.rt import stops_from_message
 from aiomobilitydatabase.feeds.static_index import StaticIndex
-from aiomobilitydatabase.feeds.transit import TransitFeedHandle
+from aiomobilitydatabase.feeds.transit import TransitFeedHandle, _inherited_rt_stops
 
 from tests.feeds.test_properties import _build_index_from_files
 from tests.feeds.test_time_window_properties import _run
@@ -251,6 +253,43 @@ def test_child_stops_inherit_from_their_parent_station(tmp_path: Path) -> None:
     index.close()
 
 
+def test_realtime_defined_stops_inherit_from_a_static_parent() -> None:
+    """A stop only a GTFS-RT feed defines (a detour's replacement stop) is a
+    stop -- RT's Stop has no location_type -- with the message's own
+    wheelchair_boarding, and inherits from a static parent station by the
+    same rules as a static stop."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    for stop_id, parent, boarding, zone in (
+        ("UNDER", "STA", None, "Europe/Lisbon"),
+        ("OWN", "STA", gtfs_realtime_pb2.Stop.NOT_AVAILABLE, ""),
+        ("LONE", "", gtfs_realtime_pb2.Stop.AVAILABLE, ""),
+        ("ZONED", "NOWHERE", None, "Asia/Tokyo"),
+    ):
+        entity = message.entity.add()
+        entity.id = stop_id
+        entity.stop.stop_id = stop_id
+        entity.stop.parent_station = parent
+        entity.stop.stop_timezone = zone
+        if boarding is not None:
+            entity.stop.wheelchair_boarding = boarding
+    static = _build_index_from_files(_feed(stops=_HIERARCHY))
+    try:
+        stops = _inherited_rt_stops(
+            stops_from_message(message), static.stops_by_id(), "UTC"
+        )
+    finally:
+        static.close()
+    assert {stop.location_type for stop in stops.values()} == {StopLocationType.STOP}
+    assert stops["UNDER"].wheelchair_boarding is WheelchairAccess.POSSIBLE
+    assert stops["UNDER"].timezone == "Europe/Berlin"
+    assert stops["OWN"].wheelchair_boarding is WheelchairAccess.NOT_POSSIBLE
+    assert stops["LONE"].wheelchair_boarding is WheelchairAccess.POSSIBLE
+    assert stops["LONE"].timezone == "UTC"
+    assert stops["ZONED"].wheelchair_boarding is WheelchairAccess.UNKNOWN
+    assert stops["ZONED"].timezone == "Asia/Tokyo"
+
+
 # -- D6: agency.txt's timezone ------------------------------------------------
 
 
@@ -276,6 +315,23 @@ def test_stop_times_are_in_the_agency_timezone(
     index = _build(tmp_path, _feed(agency=agency), catalog_zone)
     assert index.timezone_name == expected
     index.close()
+
+
+def test_an_unreadable_agency_txt_fails_as_a_parse_error(tmp_path: Path) -> None:
+    """agency.txt is read for its timezone even when a catalog supplies
+    one; a file that is not UTF-8 fails the way every loader does."""
+    zip_path = tmp_path / "latin1.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        for name, content in _feed().items():
+            if name != "agency.txt":
+                archive.writestr(name, content)
+        archive.writestr(
+            "agency.txt",
+            "agency_id,agency_name,agency_url,agency_timezone\n"
+            "A,Caf\xe9,https://e.com,UTC\n".encode("latin-1"),
+        )
+    with pytest.raises(FeedParseError, match=r"Malformed agency\.txt"):
+        StaticIndex.build(zip_path, ":memory:", "ds", "America/New_York")
 
 
 def test_no_usable_timezone_anywhere_fails_the_build(tmp_path: Path) -> None:

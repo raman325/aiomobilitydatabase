@@ -2275,6 +2275,28 @@ def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) 
         # evidence against one.
         trips = index.upcoming_trips("S1", "S2", now, timedelta(hours=24), 10)
         assert len(trips) == (0 if pickup is PickupDropOffType.NONE else 1)
+        for trip in trips:  # the journey query maps the same cells
+            assert (
+                trip.wheelchair_accessible,
+                trip.bikes_allowed,
+                trip.direction_id,
+                trip.origin_pickup_type,
+                trip.origin_drop_off_type,
+                trip.origin_timepoint_exact,
+                trip.origin_stop_headsign,
+                trip.trip_short_name,
+                trip.block_id,
+            ) == (
+                dep.wheelchair_accessible,
+                dep.bikes_allowed,
+                dep.direction_id,
+                dep.pickup_type,
+                dep.drop_off_type,
+                dep.timepoint_exact,
+                dep.stop_headsign,
+                dep.trip_short_name,
+                dep.block_id,
+            )
         # Non-None enum results from a non-blank cell are exact members whose
         # .value round-trips to the raw cell int.
         for member, cell in (

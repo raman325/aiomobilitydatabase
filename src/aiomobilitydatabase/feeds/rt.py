@@ -29,6 +29,7 @@ from .models import (
     Route,
     ServiceAlert,
     Stop,
+    StopLocationType,
     VehiclePosition,
     VehicleStopStatus,
     WheelchairAccess,
@@ -303,11 +304,21 @@ class TripModifications:
     modifications: list[Modification]
 
 
+_RT_BOARDING = {
+    "UNKNOWN": WheelchairAccess.UNKNOWN,
+    "AVAILABLE": WheelchairAccess.POSSIBLE,
+    "NOT_AVAILABLE": WheelchairAccess.NOT_POSSIBLE,
+}
+
+
 def _stop_from_rt(stop: Any) -> Stop:
     """Return a GTFS-RT Stop entity as the model a static stop uses.
 
     A replacement stop may be one the static feed has never heard of, so
-    the RT entity is the only definition of it that exists.
+    the RT entity is the only definition of it that exists. GTFS-RT's Stop
+    has no location_type, so it is a stop -- GTFS's reading of an empty
+    one. Its own cells only: parent-station inheritance needs the static
+    stops, and the handle applies it.
     """
     return Stop(
         id=stop.stop_id,
@@ -315,10 +326,16 @@ def _stop_from_rt(stop: Any) -> Stop:
         latitude=stop.stop_lat if stop.HasField("stop_lat") else None,
         longitude=stop.stop_lon if stop.HasField("stop_lon") else None,
         parent_station=stop.parent_station or None,
-        location_type=None,
+        location_type=StopLocationType.STOP,
         stop_code=stop.stop_code or None,
         platform_code=stop.platform_code or None,
-        wheelchair_boarding=None,
+        # Unset reads as the proto default, UNKNOWN: GTFS's "0 or empty".
+        wheelchair_boarding=_RT_BOARDING.get(
+            _pb_enum_name(
+                gtfs_realtime_pb2.Stop.WheelchairBoarding, stop.wheelchair_boarding
+            )
+            or ""
+        ),
         description=stop.stop_desc.translation[0].text
         if stop.stop_desc.translation
         else None,

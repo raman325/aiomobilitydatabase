@@ -737,14 +737,22 @@ class StaticIndex:
 
     @staticmethod
     def _timezone_from_agency(archive: zipfile.ZipFile, names: set[str]) -> str | None:
+        """Return the first non-blank agency_timezone in agency.txt, if any.
+
+        Read before the loaders run, so an unreadable file (not UTF-8, a
+        ragged row) fails here as the loaders would: FeedParseError.
+        """
         if "agency.txt" not in names:
             return None
         with archive.open("agency.txt") as fp:
             reader = csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
-            for row in reader:
-                tz_name = (row.get("agency_timezone") or "").strip()
-                if tz_name:
-                    return tz_name
+            try:
+                for row in reader:
+                    tz_name = (row.get("agency_timezone") or "").strip()
+                    if tz_name:
+                        return tz_name
+            except (ValueError, csv.Error, AttributeError) as err:
+                raise FeedParseError(f"Malformed agency.txt: {err}") from err
         return None
 
     @classmethod

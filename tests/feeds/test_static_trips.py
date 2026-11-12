@@ -27,8 +27,8 @@ def test_origin_to_destination_happy_path(tmp_path: Path) -> None:
     index = _index(tmp_path)
     trips = index.upcoming_trips("S1", "S3", NOW, timedelta(hours=1), 10)
     # T2 also departs S1 in-window with a LATER S3 call in its sequence, but
-    # that call has no arrival time: the d.arrival_secs IS NOT NULL clause
-    # excludes it (which is why ScheduledTrip.arrival is non-optional).
+    # that call is untimed: the d.arrival_secs IS NOT NULL clause excludes it
+    # (which is why ScheduledTrip.arrival is non-optional).
     assert [trip.trip_id for trip in trips] == ["T1"]
     trip = trips[0]
     assert trip.route_id == "R1"
@@ -70,8 +70,8 @@ def test_origin_served_but_not_destination_excluded(tmp_path: Path) -> None:
 def test_null_origin_departure_excluded(tmp_path: Path) -> None:
     index = _index(tmp_path)
     # T9 runs S2→S1 in the right direction with a valid S1 arrival, but its
-    # S2 call has no departure time: the o.departure_secs IS NOT NULL clause
-    # excludes it (which is why ScheduledTrip.departure is non-optional).
+    # S2 call is untimed: the o.departure_secs IS NOT NULL clause excludes it
+    # (which is why ScheduledTrip.departure is non-optional).
     assert index.upcoming_trips("S2", "S1", NOW, timedelta(hours=1), 10) == []
     index.close()
 
@@ -129,7 +129,7 @@ def test_past_midnight_trip_crosses_service_day(tmp_path: Path) -> None:
 
 def test_is_first_is_last_single_candidate_both_true(tmp_path: Path) -> None:
     """A pair with exactly one candidate all service day (S1->S3 only runs
-    T1: T2's S3 call has no arrival, T9 is reverse) marks that departure
+    T1: T2's S3 call is untimed, T9 is reverse) marks that departure
     both the first AND the last of its day.
     """
     index = _index(tmp_path)

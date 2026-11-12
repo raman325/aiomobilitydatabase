@@ -2,6 +2,7 @@
 
 import io
 import zipfile
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -1037,6 +1038,29 @@ def test_unusable_replacement_stops_are_skipped(
     assert applied is not None
     # The replaced call is still removed; it simply gains no substitute.
     assert [c.stop_id for c in applied] == ["S1", "S3"], reason
+
+
+def test_an_untimed_call_after_a_detour_stays_untimed() -> None:
+    """The propagated delay moves the calls after the span; an untimed one
+    (GTFS allows untimed intermediate stops) has no time to move."""
+    untimed = replace(_call(3, "S3", 20), arrival=None, departure=None)
+    modification = Modification(
+        start_stop_sequence=2,
+        start_stop_id=None,
+        end_stop_sequence=2,
+        end_stop_id=None,
+        propagated_delay_seconds=120,
+        replacements=[],
+    )
+    applied = _apply_modification(
+        [_CALLS[0], _CALLS[1], untimed, _call(4, "S4", 30)], modification, {}, {}
+    )
+    assert applied is not None
+    assert [(c.stop_id, c.departure) for c in applied] == [
+        ("S1", _CALLS[0].departure),
+        ("S3", None),
+        ("S4", datetime(2026, 7, 30, 15, 32, tzinfo=UTC)),
+    ]
 
 
 def test_match_vehicle_without_any_identity() -> None:

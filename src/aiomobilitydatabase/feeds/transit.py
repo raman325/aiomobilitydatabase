@@ -15,7 +15,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from http import HTTPStatus
@@ -58,6 +58,7 @@ from .models import (
     TripQuery,
     UpcomingTrip,
     VehiclePosition,
+    WheelchairAccess,
 )
 from .rt import (
     Modification,
@@ -904,6 +905,35 @@ def group_stations(stops: Sequence[Stop]) -> list[StationGroup]:
     )
 
 
+def _inherited_rt_stops(
+    rt_stops: Mapping[str, Stop], static_stops: Mapping[str, Stop], agency_zone: str
+) -> dict[str, Stop]:
+    """Apply GTFS's parent-station inheritance to realtime-defined stops.
+
+    The same rules :meth:`StaticIndex.stops` applies: a stop under a parent
+    station takes the parent's timezone, and its wheelchair_boarding when
+    its own is 0 (UNKNOWN); one without a known parent uses its own
+    stop_timezone, or the agency's. The parent is looked up among the
+    static stops, whose values are already resolved.
+    """
+    resolved: dict[str, Stop] = {}
+    for stop_id, stop in rt_stops.items():
+        parent = static_stops.get(stop.parent_station or "")
+        boarding = stop.wheelchair_boarding
+        if (
+            parent is not None
+            and boarding is WheelchairAccess.UNKNOWN
+            and parent.wheelchair_boarding
+            in (WheelchairAccess.POSSIBLE, WheelchairAccess.NOT_POSSIBLE)
+        ):
+            boarding = parent.wheelchair_boarding
+        zone = parent.timezone if parent is not None else stop.timezone
+        resolved[stop_id] = replace(
+            stop, wheelchair_boarding=boarding, timezone=zone or agency_zone
+        )
+    return resolved
+
+
 class _IndexGuard:
     """Readers-writer gate around the live :class:`StaticIndex`.
 
@@ -1677,6 +1707,9 @@ class TransitFeedHandle:
             modifications.extend(trip_modifications_from_message(message))
         async with self._guard.reader():
             stops_by_id = await self._index_read(self._index.stops_by_id)
+            rt_stops = _inherited_rt_stops(
+                rt_stops, stops_by_id, self._index.timezone_name
+            )
             routes_by_id = await self._index_read(self._index.routes_by_id)
             positions = await self._vehicles_from(
                 vehicle_messages, stops_by_id, routes_by_id

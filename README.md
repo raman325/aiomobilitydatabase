@@ -388,7 +388,7 @@ Notes on direct mode:
   absent-means-exact default, and open vocabularies (`route_type`,
   `direction_id`) stay raw ints. A blank or absent cell takes the value GTFS
   gives "empty" where it defines one (a regular pickup, a stop or platform,
-  no accessibility information, white-on-black route colours).
+  no accessibility information, black-on-white route colours).
   Out-of-vocabulary values degrade to `None`, so descriptive metadata never
   fails a build. Consumers decide what to keep.
 - **Numbers are ASCII-strict, and strictness follows the field's role**: a
