@@ -167,6 +167,93 @@ def test_a_journey_from_a_late_origin_given_arrivals_only_is_kept() -> None:
     ]
 
 
+_TWO_TRIPS = _feed(
+    trips="route_id,service_id,trip_id,trip_headsign\nR,S,T,Downtown\nR,S,U,Downtown\n",
+    stop_times=(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T,08:00:00,08:00:00,S0,1\nT,08:10:00,08:10:00,S1,2\n"
+        "U,08:05:00,08:05:00,S0,1\nU,08:15:00,08:15:00,S1,2\n"
+        "V,10:20:00,10:20:00,S0,1\nV,10:30:00,10:30:00,S1,2\n"
+    ),
+)
+_TWO_TRIPS["trips.txt"] += "R,S,V,Downtown\n"
+
+
+def _arrivals_only(
+    trip: str, sequence: int, at: datetime
+) -> gtfs_realtime_pb2.FeedMessage:
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = trip
+    entity.trip_update.trip.trip_id = trip
+    entity.trip_update.trip.start_date = "20260730"
+    stu = entity.trip_update.stop_time_update.add()
+    stu.stop_sequence = sequence
+    stu.arrival.time = int(at.timestamp())
+    return message
+
+
+def _ordered(
+    message: gtfs_realtime_pb2.FeedMessage,
+    start: datetime,
+    *,
+    limit: int | None = None,
+    end: datetime | None = None,
+) -> tuple[list[object], list[object]]:
+    index = _build_index_from_files(_TWO_TRIPS)
+
+    async def body(handle: TransitFeedHandle) -> tuple[list[object], list[object]]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0"], limit=limit)], start=start, end=end
+        )
+        [trips] = await handle.get_upcoming_trips(
+            [TripQuery("S0", "S1", limit=limit)], start=start, end=end
+        )
+        return [row.trip_id for row in board], [trip.trip_id for trip in trips]
+
+    return _run(index, body, message)
+
+
+def test_boards_and_journeys_order_by_when_the_vehicle_leaves() -> None:
+    """T is due 08:00 but its update says it reaches S0 only at 08:10; U is
+    due 08:05 with no realtime. U leaves first: both lists put it ahead."""
+    message = _arrivals_only("T", 1, _EIGHT + timedelta(minutes=10))
+    assert _ordered(
+        message, _EIGHT - timedelta(minutes=30), end=_EIGHT + timedelta(minutes=30)
+    ) == (["U", "T"], ["U", "T"])
+
+
+def test_a_late_row_does_not_settle_the_open_ended_scan() -> None:
+    """Open-ended, limit 1, from 08:06: T (due 08:00) reaches S0 only at
+    10:30, past the first two-hour slice read; V, due 10:20, is unread
+    then but leaves first -- the board is not settled by T."""
+    message = _arrivals_only("T", 1, _EIGHT + timedelta(hours=2, minutes=30))
+    assert _ordered(message, _EIGHT - timedelta(minutes=10), limit=1) == (["U"], ["U"])
+    late = _ordered(message, _EIGHT + timedelta(minutes=6), limit=1)
+    assert late == (["V"], ["V"])
+
+
+def test_an_early_arrival_leaves_at_the_scheduled_departure() -> None:
+    """T's update says it reaches S0 two minutes early, and nothing about
+    leaving: at 07:59 it is still to leave at its scheduled 08:00."""
+    message = _arrivals_only("T", 1, _EIGHT - timedelta(minutes=2))
+    board, trips = _ordered(
+        message, _EIGHT - timedelta(minutes=1), end=_EIGHT + timedelta(minutes=1)
+    )
+    assert board == trips == ["T"]
+
+
+def test_an_assigned_stop_names_its_call_end_to_end() -> None:
+    """A platform reassignment as the spec sends it: stop_sequence 2 with a
+    stop_id that "must match assigned_stop_id". Its 600 s reaches S2."""
+    message = _message({"sequence": 2, "departure_delay": 600})
+    stu = message.entity[0].trip_update.stop_time_update[0]
+    stu.stop_id = "S1B"
+    stu.stop_time_properties.assigned_stop_id = "S1B"
+    assert _predicted(message)["S2"] == (_EIGHT + timedelta(minutes=30),) * 2
+
+
 # -- laws over drawn StopTimeUpdates -----------------------------------------
 
 

@@ -222,42 +222,12 @@ def _rt_key_for_row(
 
 
 def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
-    """Effective departure instant for ordering and the past-row drop.
+    """Return a row's :attr:`StopArrival.effective_departure`, else ``fallback``.
 
-    The predicted departure if any. Else the scheduled departure -- but
-    never before the predicted arrival, since a vehicle does not leave
-    before it arrives: a terminus whose update gives only a late arrival
-    stays on the board until then. Else the predicted arrival (an RT-added
-    terminal call announces only an arrival), else ``fallback`` for a row
-    with no time at all. Ordering only: no predicted time is invented.
+    ``fallback`` is for a row with no time at all (an RT-added row that
+    announces neither arrival nor departure), which sorts at ``start``.
     """
-    return (
-        _effective_instant(
-            arrival.predicted_departure,
-            arrival.scheduled_departure,
-            arrival.predicted_arrival,
-        )
-        or fallback
-    )
-
-
-def _effective_instant(
-    predicted_departure: datetime | None,
-    scheduled_departure: datetime | None,
-    predicted_arrival: datetime | None,
-) -> datetime | None:
-    """When a call leaves, for ordering: never before its predicted arrival.
-
-    The predicted departure if any; else the later of the scheduled
-    departure and the predicted arrival -- a vehicle does not leave before
-    it arrives -- whichever exist. One rule for boards and journeys alike.
-    """
-    if predicted_departure is not None:
-        return predicted_departure
-    known = [
-        when for when in (scheduled_departure, predicted_arrival) if when is not None
-    ]
-    return max(known) if known else None
+    return arrival.effective_departure or fallback
 
 
 @dataclass(frozen=True)
@@ -613,15 +583,8 @@ def _detoured_rows(
 
 
 def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
-    """When the trip leaves its origin, by :func:`_effective_instant`."""
-    return (
-        _effective_instant(
-            trip.predicted_departure,
-            trip.scheduled_departure,
-            trip.origin_predicted_arrival,
-        )
-        or trip.scheduled_departure
-    )
+    """Return a journey's :attr:`UpcomingTrip.effective_departure`."""
+    return trip.effective_departure
 
 
 # Open-ended queries read the schedule over a growing horizon: the first

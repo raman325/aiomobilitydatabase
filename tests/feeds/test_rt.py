@@ -1097,6 +1097,17 @@ def test_resolve_an_update_predicts_only_its_own_events_under_a_trip_delay() -> 
     assert resolved.predictions[3].arrival == _at(20, 600)
 
 
+def test_resolve_a_time_at_an_untimed_call_keeps_its_delay() -> None:
+    """With no schedule to compare a time with, the event's delay is what it
+    states: B (untimed) gives a time and a 600 s delay, and C runs 600 s
+    late."""
+    untimed = [*_CALLS[:1], replace(_CALLS[1], arrival=None, departure=None), _CALLS[2]]
+    entry = _entry(_stu(stop_id="B", departure=_at(12), delay=600))
+    resolved = resolve_trip_predictions(entry, untimed)
+    assert resolved.predictions[2].delay_seconds == 600
+    assert resolved.predictions[3].arrival == _at(20, 600)
+
+
 def test_resolve_no_data_ends_the_trip_delay() -> None:
     """NO_DATA before any stated delay ends the trip-level delay too: "no
     realtime timing information" from there on."""

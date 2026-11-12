@@ -612,7 +612,9 @@ class StopPrediction:
     realtime says nothing about. ``delay_seconds`` is the delay at the
     stop: the one its own update states (the departure's, else the
     arrival's; an event's time against the schedule, else its delay), else
-    the carried or trip-level delay. (So with a 60 s arrival delay and a
+    for a stop with no update of its own, the carried or trip-level delay;
+    None for a stop whose own update states none. (So with a 60 s arrival
+    delay and a
     120 s departure delay it is 120; ``arrival`` is still the scheduled
     arrival plus 60.)
     """

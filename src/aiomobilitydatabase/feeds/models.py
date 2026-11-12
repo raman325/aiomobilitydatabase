@@ -23,6 +23,20 @@ def _freeze_mappings(model: object, *names: str) -> None:
             object.__setattr__(model, name, FrozenDict(value))
 
 
+def _effective_departure(
+    predicted_departure: datetime | None,
+    scheduled_departure: datetime | None,
+    predicted_arrival: datetime | None,
+) -> datetime | None:
+    """Return the predicted departure, else the later of the other two."""
+    if predicted_departure is not None:
+        return predicted_departure
+    known = [
+        when for when in (scheduled_departure, predicted_arrival) if when is not None
+    ]
+    return max(known) if known else None
+
+
 class WheelchairAccess(IntEnum):
     """Wheelchair support, as GTFS's shared 0/1/2 vocabulary.
 
@@ -366,13 +380,16 @@ class StopArrival:
 
     ``predicted_arrival``/``predicted_departure`` are each event's own
     prediction; ``delay_seconds`` is the delay realtime gives this stop --
-    its update's departure delay, else its arrival delay (an event's delay,
-    or its time against the schedule), else the delay propagated from an
-    earlier stop or the trip-level one. With different arrival and
+    its own update's departure delay, else its arrival delay (an event's
+    time against the schedule, else its delay; None if the update states
+    neither), or, for a stop with no update of its own, the delay
+    propagated from an earlier stop or the trip-level one. With different
+    arrival and
     departure delays it is the departure's, so read the arrival's lateness
     off ``predicted_arrival``, not ``delay_seconds``. An event a stop's own
     update does not give is not predicted (None), even when the other event
-    is.
+    is; :attr:`effective_departure` is when the vehicle leaves as the board
+    orders it.
     """
 
     stop_id: str
@@ -400,6 +417,20 @@ class StopArrival:
     trip_short_name: str | None
     block_id: str | None
 
+    @property
+    def effective_departure(self) -> datetime | None:
+        """When the vehicle leaves this stop, as boards are ordered and kept.
+
+        The predicted departure if realtime gives one; else the later of
+        the scheduled departure and the predicted arrival -- a vehicle does
+        not leave before it arrives, so a late terminus whose update gives
+        only its arrival is shown at that arrival. None for a row with no
+        time at all.
+        """
+        return _effective_departure(
+            self.predicted_departure, self.scheduled_departure, self.predicted_arrival
+        )
+
 
 @dataclass(frozen=True)
 class UpcomingTrip:
@@ -414,7 +445,9 @@ class UpcomingTrip:
     ``predicted_arrival`` at the destination, each None when realtime says
     nothing about that event (a feed sending only arrivals predicts no
     departure). ``delay_seconds`` is the origin's delay -- its update's
-    departure delay, else its arrival delay, else the carried one. A trip
+    departure delay, else its arrival delay (None if the origin's own
+    update states neither); an origin with no update of its own takes the
+    carried or trip-level delay. A trip
     is offered only where the rider can board and alight: never from a call
     with no pickup (``pickup_type`` 1) or to one with no drop-off
     (``drop_off_type`` 1).
@@ -481,6 +514,23 @@ class UpcomingTrip:
     is_last: bool
     trip_short_name: str | None
     block_id: str | None
+
+    @property
+    def effective_departure(self) -> datetime:
+        """When the trip leaves its origin, as journeys are ordered and kept.
+
+        The predicted departure if realtime gives one; else the later of
+        the scheduled departure and the origin's predicted arrival -- a
+        vehicle does not leave before it arrives.
+        """
+        return (
+            _effective_departure(
+                self.predicted_departure,
+                self.scheduled_departure,
+                self.origin_predicted_arrival,
+            )
+            or self.scheduled_departure
+        )
 
 
 @dataclass(frozen=True)

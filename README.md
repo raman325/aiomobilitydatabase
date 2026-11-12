@@ -129,7 +129,8 @@ async def main() -> None:
             [ArrivalsQuery([nearby_stops[0].id], limit=2)]
         )
         for arrival in arrivals:
-            when = arrival.predicted_departure or arrival.scheduled_departure
+            # When it leaves, as the board orders it: predicted if known.
+            when = arrival.effective_departure
             live = "live" if arrival.realtime else "scheduled"
             # .stop and .route are the whole static records: platform codes,
             # coordinates, route_type and route colours all come along.
