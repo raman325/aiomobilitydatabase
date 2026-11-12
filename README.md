@@ -356,10 +356,16 @@ Notes on direct mode:
   plain trip's `start_time`, when given, is its first departure, as GTFS-RT
   requires; any other value names no run) — a
   "trip X is canceled tomorrow" posting never cancels today's run. A
-  StopTimeUpdate's delay propagates to subsequent stops until newer
-  information, `NO_DATA` makes a stop schedule-only, `SKIPPED` suppresses it
+  StopTimeUpdate predicts each event (arrival, departure) by its own time,
+  else its own delay, and its delay — or, when it gives only a time, that
+  time against the schedule — propagates to subsequent stops until newer
+  information. `NO_DATA` makes a stop schedule-only, `SKIPPED` suppresses it
   (and any origin→destination row boarding or alighting there), and the
-  trip-level delay covers stops no StopTimeUpdate reaches.
+  trip-level delay covers stops no StopTimeUpdate reaches. A predicted
+  departure never comes before the predicted arrival unless the producer
+  states both. An update naming a stop by `stop_id` alone on a trip that
+  visits it twice means the visit after the previous update; one whose
+  `stop_sequence` and `stop_id` disagree names no stop.
 - **Rows carry whole records, not copied columns**: `StopArrival`,
   `UpcomingTrip`, and `VehiclePosition` each expose the full `Stop` and
   `Route` they refer to, so platform codes, coordinates, route colours and

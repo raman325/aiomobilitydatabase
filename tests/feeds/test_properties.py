@@ -8,7 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
@@ -61,6 +61,7 @@ from aiomobilitydatabase.feeds.models import (
     WheelchairAccess,
 )
 from aiomobilitydatabase.feeds.rt import (
+    StopPrediction,
     TripStopUpdate,
     TripUpdateEntry,
     _epoch_to_utc,
@@ -74,8 +75,10 @@ from aiomobilitydatabase.feeds.rt import (
 )
 from aiomobilitydatabase.feeds.static_index import (
     _SQLITE_INT_MAX,
+    ScheduledDeparture,
     ScheduledTrip,
     StaticIndex,
+    TripCall,
     _lenient_date,
     _lenient_int,
     _strict_int,
@@ -1295,10 +1298,15 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
     # Resolution totality: any entry against any stop order never raises,
     # and its outcomes never leave that order.
     stop_calls = [
-        (seq, data.draw(st.sampled_from(["A", "B", "C"])))
+        _trip_call(
+            seq,
+            data.draw(st.sampled_from(["A", "B", "C"])),
+            _PROP_ANCHOR + timedelta(minutes=seq),
+            _PROP_ANCHOR + timedelta(minutes=seq),
+        )
         for seq in sorted(data.draw(st.sets(st.integers(0, 50), max_size=4)))
     ]
-    known_seqs = {seq for seq, _ in stop_calls}
+    known_seqs = {call.stop_sequence for call in stop_calls}
     for entry in updates.trips.values():
         resolved = resolve_trip_predictions(entry, stop_calls)
         assert set(resolved.predictions) <= known_seqs
@@ -1949,9 +1957,7 @@ def test_upcoming_trips_invariants(zip_bytes: bytes, data: st.DataObject) -> Non
                 )
                 if not deps:
                     continue
-                calls_by_trip = index.trip_stop_calls(
-                    sorted({dep.trip_id for dep in deps})
-                )
+                calls_by_trip = _stop_calls_of(index, deps)
                 candidates = [
                     (dep.stop_id, later)
                     for dep in deps
@@ -3393,14 +3399,20 @@ def test_arrivals_merge_invariants(scenario: _MergeScenario) -> None:
     [[unlimited, limited, route_limited]] = boards
     assert fetches == [1]  # one TripUpdates fetch for the whole batch
 
+    # A predicted trip's S1 departure time is its delay at S1 ("a delay
+    # computed by comparing the time against the GTFS schedule time"),
+    # carried on to the trip's later calls.
+    s1_at = {trip: at for trip, stop, at in _MERGE_SCHEDULE if stop == "S1"}
+
+    def predicted_at(trip_id: str, stop_id: str, scheduled: datetime) -> datetime:
+        if trip_id not in scenario.predicted:
+            return scheduled
+        if stop_id == "S1":
+            return _MERGE_PREDICTED_AT
+        return scheduled + (_MERGE_PREDICTED_AT - s1_at[trip_id])
+
     candidates = [
-        (
-            trip_id,
-            stop_id,
-            _MERGE_PREDICTED_AT
-            if trip_id in scenario.predicted and stop_id == "S1"
-            else scheduled,
-        )
+        (trip_id, stop_id, predicted_at(trip_id, stop_id, scheduled))
         for trip_id, stop_id, scheduled in _MERGE_SCHEDULE
         if trip_id not in scenario.canceled
     ] + [
@@ -3426,9 +3438,7 @@ def test_arrivals_merge_invariants(scenario: _MergeScenario) -> None:
             assert row.realtime is True
             assert row.scheduled_departure is None
         else:
-            assert row.realtime == (
-                row.trip_id in scenario.predicted and row.stop_id == "S1"
-            )
+            assert row.realtime == (row.trip_id in scenario.predicted)
     for trip_id, departure in scenario.added_departures.items():
         rows = [row for row in unlimited if row.trip_id == trip_id]
         if trip_id in scenario.canceled or departure < now:
@@ -4514,12 +4524,12 @@ def _draw_stu_spec(
     """Draw one StopTimeUpdate spec for call position ``i`` (None = no STU).
 
     Kinds: a delay STU (departure-side, arrival-side, or BOTH with a
-    different arrival value that must lose to the departure), an
-    explicit-time STU (departure epoch, arrival epoch, or both), both
-    combined, an empty SCHEDULED STU, a SKIPPED marker, or a NO_DATA
-    marker. Addressing: stop_id, stop_sequence, both (consistent), or
-    CONFLICTING both -- stop_sequence names call ``i`` while stop_id names
-    a different call, and stop_sequence must win.
+    different arrival value, each event keeping its own), an explicit-time
+    STU (departure epoch, arrival epoch, or both), both combined, an empty
+    SCHEDULED STU, a SKIPPED marker, or a NO_DATA marker. Addressing:
+    stop_id, stop_sequence, both (consistent), or CONFLICTING both --
+    stop_sequence names call ``i`` while stop_id names a different call,
+    which names no call at all.
     """
     kinds = ["delay", "explicit", "delay_explicit", "empty", "skipped", "no_data"]
     if not forced:
@@ -4534,9 +4544,8 @@ def _draw_stu_spec(
         delay = draw(st.integers(-300, 900))
         spec["delay"] = delay
         if side == "both":
-            # The departure delay is the "last known delay" and must win;
-            # the arrival carries a DIFFERENT value so a preference flip
-            # is observable, never masked by an equal draw.
+            # The arrival carries a DIFFERENT value, so mixing the two
+            # events' delays up is observable, never masked by an equal draw.
             spec["shadow_delay"] = delay + draw(st.sampled_from([-97, 61, 293]))
     if kind in ("explicit", "delay_explicit"):
         ends = draw(st.sampled_from(["departure", "arrival", "both"]))
@@ -4566,8 +4575,8 @@ def _propagation_case(draw: st.DrawFn) -> dict[str, object]:
     """A static trip (3-8 stops) plus a drawn StopTimeUpdate set.
 
     Per stop: no STU or a :func:`_draw_stu_spec` draw. Optional loop trip
-    (a later call revisits an earlier stop id, so a bare stop_id STU must
-    resolve to the FIRST visit), optional trip-level delay, optional
+    (a later call revisits an earlier stop id, so a bare stop_id STU
+    resolves by feed order), optional trip-level delay, optional
     unplaceable "ghost" STU, optional DUPLICATE trailing STU for one call
     (the last one in feed order must win), drawn feed order.
     """
@@ -4627,7 +4636,7 @@ def _write_stu(
         stu.stop_id = call_stops[i]
     if addressing == "conflict":
         # CONFLICTING addressing: stop_sequence names call i while stop_id
-        # names a different call -- stop_sequence must win.
+        # names a different call -- together they name no call.
         stu.stop_id = call_stops[spec["conflict_index"]]  # type: ignore[index]
     if addressing in ("stop_sequence", "both", "conflict"):
         stu.stop_sequence = seq_gap * (i + 1)
@@ -4678,16 +4687,72 @@ def _propagation_message(case: dict[str, object]) -> gtfs_realtime_pb2.FeedMessa
     return msg
 
 
-def _placed_index(i: int, spec: dict[str, object], call_stops: list[str]) -> int:
-    """Which call position an STU emitted for position ``i`` lands on.
+def _stop_calls_of(
+    index: StaticIndex, departures: Sequence[ScheduledDeparture]
+) -> dict[str, list[tuple[int, str]]]:
+    """Each departure's trip's (stop_sequence, stop_id) calls on its day."""
+    return {
+        run.trip_id: [(call.stop_sequence, call.stop_id) for call in run.calls]
+        for run in index.instance_trip_calls(
+            sorted({(dep.trip_id, dep.service_date) for dep in departures})
+        )
+    }
 
-    Bare stop_id addressing resolves to the FIRST call with that stop id
-    (loop trips revisit); every sequence-bearing form addresses ``i``
-    itself (stop_sequence wins over a conflicting stop_id).
+
+def _trip_call(
+    stop_sequence: int, stop_id: str, arrival: datetime, departure: datetime
+) -> TripCall:
+    """A scheduled call, for resolving updates against a run directly."""
+    return TripCall(
+        stop_sequence=stop_sequence,
+        stop_id=stop_id,
+        arrival=arrival,
+        departure=departure,
+        pickup_type=None,
+        drop_off_type=None,
+        timepoint_exact=None,
+        stop_headsign=None,
+    )
+
+
+def _case_placements(case: dict[str, object]) -> dict[int, dict[str, object]]:
+    """Which call each emitted STU lands on, replaying the feed in order.
+
+    A stop_sequence names call ``i``; a stop_id sent with it must agree
+    ("conflict" addressing names no call). A bare stop_id names its call
+    when the trip visits that stop once, else the first visit after the
+    previously placed STU, else nothing. The last STU on a call wins.
     """
-    if spec["addressing"] == "stop_id":
-        return call_stops.index(call_stops[i])
-    return i
+    specs: dict[int, dict[str, object]] = case["specs"]  # type: ignore[assignment]
+    call_stops = _case_call_stops(case["n_stops"], case["loop"])  # type: ignore[arg-type]
+    emitted = [(i, specs[i]) for i in _case_feed_order(case)]
+    if case["extra"] is not None:
+        emitted.append(case["extra"])  # type: ignore[arg-type]
+    placed: dict[int, dict[str, object]] = {}
+    cursor = -1
+    for i, spec in emitted:
+        addressing = spec["addressing"]
+        if addressing == "conflict":
+            continue
+        if addressing == "stop_id":
+            visits = [k for k, stop in enumerate(call_stops) if stop == call_stops[i]]
+            later = [k for k in visits if k > cursor]
+            if len(visits) == 1:
+                pos = visits[0]
+            elif later:
+                pos = later[0]
+            else:
+                continue
+        else:
+            pos = i
+        placed[pos] = spec
+        cursor = pos
+    return placed
+
+
+def _prop_scheduled(i: int) -> tuple[datetime, datetime]:
+    arrival = _PROP_ANCHOR + timedelta(seconds=_prop_arr_secs(i))
+    return arrival, arrival + timedelta(seconds=_PROP_DWELL)
 
 
 def _propagation_oracle(
@@ -4695,40 +4760,33 @@ def _propagation_oracle(
 ) -> dict[int, object]:
     """Independent piecewise restatement of the spec, from the DRAWN values.
 
-    Per stop index: ``"skipped"``, ``None`` (schedule-only), or a dict with
-    the effective delay (may be None for an explicit-only stop) and the
-    explicit departure/arrival epochs (None where the prediction is purely
-    scheduled+delay). Placement first: each emitted STU lands per
-    :func:`_placed_index` in feed order, the LAST one landing on a call
-    wins it. Then the walk: last STU delay at-or-before the stop
-    propagates, NO_DATA cuts it, explicit times override at their own
-    stop, the trip-level delay covers stops no STU information reaches,
-    and everything else is schedule-only.
+    Per stop index: ``"skipped"``, ``None`` (schedule-only), or a dict of
+    the predicted ``arrival``/``departure`` instants and the ``delay``.
+    Placement per :func:`_case_placements`. Then the walk: an STU's events
+    each take their own time, else their own delay, else the other event's
+    delay at that stop, else the delay carried in; the delay it states (the
+    departure's, else the arrival's -- a delay, else a time against the
+    schedule) is carried on; NO_DATA cuts it; the trip-level delay covers
+    stops before any STU information; a derived event that crosses a
+    stated one yields to it.
     """
-    specs: dict[int, dict[str, object]] = case["specs"]  # type: ignore[assignment]
-    call_stops = _case_call_stops(case["n_stops"], case["loop"])  # type: ignore[arg-type]
-    placed: dict[int, dict[str, object]] = {}
-    for i in _case_feed_order(case):
-        spec = specs[i]
-        placed[_placed_index(i, spec, call_stops)] = spec
-    if case["extra"] is not None:
-        target, extra_spec = case["extra"]  # type: ignore[misc]
-        placed[_placed_index(target, extra_spec, call_stops)] = extra_spec
-    trip_delay = case["trip_delay"]
+    placed = _case_placements(case)
+    trip_delay: int | None = case["trip_delay"]  # type: ignore[assignment]
     outcomes: dict[int, object] = {}
     covered = False
-    current: object = None
+    current: int | None = None
+
+    def shifted(when: datetime, delay: int | None) -> datetime | None:
+        return None if delay is None else when + timedelta(seconds=delay)
+
+    def first(*values: int | None) -> int | None:
+        return next((value for value in values if value is not None), None)
+
     for i in range(case["n_stops"]):  # type: ignore[arg-type]
-        spec_at = placed.get(i)
-        if spec_at is None:
-            fallback = current if covered else trip_delay
-            outcomes[i] = (
-                None
-                if fallback is None
-                else {"delay": fallback, "dep_time": None, "arr_time": None}
-            )
-            continue
-        kind = spec_at["kind"]
+        sched_arr, sched_dep = _prop_scheduled(i)
+        incoming = current if covered else trip_delay
+        spec = placed.get(i)
+        kind = None if spec is None else spec["kind"]
         if kind == "skipped":
             outcomes[i] = "skipped"
             continue
@@ -4736,50 +4794,59 @@ def _propagation_oracle(
             covered, current = True, None
             outcomes[i] = None
             continue
-        own_delay = spec_at.get("delay")
-        if own_delay is not None:
-            covered, current = True, own_delay
-        effective = (
-            own_delay if own_delay is not None else (current if covered else trip_delay)
+        spec = spec or {}
+        side = spec.get("delay_side")
+        arr_delay_given: int | None = (
+            spec["delay"] if side == "arrival" else spec.get("shadow_delay")  # type: ignore[assignment]
         )
-        dep_time = spec_at.get("dep_time")
-        arr_time = spec_at.get("arr_time")
-        if effective is None and dep_time is None and arr_time is None:
-            outcomes[i] = None  # an empty STU carries no realtime content
-        else:
-            outcomes[i] = {
-                "delay": effective,
-                "dep_time": dep_time,
-                "arr_time": arr_time,
-            }
+        dep_delay_given: int | None = (
+            spec["delay"] if side in ("departure", "both") else None  # type: ignore[assignment]
+        )
+        arr_time: datetime | None = spec.get("arr_time")  # type: ignore[assignment]
+        dep_time: datetime | None = spec.get("dep_time")  # type: ignore[assignment]
+        arr_delay = first(
+            arr_delay_given,
+            None if arr_time is None else int((arr_time - sched_arr).total_seconds()),
+        )
+        dep_delay = first(
+            dep_delay_given,
+            None if dep_time is None else int((dep_time - sched_dep).total_seconds()),
+        )
+        stated = first(dep_delay, arr_delay)
+        if stated is not None:
+            covered, current = True, stated
+        arr_states = arr_time is not None or arr_delay_given is not None
+        dep_states = dep_time is not None or dep_delay_given is not None
+        arrival = arr_time or shifted(
+            sched_arr, arr_delay if arr_states else first(dep_delay, incoming)
+        )
+        departure = dep_time or shifted(
+            sched_dep, dep_delay if dep_states else first(arr_delay, incoming)
+        )
+        if arrival is not None and departure is not None and arrival > departure:
+            if arr_states and not dep_states:
+                departure = arrival
+            elif dep_states and not arr_states:
+                arrival = departure
+        delay = first(stated, incoming)
+        if arrival is None and departure is None and delay is None:
+            outcomes[i] = None
+            continue
+        outcomes[i] = {"arrival": arrival, "departure": departure, "delay": delay}
     return outcomes
 
 
 def _assert_prediction_matches_outcome(
-    row: StopArrival,
-    outcome: dict[str, object],
-    sched_arr: datetime,
-    sched_dep: datetime,
+    predicted: StopArrival | StopPrediction, outcome: dict[str, object]
 ) -> None:
-    """One merged row against one oracle outcome dict (explicit epochs win,
-    else scheduled+delay, else no prediction at that end -- and where an
-    explicit end and a derived one cross, the derived one yields: no call
-    departs before it arrives)."""
-    delay = outcome["delay"]
-    assert row.realtime is True
-    assert row.delay_seconds == delay
-    shift = None if delay is None else timedelta(seconds=delay)  # type: ignore[arg-type]
-    explicit_dep: datetime | None = outcome["dep_time"]  # type: ignore[assignment]
-    explicit_arr: datetime | None = outcome["arr_time"]  # type: ignore[assignment]
-    departure = explicit_dep or (None if shift is None else sched_dep + shift)
-    arrival = explicit_arr or (None if shift is None else sched_arr + shift)
-    if arrival is not None and departure is not None and arrival > departure:
-        if explicit_dep is None:
-            departure = arrival
-        elif explicit_arr is None:
-            arrival = departure
-    assert row.predicted_departure == departure
-    assert row.predicted_arrival == arrival
+    """One merged row or resolved prediction against one oracle outcome."""
+    if isinstance(predicted, StopArrival):
+        assert predicted.realtime is True
+        got = (predicted.predicted_arrival, predicted.predicted_departure)
+    else:
+        got = (predicted.arrival, predicted.departure)
+    assert got == (outcome["arrival"], outcome["departure"])
+    assert predicted.delay_seconds == outcome["delay"]
 
 
 @settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -4827,7 +4894,7 @@ def test_propagation_matches_piecewise_oracle(case: dict[str, object]) -> None:
             assert row.delay_seconds is None
             continue
         assert isinstance(outcome, dict)
-        _assert_prediction_matches_outcome(row, outcome, sched_arr, sched_dep)
+        _assert_prediction_matches_outcome(row, outcome)
 
 
 # The PURE volume property: same drawn cases and the same oracle, but run
@@ -4844,8 +4911,13 @@ def test_propagation_pure_oracle_matches_resolver(case: dict[str, object]) -> No
     call_stops = _case_call_stops(n_stops, case["loop"])  # type: ignore[arg-type]
     updates = trip_updates_from_message(_propagation_message(case))
     entry = updates.trips[("TP", None, None)]
-    stop_calls = [(seq_gap * (i + 1), call_stops[i]) for i in range(n_stops)]
-    resolved = resolve_trip_predictions(entry, stop_calls)
+    resolved = resolve_trip_predictions(
+        entry,
+        [
+            _trip_call(seq_gap * (i + 1), call_stops[i], *_prop_scheduled(i))
+            for i in range(n_stops)
+        ],
+    )
     outcomes = _propagation_oracle(case)
     assert resolved.skipped == {
         seq_gap * (i + 1) for i, outcome in outcomes.items() if outcome == "skipped"
@@ -4857,10 +4929,7 @@ def test_propagation_pure_oracle_matches_resolver(case: dict[str, object]) -> No
             assert seq not in resolved.predictions
             continue
         assert isinstance(outcome, dict)
-        prediction = resolved.predictions[seq]
-        assert prediction.delay_seconds == outcome["delay"]
-        assert prediction.departure == outcome["dep_time"]
-        assert prediction.arrival == outcome["arr_time"]
+        _assert_prediction_matches_outcome(resolved.predictions[seq], outcome)
 
 
 @settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -6152,7 +6221,7 @@ def _biased_pair(
             departures = index.upcoming_departures(
                 stops, None, probe_now, lookahead, 10_000
             )
-            calls = index.trip_stop_calls(sorted({dep.trip_id for dep in departures}))
+            calls = _stop_calls_of(index, departures)
             candidates = [
                 (dep.stop_id, later)
                 for dep in departures
@@ -6418,11 +6487,11 @@ def _shuffled_calls_feed(
 
 @given(feed=_shuffled_calls_feed(), data=st.data())
 @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_trip_stop_calls_ordered_and_scoped(
+def test_instance_trip_calls_ordered_and_scoped(
     feed: tuple[bytes, dict[str, list[tuple[int, str]]]], data: st.DataObject
 ) -> None:
-    """``trip_stop_calls`` returns each trip's calls in ``stop_sequence`` order,
-    only for requested trips, and omits trips with no ``stop_times`` rows.
+    """``instance_trip_calls`` returns each run's calls in ``stop_sequence``
+    order, only for requested runs, and omits trips with no ``stop_times``.
 
     RT delay propagation walks these lists POSITIONALLY, so a drifting
     ``ORDER BY`` would misattribute every delay rather than fail loudly.
@@ -6438,7 +6507,12 @@ def test_trip_stop_calls_ordered_and_scoped(
                 unique=True,
             )
         )
-        calls = index.trip_stop_calls(requested)
+        calls = {
+            run.trip_id: [(call.stop_sequence, call.stop_id) for call in run.calls]
+            for run in index.instance_trip_calls(
+                [(trip_id, date(2026, 7, 30)) for trip_id in requested]
+            )
+        }
         assert set(calls) <= set(requested)
         assert "TEMPTY" not in calls
         assert "MISSING" not in calls
@@ -6781,20 +6855,23 @@ def _draw_relationship_stu(
         relationship=relationship,
         arrival=arrival,
         departure=departure,
-        delay_seconds=delay,
+        arrival_delay=draw(st.none() | st.integers(-300, 900)),
+        departure_delay=delay,
     )
 
 
 @st.composite
 def _unrecognized_relationship_case(
     draw: st.DrawFn,
-) -> tuple[TripUpdateEntry, list[tuple[int, str]]]:
+) -> tuple[TripUpdateEntry, list[TripCall]]:
     """An entry whose STUs span the relationship pool, with at least one
     STU forced to a non-SCHEDULED unrecognized value so no example is
     vacuous.
     """
     n_calls = draw(st.integers(3, 8))
-    stop_calls = [(10 * (i + 1), f"S{i}") for i in range(n_calls)]
+    stop_calls = [
+        _trip_call(10 * (i + 1), f"S{i}", *_prop_scheduled(i)) for i in range(n_calls)
+    ]
     by_position: dict[int, TripStopUpdate] = {}
     for position in range(n_calls):
         if draw(st.booleans()):
@@ -6831,7 +6908,8 @@ def _as_scheduled(entry: TripUpdateEntry) -> TripUpdateEntry:
                 relationship=gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SCHEDULED,
                 arrival=stu.arrival,
                 departure=stu.departure,
-                delay_seconds=stu.delay_seconds,
+                arrival_delay=stu.arrival_delay,
+                departure_delay=stu.departure_delay,
             )
             for stu in entry.stop_updates
         ),
@@ -6843,7 +6921,7 @@ def _as_scheduled(entry: TripUpdateEntry) -> TripUpdateEntry:
 @settings(max_examples=300, deadline=None)
 @given(case=_unrecognized_relationship_case())
 def test_unrecognized_relationship_resolves_as_scheduled(
-    case: tuple[TripUpdateEntry, list[tuple[int, str]]],
+    case: tuple[TripUpdateEntry, list[TripCall]],
 ) -> None:
     """Metamorphic law for TripStopUpdate's documented commitment: any
     per-stop schedule_relationship outside {SKIPPED, NO_DATA} -- including
