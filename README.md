@@ -335,7 +335,21 @@ Notes on direct mode:
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic
   `{trip_id}#{start_secs}` ids, so every schedule query — arrivals,
-  origin→destination, routes-serving — sees them as ordinary trips.
+  origin→destination, routes-serving — sees them as ordinary trips. Each
+  repetition departs its first stop at its start, as `start_time` defines
+  it. Service with `exact_times` 0 (or empty) "does not follow a fixed
+  schedule", so its repetitions report `timepoint_exact=False`.
+- **Schedule data means what GTFS says it means**: stop times are in
+  agency.txt's `agency_timezone` (a catalog's zone is only a fallback for
+  a dataset naming no usable one). A call timed by only its arrival or only
+  its departure arrives and departs at that time. An origin→destination
+  trip is offered only where the rider can board and alight, never from a
+  call with no pickup or to one with no drop-off. Headsign filters and
+  `get_headsigns_serving()` use the headsign shown at the stop: its
+  `stop_headsign` where set, else the trip's. A stop under a parent station
+  takes the station's `stop_timezone`, and its `wheelchair_boarding` when
+  its own is 0 or empty. `stations_in()` groups stops by `parent_station`
+  alone: two stops that only share a name stay apart.
 - **Spec-correct realtime matching**: GTFS-RT updates are matched by
   `(trip_id, start_date, start_time)`, so an update addresses exactly one
   repetition of a frequency trip and exactly one service-day instance (a
@@ -372,8 +386,11 @@ Notes on direct mode:
   `PickupDropOffType`, `StopLocationType`, alert cause/effect/severity,
   vehicle status/congestion/occupancy), `timepoint` is a bool with the spec's
   absent-means-exact default, and open vocabularies (`route_type`,
-  `direction_id`) stay raw ints. Out-of-vocabulary values degrade to `None` —
-  descriptive metadata never fails a build. Consumers decide what to keep.
+  `direction_id`) stay raw ints. A blank or absent cell takes the value GTFS
+  gives "empty" where it defines one (a regular pickup, a stop or platform,
+  no accessibility information, white-on-black route colours).
+  Out-of-vocabulary values degrade to `None`, so descriptive metadata never
+  fails a build. Consumers decide what to keep.
 - **Numbers are ASCII-strict, and strictness follows the field's role**: a
   GTFS number must be plain ASCII digits, so a Unicode decimal (`٨`), a sign
   prefix, or Python's `1_0` underscore grouping is never quietly reinterpreted

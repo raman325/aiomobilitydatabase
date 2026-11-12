@@ -13,8 +13,9 @@ def _stop(
     stop_id: str,
     name: str | None = None,
     parent: str | None = None,
-    location_type: int | None = None,
+    location_type: int | None = 0,
 ) -> Stop:
+    """A stop; ``location_type`` None is an unparseable cell (unknown type)."""
     return Stop(
         id=stop_id,
         name=name,
@@ -68,25 +69,30 @@ def test_nameless_platform_with_absent_parent_uses_parent_id() -> None:
     assert groups == [StationGroup(id="ST1", name="ST1", stop_ids=("P1",))]
 
 
-def test_same_named_orphans_merge_case_insensitively() -> None:
-    """Direction pairs at an intersection share a name (modulo case) and
-    merge into one group; distinct names stay separate."""
+def test_same_named_parentless_stops_stay_apart() -> None:
+    """GTFS relates stops only through parent_station: two parentless stops
+    sharing a name (one feed's "Main St" in two towns) are two stations."""
     groups = group_stations(
         [
-            _stop("S1", "1st & Hill"),
-            _stop("S2", "1ST & HILL"),
-            _stop("S3", "2nd & Spring", location_type=0),
+            _stop("S1", "Main St"),
+            _stop("S2", "Main St"),
+            _stop("S3", "main st"),
         ]
     )
     assert groups == [
-        StationGroup(id="1st & hill", name="1st & Hill", stop_ids=("S1", "S2")),
-        StationGroup(id="2nd & spring", name="2nd & Spring", stop_ids=("S3",)),
+        StationGroup(id="S1", name="Main St", stop_ids=("S1",)),
+        StationGroup(id="S2", name="Main St", stop_ids=("S2",)),
+        StationGroup(id="S3", name="main st", stop_ids=("S3",)),
     ]
 
 
-def test_nameless_orphan_uses_its_id() -> None:
+def test_nameless_parentless_stop_uses_its_id() -> None:
     groups = group_stations([_stop("S9")])
-    assert groups == [StationGroup(id="s9", name="S9", stop_ids=("S9",))]
+    assert groups == [StationGroup(id="S9", name="S9", stop_ids=("S9",))]
+
+
+def test_stop_of_unknown_type_is_not_a_boarding_stop() -> None:
+    assert group_stations([_stop("S1", "Odd", location_type=None)]) == []
 
 
 def test_groups_sorted_by_name() -> None:
@@ -125,7 +131,7 @@ def test_groups_partition_boarding_stops(stops: list[Stop]) -> None:
     non-boarding stops (stations, entrances, nodes) never appear."""
     groups = group_stations(stops)
     grouped_ids = [stop_id for group in groups for stop_id in group.stop_ids]
-    boarding_ids = [stop.id for stop in stops if stop.location_type in (None, 0)]
+    boarding_ids = [stop.id for stop in stops if stop.location_type == 0]
     assert sorted(grouped_ids) == sorted(boarding_ids)
     assert len(grouped_ids) == len(set(grouped_ids))
 
@@ -134,4 +140,15 @@ def test_groups_partition_boarding_stops(stops: list[Stop]) -> None:
 def test_group_ids_unique_and_sorted(stops: list[Stop]) -> None:
     groups = group_stations(stops)
     assert len({group.id for group in groups}) == len(groups)
-    assert [group.name for group in groups] == sorted(group.name for group in groups)
+    keys = [(group.name, group.id) for group in groups]
+    assert keys == sorted(keys)
+
+
+@given(_stops_strategy)
+def test_groups_follow_parent_station_alone(stops: list[Stop]) -> None:
+    """A boarding stop's group is its parent station, or itself without one:
+    names never enter into it."""
+    by_id = {stop.id: stop for stop in stops}
+    for group in group_stations(stops):
+        for stop_id in group.stop_ids:
+            assert (by_id[stop_id].parent_station or stop_id) == group.id

@@ -8,7 +8,12 @@ import pytest
 from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
-from aiomobilitydatabase.feeds.models import ArrivalsQuery
+from aiomobilitydatabase.feeds.models import (
+    ArrivalsQuery,
+    BikesAllowed,
+    PickupDropOffType,
+    WheelchairAccess,
+)
 from aiomobilitydatabase.feeds.rt import Modification, ReplacementCall
 from aiomobilitydatabase.feeds.static_index import TripCall
 from aiomobilitydatabase.feeds.transit import (
@@ -128,14 +133,15 @@ async def test_schedule_only_arrivals(
     assert first.route.display_name == "10 Main Line"
     assert first.route.type == 3
     assert first.headsign == "Downtown"
-    # The base fixture ships no descriptive stop_times/trips columns: every
-    # descriptor is None EXCEPT timepoint_exact, whose GTFS default for an
-    # absent column is "times are exact".
-    assert first.wheelchair_accessible is None
+    # The base fixture ships no descriptive stop_times/trips columns: each
+    # takes GTFS's value for an empty cell where the spec defines one
+    # (regular pickup, no accessibility information, exact times) and is
+    # None where it does not (direction_id, stop_headsign).
+    assert first.wheelchair_accessible is WheelchairAccess.UNKNOWN
     assert first.direction_id is None
-    assert first.bikes_allowed is None
-    assert first.pickup_type is None
-    assert first.drop_off_type is None
+    assert first.bikes_allowed is BikesAllowed.UNKNOWN
+    assert first.pickup_type is PickupDropOffType.REGULAR
+    assert first.drop_off_type is PickupDropOffType.REGULAR
     assert first.stop_headsign is None
     assert first.timepoint_exact is True
 

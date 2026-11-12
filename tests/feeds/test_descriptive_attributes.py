@@ -100,11 +100,13 @@ _FREQUENCY_DESCRIPTOR_FILES = {
         "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
         "pickup_type,drop_off_type,timepoint,stop_headsign\n"
         "F1,08:00:00,08:00:00,S1,1,2,3,0,Loop Start\n"
-        "F1,08:10:00,08:10:30,S2,2,1,1,1,Loop End\n"
+        "F1,08:10:00,08:10:30,S2,2,1,3,1,Loop End\n"
     ),
     "calendar.txt": _CALENDAR,
+    # exact_times=1: schedule-based, so the template's timepoints stand.
     "frequencies.txt": (
-        "trip_id,start_time,end_time,headway_secs\nF1,06:00:00,06:20:00,600\n"
+        "trip_id,start_time,end_time,headway_secs,exact_times\n"
+        "F1,06:00:00,06:20:00,600,1\n"
     ),
 }
 
@@ -152,23 +154,26 @@ def test_stop_descriptive_columns_and_lenient_boundary(tmp_path: Path) -> None:
     assert stops["S1"].description == "Northeast corner"
     assert stops["S1"].url == "https://example.com/s1"
     assert stops["S1"].zone_id == "Z1"
-    # stop_timezone is display metadata only: stored verbatim, never used
-    # in time computation (stop_times values are always agency-timezone).
+    # stop_timezone is display metadata only, never used in time
+    # computation (stop_times values are always agency-timezone).
     assert stops["S1"].timezone == "America/Denver"
     assert stops["S2"].stop_code is None  # blank value
     assert stops["S2"].platform_code is None
     assert stops["S2"].description is None
     assert stops["S2"].url is None
     assert stops["S2"].zone_id is None
-    assert stops["S2"].timezone is None
+    # A parentless stop with an empty stop_timezone is in the agency's.
+    assert stops["S2"].timezone == "America/Los_Angeles"
     assert stops["S2"].wheelchair_boarding is WheelchairAccess.NOT_POSSIBLE
-    assert stops["S2"].location_type is None  # blank value
+    # "0 (or empty) - Stop (or Platform)".
+    assert stops["S2"].location_type is StopLocationType.STOP
     assert stops["S3"].wheelchair_boarding is WheelchairAccess.UNKNOWN
     assert stops["S3"].location_type is StopLocationType.BOARDING_AREA
     # Out-of-vocabulary ints and garbage text are None, never an error.
     assert stops["S4"].location_type is None
     assert stops["S4"].wheelchair_boarding is None
     assert stops["S5"].wheelchair_boarding is None
+    assert stops["S5"].location_type is StopLocationType.STOP  # blank value
     index.close()
 
 
@@ -182,8 +187,10 @@ def test_route_descriptive_columns(tmp_path: Path) -> None:
     assert routes["R1"].description == "Runs along Main"
     assert routes["R1"].sort_order == 5
     assert routes["R2"].agency_id is None
-    assert routes["R2"].color is None
-    assert routes["R2"].text_color is None
+    # "Defaults to white (FFFFFF)" / "black (000000) when omitted or left
+    # empty".
+    assert routes["R2"].color == "FFFFFF"
+    assert routes["R2"].text_color == "000000"
     assert routes["R2"].url is None
     assert routes["R2"].description is None
     assert routes["R2"].sort_order is None  # "x": garbage, lenient -> None
@@ -256,10 +263,11 @@ def test_agencies_empty_when_agency_txt_missing(tmp_path: Path) -> None:
     index.close()
 
 
-def test_absent_descriptive_columns_load_as_none(tmp_path: Path) -> None:
-    """The base fixture feed predates every descriptive column: absent
-    columns are None across stops/routes/departures -- except timepoint,
-    whose absence means the times ARE exact.
+def test_absent_descriptive_columns_take_their_spec_values(tmp_path: Path) -> None:
+    """The base fixture feed predates every descriptive column: an absent
+    column whose empty value GTFS defines takes that value (regular pickup,
+    no accessibility information, white/black route colours, exact times,
+    the agency's timezone); the rest are None.
     """
     zip_path = tmp_path / "feed.zip"
     zip_path.write_bytes(build_gtfs_zip_bytes())
@@ -267,16 +275,16 @@ def test_absent_descriptive_columns_load_as_none(tmp_path: Path) -> None:
     stops = {stop.id: stop for stop in index.stops()}
     assert stops["S1"].stop_code is None
     assert stops["S1"].platform_code is None
-    assert stops["S1"].wheelchair_boarding is None
+    assert stops["S1"].wheelchair_boarding is WheelchairAccess.UNKNOWN
     assert stops["S1"].description is None
     assert stops["S1"].url is None
     assert stops["S1"].zone_id is None
-    assert stops["S1"].timezone is None
+    assert stops["S1"].timezone == TZ
     assert stops["ST1"].location_type is StopLocationType.STATION
     routes = {route.id: route for route in index.routes()}
     assert routes["R1"].agency_id is None
-    assert routes["R1"].color is None
-    assert routes["R1"].text_color is None
+    assert routes["R1"].color == "FFFFFF"
+    assert routes["R1"].text_color == "000000"
     assert routes["R1"].url is None
     assert routes["R1"].description is None
     assert routes["R1"].sort_order is None
@@ -285,10 +293,10 @@ def test_absent_descriptive_columns_load_as_none(tmp_path: Path) -> None:
     )
     assert departures
     for dep in departures:
-        assert dep.wheelchair_accessible is None
-        assert dep.bikes_allowed is None
-        assert dep.pickup_type is None
-        assert dep.drop_off_type is None
+        assert dep.wheelchair_accessible is WheelchairAccess.UNKNOWN
+        assert dep.bikes_allowed is BikesAllowed.UNKNOWN
+        assert dep.pickup_type is PickupDropOffType.REGULAR
+        assert dep.drop_off_type is PickupDropOffType.REGULAR
         assert dep.stop_headsign is None
         assert dep.timepoint_exact is True
         assert dep.trip_short_name is None
@@ -329,12 +337,12 @@ def test_departure_stop_time_and_trip_descriptors(tmp_path: Path) -> None:
     assert t2_s1.drop_off_type is None  # "x": garbage
     assert t2_s1.timepoint_exact is None  # 2: outside the 0/1 vocabulary
     t2_s2 = by_key[("T2", "S2")]
-    assert t2_s2.pickup_type is None  # blank value
+    assert t2_s2.pickup_type is PickupDropOffType.REGULAR  # "0 or empty"
     assert t2_s2.timepoint_exact is None  # "x": garbage
     # T3: blank trip-level values; blank timepoint defaults to exact.
     t3_s1 = by_key[("T3", "S1")]
-    assert t3_s1.wheelchair_accessible is None
-    assert t3_s1.bikes_allowed is None
+    assert t3_s1.wheelchair_accessible is WheelchairAccess.UNKNOWN  # "0 or empty"
+    assert t3_s1.bikes_allowed is BikesAllowed.UNKNOWN
     assert t3_s1.timepoint_exact is True
     assert t3_s1.direction_id is None  # blank value
     assert t3_s1.trip_short_name is None  # blank value
@@ -418,7 +426,7 @@ def test_frequency_repetitions_carry_all_descriptors(tmp_path: Path) -> None:
         assert origin.stop_headsign == "Loop Start"
         terminal = by_key[(rep, "S2")]
         assert terminal.pickup_type is PickupDropOffType.NONE
-        assert terminal.drop_off_type is PickupDropOffType.NONE
+        assert terminal.drop_off_type is PickupDropOffType.COORDINATE_WITH_DRIVER
         assert terminal.timepoint_exact is True
         assert terminal.stop_headsign == "Loop End"
     trips = index.upcoming_trips(

@@ -856,20 +856,25 @@ def _select_arrivals(
         for arrival in arrivals
         if arrival.stop_id in stop_ids
         and (route_ids is None or arrival.route_id in route_ids)
-        and (headsigns is None or arrival.headsign in headsigns)
+        and (
+            headsigns is None
+            # The headsign at this stop: the stop_time's override, if any.
+            or (arrival.stop_headsign or arrival.headsign) in headsigns
+        )
     ]
     return selected[: query.limit]
 
 
 def group_stations(stops: Sequence[Stop]) -> list[StationGroup]:
-    """Group boarding stops into logical stations, sorted by name.
+    """Group boarding stops into logical stations, sorted by name then id.
 
     GTFS models stations as hierarchies: platforms (location_type 0, or
-    unset) may link to a parent station (1), while entrances (2) and
-    pathway nodes (3+) are never boarding stops and are dropped. Boarding
-    stops sharing a parent station — or, without one, an identical name —
-    are grouped so consumers can offer "Metro Center" instead of every
-    platform and entrance.
+    empty) may link to a parent station (1), while entrances (2), pathway
+    nodes (3+) and stops of unknown type are never boarding stops and are
+    dropped. Boarding stops sharing a parent station are grouped so
+    consumers can offer "Metro Center" instead of every platform; a stop
+    without one is a station of its own -- GTFS relates stops only through
+    ``parent_station``, so two stops that merely share a name stay apart.
     """
     stations = {
         stop.id: stop
@@ -879,15 +884,15 @@ def group_stations(stops: Sequence[Stop]) -> list[StationGroup]:
     names: dict[str, str] = {}
     members: dict[str, list[str]] = {}
     for stop in stops:
-        if stop.location_type not in (None, StopLocationType.STOP):
+        if stop.location_type is not StopLocationType.STOP:
             continue
         if stop.parent_station:
             key = stop.parent_station
             station = stations.get(stop.parent_station)
             name = (station.name if station else None) or stop.name or key
         else:
+            key = stop.id
             name = stop.name or stop.id
-            key = name.casefold()
         names.setdefault(key, name)
         members.setdefault(key, []).append(stop.id)
     return sorted(
@@ -895,7 +900,7 @@ def group_stations(stops: Sequence[Stop]) -> list[StationGroup]:
             StationGroup(id=key, name=names[key], stop_ids=tuple(stop_ids))
             for key, stop_ids in members.items()
         ),
-        key=lambda group: group.name,
+        key=lambda group: (group.name, group.id),
     )
 
 

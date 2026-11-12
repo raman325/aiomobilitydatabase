@@ -9,7 +9,7 @@ import sys
 import tempfile
 import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from http import HTTPStatus
@@ -2069,6 +2069,29 @@ def _expected_enum(enum_cls: type[IntEnum], cell: str) -> IntEnum | None:
     return None if parsed is None else members.get(parsed)
 
 
+class _ExactTimes(IntEnum):
+    """frequencies.txt ``exact_times`` (the library keeps it internal)."""
+
+    FREQUENCY_BASED = 0
+    SCHEDULE_BASED = 1
+
+
+def _expected_defaulted_enum(
+    enum_cls: type[IntEnum], cell: str, default: int
+) -> IntEnum | None:
+    """Oracle for vocabulary cells whose empty value GTFS defines ("0 or
+    empty"): blank -> that member; anything else as :func:`_expected_enum`."""
+    if not cell.strip():
+        return enum_cls(default)
+    return _expected_enum(enum_cls, cell)
+
+
+def _expected_defaulted_text(cell: str, default: str) -> str:
+    """Oracle for route colours: "defaults to ... when omitted or left empty"
+    (whitespace-only included); anything else verbatim."""
+    return cell if cell.strip() else default
+
+
 def _expected_text(cell: str) -> str | None:
     """Oracle for text cells: verbatim pass-through, empty -> None."""
     return cell or None
@@ -2090,6 +2113,12 @@ _ONE_DAY_CALENDAR = (
 )
 _UTC_AGENCY = (
     "agency_id,agency_name,agency_url,agency_timezone\nA1,T,https://e.com,UTC\n"
+)
+# The catalog fixture's agency timezone: agency.txt's own zone wins over the
+# catalog's, so a feed meant to run on Los Angeles time says so itself.
+_LA_AGENCY = (
+    "agency_id,agency_name,agency_url,agency_timezone\n"
+    "A1,T,https://e.com,America/Los_Angeles\n"
 )
 
 _DESCRIPTIVE_ROW_CELLS = st.fixed_dictionaries(
@@ -2125,10 +2154,12 @@ _DESCRIPTIVE_ROW_CELLS = st.fixed_dictionaries(
 def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) -> None:
     """Arbitrary producer cells in EVERY descriptive column at once: the
     build never raises, in-vocabulary ints surface as the exact enum member
-    (matching .value), everything else (out-of-vocabulary, negative, huge,
-    decimal, garbage, blank) is None, open-vocabulary direction_id keeps
-    any parseable int verbatim, and text columns pass through verbatim with
-    empty -> None (whitespace-only text is kept, not blanked).
+    (matching .value), a blank cell takes the value GTFS gives "empty" where
+    the spec defines one (route colours too), everything else
+    (out-of-vocabulary, negative, huge, decimal, garbage) is None,
+    open-vocabulary direction_id keeps any parseable int verbatim, and text
+    columns pass through verbatim with empty -> None (whitespace-only text
+    is kept, not blanked).
     """
     files = {
         "agency.txt": _UTC_AGENCY,
@@ -2205,47 +2236,53 @@ def test_descriptive_cells_parse_total_and_map_per_rules(cells: dict[str, str]) 
         stop = next(s for s in index.stops() if s.id == "S1")
         assert stop.stop_code == _expected_text(cells["stop_code"])
         assert stop.platform_code == _expected_text(cells["platform_code"])
-        assert stop.wheelchair_boarding is _expected_enum(
-            WheelchairAccess, cells["wheelchair_boarding"]
+        assert stop.wheelchair_boarding is _expected_defaulted_enum(
+            WheelchairAccess, cells["wheelchair_boarding"], 0
         )
         assert stop.description == _expected_text(cells["stop_desc"])
         assert stop.url == _expected_text(cells["stop_url"])
         assert stop.zone_id == _expected_text(cells["zone_id"])
-        assert stop.timezone == _expected_text(cells["stop_timezone"])
+        # A parentless stop with an empty stop_timezone is in the agency's.
+        assert stop.timezone == (_expected_text(cells["stop_timezone"]) or "UTC")
         (route,) = index.routes()
         assert route.agency_id == _expected_text(cells["agency_id"])
-        assert route.color == _expected_text(cells["route_color"])
-        assert route.text_color == _expected_text(cells["route_text_color"])
+        assert route.color == _expected_defaulted_text(cells["route_color"], "FFFFFF")
+        assert route.text_color == _expected_defaulted_text(
+            cells["route_text_color"], "000000"
+        )
         assert route.url == _expected_text(cells["route_url"])
         assert route.description == _expected_text(cells["route_desc"])
         assert route.sort_order == _expected_lenient_int(cells["route_sort_order"])
         now = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
-        (trip,) = index.upcoming_trips("S1", "S2", now, timedelta(hours=24), 10)
-        assert trip.wheelchair_accessible is _expected_enum(
-            WheelchairAccess, cells["wheelchair_accessible"]
+        (dep,) = index.upcoming_departures(["S1"], None, now, timedelta(hours=24), 10)
+        assert dep.wheelchair_accessible is _expected_defaulted_enum(
+            WheelchairAccess, cells["wheelchair_accessible"], 0
         )
-        assert trip.bikes_allowed is _expected_enum(
-            BikesAllowed, cells["bikes_allowed"]
+        assert dep.bikes_allowed is _expected_defaulted_enum(
+            BikesAllowed, cells["bikes_allowed"], 0
         )
-        assert trip.direction_id == _expected_lenient_int(cells["direction_id"])
-        assert trip.origin_pickup_type is _expected_enum(
-            PickupDropOffType, cells["pickup_type"]
+        assert dep.direction_id == _expected_lenient_int(cells["direction_id"])
+        pickup = _expected_defaulted_enum(PickupDropOffType, cells["pickup_type"], 0)
+        assert dep.pickup_type is pickup
+        assert dep.drop_off_type is _expected_defaulted_enum(
+            PickupDropOffType, cells["drop_off_type"], 0
         )
-        assert trip.origin_drop_off_type is _expected_enum(
-            PickupDropOffType, cells["drop_off_type"]
-        )
-        assert trip.origin_timepoint_exact == _expected_timepoint(cells["timepoint"])
-        assert trip.origin_stop_headsign == _expected_text(cells["stop_headsign"])
-        assert trip.trip_short_name == _expected_text(cells["trip_short_name"])
-        assert trip.block_id == _expected_text(cells["block_id"])
-        # Non-None enum results are exact members whose .value round-trips
-        # to the raw cell int.
+        assert dep.timepoint_exact == _expected_timepoint(cells["timepoint"])
+        assert dep.stop_headsign == _expected_text(cells["stop_headsign"])
+        assert dep.trip_short_name == _expected_text(cells["trip_short_name"])
+        assert dep.block_id == _expected_text(cells["block_id"])
+        # A journey needs a pickup at its origin; an unknown cell is no
+        # evidence against one.
+        trips = index.upcoming_trips("S1", "S2", now, timedelta(hours=24), 10)
+        assert len(trips) == (0 if pickup is PickupDropOffType.NONE else 1)
+        # Non-None enum results from a non-blank cell are exact members whose
+        # .value round-trips to the raw cell int.
         for member, cell in (
             (stop.wheelchair_boarding, cells["wheelchair_boarding"]),
-            (trip.bikes_allowed, cells["bikes_allowed"]),
-            (trip.origin_pickup_type, cells["pickup_type"]),
+            (dep.bikes_allowed, cells["bikes_allowed"]),
+            (dep.pickup_type, cells["pickup_type"]),
         ):
-            if member is not None:
+            if member is not None and cell.strip():
                 assert member.value == int(cell)
     finally:
         index.close()
@@ -2468,18 +2505,24 @@ def test_unicode_digit_feed_info_dates_are_none(cell: str) -> None:
     start_offset=st.integers(min_value=0, max_value=7200),
     headway=st.sampled_from([600, 1800]),
     reps=st.integers(min_value=1, max_value=4),
+    exact_times=st.sampled_from(["", " ", "0", "1", "01", "2", "x"]),
 )
 def test_frequency_repetitions_carry_template_descriptors(
+    *,
     trip_cells: dict[str, str],
     stop_cells: list[dict[str, str]],
     start_offset: int,
     headway: int,
     reps: int,
+    exact_times: str,
 ) -> None:
     """EVERY materialized repetition carries, at EVERY stop, descriptors
     equal to what the DRAWN template cells map to (oracle from the drawn
     values, not another repetition) -- materialization may never drop or
-    garble trip-level or stop_time descriptive metadata.
+    garble trip-level or stop_time descriptive metadata. The one exception
+    is timepoint: headway-based service (exact_times "0 or empty") follows
+    no fixed schedule, so its times are approximate whatever the template
+    says, and an unparseable exact_times leaves them unknown.
     """
     template_base = 28800  # template anchored at 08:00:00 (arbitrary)
     start = 21600 + start_offset
@@ -2511,10 +2554,12 @@ def test_frequency_repetitions_carry_template_descriptors(
         ),
         "calendar.txt": _ONE_DAY_CALENDAR,
         "frequencies.txt": (
-            "trip_id,start_time,end_time,headway_secs\n"
-            f"F1,{_format_gtfs_time(start)},{_format_gtfs_time(end)},{headway}\n"
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            f"F1,{_format_gtfs_time(start)},{_format_gtfs_time(end)},{headway},"
+            f"{exact_times}\n"
         ),
     }
+    schedule = _expected_defaulted_enum(_ExactTimes, exact_times, 0)
     index = _build_index_from_files(files)
     try:
         now = datetime(2026, 7, 30, 0, 0, tzinfo=UTC)
@@ -2532,24 +2577,34 @@ def test_frequency_repetitions_carry_template_descriptors(
         for rep_id in expected_ids:
             for i, cell in enumerate(stop_cells):
                 dep = by_key[(rep_id, f"S{i}")]
-                assert dep.wheelchair_accessible is _expected_enum(
-                    WheelchairAccess, trip_cells["wheelchair"]
+                assert dep.wheelchair_accessible is _expected_defaulted_enum(
+                    WheelchairAccess, trip_cells["wheelchair"], 0
                 )
-                assert dep.bikes_allowed is _expected_enum(
-                    BikesAllowed, trip_cells["bikes"]
+                assert dep.bikes_allowed is _expected_defaulted_enum(
+                    BikesAllowed, trip_cells["bikes"], 0
                 )
-                assert dep.pickup_type is _expected_enum(
-                    PickupDropOffType, cell["pickup"]
+                assert dep.pickup_type is _expected_defaulted_enum(
+                    PickupDropOffType, cell["pickup"], 0
                 )
-                assert dep.drop_off_type is _expected_enum(
-                    PickupDropOffType, cell["drop_off"]
+                assert dep.drop_off_type is _expected_defaulted_enum(
+                    PickupDropOffType, cell["drop_off"], 0
                 )
-                assert dep.timepoint_exact == _expected_timepoint(cell["timepoint"])
+                if schedule is _ExactTimes.SCHEDULE_BASED:
+                    timepoint = _expected_timepoint(cell["timepoint"])
+                else:  # headway-based: approximate; unparseable: unknown
+                    timepoint = None if schedule is None else False
+                assert dep.timepoint_exact == timepoint
                 assert dep.stop_headsign == _expected_text(cell["headsign"])
                 assert dep.trip_short_name == _expected_text(trip_cells["short_name"])
                 assert dep.block_id == _expected_text(trip_cells["block"])
         trip_rows = index.upcoming_trips("S0", "S1", now, timedelta(hours=30), 1000)
-        assert len(trip_rows) == reps
+        # A journey needs a pickup at S0 and a drop-off at S1.
+        pickup = _expected_defaulted_enum(PickupDropOffType, stop_cells[0]["pickup"], 0)
+        drop_off = _expected_defaulted_enum(
+            PickupDropOffType, stop_cells[1]["drop_off"], 0
+        )
+        boardable = PickupDropOffType.NONE not in (pickup, drop_off)
+        assert len(trip_rows) == (reps if boardable else 0)
         for trip in trip_rows:
             assert trip.direction_id == _expected_lenient_int(trip_cells["direction"])
             assert trip.trip_short_name == _expected_text(trip_cells["short_name"])
@@ -3995,19 +4050,19 @@ def test_frequency_departures_match_progression_oracle(
     template: list[tuple[int, int]], freq_rows: list[tuple[int, int, int, str]]
 ) -> None:
     """Materialized first-stop departures are EXACTLY the union of each row's
-    arithmetic progression within [start, end), shifted by the first stop's
-    dwell -- one row per repetition, so synthetic ids never duplicate. The
-    oracle restates the GTFS rule in pure Python arithmetic, independent of
-    the parse/SQL/service-day path under test.
+    arithmetic progression within [start, end) -- start_time is "the time
+    at which the first vehicle departs from the first stop", whatever the
+    first stop's dwell -- one row per repetition, so synthetic ids never
+    duplicate. The oracle restates the GTFS rule in pure Python arithmetic,
+    independent of the parse/SQL/service-day path under test.
     """
     index = _frequency_index(template, freq_rows)
     try:
         departures = index.upcoming_departures(
             ["S0"], None, _FREQ_ANCHOR, _FREQ_LOOKAHEAD, 100_000
         )
-        dwell0 = template[0][1] - template[0][0]
         expected = {
-            (f"F1#{s}", _FREQ_ANCHOR + timedelta(seconds=s + dwell0))
+            (f"F1#{s}", _FREQ_ANCHOR + timedelta(seconds=s))
             for s in _expected_rep_starts(freq_rows)
         }
         assert {(d.trip_id, d.departure) for d in departures} == expected
@@ -4025,8 +4080,11 @@ def test_frequency_offsets_preserved_on_every_repetition(
     template: list[tuple[int, int]], freq_rows: list[tuple[int, int, int, str]]
 ) -> None:
     """EVERY stop of EVERY repetition keeps the template's elapsed offset
-    from the first-stop anchor: arrival/departure at stop i equal
-    repetition_start + template offset, for all repetitions.
+    from the first-stop departure: arrival/departure at stop i equal
+    repetition_start + (template offset - first dwell), for all repetitions.
+    The one exception: an origin arrival that would fall before its service
+    day starts (a dwell on a repetition starting at 00:00:00) has no
+    representable time, and the call arrives when it departs.
     """
     index = _frequency_index(template, freq_rows)
     try:
@@ -4036,11 +4094,16 @@ def test_frequency_offsets_preserved_on_every_repetition(
         )
         by_key = {(d.trip_id, d.stop_id): d for d in departures}
         assert len(by_key) == len(departures)
+        anchor = template[0][1]
         for start in _expected_rep_starts(freq_rows):
             for i, (arr, dep) in enumerate(template):
                 row = by_key[(f"F1#{start}", f"S{i}")]
-                assert row.arrival == _FREQ_ANCHOR + timedelta(seconds=start + arr)
-                assert row.departure == _FREQ_ANCHOR + timedelta(seconds=start + dep)
+                arrival = start + arr - anchor
+                departure = start + dep - anchor
+                if arrival < 0:
+                    arrival = departure
+                assert row.arrival == _FREQ_ANCHOR + timedelta(seconds=arrival)
+                assert row.departure == _FREQ_ANCHOR + timedelta(seconds=departure)
     finally:
         index.close()
 
@@ -4055,21 +4118,13 @@ def test_frequency_offsets_preserved_on_every_repetition(
         )
     ],
 )
-def test_frequency_exact_times_values_materialize_identically(
+def test_frequency_exact_times_changes_only_whether_times_are_exact(
     template: list[tuple[int, int]], rows: list[tuple[int, int, int]]
 ) -> None:
-    """Regression guard for the documented equivalence: exact_times=0
-    (idealized headway service) and exact_times=1 (exact schedule)
-    materialize identical repetitions.
-
-    Deliberately ONE fixed example rather than a @given property. The
-    column is read by no production code path -- _parse_frequency_spans
-    destructures only trip_id/start_time/end_time/headway_secs, and
-    static_index's docstring says the column is ignored for both values --
-    so the assertion cannot fail for any drawn input, and drawn variety
-    bought nothing but two extra full index builds per example. It stays
-    as a guard that would fail if someone later started branching on the
-    column without saying so.
+    """exact_times=0 (headway service, "does not follow a fixed schedule")
+    and exact_times=1 (an exact schedule) materialize the same repetitions
+    at the same times; only timepoint_exact differs -- False for every
+    headway-based repetition, the template's (here exact) for scheduled.
     """
     results = []
     for exact in ("0", "1"):
@@ -4085,9 +4140,12 @@ def test_frequency_exact_times_values_materialize_identically(
             )
         finally:
             index.close()
-    assert results[0] == results[1]
+    headway, scheduled = results
+    assert [replace(dep, timepoint_exact=True) for dep in headway] == scheduled
+    assert all(dep.timepoint_exact is False for dep in headway)
+    assert all(dep.timepoint_exact is True for dep in scheduled)
     # Not vacuous: the fixed feed really materializes repetitions.
-    assert results[0]
+    assert scheduled
 
 
 @settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -4145,9 +4203,8 @@ def test_frequency_repetitions_cross_midnight_correctly(
         departures = index.upcoming_departures(
             ["S0"], None, _FREQ_ANCHOR, _FREQ_LOOKAHEAD, 100_000
         )
-        dwell0 = template[0][1] - template[0][0]
         expected = {
-            (f"F1#{s}", _FREQ_ANCHOR + timedelta(seconds=s + dwell0))
+            (f"F1#{s}", _FREQ_ANCHOR + timedelta(seconds=s))
             for s in _expected_rep_starts(freq_rows)
         }
         assert {(d.trip_id, d.departure) for d in departures} == expected
@@ -4311,9 +4368,8 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
 # --- delay-propagation properties (spec-correct GTFS-RT overlay) ------------
 
 # One service day so the oracle timeline is anchor + elapsed seconds. The
-# catalog fixture's latest_dataset.agency_timezone (America/Los_Angeles)
-# overrides the generated agency.txt, so the 2026-07-30 service day starts
-# at local midnight PDT = 07:00 UTC.
+# generated agency.txt runs on America/Los_Angeles, so the 2026-07-30
+# service day starts at local midnight PDT = 07:00 UTC.
 _PROP_ANCHOR = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
 _PROP_NOW = datetime(2026, 7, 30, 14, 0, tzinfo=UTC)  # 07:00 PDT
 _PROP_BASE = 28800  # TP's first-stop arrival: 08:00:00
@@ -4356,7 +4412,7 @@ def _propagation_zip(
             sequence = seq_gap * (i + 1)
             stop_time_rows += f"{trip_id},{arr},{dep},{call_stops[i]},{sequence}\n"
     files = {
-        "agency.txt": _UTC_AGENCY,
+        "agency.txt": _LA_AGENCY,
         "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n" + stop_rows,
         "routes.txt": (
             "route_id,route_short_name,route_long_name,route_type\n"
@@ -4920,14 +4976,16 @@ _TWO_DAY_CONCRETE_IDS = ("TP", "FQ#32400", "FQ#33000")
 # Per-stop departure offsets from the service-day anchor, per concrete trip.
 _TWO_DAY_DEP_OFFSETS = {
     "TP": {"S0": 28810, "S1": 29410},
-    "FQ#32400": {"S0": 32410, "S1": 33010},
-    "FQ#33000": {"S0": 33010, "S1": 33610},
+    # Repetitions depart their first stop at their start (frequencies.txt's
+    # start_time is a departure), 10 s after the template's arrival there.
+    "FQ#32400": {"S0": 32400, "S1": 33000},
+    "FQ#33000": {"S0": 33000, "S1": 33600},
 }
 
 
 def _two_instance_zip() -> bytes:
     files = {
-        "agency.txt": _UTC_AGENCY,  # catalog fixture overrides tz to LA
+        "agency.txt": _LA_AGENCY,
         "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\n",
         "routes.txt": (
             "route_id,route_short_name,route_long_name,route_type\nR1,1,Line,3\n"
@@ -5251,8 +5309,9 @@ def test_build_progress_fraction_saturates_beyond_float_precision() -> None:
 
 # --- station grouping properties (transit.group_stations) --------------------
 
-# Names drawn from a small pool with deliberate casefold collisions (plus
-# None) so parentless same-name grouping is exercised on most examples.
+# Names drawn from a small pool with deliberate collisions, exact and by
+# case (plus None), so same-named parentless stops -- which must stay apart --
+# turn up on most examples.
 _GROUP_NAMES = (
     st.sampled_from(
         ["Metro Center", "metro center", "METRO CENTER", "Union Sq", "union sq"]
@@ -5289,10 +5348,11 @@ def _mk_stop(
 def test_group_stations_partition_oracle(data: st.DataObject) -> None:
     """Over drawn hierarchies -- parent links (including dangling ones),
     every location type, casefold-colliding names -- every boarding stop
-    lands in EXACTLY one group, entrances/nodes/boarding areas and station
-    records themselves in none, the parent station's name wins over member
-    names, and the output is name-sorted. Oracle restated from the drawn
-    values: group key = parent station id, else casefolded (name or id).
+    lands in EXACTLY one group, entrances/nodes/boarding areas, stops of
+    unknown type and station records themselves in none, the parent
+    station's name wins over member names, and the output is sorted by name
+    then id. Oracle restated from the drawn values: group key = parent
+    station id, else the stop's own id -- names never group stops.
     """
     stations = [
         _mk_stop(
@@ -5308,7 +5368,7 @@ def test_group_stations_partition_oracle(data: st.DataObject) -> None:
             f"B{k}",
             name=data.draw(_GROUP_NAMES),
             parent=data.draw(st.none() | st.sampled_from(parent_pool)),
-            location_type=data.draw(st.sampled_from([None, StopLocationType.STOP])),
+            location_type=StopLocationType.STOP,
         )
         for k in range(data.draw(st.integers(0, 6)))
     ]
@@ -5320,6 +5380,7 @@ def test_group_stations_partition_oracle(data: st.DataObject) -> None:
             location_type=data.draw(
                 st.sampled_from(
                     [
+                        None,  # an unparseable location_type: unknown
                         StopLocationType.ENTRANCE_EXIT,
                         StopLocationType.GENERIC_NODE,
                         StopLocationType.BOARDING_AREA,
@@ -5335,20 +5396,20 @@ def test_group_stations_partition_oracle(data: st.DataObject) -> None:
     station_names = {station.id: station.name for station in stations}
     expected: dict[str, tuple[str, list[str]]] = {}
     for stop in ordered:
-        if stop.location_type not in (None, StopLocationType.STOP):
+        if stop.location_type is not StopLocationType.STOP:
             continue
         if stop.parent_station:
             key = stop.parent_station
             name = station_names.get(stop.parent_station) or stop.name or key
         else:
+            key = stop.id
             name = stop.name or stop.id
-            key = name.casefold()
         if key in expected:
             expected[key][1].append(stop.id)
         else:
             expected[key] = (name, [stop.id])
     assert {g.id: (g.name, list(g.stop_ids)) for g in groups} == expected
-    assert [g.name for g in groups] == sorted(g.name for g in groups)
+    assert [(g.name, g.id) for g in groups] == sorted((g.name, g.id) for g in groups)
     # Partition: every boarding stop in exactly one group; nothing else in any.
     member_ids = [stop_id for g in groups for stop_id in g.stop_ids]
     assert sorted(member_ids) == sorted(stop.id for stop in boarding)
@@ -5357,10 +5418,10 @@ def test_group_stations_partition_oracle(data: st.DataObject) -> None:
 
 # --- multi-RT-feed aggregation properties (direct-URL, two TU sources) -------
 
-# Direct-URL handles read the timezone from agency.txt (UTC here), so the
-# 2026-07-30 service day anchors at 00:00 UTC and the TP/OTHER trips run
-# 08:00-09:1x UTC.
-_MULTI_RT_NOW = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
+# The propagation feed's agency.txt runs on America/Los_Angeles, so the
+# 2026-07-30 service day anchors at 07:00 UTC and the TP/OTHER trips run
+# 08:00-09:1x PDT; the window opens at 07:00 PDT.
+_MULTI_RT_NOW = _PROP_NOW
 
 
 _MULTI_RT_STOPS = ["S0", "S1", "S2"]
