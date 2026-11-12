@@ -11,7 +11,9 @@ import csv
 import io
 import sqlite3
 import zipfile
+import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
@@ -363,6 +365,40 @@ def _defaulted_int(value: str | None, default: int) -> int | None:
 def _defaulted_text(value: str | None, default: str) -> str:
     """Return a text cell, or GTFS's default when omitted or empty (colours)."""
     return value if value is not None and value.strip() else default
+
+
+# What a member of the zip can raise when opened: an encrypted entry, an
+# unsupported compression method, a corrupt local header.
+_OPEN_ERRORS = (RuntimeError, NotImplementedError, zipfile.BadZipFile)
+# ... and while it is read and parsed: bad bytes (not UTF-8), a failed CRC
+# or truncated stream, a field past csv's size limit, a ragged or missing
+# column the loaders index.
+_READ_ERRORS = (
+    ValueError,
+    KeyError,
+    AttributeError,
+    TypeError,
+    csv.Error,
+    zipfile.BadZipFile,
+    zlib.error,
+    EOFError,
+)
+
+
+@contextmanager
+def _open_csv(
+    archive: zipfile.ZipFile, filename: str
+) -> Iterator[tuple[IO[bytes], csv.DictReader[str]]]:
+    """Open one dataset file as CSV; anything wrong with it is FeedParseError."""
+    try:
+        fp = archive.open(filename)
+    except _OPEN_ERRORS as err:
+        raise FeedParseError(f"Unreadable {filename}: {err}") from err
+    with fp:
+        try:
+            yield fp, csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
+        except _READ_ERRORS as err:
+            raise FeedParseError(f"Malformed {filename}: {err}") from err
 
 
 type _StopRow = tuple[Any, ...]
@@ -744,15 +780,11 @@ class StaticIndex:
         """
         if "agency.txt" not in names:
             return None
-        with archive.open("agency.txt") as fp:
-            reader = csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
-            try:
-                for row in reader:
-                    tz_name = (row.get("agency_timezone") or "").strip()
-                    if tz_name:
-                        return tz_name
-            except (ValueError, csv.Error, AttributeError) as err:
-                raise FeedParseError(f"Malformed agency.txt: {err}") from err
+        with _open_csv(archive, "agency.txt") as (_fp, reader):
+            for row in reader:
+                tz_name = (row.get("agency_timezone") or "").strip()
+                if tz_name:
+                    return tz_name
         return None
 
     @classmethod
@@ -782,13 +814,8 @@ class StaticIndex:
         for filename, loader in files:
             if filename not in names:
                 continue  # build() has already rejected a missing required file
-            with archive.open(filename) as fp:
-                report = _reporter(progress, fp, completed, total)
-                reader = csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
-                try:
-                    loader(conn, reader, report)
-                except (ValueError, KeyError, AttributeError, TypeError) as err:
-                    raise FeedParseError(f"Malformed {filename}: {err}") from err
+            with _open_csv(archive, filename) as (fp, reader):
+                loader(conn, reader, _reporter(progress, fp, completed, total))
             completed += archive.getinfo(filename).file_size
             if progress is not None:
                 progress(completed, total)

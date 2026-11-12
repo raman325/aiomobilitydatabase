@@ -12,6 +12,7 @@ import codecs
 import csv
 import io
 import zipfile
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -149,6 +150,23 @@ def test_a_repetition_at_midnight_arrives_when_it_departs(tmp_path: Path) -> Non
         ("T#0", "S0", _MIDNIGHT, _MIDNIGHT),
         ("T#0", "S1", eight, eight),
     ]
+    index.close()
+
+
+def test_overlapping_rows_keep_the_first_rows_exact_times(tmp_path: Path) -> None:
+    """Two frequencies rows producing the same start are one repetition;
+    the first row's exact_times decides whether its times are exact."""
+    index = _build(
+        tmp_path,
+        _feed(
+            frequencies=(
+                "trip_id,start_time,end_time,headway_secs,exact_times\n"
+                "T,06:00:00,06:10:00,600,1\nT,06:00:00,06:10:00,600,0\n"
+            )
+        ),
+    )
+    [dep] = index.upcoming_departures(["S0"], None, _MIDNIGHT, timedelta(hours=24), 10)
+    assert (dep.trip_id, dep.timepoint_exact) == ("T#21600", True)
     index.close()
 
 
@@ -343,6 +361,18 @@ def test_an_unreadable_agency_txt_fails_as_a_parse_error(tmp_path: Path) -> None
         )
     with pytest.raises(FeedParseError, match=r"Malformed agency\.txt"):
         StaticIndex.build(zip_path, ":memory:", "ds", "America/New_York")
+
+
+def test_the_first_agency_naming_a_zone_supplies_it(tmp_path: Path) -> None:
+    """agency.txt's zone is the first agency_timezone it names: a blank
+    first row does not hand the choice to the catalog."""
+    agency = (
+        "agency_id,agency_name,agency_url,agency_timezone\n"
+        "A,T,https://e.com,\nB,U,https://e.com,America/New_York\n"
+    )
+    index = _build(tmp_path, _feed(agency=agency), "UTC")
+    assert index.timezone_name == "America/New_York"
+    index.close()
 
 
 def test_no_usable_timezone_anywhere_fails_the_build(tmp_path: Path) -> None:
@@ -629,6 +659,57 @@ def test_files_in_a_subfolder_are_missing(tmp_path: Path) -> None:
             archive.writestr(f"gtfs/{name}", content)
     with pytest.raises(FeedParseError, match=r"missing required file: routes\.txt"):
         StaticIndex.build(zip_path, ":memory:", "ds", None)
+
+
+def _stored_zip(files: dict[str, str]) -> bytearray:
+    """The feed as an uncompressed zip, so its bytes can be patched."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return bytearray(buf.getvalue())
+
+
+def _flip_stops_data(raw: bytearray) -> None:
+    """Flip one bit of stops.txt's stored bytes: its CRC no longer holds."""
+    raw[raw.index(b"stop_id,stop_name")] ^= 0x01
+
+
+def _mark_stops_encrypted(raw: bytearray) -> None:
+    """Set stops.txt's "encrypted" flag (general purpose bit 0) in the
+    central directory, which zipfile checks when the entry is opened."""
+    at = raw.index(b"PK\x01\x02")
+    while raw[at + 46 : at + 46 + int.from_bytes(raw[at + 28 : at + 30], "little")] != (
+        b"stops.txt"
+    ):
+        at = raw.index(b"PK\x01\x02", at + 4)
+    raw[at + 8] |= 0x01
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        (_flip_stops_data, r"Malformed stops\.txt"),  # Bad CRC-32
+        (_mark_stops_encrypted, r"Unreadable stops\.txt"),  # password required
+    ],
+    ids=["corrupt-entry", "encrypted-entry"],
+)
+def test_an_unreadable_zip_entry_fails_as_a_parse_error(
+    tmp_path: Path, patch: Callable[[bytearray], None], message: str
+) -> None:
+    zip_path = tmp_path / "broken.zip"
+    raw = _stored_zip(_feed())
+    patch(raw)
+    zip_path.write_bytes(raw)
+    with pytest.raises(FeedParseError, match=message):
+        StaticIndex.build(zip_path, ":memory:", "ds", None)
+
+
+def test_a_field_past_the_csv_limit_fails_as_a_parse_error(tmp_path: Path) -> None:
+    name = "x" * (csv.field_size_limit() + 1)
+    stops = f"stop_id,stop_name,stop_lat,stop_lon\nS0,{name},0,0\n"
+    with pytest.raises(FeedParseError, match=r"Malformed stops\.txt"):
+        _build(tmp_path, _feed(stops=stops))
 
 
 def test_a_failed_file_build_leaves_no_partial_database(tmp_path: Path) -> None:
