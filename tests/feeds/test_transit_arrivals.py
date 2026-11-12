@@ -2,13 +2,20 @@
 
 import io
 import zipfile
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
-from aiomobilitydatabase.feeds.models import ArrivalsQuery
+from aiomobilitydatabase.feeds.models import (
+    ArrivalsQuery,
+    BikesAllowed,
+    PickupDropOffType,
+    StopLocationType,
+    WheelchairAccess,
+)
 from aiomobilitydatabase.feeds.rt import Modification, ReplacementCall
 from aiomobilitydatabase.feeds.static_index import TripCall
 from aiomobilitydatabase.feeds.transit import (
@@ -128,14 +135,15 @@ async def test_schedule_only_arrivals(
     assert first.route.display_name == "10 Main Line"
     assert first.route.type == 3
     assert first.headsign == "Downtown"
-    # The base fixture ships no descriptive stop_times/trips columns: every
-    # descriptor is None EXCEPT timepoint_exact, whose GTFS default for an
-    # absent column is "times are exact".
-    assert first.wheelchair_accessible is None
+    # The base fixture ships no descriptive stop_times/trips columns: each
+    # takes GTFS's value for an empty cell where the spec defines one
+    # (regular pickup, no accessibility information, exact times) and is
+    # None where it does not (direction_id, stop_headsign).
+    assert first.wheelchair_accessible is WheelchairAccess.UNKNOWN
     assert first.direction_id is None
-    assert first.bikes_allowed is None
-    assert first.pickup_type is None
-    assert first.drop_off_type is None
+    assert first.bikes_allowed is BikesAllowed.UNKNOWN
+    assert first.pickup_type is PickupDropOffType.REGULAR
+    assert first.drop_off_type is PickupDropOffType.REGULAR
     assert first.stop_headsign is None
     assert first.timepoint_exact is True
 
@@ -666,6 +674,8 @@ def _detour_message(
     propagated_delay: int = 0,
     service_dates: tuple[str, ...] = ("20260730",),
     define_stop: bool = False,
+    parent_station: str = "",
+    stop_timezone: str = "",
 ) -> bytes:
     """T1 detoured: its S2 call is replaced by one at ``replacement_stop``."""
     message = gtfs_realtime_pb2.FeedMessage()
@@ -689,6 +699,8 @@ def _detour_message(
         stop_entity.stop.stop_name.translation.add().text = "Pop-up Stop"
         stop_entity.stop.stop_lat = 34.09
         stop_entity.stop.stop_lon = -118.21
+        stop_entity.stop.parent_station = parent_station
+        stop_entity.stop.stop_timezone = stop_timezone
     return message.SerializeToString()
 
 
@@ -747,6 +759,32 @@ async def test_detour_defines_its_own_replacement_stop(
         pytest.approx(34.09),
         pytest.approx(-118.21),
     )
+
+
+async def test_a_replacement_stop_inherits_from_its_static_station(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A realtime-defined stop under a static parent station takes the
+    station's timezone over its own, as a static platform would."""
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all",
+        body=_detour_message(
+            replacement_stop="POPUP",
+            define_stop=True,
+            parent_station="ST1",
+            stop_timezone="Asia/Tokyo",
+        ),
+        content_type=PB,
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["POPUP"])], start=NOW, end=NOW + timedelta(hours=2)
+    )
+    [popup] = arrivals
+    assert popup.stop is not None
+    assert popup.stop.timezone == "America/Los_Angeles"  # ST1's: the agency's
+    assert popup.stop.location_type is StopLocationType.STOP
 
 
 async def test_detour_ignores_a_service_date_it_does_not_name(
@@ -1031,6 +1069,29 @@ def test_unusable_replacement_stops_are_skipped(
     assert applied is not None
     # The replaced call is still removed; it simply gains no substitute.
     assert [c.stop_id for c in applied] == ["S1", "S3"], reason
+
+
+def test_an_untimed_call_after_a_detour_stays_untimed() -> None:
+    """The propagated delay moves the calls after the span; an untimed one
+    (GTFS allows untimed intermediate stops) has no time to move."""
+    untimed = replace(_call(3, "S3", 20), arrival=None, departure=None)
+    modification = Modification(
+        start_stop_sequence=2,
+        start_stop_id=None,
+        end_stop_sequence=2,
+        end_stop_id=None,
+        propagated_delay_seconds=120,
+        replacements=[],
+    )
+    applied = _apply_modification(
+        [_CALLS[0], _CALLS[1], untimed, _call(4, "S4", 30)], modification, {}, {}
+    )
+    assert applied is not None
+    assert [(c.stop_id, c.departure) for c in applied] == [
+        ("S1", _CALLS[0].departure),
+        ("S3", None),
+        ("S4", datetime(2026, 7, 30, 15, 32, tzinfo=UTC)),
+    ]
 
 
 def test_match_vehicle_without_any_identity() -> None:

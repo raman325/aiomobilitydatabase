@@ -15,7 +15,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from http import HTTPStatus
@@ -58,9 +58,11 @@ from .models import (
     TripQuery,
     UpcomingTrip,
     VehiclePosition,
+    WheelchairAccess,
 )
 from .rt import (
     Modification,
+    StopPrediction,
     TripModifications,
     TripPredictions,
     TripUpdateKey,
@@ -180,6 +182,32 @@ def _predicted_time(
     if scheduled is not None and delay_seconds is not None:
         return _shifted(scheduled, delay_seconds)
     return None
+
+
+def _predicted_call(
+    prediction: StopPrediction, arrival: datetime | None, departure: datetime | None
+) -> tuple[datetime | None, datetime | None]:
+    """Predict a call's (arrival, departure), never departing before arriving.
+
+    Each end is :func:`_predicted_time`. When one end is an explicit time
+    from the stop's own update and the other only the scheduled time moved
+    by a carried-over delay, and the two cross, the derived end yields to
+    the explicit one: a vehicle predicted to arrive at 08:18 does not leave
+    at 08:11. Two explicit times that cross are the producer's, and kept.
+    """
+    delay = prediction.delay_seconds
+    predicted_arrival = _predicted_time(prediction.arrival, arrival, delay)
+    predicted_departure = _predicted_time(prediction.departure, departure, delay)
+    if (
+        predicted_arrival is not None
+        and predicted_departure is not None
+        and predicted_arrival > predicted_departure
+    ):
+        if prediction.departure is None:
+            predicted_departure = predicted_arrival
+        elif prediction.arrival is None:
+            predicted_arrival = predicted_departure
+    return predicted_arrival, predicted_departure
 
 
 def _shifted(when: datetime | None, seconds: int) -> datetime | None:
@@ -856,20 +884,25 @@ def _select_arrivals(
         for arrival in arrivals
         if arrival.stop_id in stop_ids
         and (route_ids is None or arrival.route_id in route_ids)
-        and (headsigns is None or arrival.headsign in headsigns)
+        and (
+            headsigns is None
+            # The headsign at this stop: the stop_time's override, if any.
+            or (arrival.stop_headsign or arrival.headsign) in headsigns
+        )
     ]
     return selected[: query.limit]
 
 
 def group_stations(stops: Sequence[Stop]) -> list[StationGroup]:
-    """Group boarding stops into logical stations, sorted by name.
+    """Group boarding stops into logical stations, sorted by name then id.
 
     GTFS models stations as hierarchies: platforms (location_type 0, or
-    unset) may link to a parent station (1), while entrances (2) and
-    pathway nodes (3+) are never boarding stops and are dropped. Boarding
-    stops sharing a parent station — or, without one, an identical name —
-    are grouped so consumers can offer "Metro Center" instead of every
-    platform and entrance.
+    empty) may link to a parent station (1), while entrances (2), pathway
+    nodes (3+) and stops of unknown type are never boarding stops and are
+    dropped. Boarding stops sharing a parent station are grouped so
+    consumers can offer "Metro Center" instead of every platform; a stop
+    without one is a station of its own -- GTFS relates stops only through
+    ``parent_station``, so two stops that merely share a name stay apart.
     """
     stations = {
         stop.id: stop
@@ -879,15 +912,15 @@ def group_stations(stops: Sequence[Stop]) -> list[StationGroup]:
     names: dict[str, str] = {}
     members: dict[str, list[str]] = {}
     for stop in stops:
-        if stop.location_type not in (None, StopLocationType.STOP):
+        if stop.location_type is not StopLocationType.STOP:
             continue
         if stop.parent_station:
             key = stop.parent_station
             station = stations.get(stop.parent_station)
             name = (station.name if station else None) or stop.name or key
         else:
+            key = stop.id
             name = stop.name or stop.id
-            key = name.casefold()
         names.setdefault(key, name)
         members.setdefault(key, []).append(stop.id)
     return sorted(
@@ -895,8 +928,46 @@ def group_stations(stops: Sequence[Stop]) -> list[StationGroup]:
             StationGroup(id=key, name=names[key], stop_ids=tuple(stop_ids))
             for key, stop_ids in members.items()
         ),
-        key=lambda group: group.name,
+        key=lambda group: (group.name, group.id),
     )
+
+
+def _inherited_rt_stops(
+    rt_stops: Mapping[str, Stop], static_stops: Mapping[str, Stop], agency_zone: str
+) -> dict[str, Stop]:
+    """Apply GTFS's parent-station inheritance to realtime-defined stops.
+
+    The same rules :meth:`StaticIndex.stops` applies: a stop under a parent
+    station takes the parent's timezone, and its wheelchair_boarding when
+    its own is 0 (UNKNOWN); one without a known parent uses its own
+    stop_timezone, or the agency's. The parent is whichever stop the board
+    would show under that id -- a realtime one first, resolved the same
+    way, else the static one (already resolved). A ``parent_station`` cycle
+    among realtime stops ends the chain, as it does for static stops.
+    """
+
+    def resolve(stop_id: str, seen: frozenset[str]) -> Stop:
+        stop = rt_stops[stop_id]
+        parent_id = stop.parent_station or ""
+        parent: Stop | None
+        if parent_id in rt_stops and parent_id not in seen:
+            parent = resolve(parent_id, seen | {parent_id})
+        elif parent_id in rt_stops:
+            parent = None  # a cycle: no parent to inherit from
+        else:
+            parent = static_stops.get(parent_id)
+        boarding = stop.wheelchair_boarding
+        if (
+            parent is not None
+            and boarding is WheelchairAccess.UNKNOWN
+            and parent.wheelchair_boarding
+            in (WheelchairAccess.POSSIBLE, WheelchairAccess.NOT_POSSIBLE)
+        ):
+            boarding = parent.wheelchair_boarding
+        zone = parent.timezone if parent is not None else stop.timezone
+        return replace(stop, wheelchair_boarding=boarding, timezone=zone or agency_zone)
+
+    return {stop_id: resolve(stop_id, frozenset({stop_id})) for stop_id in rt_stops}
 
 
 class _IndexGuard:
@@ -1672,6 +1743,9 @@ class TransitFeedHandle:
             modifications.extend(trip_modifications_from_message(message))
         async with self._guard.reader():
             stops_by_id = await self._index_read(self._index.stops_by_id)
+            rt_stops = _inherited_rt_stops(
+                rt_stops, stops_by_id, self._index.timezone_name
+            )
             routes_by_id = await self._index_read(self._index.routes_by_id)
             positions = await self._vehicles_from(
                 vehicle_messages, stops_by_id, routes_by_id
@@ -1903,6 +1977,11 @@ class TransitFeedHandle:
                 if dep.stop_sequence in trip_rt.skipped:
                     continue  # SKIPPED: the vehicle will not serve this stop
                 prediction = trip_rt.predictions.get(dep.stop_sequence)
+            predicted_arrival, predicted_departure = (
+                _predicted_call(prediction, dep.arrival, dep.departure)
+                if prediction
+                else (None, None)
+            )
             arrivals.append(
                 StopArrival(
                     stop_id=dep.stop_id,
@@ -1914,24 +1993,8 @@ class TransitFeedHandle:
                     headsign=dep.headsign,
                     scheduled_arrival=dep.arrival,
                     scheduled_departure=dep.departure,
-                    predicted_arrival=(
-                        _predicted_time(
-                            prediction.arrival,
-                            dep.arrival,
-                            prediction.delay_seconds,
-                        )
-                        if prediction
-                        else None
-                    ),
-                    predicted_departure=(
-                        _predicted_time(
-                            prediction.departure,
-                            dep.departure,
-                            prediction.delay_seconds,
-                        )
-                        if prediction
-                        else None
-                    ),
+                    predicted_arrival=predicted_arrival,
+                    predicted_departure=predicted_departure,
                     delay_seconds=prediction.delay_seconds if prediction else None,
                     realtime=prediction is not None,
                     vehicle_id=prediction.vehicle_id if prediction else None,
@@ -2269,11 +2332,9 @@ class TransitFeedHandle:
                     destination_stop=stops_by_id.get(trip.destination_stop_id),
                     scheduled_departure=trip.departure,
                     predicted_departure=(
-                        _predicted_time(
-                            origin_pred.departure,
-                            trip.departure,
-                            origin_pred.delay_seconds,
-                        )
+                        # Only an explicit arrival can push the departure
+                        # later, so the scheduled origin arrival is not read.
+                        _predicted_call(origin_pred, None, trip.departure)[1]
                         if origin_pred
                         else None
                     ),

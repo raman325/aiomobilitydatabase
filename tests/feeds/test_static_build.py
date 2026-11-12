@@ -101,7 +101,7 @@ def test_agency_txt_present_but_blank_timezone_raises(tmp_path: Path) -> None:
             zf.writestr(name, content)
     zip_path = tmp_path / "blank_tz.zip"
     zip_path.write_bytes(buf.getvalue())
-    with pytest.raises(FeedParseError, match="No agency timezone"):
+    with pytest.raises(FeedParseError, match="No valid agency timezone"):
         StaticIndex.build(zip_path, ":memory:", DATASET, None)
 
 
@@ -617,7 +617,7 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
     }
     built.close()
     assert (SCHEMA_VERSION, fingerprint) == (
-        5,
+        6,
         {
             "agencies": [
                 "email",

@@ -113,17 +113,18 @@ def build_gtfs_zip_bytes(omit: frozenset[str] = frozenset()) -> bytes:
 # builder rather than the base data/gtfs files:
 #   T1 gains a terminal S3 call (arrival-only)  -> S1→S3 with intermediate S2
 #   T9 is a NEW reverse trip S3→S2→S1 (WKDY)    -> wrong-direction exclusion
-#   T2 gains an S3 call with NO arrival time    -> NULL-arrival exclusion
-#   T9's S2 call has NO departure time          -> NULL-departure exclusion
+#   T2 gains an UNTIMED S3 call                 -> untimed-destination exclusion
+#   T9's S2 call is UNTIMED                     -> untimed-origin exclusion
+# (A call timed by only one of arrival/departure is timed: that time is both.)
 #   T3 gains an S2 call past midnight (25:40)   -> service-day boundary
 _TRIP_QUERY_EXTRA_ROWS: dict[str, str] = {
     "trips.txt": "R1,WKDY,T9,Uptown\n",
     "stop_times.txt": (
         "T1,08:20:00,,S3,3\n"
-        "T2,,08:45:00,S3,2\n"
+        "T2,,,S3,2\n"
         "T3,25:40:00,25:41:00,S2,2\n"
         "T9,08:05:00,08:05:30,S3,1\n"
-        "T9,08:15:00,,S2,2\n"
+        "T9,,,S2,2\n"
         "T9,08:25:00,08:25:30,S1,3\n"
     ),
 }
@@ -146,8 +147,8 @@ def build_trip_query_gtfs_zip_bytes() -> bytes:
 #     S3 08:20:00, repeated 06:00-06:30 every 600s (3 reps; the 06:30
 #     repetition lands exactly on end_time and must NOT run) and 07:00-07:20
 #     every 600s with exact_times=1 (2 reps).
-#   F2 (R2, NIGHT): 2-stop template with a BLANK first arrival (anchor falls
-#     back to the departure) at 23:30:00 -> S2 23:40:00, repeated
+#   F2 (R2, NIGHT): 2-stop template with a BLANK first arrival (the call
+#     arrives when it departs) at 23:30:00 -> S2 23:40:00, repeated
 #     23:30-25:00 every 1800s (3 reps: 23:30, 24:00, 24:30 -- the last two
 #     cross the >24:00:00 boundary onto the next clock day).
 _FREQUENCY_EXTRA_ROWS: dict[str, str] = {

@@ -4,7 +4,12 @@ from datetime import UTC, date, datetime, timedelta
 
 from aiomobilitydatabase.feeds import TripQuery
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
-from aiomobilitydatabase.feeds.models import ArrivalsQuery
+from aiomobilitydatabase.feeds.models import (
+    ArrivalsQuery,
+    BikesAllowed,
+    PickupDropOffType,
+    WheelchairAccess,
+)
 
 from tests.feeds.fixtures import (
     GTFS_FEED,
@@ -74,18 +79,18 @@ async def test_schedule_only_trips(
     assert trip.route.type == 3
     assert trip.headsign == "Downtown"
     # Descriptor pass-through from the index: the base fixture ships no
-    # descriptive columns (None everywhere, timepoint defaulting to exact),
-    # and T1 is Thursday's ONLY S1->S3 candidate, so it is both the first
-    # and the last departure of its service day for the pair.
-    assert trip.wheelchair_accessible is None
-    assert trip.bikes_allowed is None
+    # descriptive columns (GTFS's empty-cell values where the spec defines
+    # one, else None), and T1 is Thursday's ONLY S1->S3 candidate, so it is
+    # both the first and the last departure of its service day for the pair.
+    assert trip.wheelchair_accessible is WheelchairAccess.UNKNOWN
+    assert trip.bikes_allowed is BikesAllowed.UNKNOWN
     assert trip.direction_id is None
-    assert trip.origin_pickup_type is None
-    assert trip.origin_drop_off_type is None
+    assert trip.origin_pickup_type is PickupDropOffType.REGULAR
+    assert trip.origin_drop_off_type is PickupDropOffType.REGULAR
     assert trip.origin_timepoint_exact is True
     assert trip.origin_stop_headsign is None
-    assert trip.destination_pickup_type is None
-    assert trip.destination_drop_off_type is None
+    assert trip.destination_pickup_type is PickupDropOffType.REGULAR
+    assert trip.destination_drop_off_type is PickupDropOffType.REGULAR
     assert trip.destination_timepoint_exact is True
     assert trip.destination_stop_headsign is None
     assert trip.is_first is True

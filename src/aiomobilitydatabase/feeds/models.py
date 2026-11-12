@@ -31,7 +31,8 @@ class WheelchairAccess(IntEnum):
     possible at the stop?): the spec defines the identical value shape for
     the two columns, and POSSIBLE/NOT_POSSIBLE reads naturally in either
     position. Values match the spec ints, so ``int(...)``/``.value``
-    comparisons keep working for consumers who want the raw number.
+    comparisons keep working for consumers who want the raw number. A
+    blank or absent cell is UNKNOWN, GTFS's "0 or empty".
     """
 
     UNKNOWN = 0
@@ -40,7 +41,10 @@ class WheelchairAccess(IntEnum):
 
 
 class BikesAllowed(IntEnum):
-    """GTFS ``trips.bikes_allowed`` vocabulary (values match the spec ints)."""
+    """GTFS ``trips.bikes_allowed`` vocabulary (values match the spec ints).
+
+    A blank or absent cell is UNKNOWN, GTFS's "0 or empty".
+    """
 
     UNKNOWN = 0
     ALLOWED = 1
@@ -51,7 +55,8 @@ class PickupDropOffType(IntEnum):
     """GTFS ``stop_times.pickup_type``/``drop_off_type`` shared vocabulary.
 
     The spec defines the identical value shape for both columns, so one
-    enum serves the two fields (values match the spec ints).
+    enum serves the two fields (values match the spec ints). A blank or
+    absent cell is REGULAR, GTFS's "0 or empty".
     """
 
     REGULAR = 0
@@ -65,7 +70,8 @@ class StopLocationType(IntEnum):
 
     Named ``StopLocationType`` because the catalog-side
     :class:`aiomobilitydatabase.models.LocationType` (a StrEnum of catalog
-    location kinds) is an unrelated vocabulary.
+    location kinds) is an unrelated vocabulary. A blank or absent cell is
+    STOP, GTFS's "0 (or empty)".
     """
 
     STOP = 0
@@ -170,11 +176,16 @@ class Stop:
     """A transit stop from the static GTFS index.
 
     ``description``/``url``/``zone_id`` are the verbatim ``stop_desc``/
-    ``stop_url``/``zone_id`` cells (empty -> None). ``timezone`` is
-    ``stop_timezone`` and is DISPLAY METADATA ONLY: per the GTFS spec,
-    every stop_times value is expressed in the AGENCY timezone regardless
-    of any stop_timezone, so no time computation in this library reads it
-    -- it exists so consumers can render "local time at this stop".
+    ``stop_url``/``zone_id`` cells (empty -> None). ``wheelchair_boarding``
+    and ``timezone`` are the values GTFS resolves for the stop, not its raw
+    cells: a stop under a parent station takes the parent's
+    ``wheelchair_boarding`` when its own is 0 or empty, and always takes
+    the parent's timezone; a stop without one uses its ``stop_timezone``,
+    or the agency's when that is empty. ``timezone`` is DISPLAY METADATA
+    ONLY: every stop_times value is expressed in the AGENCY timezone
+    regardless of any stop_timezone, so no time computation in this library
+    reads it -- it exists so consumers can render "local time at this
+    stop". It is None only for a stop a realtime feed defines without one.
     """
 
     id: str
@@ -215,10 +226,9 @@ class Agency:
 class StationGroup:
     """A logical station: boarding stops grouped for presentation.
 
-    Boarding stops sharing a GTFS ``parent_station`` — or, without one, an
-    identical name (for example direction pairs at an intersection) — form
-    one group. ``id`` is the parent station id when present, else the
-    casefolded shared name; it is stable across rebuilds of the same feed.
+    Boarding stops sharing a GTFS ``parent_station`` form one group; a
+    stop without one is a group of its own. ``id`` is the parent station id,
+    or the stop's own id; it is stable across rebuilds of the same feed.
     """
 
     id: str
@@ -233,7 +243,8 @@ class Route:
     ``type`` stays a raw int (not an enum): Google's extended route types
     (e.g. 103) are an open vocabulary a closed enum could not represent.
     ``color``/``text_color`` are the raw GTFS hex strings without a leading
-    ``#`` (e.g. ``"FFD700"``); ``agency_id`` resolves against
+    ``#`` (e.g. ``"FFD700"``), defaulting to ``"FFFFFF"``/``"000000"`` when
+    omitted or empty, as the spec does; ``agency_id`` resolves against
     :class:`Agency` records exposed on the handle/index. ``description``
     is the verbatim ``route_desc`` cell; ``sort_order`` is
     ``route_sort_order`` parsed leniently (blank/garbage -> None, any
@@ -267,9 +278,10 @@ class ArrivalsQuery:
     ``stop_ids`` is the set of GTFS stops the board covers (a station's
     platforms, a direction pair). ``route_ids`` and ``headsigns`` narrow
     the rows; ``None`` or an empty list means no narrowing. ``headsigns``
-    matches the trip-level headsign (the same values
-    :meth:`TransitFeedHandle.get_headsigns_serving` offers), so RT-added trips,
-    which announce no headsign, never pass a headsign filter. ``limit``
+    matches the headsign shown at the stop -- the stop_time's
+    ``stop_headsign`` where set, else the trip's headsign; the same values
+    :meth:`TransitFeedHandle.get_headsigns_serving` offers -- so RT-added
+    trips, which announce no headsign, never pass a headsign filter. ``limit``
     caps the merged, filtered result for this query as a whole,
     nearest effective departure first; zero asks for an empty board and
     ``None`` means unlimited (only allowed with an explicit ``end``).
@@ -327,8 +339,11 @@ class StopArrival:
     describe this stop's stop_time row (``stop_headsign`` is the per-stop
     override of the trip-level ``headsign``). ``timepoint_exact`` is True
     when the scheduled times are exact (GTFS's default when the column is
-    absent or blank), False for approximate times, None when the value is
-    outside the 0/1 vocabulary. ``trip_short_name``/``block_id`` are the
+    absent or blank), False for approximate times -- including every
+    repetition of headway-based (``exact_times`` 0) frequency service, which
+    "does not follow a fixed schedule" -- and None when the value is outside
+    the 0/1 vocabulary. A call the feed times by only its arrival or only
+    its departure reports that time as both. ``trip_short_name``/``block_id`` are the
     trip's verbatim ``trip_short_name``/``block_id`` cells -- ``block_id``
     is raw string exposure only (no block-continuation computation).
     ``vehicle`` is the live position of the vehicle serving this call,
@@ -384,7 +399,10 @@ class UpcomingTrip:
     departure from an origin stop on a trip that later serves the
     destination stop. Scheduled times are non-optional because the
     producing query requires an origin departure time and a destination
-    arrival time; ``delay_seconds`` is the origin departure delay.
+    arrival time; ``delay_seconds`` is the origin departure delay. A trip
+    is offered only where the rider can board and alight: never from a call
+    with no pickup (``pickup_type`` 1) or to one with no drop-off
+    (``drop_off_type`` 1).
 
     ``wheelchair_accessible``/``bikes_allowed``/``direction_id`` describe
     the trip (``direction_id`` stays a raw int: 0/1 with feed-defined

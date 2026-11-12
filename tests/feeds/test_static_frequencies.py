@@ -137,8 +137,8 @@ def test_is_last_past_midnight_repetition_relative_to_own_day(tmp_path: Path) ->
 def test_past_midnight_repetition_on_next_clock_day(tmp_path: Path) -> None:
     """F2's 24:00 and 24:30 repetitions belong to the PREVIOUS service day:
     querying Friday 00:15 PDT must surface Thursday's F2#88200 at Friday
-    00:30 PDT, with a None arrival because the template's first-stop
-    arrival is blank (the anchor fell back to the departure).
+    00:30 PDT. The template's first-stop arrival is blank, so the call
+    arrives when it departs.
     """
     now = datetime(2026, 7, 31, 7, 15, tzinfo=UTC)  # Friday 00:15 PDT
     index = _index(tmp_path)
@@ -148,7 +148,7 @@ def test_past_midnight_repetition_on_next_clock_day(tmp_path: Path) -> None:
     assert [(dep.trip_id, dep.departure) for dep in departures] == [
         ("F2#88200", datetime(2026, 7, 31, 7, 30, tzinfo=UTC))
     ]
-    assert departures[0].arrival is None
+    assert departures[0].arrival == departures[0].departure
     assert departures[0].route_id == "R2"
     index.close()
 

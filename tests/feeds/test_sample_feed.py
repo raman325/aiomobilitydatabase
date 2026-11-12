@@ -30,9 +30,12 @@ Every expectation below is hand-computed from the feed's own CSV rows:
 * stop_times.txt offsets: CITY1's template anchors at STAGECOACH
   (arr 6:00:00), so its later calls ride at +5:00/+7:00 (NANAA),
   +12:00/+14:00 (NADAV), +19:00/+21:00 (DADAN), +26:00/+28:00 (EMSI).
-  CITY2 anchors at EMSI's ARRIVAL 6:28:00 (not its 6:30:00 departure),
-  so its terminal STAGECOACH call (arr 6:56:00, dep 6:58:00) rides at
-  +28:00/+30:00 from each repetition start.
+  CITY2 anchors at EMSI's DEPARTURE 6:30:00 (start_time is when "the
+  first vehicle departs from the first stop"), so EMSI's 6:28:00 arrival
+  rides at -2:00 and its terminal STAGECOACH call (arr 6:56:00, dep
+  6:58:00) at +26:00/+28:00 from each repetition start.
+* frequencies.txt has no exact_times column: every repetition is
+  headway-based ("0 or empty"), so its times are approximate.
 * stop_times.txt row count: 28 CSV rows; the 12 template rows (STBA 2,
   CITY1 5, CITY2 5) are replaced by 32*2 + 52*5 + 52*5 = 584 materialized
   rows, leaving 16 plain rows -> 600 rows total.
@@ -46,7 +49,15 @@ from pathlib import Path
 
 from aiomobilitydatabase.feeds import TripQuery
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
-from aiomobilitydatabase.feeds.models import Agency, ArrivalsQuery, FeedInfo
+from aiomobilitydatabase.feeds.models import (
+    Agency,
+    ArrivalsQuery,
+    BikesAllowed,
+    FeedInfo,
+    PickupDropOffType,
+    StopLocationType,
+    WheelchairAccess,
+)
 from aiomobilitydatabase.feeds.static_index import ScheduledDeparture, StaticIndex
 
 from tests.feeds.fixtures import (
@@ -131,12 +142,14 @@ def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> N
     # blank, and none of the other optional descriptive columns.
     assert stagecoach.stop_code is None
     assert stagecoach.platform_code is None
-    assert stagecoach.wheelchair_boarding is None
-    assert stagecoach.location_type is None
+    # Absent columns whose empty value GTFS defines take that value.
+    assert stagecoach.wheelchair_boarding is WheelchairAccess.UNKNOWN
+    assert stagecoach.location_type is StopLocationType.STOP
     assert stagecoach.description is None
     assert stagecoach.url is None
     assert stagecoach.zone_id is None
-    assert stagecoach.timezone is None  # no stop_timezone column at all
+    # No stop_timezone column at all: a parentless stop is in the agency's.
+    assert stagecoach.timezone == "America/Los_Angeles"
     routes = index.routes()
     assert [route.id for route in routes] == [
         "AAMV",
@@ -149,10 +162,11 @@ def test_ingestion_exact_counts_and_unmodeled_files_ignored(tmp_path: Path) -> N
     ext = next(route for route in routes if route.id == "EXT")
     assert ext.type == 103  # extended route types survive ingestion
     # routes.txt populates agency_id everywhere; its route_url/route_color/
-    # route_text_color columns exist but every value is blank.
+    # route_text_color columns exist but every value is blank, and blank
+    # colours are GTFS's white on black.
     assert all(route.agency_id == "DTA" for route in routes)
-    assert all(route.color is None for route in routes)
-    assert all(route.text_color is None for route in routes)
+    assert all(route.color == "FFFFFF" for route in routes)
+    assert all(route.text_color == "000000" for route in routes)
     assert all(route.url is None for route in routes)
     # route_desc exists but is blank everywhere; route_sort_order is absent.
     assert all(route.description is None for route in routes)
@@ -270,16 +284,16 @@ def test_stba_repetitions_exact_starts_and_pinned_departures(tmp_path: Path) -> 
     assert first.start_secs == 21600
     assert first.headsign == "Shuttle"
     assert first.route_id == "STBA"
-    # trips.txt has no wheelchair/bikes columns; stop_times.txt HAS
-    # pickup/drop-off/headsign columns with every value blank, and no
-    # timepoint column at all -- so times are exact by the GTFS default,
-    # carried through materialization to this repetition.
-    assert first.wheelchair_accessible is None
-    assert first.bikes_allowed is None
-    assert first.pickup_type is None
-    assert first.drop_off_type is None
+    # trips.txt has no wheelchair/bikes columns and stop_times.txt has
+    # pickup/drop-off/headsign columns with every value blank: each takes
+    # GTFS's empty value. No exact_times column makes STBA headway-based
+    # service, so its repetitions' times are approximate.
+    assert first.wheelchair_accessible is WheelchairAccess.UNKNOWN
+    assert first.bikes_allowed is BikesAllowed.UNKNOWN
+    assert first.pickup_type is PickupDropOffType.REGULAR
+    assert first.drop_off_type is PickupDropOffType.REGULAR
     assert first.stop_headsign is None
-    assert first.timepoint_exact is True
+    assert first.timepoint_exact is False
     assert first.block_id is None  # STBA's block_id cell is blank
     assert first.trip_short_name is None
     assert at_stagecoach[-1].trip_id == "STBA#77400"
@@ -296,8 +310,9 @@ def test_city_repetitions_across_changing_headways(tmp_path: Path) -> None:
     """CITY1 and CITY2 each materialize the same 52 repetition starts from
     five windows whose headway flips between 1800s and 600s across the
     day. Offsets ride along per repetition, and CITY2's anchor is its
-    first stop's ARRIVAL (EMSI 6:28:00), so CITY2#21600's terminal
-    STAGECOACH call lands at +28:00/+30:00 from the 06:00 start.
+    first stop's DEPARTURE (EMSI 6:30:00), so CITY2#21600 arrives at EMSI
+    two minutes before its 06:00 start and its terminal STAGECOACH call
+    lands at +26:00/+28:00.
     """
     index = _index(tmp_path)
     rows = index.upcoming_departures(
@@ -329,14 +344,14 @@ def test_city_repetitions_across_changing_headways(tmp_path: Path) -> None:
     assert emsi.departure == datetime(2007, 6, 1, 15, 28, tzinfo=UTC)
     assert emsi.start_secs == 28800
     assert emsi.source_trip_id == "CITY1"
-    # CITY2#21600 anchors on EMSI's 6:28:00 ARRIVAL: EMSI 13:00/13:02 UTC,
-    # STAGECOACH 13:28/13:30 UTC.
+    # CITY2#21600 departs EMSI at its 06:00 start: EMSI 12:58/13:00 UTC,
+    # STAGECOACH 13:26/13:28 UTC.
     first_stop = by_key[("CITY2#21600", "EMSI")]
-    assert first_stop.arrival == datetime(2007, 6, 1, 13, 0, tzinfo=UTC)
-    assert first_stop.departure == datetime(2007, 6, 1, 13, 2, tzinfo=UTC)
+    assert first_stop.arrival == datetime(2007, 6, 1, 12, 58, tzinfo=UTC)
+    assert first_stop.departure == datetime(2007, 6, 1, 13, 0, tzinfo=UTC)
     terminal = by_key[("CITY2#21600", "STAGECOACH")]
-    assert terminal.arrival == datetime(2007, 6, 1, 13, 28, tzinfo=UTC)
-    assert terminal.departure == datetime(2007, 6, 1, 13, 30, tzinfo=UTC)
+    assert terminal.arrival == datetime(2007, 6, 1, 13, 26, tzinfo=UTC)
+    assert terminal.departure == datetime(2007, 6, 1, 13, 28, tzinfo=UTC)
     index.close()
 
 
@@ -372,24 +387,24 @@ def test_upcoming_trips_across_frequency_repetitions(tmp_path: Path) -> None:
     # neither row is the day's first (CITY1#21600) or last (CITY1#77400)
     # STAGECOACH->EMSI departure.
     assert outbound[0].direction_id == 0
-    assert outbound[0].origin_timepoint_exact is True
+    assert outbound[0].origin_timepoint_exact is False  # headway-based
     assert [(t.is_first, t.is_last) for t in outbound] == [
         (False, False),
         (False, False),
     ]
-    # Reverse pair: CITY2 reps whose EMSI departure (+2:00 from start)
-    # falls in window -- same starts; STAGECOACH arrival is +28:00.
+    # Reverse pair: CITY2 reps whose EMSI departure (their start) falls in
+    # window -- same starts; STAGECOACH arrival is +26:00.
     inbound = index.upcoming_trips("EMSI", "STAGECOACH", now, timedelta(minutes=30), 10)
     assert [(trip.trip_id, trip.departure, trip.arrival) for trip in inbound] == [
         (
             "CITY2#28800",
-            datetime(2007, 6, 1, 15, 2, tzinfo=UTC),
-            datetime(2007, 6, 1, 15, 28, tzinfo=UTC),
+            datetime(2007, 6, 1, 15, 0, tzinfo=UTC),
+            datetime(2007, 6, 1, 15, 26, tzinfo=UTC),
         ),
         (
             "CITY2#29400",
-            datetime(2007, 6, 1, 15, 12, tzinfo=UTC),
-            datetime(2007, 6, 1, 15, 38, tzinfo=UTC),
+            datetime(2007, 6, 1, 15, 10, tzinfo=UTC),
+            datetime(2007, 6, 1, 15, 36, tzinfo=UTC),
         ),
     ]
     assert inbound[0].direction_id == 1  # CITY2's direction, carried per rep
@@ -495,8 +510,8 @@ async def test_handle_answers_from_canonical_feed(
     handle = await feeds_client.get_transit_feed("mdb-100")
     # Friday 05:45 PDT, 1h window: 06:00 starts of STBA/CITY1, their
     # 06:30 follow-ups, and CITY2#21600's terminal STAGECOACH call at
-    # 06:30 (start + 30:00). CITY2#23400 reaches STAGECOACH only at
-    # 07:00 -- outside the window.
+    # 06:28 (start + 28:00). CITY2#23400 reaches STAGECOACH only at
+    # 06:58 -- outside the window.
     [arrivals] = await handle.get_arrivals(
         [ArrivalsQuery(["STAGECOACH"])],
         start=datetime(2007, 6, 1, 12, 45, tzinfo=UTC),
@@ -505,8 +520,8 @@ async def test_handle_answers_from_canonical_feed(
     assert [(a.trip_id, a.scheduled_departure) for a in arrivals] == [
         ("CITY1#21600", datetime(2007, 6, 1, 13, 0, tzinfo=UTC)),
         ("STBA#21600", datetime(2007, 6, 1, 13, 0, tzinfo=UTC)),
+        ("CITY2#21600", datetime(2007, 6, 1, 13, 28, tzinfo=UTC)),
         ("CITY1#23400", datetime(2007, 6, 1, 13, 30, tzinfo=UTC)),
-        ("CITY2#21600", datetime(2007, 6, 1, 13, 30, tzinfo=UTC)),
         ("STBA#23400", datetime(2007, 6, 1, 13, 30, tzinfo=UTC)),
     ]
     shuttle = arrivals[1]
@@ -518,8 +533,8 @@ async def test_handle_answers_from_canonical_feed(
     assert shuttle.headsign == "Shuttle"
     assert shuttle.realtime is False
     assert shuttle.predicted_departure is None
-    city2 = arrivals[3]
-    assert city2.scheduled_arrival == datetime(2007, 6, 1, 13, 28, tzinfo=UTC)
+    city2 = arrivals[2]
+    assert city2.scheduled_arrival == datetime(2007, 6, 1, 13, 26, tzinfo=UTC)
     assert city2.headsign is None  # CITY trips publish no headsign
     # Plain-trip answer: AB1 (BEATTY_AIRPORT 8:00 -> BULLFROG 8:10 local).
     # AB2 serves both stops in reverse order and must not appear.

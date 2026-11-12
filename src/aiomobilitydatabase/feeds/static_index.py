@@ -11,7 +11,9 @@ import csv
 import io
 import sqlite3
 import zipfile
-from collections.abc import Callable, Iterable, Iterator, Sequence
+import zlib
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
@@ -42,13 +44,15 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
-# Descriptive vocabulary columns are stored as the raw parsed ints (or NULL
-# for blank/unparseable values); the closed-vocabulary enums live at the
-# Python model boundary only, where out-of-vocabulary ints turn into None.
+# Descriptive vocabulary columns are stored as the raw parsed ints, with a
+# blank or absent cell resolved to the value GTFS gives "empty" (see
+# _defaulted_int) and NULL for unparseable values; the closed-vocabulary
+# enums live at the Python model boundary only, where out-of-vocabulary ints
+# turn into None.
 _SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE agencies (
@@ -124,6 +128,22 @@ _LONG_REACH = 4 * 86_400
 _EXCEPTION_SERVICE_REMOVED = 2
 # GTFS-RT requires start_date for a trip lasting longer than this.
 _ONE_DAY = 86_400
+
+# A journey needs a time at both ends, a pickup at the origin and a drop-off
+# at the destination: pickup_type/drop_off_type 1 is "No pickup available" /
+# "No drop off available". (2 and 3 -- arrange by phone, coordinate with the
+# driver -- are still a pickup.) An unparseable cell (NULL) is no evidence
+# either way and does not exclude the call.
+_USABLE_PAIR_SQL = (
+    "AND o.departure_secs IS NOT NULL AND d.arrival_secs IS NOT NULL "
+    "AND o.pickup_type IS NOT 1 AND d.drop_off_type IS NOT 1"
+)
+
+# The headsign shown at a stop: stop_times.stop_headsign "overrides the
+# default trips.trip_headsign when the headsign changes between stops".
+_HEADSIGN_SQL = "COALESCE(st.stop_headsign, t.headsign)"
+
+_REQUIRED_FILES = frozenset({"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"})
 
 _WEEKDAY_COLUMNS = (
     "monday",
@@ -325,6 +345,114 @@ def _stored_timepoint(value: str | None) -> int | None:
         return 1
     parsed = _lenient_int(value)
     return parsed if parsed in (0, 1) else None
+
+
+def _defaulted_int(value: str | None, default: int) -> int | None:
+    """Parse a descriptive integer whose blank value GTFS defines.
+
+    GTFS gives "empty" a meaning for several vocabulary columns --
+    ``pickup_type``/``drop_off_type`` "0 or empty" is a regular stop,
+    ``location_type`` "0 (or empty)" a stop or platform, the wheelchair and
+    bikes columns "0 or empty" no information -- so an absent column or a
+    blank cell is ``default``, not unknown. Anything else parses as
+    :func:`_lenient_int` does: garbage stays NULL, surfacing as None.
+    """
+    if value is None or not value.strip():
+        return default
+    return _lenient_int(value)
+
+
+def _defaulted_text(value: str | None, default: str) -> str:
+    """Return a text cell, or GTFS's default when omitted or empty (colours)."""
+    return value if value is not None and value.strip() else default
+
+
+# What a member of the zip can raise when opened: an encrypted entry, an
+# unsupported compression method, a corrupt local header.
+_OPEN_ERRORS = (RuntimeError, NotImplementedError, zipfile.BadZipFile)
+# ... and while it is read and parsed: bad bytes (not UTF-8), a failed CRC
+# or truncated stream, a field past csv's size limit, a ragged or missing
+# column the loaders index.
+_READ_ERRORS = (
+    ValueError,
+    KeyError,
+    AttributeError,
+    TypeError,
+    csv.Error,
+    zipfile.BadZipFile,
+    zlib.error,
+    EOFError,
+)
+
+
+@contextmanager
+def _open_csv(
+    archive: zipfile.ZipFile, filename: str
+) -> Iterator[tuple[IO[bytes], csv.DictReader[str]]]:
+    """Open one dataset file as CSV; anything wrong with it is FeedParseError."""
+    try:
+        fp = archive.open(filename)
+    except _OPEN_ERRORS as err:
+        raise FeedParseError(f"Unreadable {filename}: {err}") from err
+    with fp:
+        try:
+            yield fp, csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
+        except _READ_ERRORS as err:
+            raise FeedParseError(f"Malformed {filename}: {err}") from err
+
+
+type _StopRow = tuple[Any, ...]
+
+
+def _ancestor(
+    by_id: Mapping[str, _StopRow],
+    row: _StopRow,
+    climb: Callable[[_StopRow], bool],
+) -> _StopRow:
+    """Walk ``parent_station`` up from ``row`` while ``climb(row)`` holds.
+
+    Stops at the first row with no (known) parent, or before revisiting a
+    stop: a ``parent_station`` cycle ends the chain instead of looping.
+    """
+    seen = {row[0]}
+    while climb(row) and (parent := by_id.get(row[4])) is not None:
+        if parent[0] in seen:
+            break
+        seen.add(parent[0])
+        row = parent
+    return row
+
+
+def _resolved_boarding(by_id: Mapping[str, _StopRow], row: _StopRow) -> int | None:
+    """Resolve a stop's wheelchair_boarding through GTFS's parent inheritance.
+
+    0 or empty (stored 0) "will inherit ... from the parent station, if
+    specified in the parent": the nearest ancestor saying 1 or 2 decides;
+    none doing so (a 0, an unusable cell, a cycle) leaves 0.
+    """
+    own: int | None = row[8]
+    if own != 0:
+        return own
+    source: int | None = _ancestor(by_id, row, lambda r: r[8] == 0)[8]
+    return source if source in (1, 2) else 0
+
+
+def _valid_zone(name: str) -> bool:
+    """Whether ``name`` is an IANA zone this system can load."""
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, TypeError, ValueError, OSError):
+        # OSError: with the tzdata package, a directory name ("America")
+        # or an over-long one fails as a file error, not as not-found.
+        return False
+    return True
+
+
+def _shifted(secs: int | None, shift: int) -> int | None:
+    """Move a template time onto a repetition; None before its day starts."""
+    if secs is None or secs + shift < 0:
+        return None
+    return secs + shift
 
 
 def _timepoint_exact(stored: int | None) -> bool | None:
@@ -536,6 +664,11 @@ class StaticIndex:
         of the old file is never left with a half-built database. ``progress``,
         when given, is called with ``(done_bytes, total_bytes)`` as each
         source file is parsed (``total_bytes`` may be ``None``).
+
+        Stop times are "in the time zone specified by
+        ``agency.agency_timezone``", so agency.txt's zone wins; the
+        catalog's ``timezone_name`` is used only when agency.txt names no
+        valid zone (absent file, blank cell, unknown name).
         """
         try:
             archive = zipfile.ZipFile(zip_path)
@@ -543,11 +676,24 @@ class StaticIndex:
             raise FeedParseError(f"Unreadable GTFS zip: {err}") from err
         with archive:
             names = set(archive.namelist())
-            if timezone_name is None:
-                timezone_name = cls._timezone_from_agency(archive, names)
+            # Before the timezone: a zip whose files sit in a subfolder has
+            # no agency.txt either, and should say what is actually wrong.
+            if missing := sorted(_REQUIRED_FILES - names):
+                raise FeedParseError(f"GTFS zip missing required file: {missing[0]}")
+            timezone_name = next(
+                (
+                    name
+                    for name in (
+                        cls._timezone_from_agency(archive, names),
+                        timezone_name,
+                    )
+                    if name is not None and _valid_zone(name)
+                ),
+                None,
+            )
             if timezone_name is None:
                 raise FeedParseError(
-                    "No agency timezone available (catalog or agency.txt)"
+                    "No valid agency timezone available (agency.txt or catalog)"
                 )
             in_memory = db_target == ":memory:"
             build_path = db_target if in_memory else f"{db_target}.building"
@@ -619,7 +765,7 @@ class StaticIndex:
             return None
         try:
             return cls(conn, dataset_id, meta["timezone"])
-        except (ZoneInfoNotFoundError, TypeError, ValueError):
+        except (ZoneInfoNotFoundError, TypeError, ValueError, OSError):
             # Unusable cached timezone metadata (unknown key, empty, or a
             # non-string the column's TEXT affinity left as a blob) is a
             # cache miss like any other corruption: ZoneInfo raises in
@@ -629,10 +775,14 @@ class StaticIndex:
 
     @staticmethod
     def _timezone_from_agency(archive: zipfile.ZipFile, names: set[str]) -> str | None:
+        """Return the first non-blank agency_timezone in agency.txt, if any.
+
+        Read before the loaders run, so an unreadable file (not UTF-8, a
+        ragged row) fails here as the loaders would: FeedParseError.
+        """
         if "agency.txt" not in names:
             return None
-        with archive.open("agency.txt") as fp:
-            reader = csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
+        with _open_csv(archive, "agency.txt") as (_fp, reader):
             for row in reader:
                 tz_name = (row.get("agency_timezone") or "").strip()
                 if tz_name:
@@ -660,22 +810,14 @@ class StaticIndex:
             ("calendar_dates.txt", cls._load_calendar_dates),
             ("feed_info.txt", cls._load_feed_info),
         )
-        required = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
         parsed = [filename for filename, _ in files if filename in names]
         total = sum(archive.getinfo(filename).file_size for filename in parsed) or None
         completed = 0
         for filename, loader in files:
             if filename not in names:
-                if filename in required:
-                    raise FeedParseError(f"GTFS zip missing required file: {filename}")
-                continue
-            with archive.open(filename) as fp:
-                report = _reporter(progress, fp, completed, total)
-                reader = csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
-                try:
-                    loader(conn, reader, report)
-                except (ValueError, KeyError, AttributeError, TypeError) as err:
-                    raise FeedParseError(f"Malformed {filename}: {err}") from err
+                continue  # build() has already rejected a missing required file
+            with _open_csv(archive, filename) as (fp, reader):
+                loader(conn, reader, _reporter(progress, fp, completed, total))
             completed += archive.getinfo(filename).file_size
             if progress is not None:
                 progress(completed, total)
@@ -735,10 +877,10 @@ class StaticIndex:
                     float(lat) if (lat := row.get("stop_lat", "").strip()) else None,
                     float(lon) if (lon := row.get("stop_lon", "").strip()) else None,
                     row.get("parent_station") or None,
-                    _lenient_int(row.get("location_type")),
+                    _defaulted_int(row.get("location_type"), 0),
                     row.get("stop_code") or None,
                     row.get("platform_code") or None,
-                    _lenient_int(row.get("wheelchair_boarding")),
+                    _defaulted_int(row.get("wheelchair_boarding"), 0),
                     row.get("stop_desc") or None,
                     row.get("stop_url") or None,
                     row.get("zone_id") or None,
@@ -770,8 +912,8 @@ class StaticIndex:
                     row.get("route_long_name") or None,
                     _lenient_int(row.get("route_type")),
                     row.get("agency_id") or None,
-                    row.get("route_color") or None,
-                    row.get("route_text_color") or None,
+                    _defaulted_text(row.get("route_color"), "FFFFFF"),
+                    _defaulted_text(row.get("route_text_color"), "000000"),
                     row.get("route_url") or None,
                     row.get("route_desc") or None,
                     _lenient_int(row.get("route_sort_order")),
@@ -803,8 +945,8 @@ class StaticIndex:
                     row.get("trip_headsign") or None,
                     row["trip_id"],  # source_trip_id: a plain trip is its own source
                     None,  # start_secs: only frequency repetitions carry one
-                    _lenient_int(row.get("wheelchair_accessible")),
-                    _lenient_int(row.get("bikes_allowed")),
+                    _defaulted_int(row.get("wheelchair_accessible"), 0),
+                    _defaulted_int(row.get("bikes_allowed"), 0),
                     _lenient_int(row.get("direction_id")),
                     row.get("trip_short_name") or None,
                     row.get("block_id") or None,
@@ -828,15 +970,22 @@ class StaticIndex:
         rows: list[tuple[object, ...]] = []
         sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
         for row in reader:
+            arrival = parse_gtfs_time(row.get("arrival_time", ""))
+            departure = parse_gtfs_time(row.get("departure_time", ""))
             rows.append(
                 (
                     row["trip_id"],
                     row["stop_id"],
-                    parse_gtfs_time(row.get("arrival_time", "")),
-                    parse_gtfs_time(row.get("departure_time", "")),
+                    # "If there are not separate times for arrival and
+                    # departure at a stop, arrival_time and departure_time
+                    # should be the same": a call timed by one of them alone
+                    # (legal for any stop -- departure_time is required for
+                    # none but timepoints) arrives and departs at that time.
+                    arrival if arrival is not None else departure,
+                    departure if departure is not None else arrival,
                     _strict_int(row["stop_sequence"], "stop_sequence"),
-                    _lenient_int(row.get("pickup_type")),
-                    _lenient_int(row.get("drop_off_type")),
+                    _defaulted_int(row.get("pickup_type"), 0),
+                    _defaulted_int(row.get("drop_off_type"), 0),
                     _stored_timepoint(row.get("timepoint")),
                     row.get("stop_headsign") or None,
                 )
@@ -862,19 +1011,24 @@ class StaticIndex:
         repetition rules; the template alone is not a real trip. Each
         repetition becomes a full copy of the template under a synthetic
         trip id ``{trip_id}#{start_secs}`` (e.g. ``CITY1#21600``), shifted
-        so the first stop's anchor time (its arrival, falling back to its
-        departure) lands on the repetition start while every later stop
-        keeps its elapsed offset from that anchor; the original template
-        rows are then deleted. Repetition starts are ``start_time + n *
-        headway_secs`` for n = 0.. while STRICTLY less than ``end_time``
-        (a repetition landing exactly on end_time does not run), and
-        identical start seconds produced by overlapping rows for the same
-        trip are deduplicated so synthetic ids stay unique. This applies
-        to BOTH exact_times values: exact_times=0 describes idealized
-        headway service without a fixed timetable, and materializing it at
-        the stated headway is the standard journey-planner interpretation,
-        so the column is read for neither value and the two kinds are
-        indistinguishable downstream.
+        so the first stop's DEPARTURE lands on the repetition start --
+        ``start_time`` is the "time at which the first vehicle departs from
+        the first stop" -- while every other call keeps its offset from it;
+        the original template rows are then deleted. A shifted time that
+        would fall before its service day starts (an origin dwell on a
+        repetition starting at 00:00:00, or a template timed backwards) is
+        not representable and is stored blank, the call's other time
+        standing in for it as at load. Repetition starts are ``start_time
+        + n * headway_secs`` for n = 0.. while STRICTLY less than
+        ``end_time`` (a repetition landing exactly on end_time does not
+        run), and identical start seconds produced by overlapping rows for
+        the same trip are deduplicated (the first row wins) so synthetic
+        ids stay unique. Both exact_times values are materialized at the
+        stated headway, the standard journey-planner interpretation; but
+        exact_times=0 (or empty) is service that "does not follow a fixed
+        schedule", so its repetitions' times are stored as approximate
+        (timepoint 0) whatever the template says, and an unparseable
+        exact_times leaves timepoint unknown.
 
         A trips row is duplicated per repetition under the synthetic id
         (INSERT..SELECT from the original row, a no-op for orphan trips)
@@ -922,33 +1076,22 @@ class StaticIndex:
             ).fetchall()
             if not template:
                 continue  # dangling reference: nothing to repeat
-            first_arrival, first_departure = template[0][1], template[0][2]
-            if first_arrival is None and first_departure is None:
+            # The loader already lets a lone arrival stand in for a blank
+            # departure, so this is None only for an untimed first stop.
+            anchor = template[0][2]
+            if anchor is None:
                 raise ValueError(
                     f"frequency trip {trip_id!r} has no first-stop time "
                     "to anchor repetition offsets"
                 )
-            # Anchor on the template's EARLIEST time. For a valid template
-            # (times never decrease along the trip) that is the first
-            # stop's arrival, as before. For an invalid one -- a first stop
-            # arriving after it departs, a later call timed before an
-            # earlier one -- anchoring on the first arrival would shift
-            # some calls before the repetition's own service day starts,
-            # which every day-window scan assumes cannot happen.
-            anchor = min(
-                secs
-                for _stop_id, arrival, departure, *_rest in template
-                for secs in (arrival, departure)
-                if secs is not None
-            )
             conn.execute("DELETE FROM stop_times WHERE trip_id = ?", (trip_id,))
-            starts: set[int] = set()
-            for start_secs, end_secs, headway_secs in trip_spans:
+            starts: dict[int, int | None] = {}
+            for start_secs, end_secs, headway_secs, exact_times in trip_spans:
                 rep_start = start_secs
                 while rep_start < end_secs:
-                    starts.add(rep_start)
+                    starts.setdefault(rep_start, exact_times)
                     rep_start += headway_secs
-            for rep_start in sorted(starts):
+            for rep_start, exact_times in sorted(starts.items()):
                 synthetic_id = f"{trip_id}#{rep_start}"
                 shift = rep_start - anchor
                 trip_rows.append((synthetic_id, trip_id, rep_start, trip_id))
@@ -962,20 +1105,18 @@ class StaticIndex:
                     timepoint,
                     stop_headsign,
                 ) in template:
+                    arrival = _shifted(arrival_secs, shift)
+                    departure = _shifted(departure_secs, shift)
                     stop_time_rows.append(
                         (
                             synthetic_id,
                             stop_id,
-                            arrival_secs + shift if arrival_secs is not None else None,
-                            (
-                                departure_secs + shift
-                                if departure_secs is not None
-                                else None
-                            ),
+                            arrival if arrival is not None else departure,
+                            departure if departure is not None else arrival,
                             stop_sequence,
                             pickup_type,
                             drop_off_type,
-                            timepoint,
+                            timepoint if exact_times == 1 else exact_times,
                             stop_headsign,
                         )
                     )
@@ -992,13 +1133,16 @@ class StaticIndex:
     @staticmethod
     def _parse_frequency_spans(
         reader: csv.DictReader[str],
-    ) -> dict[str, list[tuple[int, int, int]]]:
-        """Parse frequencies rows into per-trip (start, end, headway) spans.
+    ) -> dict[str, list[tuple[int, int, int, int | None]]]:
+        """Parse frequencies rows into per-trip spans.
 
-        Raises (via the ``_load_all`` wrapping into FeedParseError) on rows
-        missing a start/end time or carrying a non-positive headway.
+        Each span is (start, end, headway, exact_times): exact_times is 0
+        for an absent or blank cell ("0 or empty"), 0/1 as written, and
+        None when unparseable or outside that vocabulary. Raises (via the
+        ``_load_all`` wrapping into FeedParseError) on rows missing a
+        start/end time or carrying a non-positive headway.
         """
-        spans: dict[str, list[tuple[int, int, int]]] = {}
+        spans: dict[str, list[tuple[int, int, int, int | None]]] = {}
         for row in reader:
             trip_id = row["trip_id"]
             start_secs = parse_gtfs_time(row.get("start_time", ""))
@@ -1012,7 +1156,15 @@ class StaticIndex:
                 raise ValueError(
                     f"non-positive headway_secs for trip {trip_id!r}: {headway_secs}"
                 )
-            spans.setdefault(trip_id, []).append((start_secs, end_secs, headway_secs))
+            exact_times = _defaulted_int(row.get("exact_times"), 0)
+            spans.setdefault(trip_id, []).append(
+                (
+                    start_secs,
+                    end_secs,
+                    headway_secs,
+                    exact_times if exact_times in (0, 1) else None,
+                )
+            )
         return spans
 
     @classmethod
@@ -1109,7 +1261,23 @@ class StaticIndex:
     # -- queries -----------------------------------------------------------
 
     def stops(self) -> list[Stop]:
-        """All stops (for pickers)."""
+        """All stops (for pickers), with GTFS's parent inheritance applied.
+
+        A stop whose ``wheelchair_boarding`` is 0 or empty "will inherit its
+        wheelchair_boarding behavior from the parent station"; a stop with
+        a parent "inherits the parent station's timezone instead of applying
+        its own", and one without falls back to ``agency_timezone``. Both
+        resolve through the parent's own resolved value, so a boarding area
+        under a platform under a station reads the station's. A parent id
+        naming no stop, or a ``parent_station`` cycle, ends the chain there.
+        """
+        rows = self._conn.execute(
+            "SELECT id, name, lat, lon, parent_station, location_type, "
+            "stop_code, platform_code, wheelchair_boarding, "
+            "description, url, zone_id, timezone "
+            "FROM stops ORDER BY name"
+        ).fetchall()
+        by_id = {row[0]: row for row in rows}
         return [
             Stop(
                 id=row[0],
@@ -1120,18 +1288,16 @@ class StaticIndex:
                 location_type=_enum_or_none(StopLocationType, row[5]),
                 stop_code=row[6],
                 platform_code=row[7],
-                wheelchair_boarding=_enum_or_none(WheelchairAccess, row[8]),
+                wheelchair_boarding=_enum_or_none(
+                    WheelchairAccess, _resolved_boarding(by_id, row)
+                ),
                 description=row[9],
                 url=row[10],
                 zone_id=row[11],
-                timezone=row[12],
+                timezone=_ancestor(by_id, row, lambda _: True)[12]
+                or self.timezone_name,
             )
-            for row in self._conn.execute(
-                "SELECT id, name, lat, lon, parent_station, location_type, "
-                "stop_code, platform_code, wheelchair_boarding, "
-                "description, url, zone_id, timezone "
-                "FROM stops ORDER BY name"
-            )
+            for row in rows
         ]
 
     @staticmethod
@@ -1443,24 +1609,23 @@ class StaticIndex:
         ]
 
     def headsigns_serving(self, stop_id: str, route_id: str | None = None) -> list[str]:
-        """Distinct trip headsigns at a stop, optionally narrowed to one route.
+        """Distinct headsigns shown at a stop, optionally narrowed to one route.
 
-        Sourced from trips.trip_headsign — the same field StopArrival.headsign
-        exposes, so picker options and filterable values always agree. (GTFS's
-        per-stop stop_times.stop_headsign override IS loaded and exposed as
-        StopArrival.stop_headsign, but deliberately not offered as picker
-        options: filters match on the trip-level headsign.)
+        The headsign at a stop is its stop_headsign where the stop_time row
+        sets one -- it "overrides the default trips.trip_headsign" -- and the
+        trip's headsign otherwise: the same value the headsign filters
+        match, so picker options and filterable values always agree.
         """
         sql = (
-            "SELECT DISTINCT t.headsign FROM stop_times st "
+            f"SELECT DISTINCT {_HEADSIGN_SQL} AS sign FROM stop_times st "
             "JOIN trips t ON t.id = st.trip_id "
-            "WHERE st.stop_id = ? AND t.headsign IS NOT NULL"
+            f"WHERE st.stop_id = ? AND {_HEADSIGN_SQL} IS NOT NULL"
         )
         params: list[str] = [stop_id]
         if route_id is not None:
             sql += " AND t.route_id = ?"
             params.append(route_id)
-        sql += " ORDER BY t.headsign"
+        sql += " ORDER BY sign"
         return [row[0] for row in self._conn.execute(sql, params)]
 
     def active_service_ids(self, service_date: date) -> set[str]:
@@ -1710,7 +1875,7 @@ class StaticIndex:
             sql += f" AND t.route_id IN ({','.join('?' * len(route_ids))})"
             params.extend(route_ids)
         if headsigns:
-            sql += f" AND t.headsign IN ({','.join('?' * len(headsigns))})"
+            sql += f" AND {_HEADSIGN_SQL} IN ({','.join('?' * len(headsigns))})"
             params.extend(headsigns)
         sql += " GROUP BY t.service_id"
         return self._ceiling_from(self._conn.execute(sql, params))
@@ -1731,7 +1896,7 @@ class StaticIndex:
             "JOIN trips t ON t.id = o.trip_id "
             "WHERE o.stop_id = ? AND d.stop_id = ? "
             "AND o.stop_sequence < d.stop_sequence "
-            "AND o.departure_secs IS NOT NULL AND d.arrival_secs IS NOT NULL "
+            f"{_USABLE_PAIR_SQL} "
             "GROUP BY t.service_id",
             (origin_stop_id, destination_stop_id),
         )
@@ -2139,7 +2304,7 @@ class StaticIndex:
         Frequency-based trips (frequencies.txt) surface as one row per
         materialized repetition, under synthetic ``{trip_id}#{start_secs}``
         trip ids (see ``_load_frequencies``); the bare template trip id
-        never appears. ``route_ids``/``headsigns`` (trip-level headsign)
+        never appears. ``route_ids``/``headsigns`` (the headsign at the stop)
         narrow the rows in SQL; None or empty means no narrowing.
         """
         results: list[ScheduledDeparture] = []
@@ -2217,7 +2382,7 @@ class StaticIndex:
             params.extend(route_ids)
         if headsigns:
             headsign_marks = ",".join("?" * len(headsigns))
-            sql += f" AND t.headsign IN ({headsign_marks})"
+            sql += f" AND {_HEADSIGN_SQL} IN ({headsign_marks})"
             params.extend(headsigns)
         for (
             trip_id,
@@ -2320,17 +2485,17 @@ class StaticIndex:
         return rows
 
     # Shared origin->destination candidate predicate: right direction, both
-    # ends timed, service active. Kept as one fragment so the row query and
-    # the first/last-of-day extremes query can NEVER drift apart (the flags
-    # are only correct if both queries agree on what a candidate is).
+    # ends timed and usable (see _USABLE_PAIR_SQL), service active. Kept as
+    # one fragment so the row query and the first/last-of-day extremes
+    # query can NEVER drift apart (the flags are only correct if both
+    # queries agree on what a candidate is).
     _PAIR_CANDIDATES_SQL = (
         "FROM stop_times o "
         "JOIN stop_times d ON d.trip_id = o.trip_id "
         "JOIN trips t ON t.id = o.trip_id "
         "WHERE o.stop_id = ? AND d.stop_id = ? "
         "AND o.stop_sequence < d.stop_sequence "
-        "AND o.departure_secs IS NOT NULL "
-        "AND d.arrival_secs IS NOT NULL "
+        f"{_USABLE_PAIR_SQL} "
         "AND t.service_id IN ({service_marks})"
     )
 

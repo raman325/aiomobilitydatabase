@@ -182,7 +182,7 @@ async def test_stations_in_groups_hierarchy(
 ) -> None:
     """stations_in collapses the fixture's hierarchy: S3 groups under its
     parent station ST1 (named Depot Station), which itself is not offered
-    as a boarding stop; orphan stops stay as single-member name groups.
+    as a boarding stop; parentless stops are stations of their own.
     """
     _mock_catalog(mock_api)
     handle = await feeds_client.get_transit_feed("mdb-100")
@@ -191,8 +191,8 @@ async def test_stations_in_groups_hierarchy(
     )
     assert groups == [
         StationGroup(id="ST1", name="Depot Station", stop_ids=("S3",)),
-        StationGroup(id="main st", name="Main St", stop_ids=("S1",)),
-        StationGroup(id="second ave", name="Second Ave", stop_ids=("S2",)),
+        StationGroup(id="S1", name="Main St", stop_ids=("S1",)),
+        StationGroup(id="S2", name="Second Ave", stop_ids=("S2",)),
     ]
 
 
