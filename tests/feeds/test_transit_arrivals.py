@@ -13,6 +13,7 @@ from aiomobilitydatabase.feeds.models import (
     ArrivalsQuery,
     BikesAllowed,
     PickupDropOffType,
+    StopLocationType,
     WheelchairAccess,
 )
 from aiomobilitydatabase.feeds.rt import Modification, ReplacementCall
@@ -673,6 +674,8 @@ def _detour_message(
     propagated_delay: int = 0,
     service_dates: tuple[str, ...] = ("20260730",),
     define_stop: bool = False,
+    parent_station: str = "",
+    stop_timezone: str = "",
 ) -> bytes:
     """T1 detoured: its S2 call is replaced by one at ``replacement_stop``."""
     message = gtfs_realtime_pb2.FeedMessage()
@@ -696,6 +699,8 @@ def _detour_message(
         stop_entity.stop.stop_name.translation.add().text = "Pop-up Stop"
         stop_entity.stop.stop_lat = 34.09
         stop_entity.stop.stop_lon = -118.21
+        stop_entity.stop.parent_station = parent_station
+        stop_entity.stop.stop_timezone = stop_timezone
     return message.SerializeToString()
 
 
@@ -754,6 +759,32 @@ async def test_detour_defines_its_own_replacement_stop(
         pytest.approx(34.09),
         pytest.approx(-118.21),
     )
+
+
+async def test_a_replacement_stop_inherits_from_its_static_station(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A realtime-defined stop under a static parent station takes the
+    station's timezone over its own, as a static platform would."""
+    _mock_catalog(mock_api, rt=True)
+    mock_api.get(
+        "/rt/all",
+        body=_detour_message(
+            replacement_stop="POPUP",
+            define_stop=True,
+            parent_station="ST1",
+            stop_timezone="Asia/Tokyo",
+        ),
+        content_type=PB,
+    )
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    [arrivals] = await handle.get_arrivals(
+        [ArrivalsQuery(["POPUP"])], start=NOW, end=NOW + timedelta(hours=2)
+    )
+    [popup] = arrivals
+    assert popup.stop is not None
+    assert popup.stop.timezone == "America/Los_Angeles"  # ST1's: the agency's
+    assert popup.stop.location_type is StopLocationType.STOP
 
 
 async def test_detour_ignores_a_service_date_it_does_not_name(

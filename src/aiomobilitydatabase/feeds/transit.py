@@ -913,12 +913,22 @@ def _inherited_rt_stops(
     The same rules :meth:`StaticIndex.stops` applies: a stop under a parent
     station takes the parent's timezone, and its wheelchair_boarding when
     its own is 0 (UNKNOWN); one without a known parent uses its own
-    stop_timezone, or the agency's. The parent is looked up among the
-    static stops, whose values are already resolved.
+    stop_timezone, or the agency's. The parent is whichever stop the board
+    would show under that id -- a realtime one first, resolved the same
+    way, else the static one (already resolved). A ``parent_station`` cycle
+    among realtime stops ends the chain, as it does for static stops.
     """
-    resolved: dict[str, Stop] = {}
-    for stop_id, stop in rt_stops.items():
-        parent = static_stops.get(stop.parent_station or "")
+
+    def resolve(stop_id: str, seen: frozenset[str]) -> Stop:
+        stop = rt_stops[stop_id]
+        parent_id = stop.parent_station or ""
+        parent: Stop | None
+        if parent_id in rt_stops and parent_id not in seen:
+            parent = resolve(parent_id, seen | {parent_id})
+        elif parent_id in rt_stops:
+            parent = None  # a cycle: no parent to inherit from
+        else:
+            parent = static_stops.get(parent_id)
         boarding = stop.wheelchair_boarding
         if (
             parent is not None
@@ -928,10 +938,9 @@ def _inherited_rt_stops(
         ):
             boarding = parent.wheelchair_boarding
         zone = parent.timezone if parent is not None else stop.timezone
-        resolved[stop_id] = replace(
-            stop, wheelchair_boarding=boarding, timezone=zone or agency_zone
-        )
-    return resolved
+        return replace(stop, wheelchair_boarding=boarding, timezone=zone or agency_zone)
+
+    return {stop_id: resolve(stop_id, frozenset({stop_id})) for stop_id in rt_stops}
 
 
 class _IndexGuard:

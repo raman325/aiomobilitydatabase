@@ -265,6 +265,12 @@ def test_realtime_defined_stops_inherit_from_a_static_parent() -> None:
         ("OWN", "STA", gtfs_realtime_pb2.Stop.NOT_AVAILABLE, ""),
         ("LONE", "", gtfs_realtime_pb2.Stop.AVAILABLE, ""),
         ("ZONED", "NOWHERE", None, "Asia/Tokyo"),
+        # A realtime station and its realtime platform.
+        ("RTSTA", "", gtfs_realtime_pb2.Stop.AVAILABLE, "Europe/Oslo"),
+        ("RTPLAT", "RTSTA", None, "Europe/Lisbon"),
+        # A realtime parent_station cycle.
+        ("C3", "C4", None, "Europe/Madrid"),
+        ("C4", "C3", None, "Europe/Rome"),
     ):
         entity = message.entity.add()
         entity.id = stop_id
@@ -288,6 +294,11 @@ def test_realtime_defined_stops_inherit_from_a_static_parent() -> None:
     assert stops["LONE"].timezone == "UTC"
     assert stops["ZONED"].wheelchair_boarding is WheelchairAccess.UNKNOWN
     assert stops["ZONED"].timezone == "Asia/Tokyo"
+    assert stops["RTPLAT"].wheelchair_boarding is WheelchairAccess.POSSIBLE
+    assert stops["RTPLAT"].timezone == "Europe/Oslo"
+    # As for static stops: a cycle ends at the last stop before it repeats.
+    assert stops["C3"].timezone == "Europe/Rome"
+    assert stops["C4"].timezone == "Europe/Madrid"
 
 
 # -- D6: agency.txt's timezone ------------------------------------------------
