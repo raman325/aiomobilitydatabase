@@ -105,6 +105,38 @@ def test_each_event_keeps_its_own_delay() -> None:
     assert predicted["S1"] == (_EIGHT + timedelta(minutes=10, seconds=120),) * 2
 
 
+def test_each_run_resolves_against_its_own_days_schedule() -> None:
+    """A window of two days holds two runs of T. A dated time-only update
+    for each -- 08:05 on the first day, 08:02 on the second -- is that
+    day's run 5 or 2 minutes late, never a day off."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    for day, minutes in ((30, 5), (31, 2)):
+        entity = message.entity.add()
+        entity.id = f"T-{day}"
+        entity.trip_update.trip.trip_id = "T"
+        entity.trip_update.trip.start_date = f"202607{day}"
+        stu = entity.trip_update.stop_time_update.add()
+        stu.stop_sequence = 1
+        stu.departure.time = int(
+            datetime(2026, 7, day, 8, minutes, tzinfo=UTC).timestamp()
+        )
+    index = _build_index_from_files(_THREE_STOPS)
+
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S2"])],
+            start=_EIGHT - timedelta(hours=1),
+            end=_EIGHT + timedelta(days=1, hours=1),
+        )
+        return [(row.scheduled_departure, row.delay_seconds) for row in board]
+
+    assert _run(index, body, message) == [
+        (_EIGHT + timedelta(minutes=20), 300),
+        (_EIGHT + timedelta(days=1, minutes=20), 120),
+    ]
+
+
 # -- laws over drawn StopTimeUpdates -----------------------------------------
 
 

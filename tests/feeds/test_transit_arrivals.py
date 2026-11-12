@@ -166,12 +166,12 @@ async def test_rt_merge_delay_cancellation_and_added(
     by_key = {(a.trip_id, a.stop_id): a for a in arrivals}
     # T2 canceled by RT: dropped entirely (no row at any stop).
     assert not any(trip_id == "T2" for trip_id, _ in by_key)
-    # T1 delayed 300s at S1 (the TU names S1 only). The producer ALSO sent
-    # explicit epoch times that differ from scheduled+delay (departure
-    # epoch+330 vs 15:00:30+300 = 15:05:30): the explicit time must win.
+    # T1 delayed at S1 (the TU names S1 only). The producer sent delay 300
+    # with explicit epoch times 330 s late (15:06:00 vs 15:00:30+300 =
+    # 15:05:30): "time will take precedence", for the instant and the delay.
     t1_s1 = by_key[("T1", "S1")]
     assert t1_s1.realtime is True
-    assert t1_s1.delay_seconds == 300
+    assert t1_s1.delay_seconds == 330
     assert t1_s1.predicted_departure == datetime.fromtimestamp(
         T1_DEPARTURE_EPOCH + 330, tz=UTC
     )
@@ -184,9 +184,9 @@ async def test_rt_merge_delay_cancellation_and_added(
     # IS realtime information -- with predicted times = scheduled + delay.
     t1_s2 = by_key[("T1", "S2")]
     assert t1_s2.realtime is True
-    assert t1_s2.delay_seconds == 300
-    assert t1_s2.predicted_arrival == datetime(2026, 7, 30, 15, 15, 0, tzinfo=UTC)
-    assert t1_s2.predicted_departure == datetime(2026, 7, 30, 15, 15, 30, tzinfo=UTC)
+    assert t1_s2.delay_seconds == 330
+    assert t1_s2.predicted_arrival == datetime(2026, 7, 30, 15, 15, 30, tzinfo=UTC)
+    assert t1_s2.predicted_departure == datetime(2026, 7, 30, 15, 16, tzinfo=UTC)
     assert t1_s2.scheduled_departure == datetime(2026, 7, 30, 15, 10, 30, tzinfo=UTC)
     assert t1_s2.vehicle_id == "V1"
     # RT-added trip at S2 with no schedule.

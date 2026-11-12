@@ -474,8 +474,9 @@ def test_blanking_one_of_two_equal_times_changes_nothing(blanks: list[str]) -> N
 
 def test_a_derived_departure_never_precedes_an_explicit_arrival() -> None:
     """A terminus timed by its arrival alone departs then too. Realtime
-    carries S0's +60 s on, but S1's own update predicts it explicitly at
-    08:18: the vehicle cannot leave at 08:11, before it gets there."""
+    carries S0's +60 s on, but S1's own update predicts its arrival at
+    08:18 (+8 min): its departure follows that, not S0's +60 s, so the
+    vehicle does not leave at 08:11, before it gets there."""
     index = _build_index_from_files(
         _feed(
             stop_times=(

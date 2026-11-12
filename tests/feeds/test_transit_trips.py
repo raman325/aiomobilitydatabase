@@ -113,13 +113,15 @@ async def test_rt_origin_prediction_only(
     assert [trip.trip_id for trip in trips] == ["T1"]
     trip = trips[0]
     assert trip.realtime is True
-    assert trip.delay_seconds == 300
+    # The fixture's times are 330 s late (its delay field says 300): "time
+    # will take precedence".
+    assert trip.delay_seconds == 330
     assert trip.predicted_departure == datetime.fromtimestamp(
         T1_DEPARTURE_EPOCH + 330, tz=UTC
     )
-    # The TU names S1 only, but its 300s delay PROPAGATES to the
-    # destination end (no explicit time there, so scheduled + delay).
-    assert trip.predicted_arrival == datetime(2026, 7, 30, 15, 25, tzinfo=UTC)
+    # The TU names S1 only, but its delay PROPAGATES to the destination end
+    # (no explicit time there, so scheduled + delay).
+    assert trip.predicted_arrival == datetime(2026, 7, 30, 15, 25, 30, tzinfo=UTC)
     assert trip.scheduled_arrival == datetime(2026, 7, 30, 15, 20, tzinfo=UTC)
 
 
@@ -160,7 +162,7 @@ async def test_rt_predictions_at_both_ends(
     assert [trip.trip_id for trip in trips] == ["T1"]
     trip = trips[0]
     assert trip.realtime is True
-    assert trip.delay_seconds == 300
+    assert trip.delay_seconds == 330  # the departure time, not its delay field
     assert trip.predicted_departure == datetime.fromtimestamp(
         T1_DEPARTURE_EPOCH + 330, tz=UTC
     )

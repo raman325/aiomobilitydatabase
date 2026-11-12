@@ -4342,8 +4342,12 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
         entity.trip_update.trip.start_time = _format_gtfs_time(rep)
     elif mode == "misaligned":
         entity.trip_update.trip.start_time = _format_gtfs_time(rep + misalign)
-    explicit_departure_epoch = (
-        int(datetime(2026, 7, 30, 13, 0, tzinfo=UTC).timestamp()) + delay
+    # The time agrees with the delay ("time should be equal to scheduled
+    # time + delay"): this property is about which repetition it reaches.
+    explicit_departure_epoch = int(
+        (
+            _F1_DAY_ANCHOR + timedelta(seconds=rep + _F1_DEP_OFFSETS[stop_id] + delay)
+        ).timestamp()
     )
     if kind == "cancellation":
         entity.trip_update.trip.schedule_relationship = (
@@ -4745,12 +4749,11 @@ def _prop_scheduled(i: int) -> tuple[datetime, datetime]:
 
 def _spec_event(
     spec: dict[str, object], event: str, scheduled: datetime
-) -> tuple[datetime | None, int | None]:
-    """One event of a drawn STU: (its explicit time, the delay it states).
+) -> tuple[datetime | None, int | None, bool]:
+    """One event of a drawn STU: (explicit time, the delay it states, stated?).
 
-    The delay is the event's own delay, or -- given only a time -- that
-    time against the schedule ("a delay computed by comparing the time
-    against the GTFS schedule time").
+    A time states its difference from the schedule ("time will take
+    precedence"); without one, the event's own delay.
     """
     side = spec.get("delay_side")
     if event == "arrival":
@@ -4759,9 +4762,58 @@ def _spec_event(
     else:
         given = spec["delay"] if side in ("departure", "both") else None
         explicit = spec.get("dep_time")
-    if given is None and explicit is not None:
+    if explicit is not None:
         given = int((explicit - scheduled).total_seconds())  # type: ignore[operator]
-    return explicit, given  # type: ignore[return-value]
+    return explicit, given, given is not None  # type: ignore[return-value]
+
+
+def _spec_stated(spec: dict[str, object], i: int) -> int | None:
+    """The delay a drawn STU at call ``i`` states: departure's, else arrival's."""
+    sched_arr, sched_dep = _prop_scheduled(i)
+    departure = _spec_event(spec, "departure", sched_dep)[1]
+    return (
+        departure
+        if departure is not None
+        else _spec_event(spec, "arrival", sched_arr)[1]
+    )
+
+
+def _bounded(outcomes: dict[int, object]) -> None:
+    """No derived instant before an earlier stated one or after a later one."""
+    events = [
+        (i, end)
+        for i, outcome in outcomes.items()
+        if isinstance(outcome, dict)
+        for end in ("arrival", "departure")
+        if outcome[end] is not None
+    ]
+    for i, end in events:
+        stated_key = f"{end}_stated"
+        earlier = [
+            outcomes[j][e]  # type: ignore[index]
+            for j, e in events[: events.index((i, end))]
+            if outcomes[j][f"{e}_stated"]  # type: ignore[index]
+        ]
+        later = [
+            outcomes[j][e]  # type: ignore[index]
+            for j, e in events[events.index((i, end)) + 1 :]
+            if outcomes[j][f"{e}_stated"]  # type: ignore[index]
+        ]
+        outcome = outcomes[i]
+        assert isinstance(outcome, dict)
+        if outcome[stated_key]:
+            continue
+        value = outcome[end]
+        if earlier:
+            value = max(value, *earlier)
+        if later:
+            value = min(value, *later)
+        outcome[f"{end}_bounded"] = value
+    for outcome in outcomes.values():
+        if isinstance(outcome, dict):
+            for end in ("arrival", "departure"):
+                if f"{end}_bounded" in outcome:
+                    outcome[end] = outcome.pop(f"{end}_bounded")
 
 
 def _propagation_oracle(
@@ -4771,41 +4823,45 @@ def _propagation_oracle(
 
     Per stop index: ``"skipped"``, ``None`` (schedule-only), or a dict of
     the predicted ``arrival``/``departure`` instants and the ``delay``.
-    Each stop looks BACK for the nearest STU at or before it that is not
-    SKIPPED ("SKIPPED will not stop delay propagation, but ... SCHEDULED
-    ... or NO_DATA will"): none -> the trip-level delay; NO_DATA -> no
-    prediction; another stop's STU -> the delay that STU states (its
-    departure's, else its arrival's; possibly none); the stop's own STU ->
-    each event from its time, else its delay, else the other event's
-    delay, a derived event never crossing a stated one.
+    Each stop looks BACK at the STUs at or before it that are not SKIPPED
+    ("SKIPPED will not stop delay propagation, but ... SCHEDULED ... or
+    NO_DATA will"). Until one of them is NO_DATA or states a delay, the
+    trip-level delay applies (it is "only propagated until the next stop
+    ... with a StopTimeUpdate delay value specified"). After that, the
+    nearest one governs: NO_DATA -> no prediction; another stop's STU ->
+    the delay it states (possibly none); the stop's own STU -> each event
+    from its time, else its delay, else the other event's delay. Finally
+    no derived instant runs before an earlier stated one or after a later
+    one (:func:`_bounded`).
     """
     placed = _case_placements(case)
     trip_delay: int | None = case["trip_delay"]  # type: ignore[assignment]
     outcomes: dict[int, object] = {}
+
+    def acting(j: int) -> bool:
+        return placed.get(j, {}).get("kind") not in (None, "skipped")
+
+    def covers(j: int) -> bool:
+        return acting(j) and (
+            placed[j]["kind"] == "no_data" or _spec_stated(placed[j], j) is not None
+        )
+
     for i in range(case["n_stops"]):  # type: ignore[arg-type]
         sched_arr, sched_dep = _prop_scheduled(i)
         if placed.get(i, {}).get("kind") == "skipped":
             outcomes[i] = "skipped"
             continue
-        source = next(
-            (
-                j
-                for j in range(i, -1, -1)
-                if placed.get(j, {}).get("kind") not in (None, "skipped")
-            ),
-            None,
-        )
+        covered_before = any(covers(j) for j in range(i))
+        source = next((j for j in range(i, -1, -1) if acting(j)), None)
         if source is not None and placed[source]["kind"] == "no_data":
             outcomes[i] = None
             continue
-        if source is None or source != i:
-            if source is None:
-                delay = trip_delay
-            else:
-                j_arr, j_dep = _prop_scheduled(source)
-                _, j_arr_delay = _spec_event(placed[source], "arrival", j_arr)
-                _, j_dep_delay = _spec_event(placed[source], "departure", j_dep)
-                delay = j_dep_delay if j_dep_delay is not None else j_arr_delay
+        if source != i:
+            delay = (
+                _spec_stated(placed[source], source)  # type: ignore[index]
+                if covered_before
+                else trip_delay
+            )
             outcomes[i] = (
                 None
                 if delay is None
@@ -4813,30 +4869,35 @@ def _propagation_oracle(
                     "arrival": sched_arr + timedelta(seconds=delay),
                     "departure": sched_dep + timedelta(seconds=delay),
                     "delay": delay,
+                    "arrival_stated": False,
+                    "departure_stated": False,
                 }
             )
             continue
-        arr_time, arr_delay = _spec_event(placed[i], "arrival", sched_arr)
-        dep_time, dep_delay = _spec_event(placed[i], "departure", sched_dep)
-        arr_used = arr_delay if arr_delay is not None else dep_delay
-        dep_used = dep_delay if dep_delay is not None else arr_delay
+        arr_time, arr_delay, arr_stated = _spec_event(placed[i], "arrival", sched_arr)
+        dep_time, dep_delay, dep_stated = _spec_event(placed[i], "departure", sched_dep)
+        own = dep_delay if dep_delay is not None else arr_delay
+        fallback = own if own is not None or covered_before else trip_delay
+        arr_used = arr_delay if arr_delay is not None else fallback
+        dep_used = dep_delay if dep_delay is not None else fallback
         arrival = arr_time or (
             None if arr_used is None else sched_arr + timedelta(seconds=arr_used)
         )
         departure = dep_time or (
             None if dep_used is None else sched_dep + timedelta(seconds=dep_used)
         )
-        if arrival is not None and departure is not None and arrival > departure:
-            if arr_delay is not None and dep_delay is None:
-                departure = arrival
-            elif dep_delay is not None and arr_delay is None:
-                arrival = departure
-        delay = dep_delay if dep_delay is not None else arr_delay
         outcomes[i] = (
             None
-            if arrival is None and departure is None and delay is None
-            else {"arrival": arrival, "departure": departure, "delay": delay}
+            if arrival is None and departure is None and fallback is None
+            else {
+                "arrival": arrival,
+                "departure": departure,
+                "delay": fallback,
+                "arrival_stated": arr_stated,
+                "departure_stated": dep_stated,
+            }
         )
+    _bounded(outcomes)
     return outcomes
 
 

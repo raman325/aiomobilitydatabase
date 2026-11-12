@@ -1616,14 +1616,16 @@ class TransitFeedHandle:
         Delay propagation (GTFS-RT spec, see
         :func:`~aiomobilitydatabase.feeds.rt.resolve_trip_predictions`): a
         StopTimeUpdate predicts each event at its stop by the event's own
-        time, else its own delay, and its delay -- or, given only a time,
-        that time against the schedule -- propagates to every subsequent
-        stop until newer information; a NO_DATA StopTimeUpdate cuts
-        propagation (subsequent stops are schedule-only until a later
-        update resumes); a SKIPPED StopTimeUpdate suppresses its stop's row
-        entirely (the vehicle will not serve it); the trip-level
-        ``TripUpdate.delay`` applies only where no StopTimeUpdate-derived
-        information covers a stop. ``realtime`` is True for propagated-only
+        time, else its own delay, else the other event's delay at that
+        stop, and its delay (a time, when given, against the schedule)
+        replaces the carried one and propagates to every subsequent stop
+        until newer information; a NO_DATA StopTimeUpdate cuts propagation
+        (subsequent stops are schedule-only until a later update resumes);
+        a SKIPPED StopTimeUpdate suppresses its stop's row entirely (the
+        vehicle will not serve it) and leaves propagation alone; the
+        trip-level ``TripUpdate.delay`` applies until the first update that
+        states a delay. Derived times never run backwards past ones the
+        producer states. ``realtime`` is True for propagated-only
         and trip-delay-only stops too -- a propagated delay IS realtime
         information. RT-ADDED trips get no propagation: with no static
         schedule to propagate over, only their explicit StopTimeUpdates

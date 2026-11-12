@@ -1045,16 +1045,16 @@ def test_resolve_an_arrival_only_update_carries_its_delay_onward() -> None:
 @pytest.mark.parametrize(
     ("arrival", "departure", "expected"),
     [
-        # Only the departure stated (05): the arrival, derived, follows it.
+        # Only the departure stated (05, so -5 min): the arrival takes that
+        # delay from the other event at its stop.
         (None, 5, (5, 5)),
         # Both stated and crossing: the producer's times, kept as given.
         (20, 5, (20, 5)),
-        # Only the arrival stated (20), the departure from A's +120 s:
-        # it would leave at 15:12 before arriving at 15:20, so it yields.
+        # Only the arrival stated (20, so +10 min): the departure takes it.
         (20, None, (20, 20)),
     ],
 )
-def test_resolve_a_derived_event_never_crosses_a_stated_one(
+def test_resolve_an_unstated_event_takes_the_other_events_delay(
     arrival: int | None, departure: int | None, expected: tuple[int, int]
 ) -> None:
     entry = _entry(
@@ -1069,6 +1069,69 @@ def test_resolve_a_derived_event_never_crosses_a_stated_one(
     assert (prediction.arrival, prediction.departure) == tuple(
         _at(minute) for minute in expected
     )
+
+
+def test_resolve_a_derived_time_never_passes_a_later_stated_one() -> None:
+    """A layover: A arrives 15:00 and departs 15:10, B is due 15:12. Times
+    only: A arrives 15:05 (+5 min), B arrives 15:12. A's departure, derived
+    from its arrival's +5 min, would be 15:15 -- after the bus reaches B --
+    so it is capped at B's stated 15:12."""
+    calls = [
+        replace(_CALLS[0], departure=_at(10)),
+        replace(_CALLS[1], arrival=_at(12), departure=_at(12)),
+    ]
+    entry = _entry(
+        _stu(stop_id="A", arrival=_at(5)), _stu(stop_id="B", arrival=_at(12))
+    )
+    resolved = resolve_trip_predictions(entry, calls)
+    assert resolved.predictions[1].arrival == _at(5)
+    assert resolved.predictions[1].departure == _at(12)
+    assert resolved.predictions[1].delay_seconds == 300  # still A's own delay
+
+
+def test_resolve_a_propagated_time_never_passes_a_later_stated_one() -> None:
+    """A is 20 min late, so B (no update) is predicted 15:30 -- but C's own
+    update says it arrives at 15:25. B cannot be reached after C."""
+    entry = _entry(_stu(stop_id="A", delay=1200), _stu(stop_id="C", arrival=_at(25)))
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.predictions[2].departure == _at(25)
+    assert resolved.predictions[2].arrival == _at(25)
+
+
+def test_resolve_a_derived_time_never_precedes_an_earlier_stated_one() -> None:
+    """B dwells 15:10-15:20. A's update states its arrival, 15:08; B's
+    states only its departure, 15:12 -- 8 min early -- so B's arrival,
+    derived from that, would be 15:02: before the bus has reached A. It is
+    raised to A's stated 15:08 (still before B's stated departure)."""
+    calls = [_CALLS[0], replace(_CALLS[1], departure=_at(20)), _CALLS[2]]
+    entry = _entry(
+        _stu(stop_id="A", arrival=_at(8)), _stu(stop_id="B", departure=_at(12))
+    )
+    resolved = resolve_trip_predictions(entry, calls)
+    assert resolved.predictions[2].arrival == _at(8)
+    assert resolved.predictions[2].departure == _at(12)  # stated: never moved
+
+
+def test_resolve_a_time_wins_over_a_disagreeing_delay() -> None:
+    """ "If both time and delay are specified, time will take precedence":
+    a departure time 10 min late with delay 0 is 10 min late, and so is the
+    rest of the trip."""
+    entry = _entry(_stu(stop_id="A", departure=_at(10), delay=0))
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.predictions[1].delay_seconds == 600
+    assert resolved.predictions[2].departure == _at(20)
+
+
+def test_resolve_a_delayless_update_does_not_end_the_trip_delay() -> None:
+    """The trip-level delay "is only propagated until the next stop along
+    the trip with a StopTimeUpdate delay value specified": an update for an
+    untimed stop states none, so the trip's 300 s still reaches C."""
+    untimed = [*_CALLS[:1], replace(_CALLS[1], arrival=None, departure=None), _CALLS[2]]
+    entry = _entry(_stu(stop_id="B", arrival=_at(12)), trip_delay=300)
+    resolved = resolve_trip_predictions(entry, untimed)
+    assert resolved.predictions[1].delay_seconds == 300
+    assert resolved.predictions[2].arrival == _at(12)
+    assert resolved.predictions[3].departure == _at(20, 300)
 
 
 def test_resolve_skipped_marks_stop_and_never_alters_propagation() -> None:
