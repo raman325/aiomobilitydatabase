@@ -4762,22 +4762,24 @@ def _assert_prediction_matches_outcome(
     sched_dep: datetime,
 ) -> None:
     """One merged row against one oracle outcome dict (explicit epochs win,
-    else scheduled+delay, else no prediction at that end)."""
+    else scheduled+delay, else no prediction at that end -- and where an
+    explicit end and a derived one cross, the derived one yields: no call
+    departs before it arrives)."""
     delay = outcome["delay"]
     assert row.realtime is True
     assert row.delay_seconds == delay
-    if outcome["dep_time"] is not None:
-        assert row.predicted_departure == outcome["dep_time"]
-    elif delay is not None:
-        assert row.predicted_departure == sched_dep + timedelta(seconds=delay)  # type: ignore[arg-type]
-    else:
-        assert row.predicted_departure is None
-    if outcome["arr_time"] is not None:
-        assert row.predicted_arrival == outcome["arr_time"]
-    elif delay is not None:
-        assert row.predicted_arrival == sched_arr + timedelta(seconds=delay)  # type: ignore[arg-type]
-    else:
-        assert row.predicted_arrival is None
+    shift = None if delay is None else timedelta(seconds=delay)  # type: ignore[arg-type]
+    explicit_dep: datetime | None = outcome["dep_time"]  # type: ignore[assignment]
+    explicit_arr: datetime | None = outcome["arr_time"]  # type: ignore[assignment]
+    departure = explicit_dep or (None if shift is None else sched_dep + shift)
+    arrival = explicit_arr or (None if shift is None else sched_arr + shift)
+    if arrival is not None and departure is not None and arrival > departure:
+        if explicit_dep is None:
+            departure = arrival
+        elif explicit_arr is None:
+            arrival = departure
+    assert row.predicted_departure == departure
+    assert row.predicted_arrival == arrival
 
 
 @settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])

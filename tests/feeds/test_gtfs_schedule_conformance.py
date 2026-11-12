@@ -21,16 +21,22 @@ from google.transit import gtfs_realtime_pb2
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds import static_index
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import (
     ArrivalsQuery,
     PickupDropOffType,
     StopLocationType,
+    TripQuery,
     WheelchairAccess,
 )
-from aiomobilitydatabase.feeds.rt import stops_from_message
+from aiomobilitydatabase.feeds.rt import StopPrediction, stops_from_message
 from aiomobilitydatabase.feeds.static_index import StaticIndex
-from aiomobilitydatabase.feeds.transit import TransitFeedHandle, _inherited_rt_stops
+from aiomobilitydatabase.feeds.transit import (
+    TransitFeedHandle,
+    _inherited_rt_stops,
+    _predicted_call,
+)
 
 from tests.feeds.test_properties import _build_index_from_files
 from tests.feeds.test_time_window_properties import _run
@@ -375,6 +381,27 @@ def test_the_first_agency_naming_a_zone_supplies_it(tmp_path: Path) -> None:
     index.close()
 
 
+def test_a_zone_name_the_system_cannot_open_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the tzdata package, ZoneInfo("America") (a directory) fails as
+    IsADirectoryError, not as not-found; it is still no usable zone."""
+    real = static_index.ZoneInfo
+
+    def zone_info(name: str) -> object:
+        if name == "America":
+            raise IsADirectoryError(name)
+        return real(name)
+
+    monkeypatch.setattr(static_index, "ZoneInfo", zone_info)
+    agency = (
+        "agency_id,agency_name,agency_url,agency_timezone\nA,T,https://e.com,America\n"
+    )
+    index = _build(tmp_path, _feed(agency=agency), "Europe/Paris")
+    assert index.timezone_name == "Europe/Paris"
+    index.close()
+
+
 def test_no_usable_timezone_anywhere_fails_the_build(tmp_path: Path) -> None:
     agency = "agency_id,agency_name,agency_url,agency_timezone\nA,T,https://e.com,X/Y\n"
     with pytest.raises(FeedParseError, match="No valid agency timezone"):
@@ -444,6 +471,80 @@ def test_blanking_one_of_two_equal_times_changes_nothing(blanks: list[str]) -> N
     finally:
         plain.close()
         blanked.close()
+
+
+def test_a_derived_departure_never_precedes_an_explicit_arrival() -> None:
+    """A terminus timed by its arrival alone departs then too. Realtime
+    carries S0's +60 s on, but S1's own update predicts it explicitly at
+    08:18: the vehicle cannot leave at 08:11, before it gets there."""
+    index = _build_index_from_files(
+        _feed(
+            stop_times=(
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                "T,08:00:00,08:00:00,S0,1\nT,08:10:00,,S1,2\n"
+            )
+        )
+    )
+    eight = _MIDNIGHT + timedelta(hours=8)
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    update = message.entity.add()
+    update.id = "T"
+    update.trip_update.trip.trip_id = "T"
+    update.trip_update.trip.start_date = "20260730"
+    origin = update.trip_update.stop_time_update.add()
+    origin.stop_sequence = 1
+    origin.departure.delay = 60
+    terminus = update.trip_update.stop_time_update.add()
+    terminus.stop_sequence = 2
+    terminus.arrival.time = int((eight + timedelta(minutes=18)).timestamp())
+
+    async def body(handle: TransitFeedHandle) -> list[object]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S1"])], start=eight, end=eight + timedelta(hours=1)
+        )
+        [trips] = await handle.get_upcoming_trips(
+            [TripQuery("S0", "S1")], start=eight, end=eight + timedelta(hours=1)
+        )
+        return [(row.predicted_arrival, row.predicted_departure) for row in board] + [
+            (trip.predicted_departure, trip.predicted_arrival) for trip in trips
+        ]
+
+    later = eight + timedelta(minutes=18)
+    assert _run(index, body, message) == [
+        (later, later),  # S1: arrives 08:18, so departs 08:18
+        (eight + timedelta(minutes=1), later),  # the journey S0 -> S1
+    ]
+
+
+@pytest.mark.parametrize(
+    ("explicit_arrival", "explicit_departure", "expected"),
+    [
+        # An explicit departure before the derived arrival: arrival yields.
+        (None, 5, (5, 5)),
+        # Both explicit and crossing: the producer's times, kept as given.
+        (20, 5, (20, 5)),
+        # Neither explicit: one delay moves both, so they cannot cross.
+        (None, None, (12, 12)),
+    ],
+)
+def test_predicted_ends_yield_only_to_explicit_times(
+    explicit_arrival: int | None,
+    explicit_departure: int | None,
+    expected: tuple[int, int],
+) -> None:
+    def at(minute: int | None) -> datetime | None:
+        return None if minute is None else _MIDNIGHT + timedelta(minutes=minute)
+
+    prediction = StopPrediction(
+        arrival=at(explicit_arrival),
+        departure=at(explicit_departure),
+        delay_seconds=120,
+        vehicle_id=None,
+    )
+    assert _predicted_call(prediction, at(10), at(10)) == tuple(
+        at(minute) for minute in expected
+    )
 
 
 # -- D8: journeys need a pickup and a drop-off --------------------------------

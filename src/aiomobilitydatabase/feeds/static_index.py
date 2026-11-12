@@ -441,7 +441,9 @@ def _valid_zone(name: str) -> bool:
     """Whether ``name`` is an IANA zone this system can load."""
     try:
         ZoneInfo(name)
-    except (ZoneInfoNotFoundError, TypeError, ValueError):
+    except (ZoneInfoNotFoundError, TypeError, ValueError, OSError):
+        # OSError: with the tzdata package, a directory name ("America")
+        # or an over-long one fails as a file error, not as not-found.
         return False
     return True
 
@@ -763,7 +765,7 @@ class StaticIndex:
             return None
         try:
             return cls(conn, dataset_id, meta["timezone"])
-        except (ZoneInfoNotFoundError, TypeError, ValueError):
+        except (ZoneInfoNotFoundError, TypeError, ValueError, OSError):
             # Unusable cached timezone metadata (unknown key, empty, or a
             # non-string the column's TEXT affinity left as a blob) is a
             # cache miss like any other corruption: ZoneInfo raises in

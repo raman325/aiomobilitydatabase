@@ -62,6 +62,7 @@ from .models import (
 )
 from .rt import (
     Modification,
+    StopPrediction,
     TripModifications,
     TripPredictions,
     TripUpdateKey,
@@ -181,6 +182,32 @@ def _predicted_time(
     if scheduled is not None and delay_seconds is not None:
         return _shifted(scheduled, delay_seconds)
     return None
+
+
+def _predicted_call(
+    prediction: StopPrediction, arrival: datetime | None, departure: datetime | None
+) -> tuple[datetime | None, datetime | None]:
+    """Predict a call's (arrival, departure), never departing before arriving.
+
+    Each end is :func:`_predicted_time`. When one end is an explicit time
+    from the stop's own update and the other only the scheduled time moved
+    by a carried-over delay, and the two cross, the derived end yields to
+    the explicit one: a vehicle predicted to arrive at 08:18 does not leave
+    at 08:11. Two explicit times that cross are the producer's, and kept.
+    """
+    delay = prediction.delay_seconds
+    predicted_arrival = _predicted_time(prediction.arrival, arrival, delay)
+    predicted_departure = _predicted_time(prediction.departure, departure, delay)
+    if (
+        predicted_arrival is not None
+        and predicted_departure is not None
+        and predicted_arrival > predicted_departure
+    ):
+        if prediction.departure is None:
+            predicted_departure = predicted_arrival
+        elif prediction.arrival is None:
+            predicted_arrival = predicted_departure
+    return predicted_arrival, predicted_departure
 
 
 def _shifted(when: datetime | None, seconds: int) -> datetime | None:
@@ -1950,6 +1977,11 @@ class TransitFeedHandle:
                 if dep.stop_sequence in trip_rt.skipped:
                     continue  # SKIPPED: the vehicle will not serve this stop
                 prediction = trip_rt.predictions.get(dep.stop_sequence)
+            predicted_arrival, predicted_departure = (
+                _predicted_call(prediction, dep.arrival, dep.departure)
+                if prediction
+                else (None, None)
+            )
             arrivals.append(
                 StopArrival(
                     stop_id=dep.stop_id,
@@ -1961,24 +1993,8 @@ class TransitFeedHandle:
                     headsign=dep.headsign,
                     scheduled_arrival=dep.arrival,
                     scheduled_departure=dep.departure,
-                    predicted_arrival=(
-                        _predicted_time(
-                            prediction.arrival,
-                            dep.arrival,
-                            prediction.delay_seconds,
-                        )
-                        if prediction
-                        else None
-                    ),
-                    predicted_departure=(
-                        _predicted_time(
-                            prediction.departure,
-                            dep.departure,
-                            prediction.delay_seconds,
-                        )
-                        if prediction
-                        else None
-                    ),
+                    predicted_arrival=predicted_arrival,
+                    predicted_departure=predicted_departure,
                     delay_seconds=prediction.delay_seconds if prediction else None,
                     realtime=prediction is not None,
                     vehicle_id=prediction.vehicle_id if prediction else None,
@@ -2316,11 +2332,9 @@ class TransitFeedHandle:
                     destination_stop=stops_by_id.get(trip.destination_stop_id),
                     scheduled_departure=trip.departure,
                     predicted_departure=(
-                        _predicted_time(
-                            origin_pred.departure,
-                            trip.departure,
-                            origin_pred.delay_seconds,
-                        )
+                        # Only an explicit arrival can push the departure
+                        # later, so the scheduled origin arrival is not read.
+                        _predicted_call(origin_pred, None, trip.departure)[1]
                         if origin_pred
                         else None
                     ),
