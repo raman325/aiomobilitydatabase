@@ -968,6 +968,64 @@ def test_a_batch_equals_its_queries_run_alone(
     _run(index, body, message)
 
 
+def _midnight_loop_feed() -> bytes:
+    """A 24-hour loop: yesterday's run is back at O exactly as today's leaves.
+
+    Trip T calls O 00:00, D 12:00, O 24:00, D 36:00 daily, so at midnight
+    yesterday's run (O at 24:00:00) and today's (O at 00:00:00) tie on every
+    field the sort key reads -- and again at D twelve hours later.
+    """
+    files = {
+        "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
+        "A,T,https://e.com,UTC\n",
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
+        "O,O,34.0,-118.0\nD,D,34.1,-118.1\n",
+        "routes.txt": "route_id,route_short_name,route_type\nR,R,3\n",
+        "trips.txt": "route_id,service_id,trip_id\nR,S,T\n",
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T,00:00:00,00:00:00,O,1\nT,12:00:00,12:00:00,D,2\n"
+        "T,24:00:00,24:00:00,O,3\nT,36:00:00,36:00:00,D,4\n",
+        "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,"
+        "saturday,sunday,start_date,end_date\nS,1,1,1,1,1,1,1,20260101,20271231\n",
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, text in files.items():
+            archive.writestr(name, text)
+    return buffer.getvalue()
+
+
+def test_runs_tied_on_every_sorted_field_keep_the_earlier_run_first() -> None:
+    """Scheduled rows the sort key cannot separate come out earlier run first.
+
+    Realtime addresses today's run, so it is read before the scan reaches
+    yesterday's; the board must not reflect that reading order -- open-ended
+    or bounded, arrivals or trips.
+    """
+    today = date(2026, 3, 9)
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    update = message.entity.add()
+    update.id = "today"
+    update.trip_update.trip.trip_id = "T"
+    update.trip_update.trip.start_date = today.strftime("%Y%m%d")
+    update.trip_update.delay = 0
+    start = datetime(2026, 3, 8, 23, tzinfo=UTC)
+
+    async def body(handle: TransitFeedHandle) -> None:
+        for end in (None, start + timedelta(hours=2)):
+            [arrivals] = await handle.get_arrivals(
+                [ArrivalsQuery(["O"], limit=2)], start=start, end=end
+            )
+            assert [row.realtime for row in arrivals] == [False, True]
+            [trips] = await handle.get_upcoming_trips(
+                [TripQuery("O", "D", limit=2)], start=start, end=end
+            )
+            assert [row.realtime for row in trips] == [False, True]
+
+    _run(_index_from_zip_bytes(_midnight_loop_feed()), body, message)
+
+
 # -- which run a date-less update addresses -------------------------------------
 
 

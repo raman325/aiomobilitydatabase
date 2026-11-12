@@ -1740,7 +1740,10 @@ class TransitFeedHandle:
                         scheduled.setdefault(_departure_key(dep), dep)
                 read_from = horizon
                 arrivals = await self._merged_arrivals(
-                    list(scheduled.values()),
+                    # Canonical order (run, then stop sequence): rows the
+                    # sort key ties on keep this order, not the order the
+                    # scan happened to read them in.
+                    [scheduled[key] for key in sorted(scheduled)],
                     all_stop_ids,
                     start=start,
                     realtime_now=realtime_now,
@@ -2003,11 +2006,15 @@ class TransitFeedHandle:
             for arrival in arrivals
             if _effective_departure(arrival, start) >= start
         ]
-        # Total sort key: effective time alone ties frequently, so trip_id
-        # and stop_id break ties -- and the scheduled times after them, since
-        # the same trip can reach the same stop at the same effective
-        # instant on two service days (tomorrow's run predicted early).
-        # Without them the order would depend on the order rows were read.
+        # Effective time alone ties frequently, so trip_id and stop_id break
+        # ties -- and the scheduled times after them, since the same trip
+        # can reach the same stop at the same effective instant on two
+        # service days (tomorrow's run predicted early). Even those can tie
+        # (yesterday's 24:00:00 is today's 00:00:00), and a stable sort then
+        # keeps the order rows were appended in: scheduled rows in
+        # ``scheduled``'s canonical order (earlier run first), then RT-added
+        # rows in feed order, then detoured runs in run order. Every part of
+        # that is fixed before the scan, so no tie depends on what it read.
         arrivals.sort(
             key=lambda a: (
                 _effective_departure(a, start),
@@ -2151,7 +2158,8 @@ class TransitFeedHandle:
                     read_from = horizon
                     rows = (
                         await self._merged_trips(
-                            list(scheduled.values()),
+                            # Canonical order, as in get_arrivals.
+                            [scheduled[key] for key in sorted(scheduled)],
                             start=start,
                             realtime_now=realtime_now,
                             updates=updates,
@@ -2306,10 +2314,11 @@ class TransitFeedHandle:
                 )
             )
         trips = [row for row in trips if _effective_trip_departure(row) >= start]
-        # Total sort key, matching get_arrivals: origin predictions can
-        # reorder rows relative to the scheduled ordering, and trip_id and
-        # the scheduled times break effective-departure ties (the same trip
-        # on two service days included) deterministically.
+        # Sort key matching get_arrivals: origin predictions can reorder
+        # rows relative to the scheduled ordering, and trip_id and the
+        # scheduled times break effective-departure ties (the same trip on
+        # two service days included); rows tied on all of them keep
+        # ``scheduled``'s canonical order (earlier run first).
         trips.sort(
             key=lambda row: (
                 _effective_trip_departure(row),
