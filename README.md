@@ -363,9 +363,12 @@ Notes on direct mode:
   (and any origin→destination row boarding or alighting there), and the
   trip-level delay covers stops no StopTimeUpdate reaches. A predicted
   departure never comes before the predicted arrival unless the producer
-  states both. An update naming a stop by `stop_id` alone on a trip that
-  visits it twice means the visit after the previous update; one whose
-  `stop_sequence` and `stop_id` disagree names no stop.
+  states both. A StopTimeUpdate replaces any delay carried in from earlier
+  stops, so one stating no delay leaves later stops without one. An update
+  naming a stop by `stop_id` alone on a trip that visits it twice names no
+  stop (the spec requires `stop_sequence` there), and one whose
+  `stop_sequence` and `stop_id` disagree names none either, unless the
+  `stop_id` is the update's own `assigned_stop_id`.
 - **Rows carry whole records, not copied columns**: `StopArrival`,
   `UpcomingTrip`, and `VehiclePosition` each expose the full `Stop` and
   `Route` they refer to, so platform codes, coordinates, route colours and

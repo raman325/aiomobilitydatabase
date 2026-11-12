@@ -363,6 +363,14 @@ class StopArrival:
     matching :attr:`UpcomingTrip.direction_id`.
     RT-added rows have no static schedule row, so every descriptive field
     is None.
+
+    ``predicted_arrival``/``predicted_departure`` are each event's own
+    prediction; ``delay_seconds`` is the delay realtime gives this stop --
+    its update's departure delay, else its arrival delay (an event's delay,
+    or its time against the schedule), else the delay propagated from an
+    earlier stop or the trip-level one. With different arrival and
+    departure delays it is the departure's, so read the arrival's lateness
+    off ``predicted_arrival``, not ``delay_seconds``.
     """
 
     stop_id: str

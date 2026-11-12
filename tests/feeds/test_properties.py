@@ -4716,12 +4716,12 @@ def _trip_call(
 
 
 def _case_placements(case: dict[str, object]) -> dict[int, dict[str, object]]:
-    """Which call each emitted STU lands on, replaying the feed in order.
+    """Which call each emitted STU lands on, straight from the spec.
 
-    A stop_sequence names call ``i``; a stop_id sent with it must agree
-    ("conflict" addressing names no call). A bare stop_id names its call
-    when the trip visits that stop once, else the first visit after the
-    previously placed STU, else nothing. The last STU on a call wins.
+    A stop_sequence names call ``i`` unless a stop_id sent with it names
+    another stop ("conflict"). A bare stop_id names call ``i`` only when
+    no other call shares its stop (stop_sequence "is required for trips
+    that visit the same stop_id more than once"). Later STUs overwrite.
     """
     specs: dict[int, dict[str, object]] = case["specs"]  # type: ignore[assignment]
     call_stops = _case_call_stops(case["n_stops"], case["loop"])  # type: ignore[arg-type]
@@ -4729,24 +4729,12 @@ def _case_placements(case: dict[str, object]) -> dict[int, dict[str, object]]:
     if case["extra"] is not None:
         emitted.append(case["extra"])  # type: ignore[arg-type]
     placed: dict[int, dict[str, object]] = {}
-    cursor = -1
     for i, spec in emitted:
-        addressing = spec["addressing"]
-        if addressing == "conflict":
+        if spec["addressing"] == "conflict":
             continue
-        if addressing == "stop_id":
-            visits = [k for k, stop in enumerate(call_stops) if stop == call_stops[i]]
-            later = [k for k in visits if k > cursor]
-            if len(visits) == 1:
-                pos = visits[0]
-            elif later:
-                pos = later[0]
-            else:
-                continue
-        else:
-            pos = i
-        placed[pos] = spec
-        cursor = pos
+        if spec["addressing"] == "stop_id" and call_stops.count(call_stops[i]) > 1:
+            continue
+        placed[i] = spec
     return placed
 
 
@@ -4755,84 +4743,100 @@ def _prop_scheduled(i: int) -> tuple[datetime, datetime]:
     return arrival, arrival + timedelta(seconds=_PROP_DWELL)
 
 
+def _spec_event(
+    spec: dict[str, object], event: str, scheduled: datetime
+) -> tuple[datetime | None, int | None]:
+    """One event of a drawn STU: (its explicit time, the delay it states).
+
+    The delay is the event's own delay, or -- given only a time -- that
+    time against the schedule ("a delay computed by comparing the time
+    against the GTFS schedule time").
+    """
+    side = spec.get("delay_side")
+    if event == "arrival":
+        given = spec["delay"] if side == "arrival" else spec.get("shadow_delay")
+        explicit = spec.get("arr_time")
+    else:
+        given = spec["delay"] if side in ("departure", "both") else None
+        explicit = spec.get("dep_time")
+    if given is None and explicit is not None:
+        given = int((explicit - scheduled).total_seconds())  # type: ignore[operator]
+    return explicit, given  # type: ignore[return-value]
+
+
 def _propagation_oracle(
     case: dict[str, object],
 ) -> dict[int, object]:
-    """Independent piecewise restatement of the spec, from the DRAWN values.
+    """Independent restatement of the spec, from the DRAWN values.
 
     Per stop index: ``"skipped"``, ``None`` (schedule-only), or a dict of
     the predicted ``arrival``/``departure`` instants and the ``delay``.
-    Placement per :func:`_case_placements`. Then the walk: an STU's events
-    each take their own time, else their own delay, else the other event's
-    delay at that stop, else the delay carried in; the delay it states (the
-    departure's, else the arrival's -- a delay, else a time against the
-    schedule) is carried on; NO_DATA cuts it; the trip-level delay covers
-    stops before any STU information; a derived event that crosses a
-    stated one yields to it.
+    Each stop looks BACK for the nearest STU at or before it that is not
+    SKIPPED ("SKIPPED will not stop delay propagation, but ... SCHEDULED
+    ... or NO_DATA will"): none -> the trip-level delay; NO_DATA -> no
+    prediction; another stop's STU -> the delay that STU states (its
+    departure's, else its arrival's; possibly none); the stop's own STU ->
+    each event from its time, else its delay, else the other event's
+    delay, a derived event never crossing a stated one.
     """
     placed = _case_placements(case)
     trip_delay: int | None = case["trip_delay"]  # type: ignore[assignment]
     outcomes: dict[int, object] = {}
-    covered = False
-    current: int | None = None
-
-    def shifted(when: datetime, delay: int | None) -> datetime | None:
-        return None if delay is None else when + timedelta(seconds=delay)
-
-    def first(*values: int | None) -> int | None:
-        return next((value for value in values if value is not None), None)
-
     for i in range(case["n_stops"]):  # type: ignore[arg-type]
         sched_arr, sched_dep = _prop_scheduled(i)
-        incoming = current if covered else trip_delay
-        spec = placed.get(i)
-        kind = None if spec is None else spec["kind"]
-        if kind == "skipped":
+        if placed.get(i, {}).get("kind") == "skipped":
             outcomes[i] = "skipped"
             continue
-        if kind == "no_data":
-            covered, current = True, None
+        source = next(
+            (
+                j
+                for j in range(i, -1, -1)
+                if placed.get(j, {}).get("kind") not in (None, "skipped")
+            ),
+            None,
+        )
+        if source is not None and placed[source]["kind"] == "no_data":
             outcomes[i] = None
             continue
-        spec = spec or {}
-        side = spec.get("delay_side")
-        arr_delay_given: int | None = (
-            spec["delay"] if side == "arrival" else spec.get("shadow_delay")  # type: ignore[assignment]
+        if source is None or source != i:
+            if source is None:
+                delay = trip_delay
+            else:
+                j_arr, j_dep = _prop_scheduled(source)
+                _, j_arr_delay = _spec_event(placed[source], "arrival", j_arr)
+                _, j_dep_delay = _spec_event(placed[source], "departure", j_dep)
+                delay = j_dep_delay if j_dep_delay is not None else j_arr_delay
+            outcomes[i] = (
+                None
+                if delay is None
+                else {
+                    "arrival": sched_arr + timedelta(seconds=delay),
+                    "departure": sched_dep + timedelta(seconds=delay),
+                    "delay": delay,
+                }
+            )
+            continue
+        arr_time, arr_delay = _spec_event(placed[i], "arrival", sched_arr)
+        dep_time, dep_delay = _spec_event(placed[i], "departure", sched_dep)
+        arr_used = arr_delay if arr_delay is not None else dep_delay
+        dep_used = dep_delay if dep_delay is not None else arr_delay
+        arrival = arr_time or (
+            None if arr_used is None else sched_arr + timedelta(seconds=arr_used)
         )
-        dep_delay_given: int | None = (
-            spec["delay"] if side in ("departure", "both") else None  # type: ignore[assignment]
-        )
-        arr_time: datetime | None = spec.get("arr_time")  # type: ignore[assignment]
-        dep_time: datetime | None = spec.get("dep_time")  # type: ignore[assignment]
-        arr_delay = first(
-            arr_delay_given,
-            None if arr_time is None else int((arr_time - sched_arr).total_seconds()),
-        )
-        dep_delay = first(
-            dep_delay_given,
-            None if dep_time is None else int((dep_time - sched_dep).total_seconds()),
-        )
-        stated = first(dep_delay, arr_delay)
-        if stated is not None:
-            covered, current = True, stated
-        arr_states = arr_time is not None or arr_delay_given is not None
-        dep_states = dep_time is not None or dep_delay_given is not None
-        arrival = arr_time or shifted(
-            sched_arr, arr_delay if arr_states else first(dep_delay, incoming)
-        )
-        departure = dep_time or shifted(
-            sched_dep, dep_delay if dep_states else first(arr_delay, incoming)
+        departure = dep_time or (
+            None if dep_used is None else sched_dep + timedelta(seconds=dep_used)
         )
         if arrival is not None and departure is not None and arrival > departure:
-            if arr_states and not dep_states:
+            if arr_delay is not None and dep_delay is None:
                 departure = arrival
-            elif dep_states and not arr_states:
+            elif dep_delay is not None and arr_delay is None:
                 arrival = departure
-        delay = first(stated, incoming)
-        if arrival is None and departure is None and delay is None:
-            outcomes[i] = None
-            continue
-        outcomes[i] = {"arrival": arrival, "departure": departure, "delay": delay}
+        delay = dep_delay if dep_delay is not None else arr_delay
+        outcomes[i] = (
+            None
+            if arrival is None and departure is None and delay is None
+            else {"arrival": arrival, "departure": departure, "delay": delay}
+        )
     return outcomes
 
 

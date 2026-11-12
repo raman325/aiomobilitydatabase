@@ -613,6 +613,8 @@ class StopPrediction:
     ``delay_seconds`` is the delay at the stop: the one its own update
     states (the departure's, else the arrival's; an event's delay, else its
     time against the schedule), else the propagated or trip-level delay.
+    (So with a 60 s arrival delay and a 120 s departure delay it is 120;
+    ``arrival`` is still the scheduled arrival plus 60.)
     """
 
     arrival: datetime | None
@@ -654,6 +656,9 @@ class TripStopUpdate:
     departure: datetime | None
     arrival_delay: int | None = None
     departure_delay: int | None = None
+    # StopTimeProperties.assigned_stop_id: a real-time platform assignment,
+    # which a stop_id sent alongside "must match".
+    assigned_stop_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -721,37 +726,35 @@ def _placed(
     """Place each StopTimeUpdate on a call position; unplaceable ones drop.
 
     A ``stop_sequence`` names its call, and a ``stop_id`` sent with it must
-    agree ("Must be the same as in stop_times.txt" / "stops.txt": together
-    they name one call, and disagreeing halves name none). A bare
-    ``stop_id`` names its call when the trip visits the stop once; on a
-    trip visiting it again, updates "should be sorted by stop_sequence (or
-    stop_ids in the order they occur in the trip)", so it names the first
-    visit after the previously placed update -- and none if there is no
-    such visit, rather than a guess. Several updates on one call: the last
-    wins.
+    agree -- with the scheduled stop, or with the update's
+    ``assigned_stop_id``, which a stop_id "must match" when both are sent;
+    otherwise the two halves name different calls and so none. A bare
+    ``stop_id`` names its call only on a trip visiting that stop once:
+    "stop_sequence is required for trips that visit the same stop_id more
+    than once (e.g., a loop) to disambiguate", and an update without it is
+    not guessed onto a visit. Several updates on one call: the last wins.
     """
     sequence_pos = {call.stop_sequence: pos for pos, call in enumerate(calls)}
     visits: dict[str, list[int]] = {}
     for index, call in enumerate(calls):
         visits.setdefault(call.stop_id, []).append(index)
     placed: dict[int, TripStopUpdate] = {}
-    cursor = -1
     for stu in entry.stop_updates:
         pos: int | None = None
         if stu.stop_sequence is not None:
             pos = sequence_pos.get(stu.stop_sequence)
-            if pos is not None and stu.stop_id not in (None, calls[pos].stop_id):
+            if pos is not None and stu.stop_id not in (
+                None,
+                calls[pos].stop_id,
+                stu.assigned_stop_id,
+            ):
                 pos = None
         elif stu.stop_id is not None:
             at = visits.get(stu.stop_id, [])
-            later = [p for p in at if p > cursor]
             if len(at) == 1:
                 pos = at[0]
-            elif later:
-                pos = later[0]
         if pos is not None:
             placed[pos] = stu
-            cursor = pos
     return placed
 
 
@@ -797,12 +800,15 @@ def resolve_trip_predictions(
       propagation: later stops are schedule-only (the trip-level delay
       does not resume -- "no data" is StopTimeUpdate-derived coverage)
       until a later update states a delay.
-    - Any other update predicts each event at its stop from the event's
-      own explicit time, else its own delay, else the other event's delay
-      at that stop, else the delay arriving from earlier stops. The delay
-      it states -- the departure's, else the arrival's, each the event's
-      delay or, given only a time, that time against the schedule -- is
-      "propagated to all subsequent stops" until newer information.
+    - Any other update (SCHEDULED, the default) predicts each event at its
+      stop from the event's own explicit time, else its own delay, else
+      the other event's delay at that stop. The delay it states -- the
+      departure's, else the arrival's, each the event's delay or, given
+      only a time, that time against the schedule -- replaces the one
+      arriving from earlier stops ("updates with schedule relationships of
+      SCHEDULED ... or NO_DATA will" stop delay propagation) and is
+      "propagated to all subsequent stops" until newer information; an
+      update stating none leaves later stops without one, as NO_DATA does.
     - A stop no update reaches takes the propagated delay, or the
       trip-level delay before any update, else stays schedule-only.
 
@@ -841,38 +847,26 @@ def resolve_trip_predictions(
             own.departure, own.departure_delay, call.departure
         )
         stated = departure_delay if departure_delay is not None else arrival_delay
-        if stated is not None:
-            covered, current = True, stated
+        covered, current = True, stated
         arrival_states = own.arrival is not None or own.arrival_delay is not None
         departure_states = own.departure is not None or own.departure_delay is not None
         arrival = own.arrival or _moved(
-            call.arrival,
-            arrival_delay if arrival_states else _first(departure_delay, incoming),
+            call.arrival, arrival_delay if arrival_states else departure_delay
         )
         departure = own.departure or _moved(
-            call.departure,
-            departure_delay if departure_states else _first(arrival_delay, incoming),
+            call.departure, departure_delay if departure_states else arrival_delay
         )
         if arrival is not None and departure is not None and arrival > departure:
             if arrival_states and not departure_states:
                 departure = arrival
             elif departure_states and not arrival_states:
                 arrival = departure
-        if (
-            arrival is None
-            and departure is None
-            and stated is None
-            and incoming is None
-        ):
+        if arrival is None and departure is None and stated is None:
             continue  # an update with no times and no delay: no realtime content
         predictions[call.stop_sequence] = _prediction(
-            arrival, departure, _first(stated, incoming), entry.vehicle_id
+            arrival, departure, stated, entry.vehicle_id
         )
     return TripPredictions(predictions=predictions, skipped=frozenset(skipped))
-
-
-def _first(*values: int | None) -> int | None:
-    return next((value for value in values if value is not None), None)
 
 
 def _prediction(
@@ -980,6 +974,11 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
                         departure=departure,
                         arrival_delay=arrival_delay,
                         departure_delay=departure_delay,
+                        assigned_stop_id=(
+                            stu.stop_time_properties.assigned_stop_id or None
+                            if stu.HasField("stop_time_properties")
+                            else None
+                        ),
                     )
                 )
         if not is_added:

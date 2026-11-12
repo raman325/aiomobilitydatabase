@@ -1,6 +1,7 @@
 """Tests for GTFS-RT fetching (auth, errors) and protobuf parsing."""
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 
@@ -1082,39 +1083,77 @@ def test_resolve_skipped_marks_stop_and_never_alters_propagation() -> None:
     assert resolved.predictions[3].delay_seconds == 300
 
 
-def test_resolve_empty_stu_has_no_content_unless_covered() -> None:
-    """A SCHEDULED STU with no times and no delay contributes nothing on
-    its own, but inside a propagation region it surfaces the inherited
-    last-known delay at its stop.
-    """
-    alone = resolve_trip_predictions(_entry(_stu(stop_id="B")), _CALLS)
-    assert alone.predictions == {}
-    covered = resolve_trip_predictions(
-        _entry(_stu(stop_id="A", delay=300), _stu(stop_id="B")), _CALLS
-    )
-    assert covered.predictions[2].delay_seconds == 300
-
-
-def test_resolve_a_bare_stop_id_names_the_next_visit_on_a_loop() -> None:
-    """Updates "should be sorted by stop_sequence (or stop_ids in the order
-    they occur in the trip)": an A after B is A's second visit."""
-    entry = _entry(_stu(stop_id="B", delay=60), _stu(stop_id="A", delay=120))
-    resolved = resolve_trip_predictions(entry, _LOOP_CALLS)
+def test_resolve_a_bare_stop_id_on_a_revisited_stop_names_nothing() -> None:
+    """ "stop_sequence is required for trips that visit the same stop_id
+    more than once (e.g., a loop) to disambiguate": a bare A on a trip
+    calling at A twice is not guessed onto either visit, whatever came
+    before it -- a 15:31 meant for the second A would otherwise make the
+    whole trip half an hour late."""
+    alone = _entry(_stu(stop_id="A", arrival=_at(31)))
+    assert resolve_trip_predictions(alone, _LOOP_CALLS).predictions == {}
+    after_b = _entry(_stu(stop_id="B", delay=60), _stu(stop_id="A", delay=120))
+    resolved = resolve_trip_predictions(after_b, _LOOP_CALLS)
     assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
         2: 60,
-        3: 120,
-        4: 120,
+        3: 60,
+        4: 60,
     }
 
 
-def test_resolve_a_bare_stop_id_with_no_visit_left_names_nothing() -> None:
-    """After the second A, a further bare A has no visit to name; guessing
-    the first would rewrite a call already passed."""
-    entry = _entry(_stu(stop_sequence=3, delay=60), _stu(stop_id="A", delay=999))
-    resolved = resolve_trip_predictions(entry, _LOOP_CALLS)
+def test_resolve_an_assigned_stop_agrees_with_its_sequence() -> None:
+    """A stop_id "must match assigned_stop_id" when both are sent: stop 2
+    reassigned to platform B2 still names stop_sequence 2, and its newer
+    delay replaces A's."""
+    reassigned = TripStopUpdate(
+        stop_id="B2",
+        stop_sequence=2,
+        relationship=0,
+        arrival=None,
+        departure=None,
+        departure_delay=600,
+        assigned_stop_id="B2",
+    )
+    entry = _entry(_stu(stop_sequence=1, delay=60), reassigned)
+    resolved = resolve_trip_predictions(entry, _CALLS)
     assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
-        3: 60,
-        4: 60,
+        1: 60,
+        2: 600,
+        3: 600,
+    }
+
+
+def test_resolve_a_scheduled_update_replaces_the_carried_delay() -> None:
+    """ "Updates with schedule relationships of SCHEDULED ... or NO_DATA
+    will" stop delay propagation. An update for an untimed stop (no
+    schedule to compare its time with) states no delay, so A's 600 s does
+    not reach past it; an update stating nothing at all likewise."""
+    untimed = [*_CALLS[:1], replace(_CALLS[1], arrival=None, departure=None), _CALLS[2]]
+    timed_at_untimed = _entry(
+        _stu(stop_id="A", delay=600), _stu(stop_id="B", arrival=_at(12))
+    )
+    resolved = resolve_trip_predictions(timed_at_untimed, untimed)
+    assert resolved.predictions[2].arrival == _at(12)
+    assert resolved.predictions[2].delay_seconds is None
+    assert 3 not in resolved.predictions
+    empty = _entry(_stu(stop_id="A", delay=300), _stu(stop_id="B"))
+    assert set(resolve_trip_predictions(empty, _CALLS).predictions) == {1}
+    assert resolve_trip_predictions(_entry(_stu(stop_id="B")), _CALLS).predictions == {}
+
+
+def test_resolve_the_specs_example_2() -> None:
+    """trip-updates.md, Example 2, verbatim: 300 s at stop_sequence 3,
+    60 s at 8, NO_DATA at 10 on a 20-stop trip -- 1,2 unknown; 3-7 300 s;
+    8,9 60 s; 10-20 unknown."""
+    calls = _calls(*(f"S{n}" for n in range(1, 21)))
+    entry = _entry(
+        _stu(stop_sequence=3, delay=300, arrival_delay=300),
+        _stu(stop_sequence=8, delay=60, arrival_delay=60),
+        _stu(stop_sequence=10, relationship=_NO_DATA),
+    )
+    resolved = resolve_trip_predictions(entry, calls)
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        **dict.fromkeys(range(3, 8), 300),
+        **dict.fromkeys(range(8, 10), 60),
     }
 
 
@@ -1123,19 +1162,6 @@ def test_resolve_disagreeing_sequence_and_stop_name_no_call() -> None:
     call of this trip and is ignored, as a StopSelector would be."""
     entry = _entry(_stu(stop_sequence=1, stop_id="C", delay=300))
     assert resolve_trip_predictions(entry, _CALLS).predictions == {}
-
-
-def test_resolve_stop_id_matches_first_call_on_loop_trips() -> None:
-    entry = _entry(_stu(stop_id="A", delay=100))
-    resolved = resolve_trip_predictions(entry, _LOOP_CALLS)
-    # Bare stop_id addresses the FIRST visit to A; propagation then covers
-    # every later call, including the second visit.
-    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
-        1: 100,
-        2: 100,
-        3: 100,
-        4: 100,
-    }
 
 
 def test_resolve_stop_sequence_wins_and_addresses_later_loop_visit() -> None:
