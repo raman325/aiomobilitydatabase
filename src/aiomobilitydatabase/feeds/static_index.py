@@ -1882,19 +1882,19 @@ class StaticIndex:
         return self._ceiling_from(rows)
 
     def rt_instances[K: tuple[str, date | None, int | None]](
-        self, keys: Iterable[K], now: datetime
+        self, keys: Iterable[K]
     ) -> list[tuple[tuple[str, date], K]]:
-        """Resolve TripUpdate keys to the concrete runs they address.
+        """Resolve matched TripUpdate keys to the concrete runs they address.
 
-        Each key is ``(source trip id, start_date or None, start_secs or
-        None)``. Its trip resolves the way the merge matches rows: a plain
-        trip only by a key without start_secs, a frequency repetition only
-        by its own start. A dated key addresses that day's run if the
-        trip's service runs that day; a date-less key its current run as of
-        ``now`` (:meth:`current_service_dates`). Returns
+        Each key is ``(source trip id, start_date, start_secs or None)``.
+        Its trip resolves the way the merge matches rows: a plain trip only
+        by a key without start_secs, a frequency repetition only by its own
+        start; the key addresses that day's run if the trip's service runs
+        that day. A key without a date addresses nothing (matching gives
+        every reference that names a run its date first). Returns
         ``((concrete trip id, service date), key)`` pairs.
         """
-        keys = list(keys)
+        keys = [key for key in keys if key[1] is not None]
         if not keys:
             return []
         sources = sorted({source for source, _day, _secs in keys})
@@ -1909,27 +1909,66 @@ class StaticIndex:
         ).fetchall()
         by_identity = {(source, secs): trip_id for trip_id, source, secs, _ in trips}
         service_of = {trip_id: service for trip_id, _, _, service in trips}
-        dateless = [
-            trip_id
-            for source, day, secs in keys
-            if day is None and (trip_id := by_identity.get((source, secs)))
-        ]
-        current = self.current_service_dates(dateless, now)
         active: dict[date, set[str]] = {}
         found: list[tuple[tuple[str, date], K]] = []
         for key in keys:
             source, day, secs = key
             trip_id = by_identity.get((source, secs))
-            if trip_id is None:
-                continue
-            if day is None:
-                if trip_id in current:
-                    found.append(((trip_id, current[trip_id]), key))
+            if trip_id is None or day is None:
                 continue
             if day not in active:
                 active[day] = self.active_service_ids(day)
             if service_of[trip_id] in active[day]:
                 found.append(((trip_id, day), key))
+        return found
+
+    def alternative_trip_ids(
+        self, refs: Iterable[tuple[str, int, date, int]]
+    ) -> dict[tuple[str, int, date, int], str]:
+        """Resolve trip_id-less TripDescriptors to the one trip each names.
+
+        GTFS-RT's alternative trip matching: a trip that is not frequency
+        based "may also be uniquely identified by" ``(route_id,
+        direction_id, start_time, start_date)``, "as long as the
+        combination of ids provided resolves to a unique trip".
+        ``start_time`` is the trip's scheduled first departure (see
+        :meth:`plain_trip_starts`) and its service must run on
+        ``start_date``. A ref matching no trip, or several, names none; a
+        trip with no direction_id matches no direction.
+        """
+        refs = sorted(set(refs))
+        if not refs:
+            return {}
+        routes = sorted({route for route, _direction, _day, _secs in refs})
+        trips = self._conn.execute(
+            "SELECT id, route_id, direction_id, service_id FROM trips "
+            f"WHERE route_id IN ({','.join('?' * len(routes))}) "
+            "AND start_secs IS NULL AND source_trip_id = id",
+            routes,
+        ).fetchall()
+        starts = self.plain_trip_starts(trip_id for trip_id, *_ in trips)
+        by_slot: dict[tuple[str, int, int], list[tuple[str, str]]] = {}
+        for trip_id, route_id, direction_id, service_id in trips:
+            if direction_id is None or trip_id not in starts:
+                continue
+            by_slot.setdefault((route_id, direction_id, starts[trip_id]), []).append(
+                (trip_id, service_id)
+            )
+        active: dict[date, set[str]] = {}
+        found: dict[tuple[str, int, date, int], str] = {}
+        for ref in refs:
+            route_id, direction_id, day, secs = ref
+            if day not in active:
+                active[day] = self.active_service_ids(day)
+            running = [
+                trip_id
+                for trip_id, service_id in by_slot.get(
+                    (route_id, direction_id, secs), []
+                )
+                if service_id in active[day]
+            ]
+            if len(running) == 1:
+                found[ref] = running[0]
         return found
 
     def current_service_dates(

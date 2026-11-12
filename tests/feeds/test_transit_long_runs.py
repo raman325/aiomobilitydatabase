@@ -55,6 +55,11 @@ def _times(rows: Sequence[StopArrival]) -> list[datetime | None]:
     return [row.scheduled_departure for row in rows]
 
 
+def _canceled(rows: Sequence[StopArrival]) -> list[datetime | None]:
+    """Scheduled departures of the rows shown as cancelled."""
+    return [row.scheduled_departure for row in rows if row.canceled]
+
+
 def test_a_multi_day_trips_late_calls_are_read() -> None:
     """A at 00:00, B at 60:00:00: the runs of two and three days ago reach B
     inside a 48h window, with or without realtime naming them.
@@ -1002,7 +1007,6 @@ def test_a_trip_longer_than_a_day_takes_no_dateless_update() -> None:
     index = _index_from_zip_bytes(_feed(_LONG_DAILY))
     now = datetime(2026, 6, 10, 9, tzinfo=UTC)
     assert index.current_service_dates(["T"], now) == {}
-    assert index.rt_instances([("T", None, None)], now) == []
 
     async def body(handle: TransitFeedHandle) -> None:
         [board] = await handle.get_arrivals(
@@ -1039,7 +1043,8 @@ def test_a_dated_update_still_reaches_one_of_two_colliding_runs() -> None:
 
 def test_a_dateless_cancellation_of_colliding_runs_cancels_neither() -> None:
     """Conservative for cancellations too: with no way to tell which run
-    is cancelled, both stay on the board; a dated one removes its run.
+    is cancelled, both stay on the board as running; a dated one cancels
+    its run, which stays on the board shown as cancelled.
     """
     now = datetime(2026, 6, 10, 9, tzinfo=UTC)
     both = [
@@ -1047,8 +1052,8 @@ def test_a_dateless_cancellation_of_colliding_runs_cancels_neither() -> None:
         datetime(2026, 6, 11, 10, tzinfo=UTC),
     ]
     for message, expected in (
-        (_cancellation(now), both),
-        (_cancellation(now, "20260609"), both[1:]),
+        (_cancellation(now), []),
+        (_cancellation(now, "20260609"), both[:1]),
     ):
 
         async def body(
@@ -1059,7 +1064,8 @@ def test_a_dateless_cancellation_of_colliding_runs_cancels_neither() -> None:
                 start=now,
                 end=now + timedelta(days=1, hours=2),
             )
-            assert _times(board) == expected
+            assert _times(board) == both
+            assert _canceled(board) == expected
 
         _run(_index_from_zip_bytes(_feed(_LONG_DAILY)), body, message)
 
@@ -1476,7 +1482,8 @@ def test_a_plain_trip_named_with_its_own_start_time(
         [board] = await handle.get_arrivals(
             [ArrivalsQuery(["B"], limit=None)], start=now, end=now + timedelta(hours=2)
         )
-        assert (_times(board) == []) is applies
+        assert _times(board) == [datetime(2026, 6, 10, 8, 30, tzinfo=UTC)]
+        assert [row.canceled for row in board] == [applies]
 
     _run(_index_from_zip_bytes(feed), cancelled, cancel)
 

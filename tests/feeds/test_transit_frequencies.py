@@ -71,20 +71,18 @@ async def test_start_time_prediction_and_cancellation_hit_one_repetition(
 ) -> None:
     """The matched fixture predicts F1's 06:10:00 repetition (+120s at S1)
     and cancels its 06:20:00 repetition: exactly F1#22200 turns realtime,
-    exactly F1#22800 disappears, and every sibling stays schedule-only.
+    exactly F1#22800 is shown cancelled, and every sibling stays
+    schedule-only.
     """
     _mock_catalog_with_rt(mock_api, _dated(TRIP_UPDATES_FREQ_MATCHED))
     handle = await feeds_client.get_transit_feed("mdb-100")
     [arrivals] = await handle.get_arrivals(
         [ArrivalsQuery(["S1"])], start=NOW, end=NOW + timedelta(hours=2)
     )
-    assert [a.trip_id for a in arrivals] == [
-        "F1#21600",
-        "F1#22200",
-        "F1#25200",
-        "F1#25800",
-    ]
+    assert [a.trip_id for a in arrivals] == F1_SYNTHETIC_IDS
     by_trip = {a.trip_id: a for a in arrivals}
+    assert [a.trip_id for a in arrivals if a.canceled] == ["F1#22800"]
+    assert by_trip["F1#22800"].predicted_departure is None
     predicted = by_trip["F1#22200"]
     assert predicted.realtime is True
     assert predicted.delay_seconds == 120
@@ -120,7 +118,7 @@ async def test_start_time_matching_applies_to_upcoming_trips_overlay(
 ) -> None:
     """The origin-to-destination overlay resolves repetitions the same way:
     the predicted repetition gains an origin prediction, the canceled one
-    is dropped, and siblings stay schedule-only.
+    is shown cancelled, and siblings stay schedule-only.
     """
     _mock_catalog_with_rt(mock_api, _dated(TRIP_UPDATES_FREQ_MATCHED))
     handle = await feeds_client.get_transit_feed("mdb-100")
@@ -129,19 +127,17 @@ async def test_start_time_matching_applies_to_upcoming_trips_overlay(
             [TripQuery("S1", "S3")], start=NOW, end=NOW + timedelta(hours=2)
         )
     )[0]
-    assert [t.trip_id for t in trips] == [
-        "F1#21600",
-        "F1#22200",
-        "F1#25200",
-        "F1#25800",
-    ]
+    assert [t.trip_id for t in trips] == F1_SYNTHETIC_IDS
+    assert [t.trip_id for t in trips if t.canceled] == ["F1#22800"]
     predicted = next(t for t in trips if t.trip_id == "F1#22200")
     assert predicted.realtime is True
     assert predicted.delay_seconds == 120
     assert predicted.predicted_departure == F1_22200_S1_DEPARTURE + timedelta(
         seconds=120
     )
-    assert all(t.realtime is False for t in trips if t.trip_id != "F1#22200")
+    assert all(
+        t.realtime is False for t in trips if t.trip_id not in {"F1#22200", "F1#22800"}
+    )
 
 
 async def test_unmatched_predictions_attach_to_no_repetition(

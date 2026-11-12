@@ -171,20 +171,29 @@ async def test_rt_predictions_at_both_ends(
     )
 
 
-async def test_rt_cancellation_drops_trip(
+async def test_rt_cancellation_flags_trip(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
     _mock_catalog(mock_api, rt=True)
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_CANCELED, content_type=PB)
     handle = await feeds_client.get_transit_feed("mdb-100")
-    # T1 is the only scheduled S1→S3 candidate in the window; canceling it
-    # must drop the trip entirely (cancellation-wins, as in get_arrivals).
-    trips = (
+    # T1 is the only scheduled S1→S3 candidate in the window; cancelling it
+    # keeps the journey, shown as cancelled, as in get_arrivals: at its
+    # scheduled times, with no prediction and no vehicle.
+    [trip] = (
         await handle.get_upcoming_trips(
             [TripQuery("S1", "S3")], start=NOW, end=NOW + timedelta(hours=1)
         )
     )[0]
-    assert trips == []
+    assert trip.trip_id == "T1"
+    assert trip.canceled is True
+    assert trip.realtime is True
+    assert trip.predicted_departure is None
+    assert trip.origin_predicted_arrival is None
+    assert trip.predicted_arrival is None
+    assert trip.delay_seconds is None
+    assert trip.vehicle is None
+    assert trip.effective_departure == trip.scheduled_departure
 
 
 async def test_skipped_origin_kills_only_that_boarding(

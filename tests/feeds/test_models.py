@@ -88,6 +88,7 @@ def test_stop_arrival_realtime_flags() -> None:
         predicted_departure=None,
         delay_seconds=None,
         realtime=False,
+        canceled=False,
         vehicle_id=None,
         vehicle=None,
         wheelchair_accessible=WheelchairAccess.POSSIBLE,

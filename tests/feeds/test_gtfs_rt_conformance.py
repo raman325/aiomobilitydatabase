@@ -8,13 +8,15 @@ the spec states outright.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 
 from google.transit import gtfs_realtime_pb2
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from aiomobilitydatabase.feeds.models import ArrivalsQuery, TripQuery
+from aiomobilitydatabase import EntityType
+from aiomobilitydatabase.feeds.models import ArrivalsQuery, StopArrival, TripQuery
 from aiomobilitydatabase.feeds.rt import (
     TripStopUpdate,
     TripUpdateEntry,
@@ -402,3 +404,364 @@ def test_unscheduled_and_unset_trips_read_as_scheduled(
     if relationship is not None:
         other.entity[0].trip_update.trip.schedule_relationship = relationship
     assert trip_updates_from_message(other) == trip_updates_from_message(scheduled)
+
+
+# --- Which run a TripDescriptor names, and what it says about it -----------
+
+_DIRECTED = _feed(
+    stops="stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\nS2,C,0,0\n",
+    trips=(
+        "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+        "R,S,T,Out,0\nR,S,U,Back,1\nR,S,X,Out,0\n"
+    ),
+    stop_times=(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T,08:00:00,08:00:00,S0,1\nT,08:10:00,08:10:00,S1,2\n"
+        "U,08:00:00,08:00:00,S1,1\nU,08:10:00,08:10:00,S2,2\n"
+        "X,09:00:00,09:00:00,S0,1\nX,09:10:00,09:10:00,S1,2\n"
+    ),
+)
+
+
+def _descriptor_message(
+    *descriptors: dict[str, object], timestamp: datetime | None = None
+) -> gtfs_realtime_pb2.FeedMessage:
+    """One TripUpdate per dict: TripDescriptor fields, plus ``delay`` (an
+    S0 departure delay) or a ``relationship``."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    if timestamp is not None:
+        message.header.timestamp = int(timestamp.timestamp())
+    for n, fields in enumerate(descriptors):
+        entity = message.entity.add()
+        entity.id = f"e{n}"
+        trip = entity.trip_update.trip
+        for name in ("trip_id", "route_id", "direction_id", "start_time", "start_date"):
+            if name in fields:
+                setattr(trip, name, fields[name])
+        if "relationship" in fields:
+            trip.schedule_relationship = fields["relationship"]
+        if "delay" in fields:
+            stu = entity.trip_update.stop_time_update.add()
+            stu.stop_id = "S0"
+            stu.departure.delay = fields["delay"]
+    return message
+
+
+def _run_feeds[T](
+    files: dict[str, str],
+    body: Callable[[TransitFeedHandle], Awaitable[T]],
+    trip_updates: Sequence[gtfs_realtime_pb2.FeedMessage],
+    vehicles: Sequence[gtfs_realtime_pb2.FeedMessage] = (),
+) -> T:
+    """Run ``body`` with several TripUpdates feeds (in catalog order) and
+    VehiclePositions feeds, each its own message."""
+    index = _build_index_from_files(files)
+
+    async def scenario(handle: TransitFeedHandle) -> T:
+        async def fetch(
+            entity_type: EntityType, *_args: object
+        ) -> list[gtfs_realtime_pb2.FeedMessage]:
+            if entity_type is EntityType.TRIP_UPDATES:
+                return list(trip_updates)
+            return list(vehicles)
+
+        handle._fetch_entity_messages = fetch  # type: ignore[method-assign,assignment]
+        return await body(handle)
+
+    return _run(index, scenario)
+
+
+def _board(
+    start: datetime, *, with_vehicles: bool = False
+) -> Callable[[TransitFeedHandle], Awaitable[list[StopArrival]]]:
+    async def body(handle: TransitFeedHandle) -> list[StopArrival]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0"])],
+            start=start,
+            end=start + timedelta(hours=2),
+            with_vehicles=with_vehicles,
+        )
+        return board
+
+    return body
+
+
+def test_a_deleted_trip_is_not_shown_and_a_canceled_one_is() -> None:
+    """DELETED: "A trip that existed in the schedule but was removed that
+    must not be shown to users" -- "so the trip is not shown as cancelled
+    to riders". A CANCELED one is: it stays, flagged, on boards and
+    journeys alike."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    message = _descriptor_message(
+        {"trip_id": "T", "start_date": "20260730", "relationship": descriptor.DELETED},
+        {"trip_id": "X", "start_date": "20260730", "relationship": descriptor.CANCELED},
+    )
+
+    async def body(handle: TransitFeedHandle) -> tuple[list[object], list[object]]:
+        start = _EIGHT - timedelta(minutes=30)
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0"])], start=start, end=start + timedelta(hours=3)
+        )
+        [journeys] = await handle.get_upcoming_trips(
+            [TripQuery("S0", "S1")], start=start, end=start + timedelta(hours=3)
+        )
+        return (
+            [(row.trip_id, row.canceled) for row in board],
+            [(trip.trip_id, trip.canceled) for trip in journeys],
+        )
+
+    assert _run_feeds(_DIRECTED, body, [message]) == (
+        [("X", True)],
+        [("X", True)],
+    )
+
+
+def test_a_deletion_wins_over_a_cancellation_and_predictions() -> None:
+    """At most one update per run, but a producer sending a deletion beside
+    a cancellation or predictions for the same run gets it removed
+    outright, in either order."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    parts: list[dict[str, object]] = [
+        {"trip_id": "T", "start_date": "20260730", "delay": 60},
+        {"trip_id": "T", "start_date": "20260730", "relationship": descriptor.CANCELED},
+        {"trip_id": "T", "start_date": "20260730", "relationship": descriptor.DELETED},
+    ]
+    for ordered in (parts, parts[::-1]):
+        board = _run_feeds(
+            _DIRECTED,
+            _board(_EIGHT - timedelta(minutes=30)),
+            [_descriptor_message(*ordered)],
+        )
+        assert [row.trip_id for row in board] == ["X"]
+
+
+def test_a_trip_id_less_descriptor_names_its_unique_trip() -> None:
+    """ "If the trip_id field can't be provided, then route_id,
+    direction_id, start_date, and start_time must all be provided": route
+    R, direction 0, leaving at 08:00:00 on 2026-07-30 is T -- U leaves at
+    08:00:00 the other way (from S1), X later the same way."""
+    message = _descriptor_message(
+        {
+            "route_id": "R",
+            "direction_id": 0,
+            "start_time": "08:00:00",
+            "start_date": "20260730",
+            "delay": 120,
+        }
+    )
+    board = _run_feeds(_DIRECTED, _board(_EIGHT - timedelta(minutes=30)), [message])
+    assert [(row.trip_id, row.delay_seconds) for row in board] == [
+        ("T", 120),
+        ("X", None),
+    ]
+
+
+def test_a_trip_id_less_descriptor_names_no_trip_unless_unique_and_complete() -> None:
+    """Alternative matching holds only "as long as the combination of ids
+    provided resolves to a unique trip", and needs all four ids: two trips
+    leaving together the same way name neither, and a descriptor missing
+    one id, naming a day the trip does not run, or naming a frequency
+    trip names nothing."""
+    twin = _feed(
+        trips=(
+            "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+            "R,S,T,Out,0\nR,S,V,Out,0\nR,S,F,Out,0\n"
+        ),
+        stop_times=(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T,08:00:00,08:00:00,S0,1\nT,08:10:00,08:10:00,S1,2\n"
+            "V,08:00:00,08:00:00,S0,1\nV,08:10:00,08:10:00,S1,2\n"
+            "F,09:00:00,09:00:00,S0,1\nF,09:10:00,09:10:00,S1,2\n"
+        ),
+        frequencies="trip_id,start_time,end_time,headway_secs\nF,09:00:00,09:30:00,600\n",
+    )
+    complete = {
+        "route_id": "R",
+        "direction_id": 0,
+        "start_time": "08:00:00",
+        "start_date": "20260730",
+        "delay": 120,
+    }
+    cases = [
+        complete,
+        {**complete, "start_time": "09:00:00"},  # a frequency repetition
+        {**complete, "start_date": "20280101"},  # outside the calendar
+        *(
+            {k: v for k, v in complete.items() if k != gone}
+            for gone in ("route_id", "direction_id", "start_time", "start_date")
+        ),
+    ]
+    for fields in cases:
+        board = _run_feeds(
+            twin, _board(_EIGHT - timedelta(minutes=30)), [_descriptor_message(fields)]
+        )
+        assert all(row.delay_seconds is None for row in board), fields
+
+
+def test_each_feeds_dateless_updates_are_judged_at_its_own_time() -> None:
+    """Each FeedHeader.timestamp "identifies the moment when the content of
+    this feed has been created". Feed A, stamped Thursday 07:45, cancels T
+    without a date: Thursday's run. Feed B is stamped Friday 07:45. On
+    Friday morning's board T runs -- B's later time must not move A's
+    cancellation onto Friday."""
+    thursday = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    friday = thursday + timedelta(days=1)
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    feed_a = _descriptor_message(
+        {"trip_id": "T", "relationship": descriptor.CANCELED}, timestamp=thursday
+    )
+    feed_b = _descriptor_message({"trip_id": "X", "delay": 60}, timestamp=friday)
+    for feeds in ([feed_a, feed_b], [feed_b, feed_a]):
+        thursdays = _run_feeds(_DIRECTED, _board(thursday), feeds)
+        fridays = _run_feeds(_DIRECTED, _board(friday), feeds)
+        assert [(r.trip_id, r.canceled) for r in thursdays] == [
+            ("T", True),
+            ("X", False),
+        ]
+        assert [(r.trip_id, r.canceled, r.delay_seconds) for r in fridays] == [
+            ("T", False, None),
+            ("X", False, 60),
+        ]
+
+
+def test_a_dateless_vehicle_is_judged_at_its_own_feeds_time() -> None:
+    """The same for VehiclePositions: a vehicle naming T without a date in
+    a feed stamped Thursday 07:45 rides Thursday's run, whatever time the
+    TripUpdates feed carries."""
+    thursday = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    friday = thursday + timedelta(days=1)
+    vehicles = gtfs_realtime_pb2.FeedMessage()
+    vehicles.header.gtfs_realtime_version = "2.0"
+    vehicles.header.timestamp = int(thursday.timestamp())
+    entity = vehicles.entity.add()
+    entity.id = "v"
+    entity.vehicle.vehicle.id = "BUS"
+    entity.vehicle.trip.trip_id = "T"
+    entity.vehicle.position.latitude = 0
+    entity.vehicle.position.longitude = 0
+    trip_updates = _descriptor_message(timestamp=friday)
+    for start, expected in ((thursday, "BUS"), (friday, None)):
+        board = _run_feeds(
+            _DIRECTED,
+            _board(start, with_vehicles=True),
+            [trip_updates],
+            [vehicles],
+        )
+        [t_row] = [row for row in board if row.trip_id == "T"]
+        assert (t_row.vehicle.vehicle_id if t_row.vehicle else None) == expected
+
+
+def test_the_most_explicit_reference_to_a_run_wins() -> None:
+    """One update per run: when two name the same run, the one naming its
+    date beats one leaving it to the feed's time, and one omitting a plain
+    trip's start time beats one spelling it out -- in any feed order."""
+    stamp = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    dated = _descriptor_message(
+        {"trip_id": "T", "start_date": "20260730", "delay": 60}, timestamp=stamp
+    )
+    dateless = _descriptor_message({"trip_id": "T", "delay": 120}, timestamp=stamp)
+    bare = _descriptor_message(
+        {"trip_id": "T", "start_date": "20260730", "delay": 180}, timestamp=stamp
+    )
+    spelled = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "start_time": "08:00:00",
+            "delay": 240,
+        },
+        timestamp=stamp,
+    )
+    for feeds, delay in (
+        ([dated, dateless], 60),
+        ([dateless, dated], 60),
+        ([bare, spelled], 180),
+        ([spelled, bare], 180),
+    ):
+        board = _run_feeds(_DIRECTED, _board(stamp), feeds)
+        assert [(r.trip_id, r.delay_seconds) for r in board] == [
+            ("T", delay),
+            ("X", None),
+        ]
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    other_offset=st.integers(-3 * 86_400, 3 * 86_400),
+    kind=st.sampled_from(["cancel", "delay"]),
+    board_day=st.integers(0, 1),
+)
+def test_another_feeds_time_never_moves_a_dateless_update(
+    other_offset: int, kind: str, board_day: int
+) -> None:
+    """Law: the run a date-less update in feed A addresses is a function of
+    A's header timestamp only. Feed B's timestamp -- earlier, later, across
+    service-day boundaries -- leaves every board exactly as without B's
+    clock (B updates an unrelated trip)."""
+    stamp = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    update: dict[str, object] = (
+        {"trip_id": "T", "relationship": descriptor.CANCELED}
+        if kind == "cancel"
+        else {"trip_id": "T", "delay": 90}
+    )
+    feed_a = _descriptor_message(update, timestamp=stamp)
+    feed_b = _descriptor_message(
+        {"trip_id": "X", "start_date": "20260730", "delay": 60},
+        timestamp=stamp + timedelta(seconds=other_offset),
+    )
+    feed_b_same = _descriptor_message(
+        {"trip_id": "X", "start_date": "20260730", "delay": 60}, timestamp=stamp
+    )
+    start = stamp + timedelta(days=board_day)
+    assert _run_feeds(_DIRECTED, _board(start), [feed_a, feed_b]) == _run_feeds(
+        _DIRECTED, _board(start), [feed_a, feed_b_same]
+    )
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    trip=st.sampled_from([("T", 0, "08:00:00"), ("X", 0, "09:00:00")]),
+    day=st.sampled_from(["20260730", "20260731"]),
+    kind=st.sampled_from(["cancel", "delete", "delay"]),
+    delay=st.integers(-600, 1800),
+)
+def test_a_unique_trip_id_less_descriptor_reads_as_its_trip_id(
+    trip: tuple[str, int, str], day: str, kind: str, delay: int
+) -> None:
+    """Law: where route, direction, start time and date name exactly one
+    trip, a descriptor giving them instead of the trip_id means exactly
+    what the trip_id descriptor means -- boards and journeys alike."""
+    trip_id, direction, start_time = trip
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    payloads: dict[str, dict[str, object]] = {
+        "cancel": {"relationship": descriptor.CANCELED},
+        "delete": {"relationship": descriptor.DELETED},
+        "delay": {"delay": delay},
+    }
+    payload = payloads[kind]
+    by_id = _descriptor_message({"trip_id": trip_id, "start_date": day, **payload})
+    by_route = _descriptor_message(
+        {
+            "route_id": "R",
+            "direction_id": direction,
+            "start_time": start_time,
+            "start_date": day,
+            **payload,
+        }
+    )
+
+    async def body(handle: TransitFeedHandle) -> tuple[object, ...]:
+        start = datetime(2026, 7, 30, 7, 30, tzinfo=UTC)
+        boards = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S1"])], start=start, end=start + timedelta(days=2)
+        )
+        journeys = await handle.get_upcoming_trips(
+            [TripQuery("S0", "S1")], start=start, end=start + timedelta(days=2)
+        )
+        return boards, journeys
+
+    assert _run_feeds(_DIRECTED, body, [by_route]) == _run_feeds(
+        _DIRECTED, body, [by_id]
+    )

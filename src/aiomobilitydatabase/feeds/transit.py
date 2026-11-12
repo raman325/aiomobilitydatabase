@@ -65,14 +65,17 @@ from .rt import (
     TripModifications,
     TripPredictions,
     TripUpdateKey,
+    TripUpdateRecord,
     TripUpdates,
     alerts_from_message,
     feed_request_fields,
+    feed_timestamp,
     fetch_feed_message,
+    indexed_trip_updates,
     resolve_trip_predictions,
     stops_from_message,
     trip_modifications_from_message,
-    trip_updates_from_message,
+    trip_update_records,
     vehicles_from_message,
 )
 from .static_index import (
@@ -187,38 +190,16 @@ _RtIdentity = tuple[str, int | None]
 _TripInstance = tuple[str, date]
 
 
-def _rt_key_for_row(
-    identity: _RtIdentity,
-    service_date: date,
-    keys: Collection[TripUpdateKey],
-    current_dates: Mapping[_RtIdentity, date],
-) -> TripUpdateKey | None:
-    """Resolve which RT key in ``keys`` (if any) addresses one scheduled row.
+def _run_key(identity: _RtIdentity, service_date: date) -> TripUpdateKey:
+    """Return the matched realtime key naming one scheduled run.
 
-    A key WITH a start_date matches only the row whose service day equals
-    it -- AND-ed with the start_time rules, which are unchanged: frequency
-    rows need an aligned start_secs, plain rows need start_secs None. A
-    key WITHOUT a start_date matches only the run the identity's trip_id
-    alone names, ``current_dates[identity]`` (see
-    :meth:`StaticIndex.current_service_dates`): the spec requires a
-    start_date for a frequency trip or one longer than a day, which so
-    have none. That is decided from the whole trip and the feed's own time
-    (see ``_realtime_now``), never from which runs happen to fall in the
-    window -- so a long or open-ended window can't move a date-less update
-    onto tomorrow's run. An identity with no such run takes no date-less
-    update at all. When a
-    dated and a date-less key both exist for one row, the dated key wins
-    (it is strictly more specific). A garbage start_date parses to None
-    (see ``rt._trip_start_date``), so it behaves exactly like an absent one.
+    Matching (see :meth:`TransitFeedHandle._matched_realtime`) gives every
+    reference its service day and drops a plain trip's own start time, so
+    a run is addressed by exactly ``(source trip id, service day,
+    repetition start or None)``.
     """
     source_trip_id, start_secs = identity
-    dated: TripUpdateKey = (source_trip_id, service_date, start_secs)
-    if dated in keys:
-        return dated
-    dateless: TripUpdateKey = (source_trip_id, None, start_secs)
-    if dateless in keys and current_dates.get(identity) == service_date:
-        return dateless
-    return None
+    return (source_trip_id, service_date, start_secs)
 
 
 def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
@@ -232,118 +213,125 @@ def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
 
 @dataclass(frozen=True)
 class _Vehicles:
-    """Live vehicles indexed for matching onto scheduled runs.
+    """Live vehicles indexed for matching onto runs.
 
     ``by_instance`` is keyed by (trip id, start seconds, service date) --
     the trip, the repetition of a frequency-based trip, and the run's
-    service day, as a VehiclePosition's TripDescriptor names them (either
-    of the last two may be absent). ``dateless_trip_ids`` are trips some
-    vehicle names WITHOUT a start date: those vehicles can only match the
-    trip's current run, which the caller resolves.
+    service day, as matching resolved the vehicle's TripDescriptor (see
+    :func:`_dated`). A date-less claim keeps a None day only where it names
+    no scheduled run: it can then ride an RT-added trip of that id.
     """
 
     by_vehicle_id: Mapping[str, VehiclePosition]
     by_instance: Mapping[tuple[str, int | None, date | None], VehiclePosition | None]
-    dateless_trip_ids: frozenset[str]
 
 
-def _vehicle_index(
-    vehicles: Sequence[VehiclePosition], plain_starts: Mapping[str, int]
-) -> _Vehicles:
-    """Index live vehicles for matching, by vehicle id and by run.
-
-    An instance entry holds None where two vehicles claim the same run:
-    that is a genuinely ambiguous feed, not a resolvable one, and guessing
-    would put the wrong vehicle on the map. A plain trip named with its own
-    start time (``plain_starts``) is indexed as named without one (see
-    :func:`_plain_start_key`); the vehicle itself keeps what it reported.
-    """
-    by_vehicle_id: dict[str, VehiclePosition] = {}
-    by_instance: dict[tuple[str, int | None, date | None], VehiclePosition | None] = {}
-    dateless: set[str] = set()
-    # Claims as sent first, then those naming a plain trip by its own start
-    # time: as for TripUpdates, the bare form wins over the equivalent one
-    # rather than both poisoning each other.
-    claims: list[tuple[VehiclePosition, tuple[str, int | None, date | None], bool]] = []
-    for vehicle in vehicles:
-        if vehicle.vehicle_id:
-            by_vehicle_id[vehicle.vehicle_id] = vehicle
-        if vehicle.trip_id:
-            trip_id, _date, secs = _plain_start_key(
-                (vehicle.trip_id, vehicle.trip_start_date, vehicle.trip_start_secs),
-                plain_starts,
-            )
-            rewritten = secs != vehicle.trip_start_secs
-            claims.append(
-                (vehicle, (trip_id, secs, vehicle.trip_start_date), rewritten)
-            )
-            if vehicle.trip_start_date is None:
-                dateless.add(vehicle.trip_id)
-    bare = {key for _, key, rewritten in claims if not rewritten}
-    for vehicle, key, rewritten in sorted(claims, key=lambda claim: claim[2]):
-        if rewritten and key in bare:
-            continue
-        # A second claimant poisons the entry rather than overwriting it.
-        by_instance[key] = None if key in by_instance else vehicle
-    return _Vehicles(by_vehicle_id, by_instance, frozenset(dateless))
+# A trip reference as a TripDescriptor sends it: (trip_id, start_date,
+# start_secs), either of the last two possibly absent.
+_Reference = tuple[str, date | None, int | None]
+# How explicitly a reference named its run: (named its date, named a plain
+# trip without its own start time). A higher one wins over an equivalent.
+_Precedence = tuple[bool, bool]
 
 
-def _plain_start_key(
-    key: TripUpdateKey, plain_starts: Mapping[str, int]
-) -> TripUpdateKey:
-    """Return a realtime key with a plain trip's own start time dropped.
+def _dated(
+    reference: _Reference,
+    plain_starts: Mapping[str, int],
+    current: Mapping[str, date],
+) -> tuple[_Reference, _Precedence]:
+    """Return the run a reference names, its day filled in, and its precedence.
 
     GTFS-RT: a non-frequency trip's ``start_time`` "should either be
     omitted or be equal to the value in the GTFS feed", so one equal to the
-    trip's first departure names the same run as one omitting it. Any
-    other start time on a plain trip names no run (it is kept, and so
-    matches nothing); a frequency repetition's is its identity.
+    trip's first departure (``plain_starts``) names the same run as one
+    omitting it, and is dropped; any other start time on a plain trip names
+    no run (it is kept, and so matches nothing); a frequency repetition's is
+    its identity. A date-less reference to a plain trip names the run its
+    trip_id alone means as of its own feed's time (``current``, see
+    :meth:`StaticIndex.current_service_dates`); one to a frequency
+    repetition or a trip longer than a day names none -- the spec requires
+    those to carry a start_date -- and keeps its None day.
+
+    The precedence ranks equivalent references for one run: one naming its
+    date over one leaving it to the feed's time, then one omitting a plain
+    trip's start time over one spelling it out. The spec allows one update
+    per run, and the more explicit form is the one to keep.
     """
-    trip_id, start_date, start_secs = key
-    if start_secs is not None and plain_starts.get(trip_id) == start_secs:
-        return (trip_id, start_date, None)
-    return key
+    trip_id, day, secs = reference
+    spelled_out = secs is not None and plain_starts.get(trip_id) == secs
+    if spelled_out:
+        secs = None
+    precedence = (day is not None, not spelled_out)
+    if day is None and secs is None:
+        day = current.get(trip_id)
+    return (trip_id, day, secs), precedence
 
 
-def _with_plain_starts(
-    updates: TripUpdates, plain_starts: Mapping[str, int]
-) -> TripUpdates:
-    """Return ``updates`` with every key passed through :func:`_plain_start_key`.
+def _alternative_ref(record: TripUpdateRecord) -> tuple[str, int, date, int] | None:
+    """Return a trip_id-less record's (route, direction, start date, time).
 
-    A key already naming the same run without a start time wins: the spec
-    allows one update per run, and the bare form is the canonical one.
+    GTFS-RT: "If the trip_id field can't be provided, then route_id,
+    direction_id, start_date, and start_time must all be provided"; a
+    record missing any of them (or naming its trip_id) has no such ref.
     """
-    if not plain_starts:
-        return updates
-    trips = dict(updates.trips)
-    for key, entry in updates.trips.items():
-        bare = _plain_start_key(key, plain_starts)
-        if bare != key:
-            del trips[key]
-            trips.setdefault(bare, entry)
-    return TripUpdates(
-        trips=trips,
-        canceled_trips={
-            _plain_start_key(k, plain_starts) for k in updates.canceled_trips
-        },
-        added=updates.added,
-        feed_time=updates.feed_time,
-    )
+    if (
+        record.trip_id
+        or record.route_id is None
+        or record.direction_id is None
+        or record.start_date is None
+        or record.start_secs is None
+    ):
+        return None
+    return (record.route_id, record.direction_id, record.start_date, record.start_secs)
 
 
-def _plain_start_candidates(
-    updates: TripUpdates, vehicles: Sequence[VehiclePosition]
-) -> set[str]:
-    """Trip ids some realtime key names WITH a start time."""
-    return {
-        trip_id
-        for trip_id, _date, secs in (*updates.trips, *updates.canceled_trips)
-        if secs is not None
-    } | {
-        vehicle.trip_id
-        for vehicle in vehicles
-        if vehicle.trip_id and vehicle.trip_start_secs is not None
+def _record_trip_id(
+    record: TripUpdateRecord,
+    alternative: Mapping[tuple[str, int, date, int], str],
+) -> str:
+    """Return the trip a record names (``""``: none).
+
+    Its trip_id, else the one its route, direction, start date and time
+    resolve to.
+    """
+    if record.trip_id:
+        return record.trip_id
+    ref = _alternative_ref(record)
+    return alternative.get(ref, "") if ref is not None else ""
+
+
+def _vehicle_index(
+    claims: Sequence[tuple[_Reference, _Precedence, VehiclePosition]],
+    positions: Sequence[VehiclePosition],
+) -> _Vehicles:
+    """Index live vehicles for matching, by vehicle id and by matched run.
+
+    Of the claims on one run only the most explicit count (see
+    :func:`_dated`), as for TripUpdates. An instance entry holds None where
+    two of those vehicles claim the same run: that is a genuinely ambiguous
+    feed, not a resolvable one, and guessing would put the wrong vehicle on
+    the map. The vehicle itself keeps what it reported.
+    """
+    by_vehicle_id = {
+        vehicle.vehicle_id: vehicle for vehicle in positions if vehicle.vehicle_id
     }
+    best: dict[
+        tuple[str, int | None, date | None], tuple[_Precedence, list[VehiclePosition]]
+    ] = {}
+    for (trip_id, day, secs), precedence, vehicle in claims:
+        key = (trip_id, secs, day)
+        held = best.get(key)
+        if held is None or precedence > held[0]:
+            best[key] = (precedence, [vehicle])
+        elif precedence == held[0]:
+            held[1].append(vehicle)
+    return _Vehicles(
+        by_vehicle_id,
+        {
+            key: vehicles[0] if len(vehicles) == 1 else None
+            for key, (_precedence, vehicles) in best.items()
+        },
+    )
 
 
 def _match_vehicle(
@@ -352,7 +340,6 @@ def _match_vehicle(
     start_secs: int | None,
     *,
     service_date: date | None,
-    current_dates: Mapping[_RtIdentity, date],
     vehicles: _Vehicles,
     scheduled: bool = True,
 ) -> VehiclePosition | None:
@@ -360,10 +347,9 @@ def _match_vehicle(
 
     A vehicle id from the row's own realtime prediction wins: that
     prediction was already matched to this exact run. Otherwise the row's
-    run is looked up by trip: a vehicle naming this service day matches;
-    one naming no day matches only the trip's CURRENT run (``service_date``
-    equal to ``current_dates`` for the identity), so today's vehicle never
-    lands on tomorrow's row.
+    run is looked up as matching resolved each vehicle's claim: by trip,
+    repetition start and service day, so today's vehicle never lands on
+    tomorrow's row.
 
     ``plain_trip_id`` must be the PRODUCER-facing trip id (a repetition's
     template id, not its synthetic ``{trip_id}#{start_secs}`` id). A
@@ -379,16 +365,11 @@ def _match_vehicle(
         return vehicle
     if not plain_trip_id:
         return None
-    # An RT-added row has no schedule to judge "current" against: a vehicle
-    # naming no day may ride it, as may one naming the row's own day.
-    is_current = (
-        not scheduled or current_dates.get((plain_trip_id, start_secs)) == service_date
-    )
     if service_date is not None and (
         dated := vehicles.by_instance.get((plain_trip_id, start_secs, service_date))
     ):
         return dated
-    if is_current and (
+    if not scheduled and (
         dateless := vehicles.by_instance.get((plain_trip_id, start_secs, None))
     ):
         return dateless
@@ -566,6 +547,7 @@ def _detoured_rows(
                 predicted_departure=None,
                 delay_seconds=None,
                 realtime=True,
+                canceled=False,
                 vehicle_id=None,
                 vehicle=None,
                 wheelchair_accessible=template.wheelchair_accessible,
@@ -592,18 +574,19 @@ def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
 _INITIAL_HORIZON = timedelta(hours=2)
 
 
-def _realtime_now(updates: TripUpdates, start: datetime) -> datetime:
-    """Return the instant realtime describes: the feed's time, else the present.
+def _realtime_now(feed_time: datetime | None, start: datetime) -> datetime:
+    """Return the instant one feed describes: its own time, else the present.
 
-    The run a date-less update means is judged at the producer's header
-    timestamp, not at the query's ``start`` -- a board
+    The run a date-less reference means is judged at its feed's header
+    timestamp -- the moment "the content of this feed has been created" --
+    not at the query's ``start``, and not at another feed's time: a board
     for tomorrow morning must not move today's cancellation onto
     tomorrow's run. A feed without a timestamp (the spec requires one)
     falls back to now, but never later than ``start``: realtime describes
     the present, and a query about the past is answered as of its start.
     """
-    if updates.feed_time is not None:
-        return updates.feed_time
+    if feed_time is not None:
+        return feed_time
     return min(start, datetime.now(UTC))
 
 
@@ -807,6 +790,7 @@ def _scheduled_row(
         predicted_departure=None,
         delay_seconds=None,
         realtime=False,
+        canceled=False,
         vehicle_id=None,
         vehicle=None,
         wheelchair_accessible=dep.wheelchair_accessible,
@@ -1494,27 +1478,154 @@ class TransitFeedHandle:
             messages.append(message)
         return messages
 
-    async def _aggregated_trip_updates(
-        self, memo: dict[str, gtfs_realtime_pb2.FeedMessage] | None = None
-    ) -> TripUpdates:
-        """Merge TripUpdates across every TU-capable sibling RT source.
+    async def _matched_realtime(
+        self,
+        tu_messages: Sequence[gtfs_realtime_pb2.FeedMessage],
+        vp_messages: Sequence[gtfs_realtime_pb2.FeedMessage],
+        start: datetime,
+        stops_by_id: Mapping[str, Stop],
+        routes_by_id: Mapping[str, Route],
+    ) -> tuple[TripUpdates, _Vehicles]:
+        """Match every realtime trip reference to the dated run it names.
 
-        Deliberate tiebreak: when multiple TU-capable sibling feeds report
-        the same (trip_id, start_date, start_secs) identity, the last feed
-        in catalog order wins wholesale (no freshness reconciliation in
-        v1).
+        A TripUpdate without a trip_id is resolved by route, direction,
+        start time and date (:meth:`StaticIndex.alternative_trip_ids`); a
+        plain trip's own start time is dropped and a date-less reference
+        given its day (:func:`_dated`), each feed's at that feed's own
+        header time -- never at another feed's. ADDED trips are not in the
+        schedule and keep their references as sent, as does a cancellation
+        or deletion naming no scheduled run (it can still remove an ADDED
+        trip of that id); any other update naming no run is dropped.
+        TripUpdates from every TU-capable sibling feed then merge: a
+        cancellation or deletion anywhere wins, and of several updates for
+        one run the most explicit reference wins, then the later feed in
+        catalog order (no freshness reconciliation). Returns the matched
+        TripUpdates and the vehicles parsed from ``vp_messages``, indexed
+        by the run each claims. Caller holds the reader guard.
         """
-        aggregate = TripUpdates()
-        for message in await self._fetch_entity_messages(EntityType.TRIP_UPDATES, memo):
-            updates = trip_updates_from_message(message)
-            aggregate.trips.update(updates.trips)
-            aggregate.canceled_trips |= updates.canceled_trips
-            aggregate.added.extend(updates.added)
-            if updates.feed_time is not None and (
-                aggregate.feed_time is None or updates.feed_time > aggregate.feed_time
+        descriptor = gtfs_realtime_pb2.TripDescriptor
+        removals = (descriptor.CANCELED, descriptor.DELETED)
+        tu_feeds = [
+            (trip_update_records(message), feed_timestamp(message))
+            for message in tu_messages
+        ]
+        vp_feeds = list(
+            zip(
+                await self._vehicles_from(vp_messages, stops_by_id, routes_by_id),
+                (feed_timestamp(message) for message in vp_messages),
+                strict=True,
+            )
+        )
+        alternative = await self._index_read(
+            self._index.alternative_trip_ids,
+            [
+                ref
+                for records, _ in tu_feeds
+                for record in records
+                if (ref := _alternative_ref(record)) is not None
+            ],
+        )
+        # Every feed's references as sent, a trip_id-less one resolved.
+        tu_refs = [
+            [
+                (
+                    _record_trip_id(record, alternative),
+                    record.start_date,
+                    record.start_secs,
+                )
+                for record in records
+            ]
+            for records, _ in tu_feeds
+        ]
+        vp_refs = [
+            [
+                (vehicle.trip_id, vehicle.trip_start_date, vehicle.trip_start_secs)
+                for vehicle in vehicles
+                if vehicle.trip_id
+            ]
+            for vehicles, _ in vp_feeds
+        ]
+        plain_starts = await self._index_read(
+            self._index.plain_trip_starts,
+            {
+                trip_id
+                for refs in (*tu_refs, *vp_refs)
+                for trip_id, _day, secs in refs
+                if trip_id and secs is not None
+            },
+        )
+        ranked: list[tuple[_Precedence, TripUpdateRecord]] = []
+        for (records, feed_time), refs in zip(tu_feeds, tu_refs, strict=True):
+            dated = await self._dated_references(refs, feed_time, plain_starts, start)
+            for record, ((trip_id, day, secs), precedence) in zip(
+                records, dated, strict=True
             ):
-                aggregate.feed_time = updates.feed_time
-        return aggregate
+                if record.relationship == descriptor.ADDED:
+                    ranked.append(((True, True), record))
+                elif trip_id and day is not None:
+                    ranked.append(
+                        (
+                            precedence,
+                            replace(
+                                record, trip_id=trip_id, start_date=day, start_secs=secs
+                            ),
+                        )
+                    )
+                elif record.relationship in removals:
+                    # Names no scheduled run, so as sent it removes none --
+                    # but it still removes an ADDED trip of that id.
+                    ranked.append((precedence, record))
+        # Stable: least explicit first, so the most explicit (then the
+        # later feed, then the later entity) wins.
+        ranked.sort(key=lambda item: item[0])
+        claims: list[tuple[_Reference, _Precedence, VehiclePosition]] = []
+        for (vehicles, feed_time), refs in zip(vp_feeds, vp_refs, strict=True):
+            dated = await self._dated_references(refs, feed_time, plain_starts, start)
+            claims.extend(
+                (reference, precedence, vehicle)
+                for vehicle, (reference, precedence) in zip(
+                    [vehicle for vehicle in vehicles if vehicle.trip_id],
+                    dated,
+                    strict=True,
+                )
+            )
+        return (
+            indexed_trip_updates(record for _, record in ranked),
+            _vehicle_index(
+                claims, [vehicle for vehicles, _ in vp_feeds for vehicle in vehicles]
+            ),
+        )
+
+    async def _dated_references(
+        self,
+        refs: Sequence[_Reference],
+        feed_time: datetime | None,
+        plain_starts: Mapping[str, int],
+        start: datetime,
+    ) -> list[tuple[_Reference, _Precedence]]:
+        """Pass one feed's references through :func:`_dated`, at its own time.
+
+        Caller holds the reader guard.
+        """
+        dateless = sorted(
+            {
+                trip_id
+                for trip_id, day, secs in refs
+                if trip_id
+                and day is None
+                and (secs is None or plain_starts.get(trip_id) == secs)
+            }
+        )
+        current = (
+            await self._index_read(
+                self._index.current_service_dates,
+                dateless,
+                _realtime_now(feed_time, start),
+            )
+            if dateless
+            else {}
+        )
+        return [_dated(reference, plain_starts, current) for reference in refs]
 
     async def _resolve_predictions(
         self,
@@ -1527,7 +1638,7 @@ class TransitFeedHandle:
         ``rt_keys`` maps each matched instance -- CONCRETE trip id
         (synthetic repetition ids included) plus service day -- to the
         ``updates.trips`` key that addresses it, as resolved per row by
-        :func:`_rt_key_for_row` (callers pass matched instances only).
+        :func:`_run_key` (callers pass matched instances only).
         Instances are the unit here, not bare trip ids, because a window
         of 24h or more holds several service days' rows for one concrete
         trip id and a dated update must reach exactly one of them. Each
@@ -1642,15 +1753,26 @@ class TransitFeedHandle:
         requires; any other value names no run.
 
         ``TripDescriptor.start_date`` picks the SERVICE DAY instance the
-        start_time rules then apply within (see :func:`_rt_key_for_row`):
+        start_time rules then apply within (see :func:`_dated`):
         a dated prediction or cancellation affects only the instance whose
         service day it names — an early-posted "trip X canceled tomorrow"
         never cancels today's departure — while a date-less one affects
-        only the run it means as of the feed's own timestamp: the run
+        only the run it means as of its own feed's timestamp (never another
+        feed's): the run
         under way, else the nearest up to today, and none for a frequency
         trip or one longer than a day, which the spec requires to carry a date
         (see :meth:`StaticIndex.current_service_dates`), so a board for
         tomorrow morning never moves today's update onto tomorrow's run.
+        An update without a trip_id names the one non-frequency trip its
+        route_id, direction_id, start_time (the first departure) and
+        start_date resolve to, and none if any is missing or several match
+        (see :meth:`StaticIndex.alternative_trip_ids`).
+
+        A CANCELED run stays on the board at its scheduled time, flagged
+        ``canceled`` with no prediction and no vehicle, so riders see the
+        cancellation; a DELETED run "must not be shown to users" and has no
+        rows. Both win over predictions for the same run, and a deletion
+        over a cancellation.
 
         ``with_vehicles`` attaches each row's live
         :class:`VehiclePosition` when one can be pinned down -- off by
@@ -1669,19 +1791,17 @@ class TransitFeedHandle:
         # One memo per call: a bundled feed serving both TripUpdates and
         # VehiclePositions is downloaded and parsed once, not once per type.
         rt_memo: dict[str, gtfs_realtime_pb2.FeedMessage] = {}
-        updates = await self._aggregated_trip_updates(rt_memo)
+        # Detours come from the TU-declaring feeds, NOT from whatever the
+        # memo happens to hold: reading the memo made a vp-declaring feed
+        # that also bundles trip_modifications contribute detours only when
+        # with_vehicles was set, so a display flag changed the schedule.
+        tu_messages = await self._fetch_entity_messages(
+            EntityType.TRIP_UPDATES, rt_memo
+        )
         vehicle_messages = (
             await self._fetch_entity_messages(EntityType.VEHICLE_POSITIONS, rt_memo)
             if with_vehicles
             else []
-        )
-        # Sourced from the TU-declaring feeds, NOT from whatever the memo
-        # happens to hold: reading the memo made a vp-declaring feed that
-        # also bundles trip_modifications contribute detours only when
-        # with_vehicles was set, so a display flag changed the schedule.
-        # These are all memo hits, so this costs no request.
-        tu_messages = await self._fetch_entity_messages(
-            EntityType.TRIP_UPDATES, rt_memo
         )
         rt_stops: dict[str, Stop] = {}
         modifications: list[TripModifications] = []
@@ -1694,16 +1814,9 @@ class TransitFeedHandle:
                 rt_stops, stops_by_id, self._index.timezone_name
             )
             routes_by_id = await self._index_read(self._index.routes_by_id)
-            positions = await self._vehicles_from(
-                vehicle_messages, stops_by_id, routes_by_id
+            updates, vehicles = await self._matched_realtime(
+                tu_messages, vehicle_messages, start, stops_by_id, routes_by_id
             )
-            plain_starts = await self._index_read(
-                self._index.plain_trip_starts,
-                _plain_start_candidates(updates, positions),
-            )
-            updates = _with_plain_starts(updates, plain_starts)
-            vehicles = _vehicle_index(positions, plain_starts)
-            realtime_now = _realtime_now(updates, start)
             # Realtime moves exactly the runs it names: those a TripUpdate
             # addresses and those a detour rebuilds. Both are read whole,
             # here, with the window applied to their scheduled times -- so
@@ -1715,7 +1828,7 @@ class TransitFeedHandle:
                 dep
                 for dep in await self._index_read(
                     self._index.instance_departures,
-                    await self._addressed_runs(updates, realtime_now),
+                    await self._addressed_runs(updates),
                     batch_stops,
                     batch_routes,
                     batch_headsigns,
@@ -1767,7 +1880,6 @@ class TransitFeedHandle:
                     [scheduled[key] for key in sorted(scheduled)],
                     all_stop_ids,
                     start=start,
-                    realtime_now=realtime_now,
                     updates=updates,
                     modified_rows=modified_rows,
                     modified_instances=modified_instances,
@@ -1792,57 +1904,21 @@ class TransitFeedHandle:
                     break
             return [board or [] for board in boards]
 
-    async def _addressed_runs(
-        self, updates: TripUpdates, now: datetime
-    ) -> list[_TripInstance]:
-        """Return the runs TripUpdates address, resolved as the merge does.
+    async def _addressed_runs(self, updates: TripUpdates) -> list[_TripInstance]:
+        """Return the runs TripUpdates predict, as the merge matches them.
 
-        Dated keys name their day; date-less ones the run they mean as of
-        ``now`` (see :meth:`StaticIndex.current_service_dates`). These are
-        the only scheduled runs realtime can move (detours aside), so they
-        are read whole before any scan. Caller holds the reader guard.
+        These are the only scheduled runs realtime can move (detours
+        aside), so they are read whole before any scan. Caller holds the
+        reader guard.
         """
         return sorted(
             {
                 instance
                 for instance, _key in await self._index_read(
-                    self._index.rt_instances, list(updates.trips), now
+                    self._index.rt_instances, list(updates.trips)
                 )
             }
         )
-
-    async def _current_runs(
-        self,
-        rows: Sequence[tuple[str, str, int | None]],
-        updates: TripUpdates,
-        vehicles: _Vehicles,
-        now: datetime,
-    ) -> dict[_RtIdentity, date]:
-        """Current-run service days for the identities that need one.
-
-        ``rows`` are (concrete trip id, source trip id, start secs). Only
-        identities some date-less TripUpdate, cancellation or vehicle could
-        address are looked up (see :meth:`StaticIndex.current_service_dates`);
-        caller holds the reader guard.
-        """
-        dateless_keys = {
-            (key[0], key[2])
-            for key in (*updates.trips, *updates.canceled_trips)
-            if key[1] is None
-        }
-        wanted = {
-            trip_id: (source, start)
-            for trip_id, source, start in rows
-            if (source, start) in dateless_keys or source in vehicles.dateless_trip_ids
-        }
-        if not wanted:
-            return {}
-        dates = await self._index_read(
-            self._index.current_service_dates, sorted(wanted), now
-        )
-        return {
-            wanted[trip_id]: service_date for trip_id, service_date in dates.items()
-        }
 
     async def _merged_arrivals(
         self,
@@ -1850,7 +1926,6 @@ class TransitFeedHandle:
         all_stop_ids: list[str],
         *,
         start: datetime,
-        realtime_now: datetime,
         updates: TripUpdates,
         modified_rows: Sequence[StopArrival],
         modified_instances: Collection[tuple[str, date]],
@@ -1868,57 +1943,45 @@ class TransitFeedHandle:
         the reader guard and applies per-query filters and limits. Runs
         once per horizon of :meth:`get_arrivals`, with RT already fetched.
         """
-        canceled = updates.canceled_trips
         added_rows = updates.added
         # The unmodified schedule for these instances describes a route the
         # vehicle is no longer taking. Keyed by INSTANCE, not by trip: a
         # detour dated yesterday must not delete today's run of the trip.
+        # A deleted run "must not be shown to users" at all.
         scheduled = [
             dep
             for dep in scheduled
             if (dep.trip_id, dep.service_date) not in modified_instances
+            and _run_key((dep.source_trip_id, dep.start_secs), dep.service_date)
+            not in updates.deleted_trips
         ]
-        # Per-row RT matching: each scheduled row's (identity, service day)
-        # resolves to at most one TripUpdates key via _rt_key_for_row —
-        # dated keys hit exactly their service day's run, date-less keys
-        # only the trip's current run.
-        current_dates = await self._current_runs(
-            [(dep.trip_id, dep.source_trip_id, dep.start_secs) for dep in scheduled],
-            updates,
-            vehicles,
-            realtime_now,
-        )
+        # Per-row RT matching: each scheduled row's run has exactly one
+        # matched key (see _matched_realtime).
         resolved = await self._resolve_predictions(
             updates,
             {
                 (dep.trip_id, dep.service_date): key
                 for dep in scheduled
                 if (
-                    key := _rt_key_for_row(
-                        (dep.source_trip_id, dep.start_secs),
-                        dep.service_date,
-                        updates.trips,
-                        current_dates,
+                    key := _run_key(
+                        (dep.source_trip_id, dep.start_secs), dep.service_date
                     )
                 )
-                is not None
+                in updates.trips
             },
             memo,
         )
 
         arrivals: list[StopArrival] = []
         for dep in scheduled:
-            if (
-                _rt_key_for_row(
-                    (dep.source_trip_id, dep.start_secs),
-                    dep.service_date,
-                    canceled,
-                    current_dates,
-                )
-                is not None
-            ):
-                continue
-            trip_rt = resolved.get((dep.trip_id, dep.service_date))
+            # Shown as cancelled: no prediction, no vehicle.
+            canceled = (
+                _run_key((dep.source_trip_id, dep.start_secs), dep.service_date)
+                in updates.canceled_trips
+            )
+            trip_rt = (
+                None if canceled else resolved.get((dep.trip_id, dep.service_date))
+            )
             prediction = None
             if trip_rt is not None:
                 if dep.stop_sequence in trip_rt.skipped:
@@ -1938,14 +2001,16 @@ class TransitFeedHandle:
                     predicted_arrival=prediction.arrival if prediction else None,
                     predicted_departure=prediction.departure if prediction else None,
                     delay_seconds=prediction.delay_seconds if prediction else None,
-                    realtime=prediction is not None,
+                    realtime=canceled or prediction is not None,
+                    canceled=canceled,
                     vehicle_id=prediction.vehicle_id if prediction else None,
-                    vehicle=_match_vehicle(
+                    vehicle=None
+                    if canceled
+                    else _match_vehicle(
                         prediction.vehicle_id if prediction else None,
                         dep.source_trip_id,
                         dep.start_secs,
                         service_date=dep.service_date,
-                        current_dates=current_dates,
                         vehicles=vehicles,
                     ),
                     wheelchair_accessible=dep.wheelchair_accessible,
@@ -1976,7 +2041,6 @@ class TransitFeedHandle:
                         row.trip_id,
                         None,
                         service_date=row.start_date,
-                        current_dates={},
                         vehicles=vehicles,
                         scheduled=False,
                     ),
@@ -1987,6 +2051,7 @@ class TransitFeedHandle:
                     predicted_departure=row.departure,
                     delay_seconds=None,
                     realtime=True,
+                    canceled=False,
                     vehicle_id=row.vehicle_id,
                     # RT-added trips have no static schedule row, so every
                     # descriptive field is unknown — including timepoint,
@@ -2063,14 +2128,15 @@ class TransitFeedHandle:
         a ``start - grace`` outside 0001-01-03 to 9999-12-01 UTC, or a
         negative ``grace``.
         Each query's ``limit`` caps its merged result,
-        nearest effective origin departure first. RT cancellations — and
-        SKIPPED stops: a skipped origin or skipped destination kills the
-        row (the rider cannot board or alight there), while a skipped
-        intermediate stop changes nothing — are removed before the limit
-        applies. RT-added trips (schedule_relationship ADDED) are never
-        included: an added trip's full stop sequence is unknown, so
-        whether it serves the destination after the origin cannot be
-        determined.
+        nearest effective origin departure first. A cancelled run is kept,
+        flagged ``canceled`` at its scheduled departure, and counts toward
+        the limit, as on boards; DELETED runs and SKIPPED stops are removed
+        before the limit applies -- a skipped origin or skipped destination
+        kills the row (the rider cannot board or alight there), while a
+        skipped intermediate stop changes nothing. RT-added trips
+        (schedule_relationship ADDED) are never included: an added trip's
+        full stop sequence is unknown, so whether it serves the destination
+        after the origin cannot be determined.
 
         Delay propagation follows :meth:`get_arrivals` exactly: an end with
         its own StopTimeUpdate is predicted at the events that update gives;
@@ -2091,8 +2157,9 @@ class TransitFeedHandle:
         ``TripDescriptor.start_date`` service-day matching also follows
         :meth:`get_arrivals` exactly: a dated update or cancellation
         affects only its named service day's instance, a date-less one
-        only the trip's current run as of the feed's timestamp (see
-        :func:`_rt_key_for_row`).
+        only the trip's current run as of its own feed's timestamp (see
+        :func:`_dated`), and one without a trip_id the unique trip its
+        route, direction, start time and date name.
 
         ``with_vehicles`` attaches the live :class:`VehiclePosition` running
         each journey, exactly as :meth:`get_arrivals` does; ``vehicle_id``
@@ -2103,7 +2170,9 @@ class TransitFeedHandle:
         if not queries or (end is not None and end < start):
             return [[] for _ in queries]
         rt_memo: dict[str, gtfs_realtime_pb2.FeedMessage] = {}
-        updates = await self._aggregated_trip_updates(rt_memo)
+        tu_messages = await self._fetch_entity_messages(
+            EntityType.TRIP_UPDATES, rt_memo
+        )
         vehicle_messages = (
             await self._fetch_entity_messages(EntityType.VEHICLE_POSITIONS, rt_memo)
             if with_vehicles
@@ -2112,19 +2181,12 @@ class TransitFeedHandle:
         async with self._guard.reader():
             routes_by_id = await self._index_read(self._index.routes_by_id)
             stops_by_id = await self._index_read(self._index.stops_by_id)
-            positions = await self._vehicles_from(
-                vehicle_messages, stops_by_id, routes_by_id
+            updates, vehicles = await self._matched_realtime(
+                tu_messages, vehicle_messages, start, stops_by_id, routes_by_id
             )
-            plain_starts = await self._index_read(
-                self._index.plain_trip_starts,
-                _plain_start_candidates(updates, positions),
-            )
-            updates = _with_plain_starts(updates, plain_starts)
-            vehicles = _vehicle_index(positions, plain_starts)
-            realtime_now = _realtime_now(updates, start)
             # As in get_arrivals: the runs realtime addresses are read whole
             # up front, so the scan only adds rows at their scheduled time.
-            addressed = await self._addressed_runs(updates, realtime_now)
+            addressed = await self._addressed_runs(updates)
             memo = _PredictionMemo()
             results: list[list[UpcomingTrip]] = []
             for query in queries:
@@ -2170,7 +2232,6 @@ class TransitFeedHandle:
                             # Canonical order, as in get_arrivals.
                             [scheduled[key] for key in sorted(scheduled)],
                             start=start,
-                            realtime_now=realtime_now,
                             updates=updates,
                             stops_by_id=stops_by_id,
                             routes_by_id=routes_by_id,
@@ -2192,7 +2253,6 @@ class TransitFeedHandle:
         scheduled: list[ScheduledTrip],
         *,
         start: datetime,
-        realtime_now: datetime,
         updates: TripUpdates,
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
@@ -2203,51 +2263,36 @@ class TransitFeedHandle:
 
         ``scheduled`` is every scheduled journey read so far, with its
         origin departure in ``[start - grace, end]``. Adds the realtime
-        overlay, removes cancellations and skips, and drops rows whose
-        effective origin departure is before ``start``. Caller holds the
-        reader guard and applies the query's limit.
+        overlay, flags cancellations, removes deletions and skips, and
+        drops rows whose effective origin departure is before ``start``.
+        Caller holds the reader guard and applies the query's limit.
         """
-        # Same per-run RT matching as get_arrivals (_rt_key_for_row): dated
-        # keys hit their service day's run, date-less keys only the current.
-        current_dates = await self._current_runs(
-            [
-                (trip.trip_id, trip.source_trip_id, trip.start_secs)
-                for trip in scheduled
-            ],
-            updates,
-            vehicles,
-            realtime_now,
-        )
+        # Same per-run RT matching as get_arrivals: each run has exactly one
+        # matched key (see _matched_realtime).
         resolved = await self._resolve_predictions(
             updates,
             {
                 (trip.trip_id, trip.service_date): key
                 for trip in scheduled
                 if (
-                    key := _rt_key_for_row(
-                        (trip.source_trip_id, trip.start_secs),
-                        trip.service_date,
-                        updates.trips,
-                        current_dates,
+                    key := _run_key(
+                        (trip.source_trip_id, trip.start_secs), trip.service_date
                     )
                 )
-                is not None
+                in updates.trips
             },
             memo,
         )
         trips: list[UpcomingTrip] = []
         for trip in scheduled:
-            if (
-                _rt_key_for_row(
-                    (trip.source_trip_id, trip.start_secs),
-                    trip.service_date,
-                    updates.canceled_trips,
-                    current_dates,
-                )
-                is not None
-            ):
-                continue
-            trip_rt = resolved.get((trip.trip_id, trip.service_date))
+            key = _run_key((trip.source_trip_id, trip.start_secs), trip.service_date)
+            if key in updates.deleted_trips:
+                continue  # "must not be shown to users"
+            # Shown as cancelled: no prediction, no vehicle.
+            canceled = key in updates.canceled_trips
+            trip_rt = (
+                None if canceled else resolved.get((trip.trip_id, trip.service_date))
+            )
             origin_pred = dest_pred = None
             if trip_rt is not None:
                 if (
@@ -2284,14 +2329,18 @@ class TransitFeedHandle:
                     scheduled_arrival=trip.arrival,
                     predicted_arrival=dest_pred.arrival if dest_pred else None,
                     delay_seconds=(origin_pred.delay_seconds if origin_pred else None),
-                    realtime=origin_pred is not None or dest_pred is not None,
+                    realtime=canceled
+                    or origin_pred is not None
+                    or dest_pred is not None,
+                    canceled=canceled,
                     vehicle_id=vehicle_id,
-                    vehicle=_match_vehicle(
+                    vehicle=None
+                    if canceled
+                    else _match_vehicle(
                         vehicle_id,
                         trip.source_trip_id,
                         trip.start_secs,
                         service_date=trip.service_date,
-                        current_dates=current_dates,
                         vehicles=vehicles,
                     ),
                     wheelchair_accessible=trip.wheelchair_accessible,
@@ -2342,7 +2391,13 @@ class TransitFeedHandle:
         async with self._guard.reader():
             routes_by_id = await self._index_read(self._index.routes_by_id)
             stops_by_id = await self._index_read(self._index.stops_by_id)
-            vehicles = await self._vehicles_from(messages, stops_by_id, routes_by_id)
+            vehicles = [
+                vehicle
+                for feed in await self._vehicles_from(
+                    messages, stops_by_id, routes_by_id
+                )
+                for vehicle in feed
+            ]
         if zone is None:
             return vehicles
         return [
@@ -2356,11 +2411,12 @@ class TransitFeedHandle:
         messages: Sequence[gtfs_realtime_pb2.FeedMessage],
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
-    ) -> list[VehiclePosition]:
-        """Parse VehiclePositions, resolving each trip's route from the index.
+    ) -> list[list[VehiclePosition]]:
+        """Parse each message's VehiclePositions, resolving trips' routes.
 
-        Caller holds the reader guard. Only trips the messages name are
-        looked up, so an empty message list costs no index read.
+        One list per message, in order. Caller holds the reader guard. Only
+        trips the messages name are looked up, so an empty message list
+        costs no index read.
         """
         if not messages:
             return []
@@ -2373,17 +2429,15 @@ class TransitFeedHandle:
             }
         )
         trip_routes = await self._index_read(self._index.routes_for_trips, trip_ids)
-        vehicles: list[VehiclePosition] = []
-        for message in messages:
-            vehicles.extend(
-                vehicles_from_message(
-                    message,
-                    routes_by_id=routes_by_id,
-                    stops_by_id=stops_by_id,
-                    trip_routes=trip_routes,
-                )
+        return [
+            vehicles_from_message(
+                message,
+                routes_by_id=routes_by_id,
+                stops_by_id=stops_by_id,
+                trip_routes=trip_routes,
             )
-        return vehicles
+            for message in messages
+        ]
 
     async def _apply_trip_modifications(
         self,

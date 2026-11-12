@@ -300,7 +300,7 @@ async def test_direct_rt_typed_layers(
         [ArrivalsQuery(["S1", "S2"])], start=NOW, end=NOW + timedelta(hours=1)
     )
     by_key = {(a.trip_id, a.stop_id): a for a in arrivals}
-    assert not any(trip_id == "T2" for trip_id, _ in by_key)  # canceled by RT
+    assert by_key[("T2", "S1")].canceled is True  # canceled by RT
     t1_s1 = by_key[("T1", "S1")]
     assert t1_s1.realtime is True
     # The fixture's departure time is 330 s late (its delay field says 300):

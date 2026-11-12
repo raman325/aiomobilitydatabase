@@ -64,6 +64,7 @@ from aiomobilitydatabase.feeds.rt import (
     StopPrediction,
     TripStopUpdate,
     TripUpdateEntry,
+    TripUpdates,
     _epoch_to_utc,
     _first_translation,
     _trip_start_date,
@@ -1153,11 +1154,12 @@ def _maybe_fill_trip_update_entity(
 ) -> tuple[
     set[tuple[str, date | None, int | None]],
     set[tuple[str, date | None, int | None]],
+    set[tuple[str, date | None, int | None]],
 ]:
-    """Fill a trip_update entity; return ``(eligible_keys, canceled_keys)``:
+    """Fill a trip_update entity; return ``(eligible, canceled, deleted)``:
     the (trip_id, start_date, start_secs) key it contributes as a trip
-    entry, and the key it contributes as a cancellation (ADDED entities
-    contribute neither). Tracking BOTH sets lets the property assert the
+    entry, as a cancellation, or as a deletion (ADDED entities, and any
+    without a trip_id, contribute none). Tracking BOTH sets lets the property assert the
     parsed trips index EXACTLY (a subset check would pass on an empty
     parse). Draws exercise the full StopTimeUpdate surface: per-stop
     schedule_relationship (all valid values), stop_id and/or stop_sequence
@@ -1174,7 +1176,7 @@ def _maybe_fill_trip_update_entity(
     if start_date_cell:
         entity.trip_update.trip.start_date = start_date_cell
     start_date = _START_DATE_SAMPLES[start_date_cell]
-    relationship = data.draw(st.sampled_from([0, 1, 2, 3, 5]))
+    relationship = data.draw(st.sampled_from([0, 1, 2, 3, 5, 6, 7, 8]))
     entity.trip_update.trip.schedule_relationship = relationship
     if data.draw(st.booleans()):
         entity.trip_update.delay = data.draw(st.integers(-3600, 3600))
@@ -1190,11 +1192,15 @@ def _maybe_fill_trip_update_entity(
         if data.draw(st.booleans()):
             stu.departure.delay = data.draw(st.integers(-3600, 3600))
     key = (trip_id, start_date, start_secs)
+    if not trip_id:  # names its trip only through the schedule
+        return set(), set(), set()
     if relationship == gtfs_realtime_pb2.TripDescriptor.CANCELED:
-        return set(), {key}
+        return set(), {key}, set()
+    if relationship == gtfs_realtime_pb2.TripDescriptor.DELETED:
+        return set(), set(), {key}
     if relationship == gtfs_realtime_pb2.TripDescriptor.ADDED:
-        return set(), set()
-    return {key}, set()
+        return set(), set(), set()
+    return {key}, set(), set()
 
 
 def _maybe_fill_alert_entity(
@@ -1234,6 +1240,22 @@ def _maybe_fill_alert_entity(
     return sorted(trip_ids)
 
 
+def _assert_trip_update_keys(
+    updates: TripUpdates,
+    eligible: set[tuple[str, date | None, int | None]],
+    canceled: set[tuple[str, date | None, int | None]],
+    deleted: set[tuple[str, date | None, int | None]],
+) -> None:
+    """EXACT key-set equalities (a `<=` check passed even on an empty
+    parse): every eligible entity's key survives unless removed, a deletion
+    wins over a cancellation, and the removal sets are exactly the drawn
+    keys."""
+    assert updates.canceled_trips.isdisjoint(set(updates.trips))
+    assert updates.deleted_trips == deleted
+    assert updates.canceled_trips == canceled - deleted
+    assert set(updates.trips) == eligible - canceled - deleted
+
+
 @given(data=st.data())
 @settings(max_examples=100, deadline=None)
 def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
@@ -1254,6 +1276,7 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
     expected_alert_trip_ids: list[list[str]] = []
     eligible_keys: set[tuple[str, date | None, int | None]] = set()
     canceled_keys: set[tuple[str, date | None, int | None]] = set()
+    deleted_keys: set[tuple[str, date | None, int | None]] = set()
     for i in range(data.draw(st.integers(0, 4))):
         entity = msg.entity.add()
         entity.id = f"e{i}"
@@ -1266,9 +1289,10 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
             if result is not None:
                 expected_vehicles.append(result)  # type: ignore[arg-type]
         elif kind == "trip_update":
-            entity_eligible, entity_canceled = result  # type: ignore[misc]
+            entity_eligible, entity_canceled, entity_deleted = result  # type: ignore[misc]
             eligible_keys |= entity_eligible
             canceled_keys |= entity_canceled
+            deleted_keys |= entity_deleted
         elif kind == "alert":
             expected_alert_trip_ids.append(result)  # type: ignore[arg-type]
     vehicles = vehicles_from_message(
@@ -1289,12 +1313,7 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         assert vehicle.current_stop_sequence == expected["current_stop_sequence"]
         assert vehicle.license_plate == expected["license_plate"]
     updates = trip_updates_from_message(msg)
-    assert updates.canceled_trips.isdisjoint(set(updates.trips))
-    # EXACT key-set equalities (a `<=` check passed even on an empty
-    # parse): every eligible entity's key survives unless canceled, and
-    # the cancellation set is exactly the drawn CANCELED keys.
-    assert updates.canceled_trips == canceled_keys
-    assert set(updates.trips) == eligible_keys - canceled_keys
+    _assert_trip_update_keys(updates, eligible_keys, canceled_keys, deleted_keys)
     # Resolution totality: any entry against any stop order never raises,
     # and its outcomes never leave that order.
     stop_calls = [
@@ -3366,11 +3385,12 @@ def _merge_scenarios(draw: st.DrawFn) -> _MergeScenario:
 @given(scenario=_merge_scenarios())
 @settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_arrivals_merge_invariants(scenario: _MergeScenario) -> None:
-    """The merged board equals a FULL independent model of it: canceled trips
-    (fixture and ADDED alike) absent, each predicted trip's S1 row at its
-    announced epoch, every non-canceled ADDED call present exactly once at
-    its announced stop, rows whose effective departure is before ``now``
-    dropped, and the whole list in documented sort order.
+    """The merged board equals a FULL independent model of it: canceled
+    fixture trips shown at their scheduled times, flagged, canceled ADDED
+    trips absent, each predicted trip's S1 row at its announced epoch, every
+    non-canceled ADDED call present exactly once at its announced stop,
+    rows whose effective departure is before ``now`` dropped, and the whole
+    list in documented sort order.
 
     ``limit`` is then pinned as a cap on the board AS A WHOLE -- drawn small
     enough to bind, asserted equal to a plain truncation of the unlimited
@@ -3405,7 +3425,7 @@ def test_arrivals_merge_invariants(scenario: _MergeScenario) -> None:
     s1_at = {trip: at for trip, stop, at in _MERGE_SCHEDULE if stop == "S1"}
 
     def predicted_at(trip_id: str, stop_id: str, scheduled: datetime) -> datetime:
-        if trip_id not in scenario.predicted:
+        if trip_id not in scenario.predicted or trip_id in scenario.canceled:
             return scheduled
         if stop_id == "S1":
             return _MERGE_PREDICTED_AT
@@ -3414,7 +3434,6 @@ def test_arrivals_merge_invariants(scenario: _MergeScenario) -> None:
     candidates = [
         (trip_id, stop_id, predicted_at(trip_id, stop_id, scheduled))
         for trip_id, stop_id, scheduled in _MERGE_SCHEDULE
-        if trip_id not in scenario.canceled
     ] + [
         (trip_id, "S1", departure)
         for trip_id, departure in scenario.added_departures.items()
@@ -3436,9 +3455,14 @@ def test_arrivals_merge_invariants(scenario: _MergeScenario) -> None:
         assert row.headsign == _expected_headsign(row.trip_id, added_ids)
         if row.trip_id in added_ids:
             assert row.realtime is True
+            assert row.canceled is False
             assert row.scheduled_departure is None
         else:
-            assert row.realtime == (row.trip_id in scenario.predicted)
+            canceled = row.trip_id in scenario.canceled
+            assert row.canceled is canceled
+            assert row.realtime == (canceled or row.trip_id in scenario.predicted)
+            if canceled:
+                assert row.predicted_arrival is row.predicted_departure is None
     for trip_id, departure in scenario.added_departures.items():
         rows = [row for row in unlimited if row.trip_id == trip_id]
         if trip_id in scenario.canceled or departure < now:
@@ -4328,7 +4352,8 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
     repetition and never a stop before the STU; a MISALIGNED start_time
     (off by 1..599s -- repetitions are >=600s apart, so it never lands on
     a sibling) or a MISSING start_time affects none. The window holds 15
-    synthetic rows (5 F1 repetitions x 3 stops) when nothing is canceled.
+    synthetic rows (5 F1 repetitions x 3 stops), a cancelled repetition's
+    shown flagged.
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
@@ -4362,10 +4387,13 @@ def test_frequency_rt_start_time_matches_exactly_one_repetition(
     all_ids = {f"F1#{start}" for start in _F1_REP_STARTS}
     got_ids = {row.trip_id for row in arrivals}
     if kind == "cancellation":
-        dropped = {f"F1#{rep}"} if mode == "aligned" else set()
-        assert got_ids == all_ids - dropped
-        assert len(arrivals) == 15 - 3 * len(dropped)
-        assert all(row.realtime is False for row in arrivals)
+        canceled = {f"F1#{rep}"} if mode == "aligned" else set()
+        assert got_ids == all_ids
+        assert len(arrivals) == 15
+        for row in arrivals:
+            assert row.canceled is (row.trip_id in canceled)
+            assert row.realtime is row.canceled
+            assert row.predicted_departure is None
         return
     assert got_ids == all_ids
     assert len(arrivals) == 15
@@ -5226,12 +5254,15 @@ def test_two_instance_start_date_disambiguation_oracle(
     }
     assert len(got_rows) == len(arrivals)
     if kind == "cancellation":
-        # Exactly the affected instance's rows disappear; nothing else is
-        # touched (all survivors schedule-only).
-        assert got_rows == all_rows - {
-            (trip_id, day, stop) for trip_id, day in affected for stop in ("S0", "S1")
-        }
-        assert all(a.realtime is False for a in arrivals)
+        # Exactly the affected instance's rows are shown cancelled; nothing
+        # else is touched (all others schedule-only).
+        assert got_rows == all_rows
+        for a in arrivals:
+            assert a.scheduled_departure is not None
+            is_target = (a.trip_id, _instance_day(a.scheduled_departure)) in affected
+            assert a.canceled is is_target
+            assert a.realtime is is_target
+            assert a.predicted_departure is None
     else:
         assert got_rows == all_rows
         anchor = {
@@ -5263,8 +5294,11 @@ def test_two_instance_start_date_disambiguation_oracle(
         for day in (_TWO_DAY_A, _TWO_DAY_B)
     }
     if kind == "cancellation":
-        assert got_journeys == all_journeys - affected
-        assert all(t.realtime is False for t in journeys)
+        assert got_journeys == all_journeys
+        for t in journeys:
+            is_target = (t.trip_id, _instance_day(t.scheduled_departure)) in affected
+            assert t.canceled is is_target
+            assert t.realtime is is_target
     else:
         assert got_journeys == all_journeys
         for journey in journeys:
@@ -5336,7 +5370,7 @@ def test_short_window_start_date_invariance(
     # Guard against vacuous equality: the matching-date run really attached.
     tp_rows = [a for a in matching if a.trip_id == "TP"]
     if kind == "cancellation":
-        assert tp_rows == []
+        assert tp_rows and all(a.canceled for a in tp_rows)
     else:
         assert tp_rows and all(a.realtime is True for a in tp_rows)
     wrong_day, wrong_day_trips = _run_propagation_scenario(
@@ -5617,7 +5651,7 @@ def test_multi_rt_aggregation_last_feed_wins_and_cancellation_suppresses(
 ) -> None:
     """Two to four TU-capable sources sharing the TP identity: the LAST
     source in catalog order that sent an entry wins WHOLESALE, a
-    cancellation in ANY source suppresses the rows end-to-end -- including
+    cancellation in ANY source cancels the rows end-to-end -- including
     the delay+cancel mix where the identity sits in both ``trips`` and
     ``canceled_trips`` after aggregation -- and the RT-untouched sibling
     trip is never affected.
@@ -5639,10 +5673,13 @@ def test_multi_rt_aggregation_last_feed_wins_and_cancellation_suppresses(
     assert {row.stop_id for row in other_rows} == set(_MULTI_RT_STOPS)
     assert all(row.realtime is False for row in other_rows)
     tp_rows = [row for row in arrivals if row.trip_id == "TP"]
-    if "cancel" in kinds:
-        assert tp_rows == []  # cancellation wins over any sibling entry
-        return
     assert {row.stop_id for row in tp_rows} == set(_MULTI_RT_STOPS)
+    if "cancel" in kinds:
+        # Cancellation wins over any sibling entry: shown, flagged.
+        assert all(row.canceled for row in tp_rows)
+        assert all(row.predicted_departure is None for row in tp_rows)
+        return
+    assert not any(row.canceled for row in tp_rows)
     winners = [index for index, kind in enumerate(kinds) if kind == "delay"]
     if not winners:
         assert all(row.realtime is False for row in tp_rows)

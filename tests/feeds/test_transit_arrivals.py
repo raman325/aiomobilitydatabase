@@ -164,8 +164,18 @@ async def test_rt_merge_delay_cancellation_and_added(
     # One row per (trip, stop): a trip serving both queried stops appears twice
     # (a two-stop departure board must show both calls of the same vehicle).
     by_key = {(a.trip_id, a.stop_id): a for a in arrivals}
-    # T2 canceled by RT: dropped entirely (no row at any stop).
-    assert not any(trip_id == "T2" for trip_id, _ in by_key)
+    # T2 canceled by RT: shown as cancelled (its only call in the window,
+    # at S1), at its scheduled time, with no prediction and no vehicle.
+    assert [key for key in by_key if key[0] == "T2"] == [("T2", "S1")]
+    for t2 in (by_key[("T2", "S1")],):
+        assert t2.canceled is True
+        assert t2.realtime is True
+        assert t2.predicted_arrival is None
+        assert t2.predicted_departure is None
+        assert t2.delay_seconds is None
+        assert t2.vehicle_id is None
+        assert t2.effective_departure == t2.scheduled_departure
+    assert not any(a.canceled for a in arrivals if a.trip_id != "T2")
     # T1 delayed at S1 (the TU names S1 only). The producer sent delay 300
     # with explicit epoch times 330 s late (15:06:00 vs 15:00:30+300 =
     # 15:05:30): "time will take precedence", for the instant and the delay.
@@ -289,12 +299,12 @@ async def test_tomorrow_cancellation_spares_todays_instance(
     assert all(a.realtime is False for a in arrivals)
 
 
-async def test_tomorrow_cancellation_drops_only_tomorrows_instance(
+async def test_tomorrow_cancellation_cancels_only_tomorrows_instance(
     mock_api: MockApi, feeds_client: MobilityFeedsClient
 ) -> None:
     """With a 30h window holding BOTH daily instances of T1, the dated
-    cancellation removes exactly Friday's row; Thursday's T1, both T2
-    instances, Thursday's T3 spillover, and Friday's T4 all survive.
+    cancellation cancels exactly Friday's row; Thursday's T1, both T2
+    instances, Thursday's T3 spillover, and Friday's T4 all run.
     """
     _mock_catalog(mock_api, rt=True)
     mock_api.get("/rt/all", body=TRIP_UPDATES_T1_CANCELED_TOMORROW, content_type=PB)
@@ -306,11 +316,13 @@ async def test_tomorrow_cancellation_drops_only_tomorrows_instance(
         ("T1", T1_S1_THURSDAY),
         ("T2", datetime(2026, 7, 30, 15, 30, 30, tzinfo=UTC)),
         ("T3", datetime(2026, 7, 31, 8, 31, tzinfo=UTC)),
-        # Friday's T1 (15:00:30) is canceled; T2/T4 keep Friday rows.
+        # Friday's T1 (15:00:30) is canceled: shown, flagged.
+        ("T1", T1_S1_FRIDAY),
         ("T2", datetime(2026, 7, 31, 15, 30, 30, tzinfo=UTC)),
         ("T4", datetime(2026, 7, 31, 16, 0, 30, tzinfo=UTC)),
     ]
-    assert all(a.realtime is False for a in arrivals)
+    assert [a.canceled for a in arrivals] == [False, False, False, True, False, False]
+    assert all(a.realtime is a.canceled for a in arrivals)
 
 
 async def test_dated_prediction_attaches_to_second_instance_only(
@@ -353,7 +365,8 @@ async def test_delayed_trip_survives_its_scheduled_time(
     [arrivals] = await handle.get_arrivals(
         [ArrivalsQuery(["S1"])], start=NOW_LATE, end=NOW_LATE + timedelta(hours=1)
     )
-    assert [a.trip_id for a in arrivals] == ["T1"]  # T2 is canceled by RT
+    # T2 is canceled by RT: still listed, flagged.
+    assert [(a.trip_id, a.canceled) for a in arrivals] == [("T1", False), ("T2", True)]
     t1 = arrivals[0]
     assert t1.realtime is True
     assert t1.scheduled_departure == datetime(2026, 7, 30, 15, 0, 30, tzinfo=UTC)
@@ -372,7 +385,8 @@ async def test_zero_grace_drops_delayed_trip_at_its_scheduled_time(
         end=NOW_LATE + timedelta(hours=1),
         grace=timedelta(0),
     )
-    assert arrivals == []
+    # Only the cancelled T2, still ahead at its scheduled time.
+    assert [(a.trip_id, a.canceled) for a in arrivals] == [("T2", True)]
 
 
 async def test_past_schedule_only_rows_are_dropped(
@@ -452,7 +466,11 @@ async def test_batch_shares_one_realtime_fetch(
         end=NOW + timedelta(hours=1),
     )
     assert len(results) == 3
-    assert [a.trip_id for a in results[0]] == ["T1"]
+    # T2 is cancelled: listed, flagged, at its scheduled time.
+    assert [(a.trip_id, a.canceled) for a in results[0]] == [
+        ("T1", False),
+        ("T2", True),
+    ]
     # At S2 the 300s delay propagated to T1 pushes it to 15:15:30, behind
     # ADDED-9's 15:11:00 departure: rows sort by effective departure.
     assert [a.trip_id for a in results[1]] == ["ADDED-9", "T1"]
@@ -460,6 +478,7 @@ async def test_batch_shares_one_realtime_fetch(
         ("T1", "S1"),
         ("ADDED-9", "S2"),
         ("T1", "S2"),
+        ("T2", "S1"),
     ]
     assert len([r for r in mock_api.requests if r.path == "/rt/all"]) == 1
 
@@ -1101,13 +1120,9 @@ def test_match_vehicle_without_any_identity() -> None:
     trip_id: there is nothing to join on, and the first vehicle in the
     feed is not an answer.
     """
-    vehicles = _vehicle_index([], {})
-    assert (
-        _match_vehicle(
-            None, None, None, service_date=None, current_dates={}, vehicles=vehicles
-        )
-        is None
-    )
+    vehicles = _vehicle_index([], [])
+    matched = _match_vehicle(None, None, None, service_date=None, vehicles=vehicles)
+    assert matched is None
 
 
 async def test_unresolvable_detour_leaves_the_schedule_intact(
