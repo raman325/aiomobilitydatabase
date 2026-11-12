@@ -606,15 +606,15 @@ def vehicles_from_message(
 class StopPrediction:
     """Resolved RT outcome for one call of one trip instance.
 
-    ``arrival``/``departure`` are the predicted instants, final: an
-    explicit time from the stop's own StopTimeUpdate, else the scheduled
-    time moved by the delay that applies at that end (see
-    :func:`resolve_trip_predictions`); None where neither exists.
-    ``delay_seconds`` is the delay at the stop: the one its own update
-    states (the departure's, else the arrival's; an event's delay, else its
-    time against the schedule), else the propagated or trip-level delay.
-    (So with a 60 s arrival delay and a 120 s departure delay it is 120;
-    ``arrival`` is still the scheduled arrival plus 60.)
+    ``arrival``/``departure`` are the predicted instants (see
+    :func:`resolve_trip_predictions`): an event's own time, else the
+    scheduled time moved by its own or the carried delay; None for an event
+    realtime says nothing about. ``delay_seconds`` is the delay at the
+    stop: the one its own update states (the departure's, else the
+    arrival's; an event's time against the schedule, else its delay), else
+    the carried or trip-level delay. (So with a 60 s arrival delay and a
+    120 s departure delay it is 120; ``arrival`` is still the scheduled
+    arrival plus 60.)
     """
 
     arrival: datetime | None
@@ -790,51 +790,39 @@ def resolve_trip_predictions(
 
     ``calls`` is the instance's complete ordered call list with its
     scheduled instants (one materialized repetition's for frequency
-    trips). Walking the calls in order:
+    trips). Only what the spec states is predicted, walking the calls in
+    order:
 
-    - A SKIPPED update marks its stop skipped and nothing else -- it never
-      alters propagation, and any times/delays it carries are ignored.
-    - A NO_DATA update yields no prediction at its stop and cuts
-      propagation: later stops are schedule-only (the trip-level delay
-      does not resume -- "no data" is StopTimeUpdate-derived coverage)
-      until a later update states a delay.
-    - Any other update (SCHEDULED, the default) predicts each event at its
-      stop from the event's own explicit time, else its own delay, else
-      the other event's delay at that stop. The delay it states -- the
-      departure's, else the arrival's, each the event's time against the
-      schedule or, given no time, its delay -- replaces any stop-level
-      delay arriving from earlier stops ("updates with schedule
-      relationships of SCHEDULED ... or NO_DATA will" stop delay
-      propagation) and is "propagated to all subsequent stops" until newer
-      information; one stating none leaves later stops without one. The
-      trip-level delay is different: it is "only propagated until the next
-      stop along the trip with a StopTimeUpdate delay value specified", so
-      an update stating none does not end it.
-    - A stop no update reaches takes the propagated delay, or the
-      trip-level delay before any update states one, else stays
-      schedule-only.
+    - An event (arrival or departure) an update gives is predicted from its
+      time, else its delay ("If both time and delay are specified, time
+      will take precedence"); an event it does not give is not predicted
+      from it.
+    - The delay an update states -- its departure's, else its arrival's;
+      an event's time against the schedule, else its delay -- "is
+      propagated to all subsequent stops" until newer information. Every
+      SCHEDULED update replaces the delay carried from earlier stops ("updates
+      with schedule relationships of SCHEDULED ... or NO_DATA will" stop
+      propagation), so one stating none leaves later stops without one.
+    - A SKIPPED update marks its stop skipped and leaves propagation alone.
+      A NO_DATA update predicts nothing and cuts propagation: later stops
+      are schedule-only until an update states a delay.
+    - The trip-level delay covers every event until the first update that
+      states a delay or is NO_DATA: it "is only propagated until the next
+      stop along the trip with a StopTimeUpdate delay value specified".
+    - A stop no update reaches takes the carried delay at both events.
 
-    Times never run backwards against what the producer states: each event
-    the producer states (a time or its own delay) bounds the derived ones
-    around it, so a derived instant is raised to the latest stated instant
-    before it and capped at the earliest stated one after it -- a layover
-    stop whose arrival is 5 minutes late does not "depart" after the next
-    stop's stated arrival. Stated events are the producer's and are never
-    moved. ``delay_seconds`` stays the delay realtime gives the stop.
     Placement is :func:`_placed`.
     """
     placed = _placed(entry, calls)
     skipped_rel = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
     no_data_rel = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
-    # Per predicted call: [arrival, departure] as (instant, stated) pairs.
-    events: dict[int, list[tuple[datetime | None, bool]]] = {}
-    delays: dict[int, int | None] = {}
+    predictions: dict[int, StopPrediction] = {}
     skipped: set[int] = set()
-    covered = False  # has any stop-level delay or NO_DATA been passed?
-    current: int | None = None  # propagated delay; None while covered = no data
+    covered = False  # has a stated delay or NO_DATA ended the trip-level delay?
+    current: int | None = None  # the stop-level delay carried on, once covered
     for pos, call in enumerate(calls):
         own = placed.get(pos)
-        incoming = current if covered else entry.delay_seconds
+        carried = current if covered else entry.delay_seconds
         if own is not None and own.relationship == skipped_rel:
             skipped.add(call.stop_sequence)
             continue
@@ -842,70 +830,38 @@ def resolve_trip_predictions(
             covered, current = True, None
             continue
         if own is None:
-            if incoming is not None:
-                events[call.stop_sequence] = [
-                    (_moved(call.arrival, incoming), False),
-                    (_moved(call.departure, incoming), False),
-                ]
-                delays[call.stop_sequence] = incoming
-            continue
-        arrival_delay = _event_delay(own.arrival, own.arrival_delay, call.arrival)
-        departure_delay = _event_delay(
-            own.departure, own.departure_delay, call.departure
-        )
-        stated = departure_delay if departure_delay is not None else arrival_delay
-        # A stop-level delay stops here; a trip-level one only at a stated delay.
-        fallback = stated if stated is not None or covered else entry.delay_seconds
-        if stated is not None or covered:
-            covered, current = True, stated
-        arrival_states = own.arrival is not None or own.arrival_delay is not None
-        departure_states = own.departure is not None or own.departure_delay is not None
-        arrival = own.arrival or _moved(
-            call.arrival, arrival_delay if arrival_states else fallback
-        )
-        departure = own.departure or _moved(
-            call.departure, departure_delay if departure_states else fallback
-        )
-        if arrival is None and departure is None and fallback is None:
-            continue  # an update with no times and no delay: no realtime content
-        events[call.stop_sequence] = [
-            (arrival, arrival_states),
-            (departure, departure_states),
-        ]
-        delays[call.stop_sequence] = fallback
-    _bound_derived(events)
-    return TripPredictions(
-        predictions={
-            seq: StopPrediction(
-                arrival=pair[0][0],
-                departure=pair[1][0],
-                delay_seconds=delays[seq],
-                vehicle_id=entry.vehicle_id,
+            arrival = _moved(call.arrival, carried)
+            departure = _moved(call.departure, carried)
+            delay = carried
+        else:
+            arrival_delay = _event_delay(own.arrival, own.arrival_delay, call.arrival)
+            departure_delay = _event_delay(
+                own.departure, own.departure_delay, call.departure
             )
-            for seq, pair in events.items()
-        },
-        skipped=frozenset(skipped),
-    )
-
-
-def _bound_derived(events: dict[int, list[tuple[datetime | None, bool]]]) -> None:
-    """Keep derived instants between the stated ones around them, in place.
-
-    ``events`` is in trip order. Forward, a derived instant is raised to
-    the latest stated instant before it; backward, capped at the earliest
-    stated instant after it. Stated instants never move.
-    """
-    slots = [(seq, end) for seq in events for end in (0, 1)]
-    for order, beyond in ((slots, max), (list(reversed(slots)), min)):
-        bound: datetime | None = None
-        for seq, end in order:
-            instant, stated = events[seq][end]
-            if instant is None:
-                continue
-            if stated:
-                bound = instant if bound is None else beyond(bound, instant)
-            elif bound is not None and beyond(bound, instant) == bound:
-                events[seq][end] = (bound, False)
+            stated = departure_delay if departure_delay is not None else arrival_delay
+            # Before any stated delay, the trip-level one still covers this
+            # stop's events the update leaves out; after one, nothing does.
+            fill = None if covered or stated is not None else entry.delay_seconds
+            arrival = own.arrival or _moved(
+                call.arrival,
+                own.arrival_delay if own.arrival_delay is not None else fill,
+            )
+            departure = own.departure or _moved(
+                call.departure,
+                own.departure_delay if own.departure_delay is not None else fill,
+            )
+            delay = stated if stated is not None else fill
+            if stated is not None or covered:
+                covered, current = True, stated
+        if arrival is None and departure is None and delay is None:
+            continue
+        predictions[call.stop_sequence] = StopPrediction(
+            arrival=arrival,
+            departure=departure,
+            delay_seconds=delay,
+            vehicle_id=entry.vehicle_id,
+        )
+    return TripPredictions(predictions=predictions, skipped=frozenset(skipped))
 
 
 def _trip_start_secs(trip: gtfs_realtime_pb2.TripDescriptor) -> int | None:

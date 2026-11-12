@@ -370,10 +370,9 @@ class StopArrival:
     or its time against the schedule), else the delay propagated from an
     earlier stop or the trip-level one. With different arrival and
     departure delays it is the departure's, so read the arrival's lateness
-    off ``predicted_arrival``, not ``delay_seconds``. A predicted time that
-    realtime only derives is held between the times the producer states
-    around it -- a stop is never "departed" after the next stop's stated
-    arrival -- while ``delay_seconds`` stays the delay realtime gives.
+    off ``predicted_arrival``, not ``delay_seconds``. An event a stop's own
+    update does not give is not predicted (None), even when the other event
+    is.
     """
 
     stop_id: str

@@ -224,16 +224,21 @@ def _rt_key_for_row(
 def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
     """Effective departure instant for ordering and the past-row drop.
 
-    Predicted departure if any, else scheduled, else the predicted arrival
-    (an RT-added terminal call announces only an arrival), else
-    ``fallback`` for a row with no time at all.
+    The predicted departure if any. Else the scheduled departure -- but
+    never before the predicted arrival, since a vehicle does not leave
+    before it arrives: a terminus whose update gives only a late arrival
+    stays on the board until then. Else the predicted arrival (an RT-added
+    terminal call announces only an arrival), else ``fallback`` for a row
+    with no time at all. Ordering only: no predicted time is invented.
     """
-    return (
-        arrival.predicted_departure
-        or arrival.scheduled_departure
-        or arrival.predicted_arrival
-        or fallback
-    )
+    if arrival.predicted_departure is not None:
+        return arrival.predicted_departure
+    known = [
+        when
+        for when in (arrival.scheduled_departure, arrival.predicted_arrival)
+        if when is not None
+    ]
+    return max(known) if known else fallback
 
 
 @dataclass(frozen=True)
@@ -1615,17 +1620,19 @@ class TransitFeedHandle:
 
         Delay propagation (GTFS-RT spec, see
         :func:`~aiomobilitydatabase.feeds.rt.resolve_trip_predictions`): a
-        StopTimeUpdate predicts each event at its stop by the event's own
-        time, else its own delay, else the other event's delay at that
-        stop, and its delay (a time, when given, against the schedule)
-        replaces the carried one and propagates to every subsequent stop
-        until newer information; a NO_DATA StopTimeUpdate cuts propagation
-        (subsequent stops are schedule-only until a later update resumes);
-        a SKIPPED StopTimeUpdate suppresses its stop's row entirely (the
-        vehicle will not serve it) and leaves propagation alone; the
-        trip-level ``TripUpdate.delay`` applies until the first update that
-        states a delay. Derived times never run backwards past ones the
-        producer states. ``realtime`` is True for propagated-only
+        StopTimeUpdate predicts the events it gives by their own time, else
+        their own delay -- an event it does not give is not predicted --
+        and its delay (a time, when given, against the schedule) replaces
+        the carried one and propagates to every subsequent stop until newer
+        information, so one stating none leaves later stops without one; a
+        NO_DATA StopTimeUpdate cuts propagation (subsequent stops are
+        schedule-only until a later update states a delay); a SKIPPED
+        StopTimeUpdate suppresses its stop's row entirely (the vehicle will
+        not serve it) and leaves propagation alone; the trip-level
+        ``TripUpdate.delay`` covers stops until the first update that
+        states a delay or is NO_DATA. A row whose departure realtime does
+        not predict stays on the board until its predicted arrival, if
+        later than the scheduled departure. ``realtime`` is True for propagated-only
         and trip-delay-only stops too -- a propagated delay IS realtime
         information. RT-ADDED trips get no propagation: with no static
         schedule to propagate over, only their explicit StopTimeUpdates
@@ -2086,7 +2093,8 @@ class TransitFeedHandle:
         ids) match RT via ``TripDescriptor.start_time`` exactly as in
         :meth:`get_arrivals`: aligned start_time applies to that one
         repetition; missing or unmatched start_time applies to no
-        repetition, and plain trips only match start_time-less updates.
+        repetition, and a plain trip's start_time, when given, is its first
+        departure (any other value names no run).
         ``TripDescriptor.start_date`` service-day matching also follows
         :meth:`get_arrivals` exactly: a dated update or cancellation
         affects only its named service day's instance, a date-less one

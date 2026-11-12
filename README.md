@@ -356,17 +356,17 @@ Notes on direct mode:
   plain trip's `start_time`, when given, is its first departure, as GTFS-RT
   requires; any other value names no run) — a
   "trip X is canceled tomorrow" posting never cancels today's run. A
-  StopTimeUpdate predicts each event (arrival, departure) by its own time,
-  else its own delay, else the other event's delay at that stop; its delay
-  (a time, when given, against the schedule — "time will take precedence")
-  propagates to subsequent stops until newer information. Every update
-  except a `SKIPPED` one replaces the delay carried in from earlier stops,
-  so one stating no delay leaves later stops without one; the trip-level
-  delay covers stops until the first update that states a delay. `NO_DATA`
-  makes a stop schedule-only, and `SKIPPED` suppresses it (and any
-  origin→destination row boarding or alighting there). A time realtime only
-  derives never runs backwards past one the producer states: a stop is not
-  "departed" after the next stop's stated arrival. An update
+  StopTimeUpdate predicts the events (arrival, departure) it gives by their
+  own time, else their own delay — an event it does not give is not
+  predicted — and its delay (a time, when given, against the schedule:
+  "time will take precedence") propagates to subsequent stops until newer
+  information. Every update except a `SKIPPED` one replaces the delay
+  carried from earlier stops, so one stating none leaves later stops
+  without one. `NO_DATA` cuts propagation: that stop and every later one
+  are schedule-only until an update states a delay. `SKIPPED` suppresses
+  its stop (and any origin→destination row boarding or alighting there)
+  and leaves propagation alone. The trip-level delay covers stops until the
+  first update that states a delay or is `NO_DATA`. An update
   naming a stop by `stop_id` alone on a trip that visits it twice names no
   stop (the spec requires `stop_sequence` there), and one whose
   `stop_sequence` and `stop_id` disagree names none either, unless the

@@ -1019,7 +1019,7 @@ def test_resolve_time_only_update_propagates_its_computed_delay() -> None:
     )
     resolved = resolve_trip_predictions(entry, _CALLS)
     assert resolved.predictions[2].departure == _at(30)
-    assert resolved.predictions[2].arrival == _at(30)  # its own stop's delay
+    assert resolved.predictions[2].arrival is None  # B's update gives no arrival
     assert resolved.predictions[2].delay_seconds == 1200
     assert resolved.predictions[3].delay_seconds == 1200
     assert resolved.predictions[3].departure == _at(20, 1200)
@@ -1038,44 +1038,15 @@ def test_resolve_each_event_keeps_its_own_delay() -> None:
 def test_resolve_an_arrival_only_update_carries_its_delay_onward() -> None:
     entry = _entry(_stu(stop_id="A", arrival_delay=90))
     resolved = resolve_trip_predictions(entry, _CALLS)
-    assert resolved.predictions[1].departure == _at(0, 90)
+    assert resolved.predictions[1].arrival == _at(0, 90)
+    assert resolved.predictions[1].departure is None  # not given: not predicted
     assert resolved.predictions[3].arrival == _at(20, 90)
 
 
-@pytest.mark.parametrize(
-    ("arrival", "departure", "expected"),
-    [
-        # Only the departure stated (05, so -5 min): the arrival takes that
-        # delay from the other event at its stop.
-        (None, 5, (5, 5)),
-        # Both stated and crossing: the producer's times, kept as given.
-        (20, 5, (20, 5)),
-        # Only the arrival stated (20, so +10 min): the departure takes it.
-        (20, None, (20, 20)),
-    ],
-)
-def test_resolve_an_unstated_event_takes_the_other_events_delay(
-    arrival: int | None, departure: int | None, expected: tuple[int, int]
-) -> None:
-    entry = _entry(
-        _stu(stop_id="A", delay=120),
-        _stu(
-            stop_id="B",
-            arrival=None if arrival is None else _at(arrival),
-            departure=None if departure is None else _at(departure),
-        ),
-    )
-    prediction = resolve_trip_predictions(entry, _CALLS).predictions[2]
-    assert (prediction.arrival, prediction.departure) == tuple(
-        _at(minute) for minute in expected
-    )
-
-
-def test_resolve_a_derived_time_never_passes_a_later_stated_one() -> None:
-    """A layover: A arrives 15:00 and departs 15:10, B is due 15:12. Times
-    only: A arrives 15:05 (+5 min), B arrives 15:12. A's departure, derived
-    from its arrival's +5 min, would be 15:15 -- after the bus reaches B --
-    so it is capped at B's stated 15:12."""
+def test_resolve_predicts_only_the_events_an_update_gives() -> None:
+    """A layover: A due 15:00-15:10, B 15:12. Times only: A arrives 15:05,
+    B arrives 15:12. A's departure is not given, so it is not predicted --
+    not worked out from its arrival as 15:15, after the bus reaches B."""
     calls = [
         replace(_CALLS[0], departure=_at(10)),
         replace(_CALLS[1], arrival=_at(12), departure=_at(12)),
@@ -1084,32 +1055,12 @@ def test_resolve_a_derived_time_never_passes_a_later_stated_one() -> None:
         _stu(stop_id="A", arrival=_at(5)), _stu(stop_id="B", arrival=_at(12))
     )
     resolved = resolve_trip_predictions(entry, calls)
-    assert resolved.predictions[1].arrival == _at(5)
-    assert resolved.predictions[1].departure == _at(12)
-    assert resolved.predictions[1].delay_seconds == 300  # still A's own delay
-
-
-def test_resolve_a_propagated_time_never_passes_a_later_stated_one() -> None:
-    """A is 20 min late, so B (no update) is predicted 15:30 -- but C's own
-    update says it arrives at 15:25. B cannot be reached after C."""
-    entry = _entry(_stu(stop_id="A", delay=1200), _stu(stop_id="C", arrival=_at(25)))
-    resolved = resolve_trip_predictions(entry, _CALLS)
-    assert resolved.predictions[2].departure == _at(25)
-    assert resolved.predictions[2].arrival == _at(25)
-
-
-def test_resolve_a_derived_time_never_precedes_an_earlier_stated_one() -> None:
-    """B dwells 15:10-15:20. A's update states its arrival, 15:08; B's
-    states only its departure, 15:12 -- 8 min early -- so B's arrival,
-    derived from that, would be 15:02: before the bus has reached A. It is
-    raised to A's stated 15:08 (still before B's stated departure)."""
-    calls = [_CALLS[0], replace(_CALLS[1], departure=_at(20)), _CALLS[2]]
-    entry = _entry(
-        _stu(stop_id="A", arrival=_at(8)), _stu(stop_id="B", departure=_at(12))
+    assert (resolved.predictions[1].arrival, resolved.predictions[1].departure) == (
+        _at(5),
+        None,
     )
-    resolved = resolve_trip_predictions(entry, calls)
-    assert resolved.predictions[2].arrival == _at(8)
-    assert resolved.predictions[2].departure == _at(12)  # stated: never moved
+    assert resolved.predictions[1].delay_seconds == 300
+    assert resolved.predictions[2].arrival == _at(12)
 
 
 def test_resolve_a_time_wins_over_a_disagreeing_delay() -> None:

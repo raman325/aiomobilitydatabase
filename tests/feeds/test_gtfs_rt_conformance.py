@@ -84,7 +84,7 @@ def test_a_time_only_update_propagates_its_computed_delay() -> None:
     five = timedelta(minutes=5)
     departs = int((_EIGHT + five).timestamp())
     assert _predicted(_message({"sequence": 1, "departure_time": departs})) == {
-        "S0": (_EIGHT + five, _EIGHT + five),
+        "S0": (None, _EIGHT + five),  # the update gives S0's departure only
         "S1": (_EIGHT + timedelta(minutes=10) + five,) * 2,
         "S2": (_EIGHT + timedelta(minutes=20) + five,) * 2,
     }

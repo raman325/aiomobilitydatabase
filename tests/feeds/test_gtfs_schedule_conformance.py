@@ -472,11 +472,12 @@ def test_blanking_one_of_two_equal_times_changes_nothing(blanks: list[str]) -> N
         blanked.close()
 
 
-def test_a_derived_departure_never_precedes_an_explicit_arrival() -> None:
-    """A terminus timed by its arrival alone departs then too. Realtime
-    carries S0's +60 s on, but S1's own update predicts its arrival at
-    08:18 (+8 min): its departure follows that, not S0's +60 s, so the
-    vehicle does not leave at 08:11, before it gets there."""
+def test_a_late_terminus_stays_on_the_board_until_it_arrives() -> None:
+    """A terminus timed by its arrival alone departs then too (08:10).
+    Realtime carries S0's +60 s on, but S1's own update predicts its
+    arrival at 08:18. Its departure is not given, so not predicted -- yet
+    at 08:12 the row is still on the board: a vehicle does not leave
+    before it arrives."""
     index = _build_index_from_files(
         _feed(
             stop_times=(
@@ -501,7 +502,9 @@ def test_a_derived_departure_never_precedes_an_explicit_arrival() -> None:
 
     async def body(handle: TransitFeedHandle) -> list[object]:
         [board] = await handle.get_arrivals(
-            [ArrivalsQuery(["S1"])], start=eight, end=eight + timedelta(hours=1)
+            [ArrivalsQuery(["S1"])],
+            start=eight + timedelta(minutes=12),
+            end=eight + timedelta(hours=1),
         )
         [trips] = await handle.get_upcoming_trips(
             [TripQuery("S0", "S1")], start=eight, end=eight + timedelta(hours=1)
@@ -512,7 +515,7 @@ def test_a_derived_departure_never_precedes_an_explicit_arrival() -> None:
 
     later = eight + timedelta(minutes=18)
     assert _run(index, body, message) == [
-        (later, later),  # S1: arrives 08:18, so departs 08:18
+        (later, None),  # S1: arrives 08:18; its departure is not given
         (eight + timedelta(minutes=1), later),  # the journey S0 -> S1
     ]
 
