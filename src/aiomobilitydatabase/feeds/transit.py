@@ -62,7 +62,6 @@ from .models import (
 )
 from .rt import (
     Modification,
-    StopPrediction,
     TripModifications,
     TripPredictions,
     TripUpdateKey,
@@ -165,51 +164,6 @@ class _DirectUrls:
     headers: Mapping[str, str] | None
 
 
-def _predicted_time(
-    explicit: datetime | None, scheduled: datetime | None, delay_seconds: int | None
-) -> datetime | None:
-    """One end's predicted instant: explicit epoch wins over scheduled+delay.
-
-    An explicit ``arrival.time``/``departure.time`` from the stop's own
-    StopTimeUpdate takes precedence exactly as before this seam existed;
-    otherwise a known (possibly propagated or trip-level) delay shifts the
-    scheduled instant. No prediction when neither applies (e.g. a delay
-    with no scheduled time at that end), nor when the shifted instant falls
-    outside what datetime can hold (a delay on a 9999-12-31 run).
-    """
-    if explicit is not None:
-        return explicit
-    if scheduled is not None and delay_seconds is not None:
-        return _shifted(scheduled, delay_seconds)
-    return None
-
-
-def _predicted_call(
-    prediction: StopPrediction, arrival: datetime | None, departure: datetime | None
-) -> tuple[datetime | None, datetime | None]:
-    """Predict a call's (arrival, departure), never departing before arriving.
-
-    Each end is :func:`_predicted_time`. When one end is an explicit time
-    from the stop's own update and the other only the scheduled time moved
-    by a carried-over delay, and the two cross, the derived end yields to
-    the explicit one: a vehicle predicted to arrive at 08:18 does not leave
-    at 08:11. Two explicit times that cross are the producer's, and kept.
-    """
-    delay = prediction.delay_seconds
-    predicted_arrival = _predicted_time(prediction.arrival, arrival, delay)
-    predicted_departure = _predicted_time(prediction.departure, departure, delay)
-    if (
-        predicted_arrival is not None
-        and predicted_departure is not None
-        and predicted_arrival > predicted_departure
-    ):
-        if prediction.departure is None:
-            predicted_departure = predicted_arrival
-        elif prediction.arrival is None:
-            predicted_arrival = predicted_departure
-    return predicted_arrival, predicted_departure
-
-
 def _shifted(when: datetime | None, seconds: int) -> datetime | None:
     """Return ``when`` moved by ``seconds``; None if it has no such instant."""
     if when is None:
@@ -268,18 +222,12 @@ def _rt_key_for_row(
 
 
 def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
-    """Effective departure instant for ordering and the past-row drop.
+    """Return a row's :attr:`StopArrival.effective_departure`, else ``fallback``.
 
-    Predicted departure if any, else scheduled, else the predicted arrival
-    (an RT-added terminal call announces only an arrival), else
-    ``fallback`` for a row with no time at all.
+    ``fallback`` is for a row with no time at all (an RT-added row that
+    announces neither arrival nor departure), which sorts at ``start``.
     """
-    return (
-        arrival.predicted_departure
-        or arrival.scheduled_departure
-        or arrival.predicted_arrival
-        or fallback
-    )
+    return arrival.effective_departure or fallback
 
 
 @dataclass(frozen=True)
@@ -635,8 +583,8 @@ def _detoured_rows(
 
 
 def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
-    """Predicted origin departure if any, else scheduled."""
-    return trip.predicted_departure or trip.scheduled_departure
+    """Return a journey's :attr:`UpcomingTrip.effective_departure`."""
+    return trip.effective_departure
 
 
 # Open-ended queries read the schedule over a growing horizon: the first
@@ -827,13 +775,14 @@ def _board_settles(
 class _PredictionMemo:
     """One call's resolved predictions, kept across its horizon passes.
 
-    ``resolved`` is keyed by (concrete trip id, TripUpdate key): resolution
-    depends on nothing else. ``stop_calls`` holds the static stop orders it
-    was resolved against.
+    ``resolved`` is keyed by (trip instance, TripUpdate key): resolution
+    depends on nothing else. ``calls`` holds each instance's scheduled
+    calls it was resolved against (an absent entry: never looked up; an
+    empty one: the run does not exist).
     """
 
-    stop_calls: dict[str, list[tuple[int, str]]] = field(default_factory=dict)
-    resolved: dict[tuple[str, TripUpdateKey], TripPredictions] = field(
+    calls: dict[_TripInstance, list[TripCall]] = field(default_factory=dict)
+    resolved: dict[tuple[_TripInstance, TripUpdateKey], TripPredictions] = field(
         default_factory=dict
     )
 
@@ -1582,33 +1531,26 @@ class TransitFeedHandle:
         Instances are the unit here, not bare trip ids, because a window
         of 24h or more holds several service days' rows for one concrete
         trip id and a dated update must reach exactly one of them. Each
-        resolves via :func:`resolve_trip_predictions` against its trip's
-        static stop order, which is service-day independent -- so a
-        resolution depends only on (concrete trip, key), and ``memo``
-        keeps it for the rest of the call's horizon passes. Every matched
-        trip is guaranteed a stop-calls entry: scheduled rows only exist
-        because the trip has stop_times rows.
+        resolves via :func:`resolve_trip_predictions` against the run's own
+        scheduled calls -- a time-only update's delay is its time against
+        that run's schedule -- and ``memo`` keeps it for the rest of the
+        call's horizon passes. Matched instances are runs that exist: their
+        scheduled rows came from them.
         """
-        missing = sorted(
-            {
-                trip_id
-                for (trip_id, _), key in rt_keys.items()
-                if (trip_id, key) not in memo.resolved
-            }
-            - memo.stop_calls.keys()
-        )
+        missing = sorted(set(rt_keys) - memo.calls.keys())
         if missing:
-            memo.stop_calls.update(
-                await self._index_read(self._index.trip_stop_calls, missing)
-            )
+            for run in await self._index_read(self._index.instance_trip_calls, missing):
+                memo.calls[(run.trip_id, run.service_date)] = run.calls
+            for instance in missing:
+                memo.calls.setdefault(instance, [])
         resolved: dict[_TripInstance, TripPredictions] = {}
-        for (trip_id, service_date), key in rt_keys.items():
-            found = memo.resolved.get((trip_id, key))
+        for instance, key in rt_keys.items():
+            found = memo.resolved.get((instance, key))
             if found is None:
-                found = memo.resolved[(trip_id, key)] = resolve_trip_predictions(
-                    updates.trips[key], memo.stop_calls[trip_id]
+                found = memo.resolved[(instance, key)] = resolve_trip_predictions(
+                    updates.trips[key], memo.calls[instance]
                 )
-            resolved[(trip_id, service_date)] = found
+            resolved[instance] = found
         return resolved
 
     async def get_arrivals(
@@ -1665,20 +1607,26 @@ class TransitFeedHandle:
         ``start`` are dropped: a schedule-only row past its time is gone, a
         delayed one stays until its prediction passes.
 
-        Delay propagation (GTFS-RT spec): a StopTimeUpdate's delay applies
-        to its own stop AND propagates to every subsequent stop of the
-        trip until the next StopTimeUpdate provides newer information; a
+        Delay propagation (GTFS-RT spec, see
+        :func:`~aiomobilitydatabase.feeds.rt.resolve_trip_predictions`): a
+        StopTimeUpdate predicts the events it gives by their own time, else
+        their own delay -- an event it does not give is not predicted --
+        and its delay (a time, when given, against the schedule) replaces
+        the carried one and propagates to every subsequent stop until newer
+        information (one stating none, once any update has, leaves later
+        stops without one); a
         NO_DATA StopTimeUpdate cuts propagation (subsequent stops are
-        schedule-only until a later update resumes); a SKIPPED
-        StopTimeUpdate suppresses its stop's row entirely (the vehicle
-        will not serve it); the trip-level ``TripUpdate.delay`` applies
-        only where no StopTimeUpdate-derived information covers a stop.
-        ``realtime`` is True for propagated-only and trip-delay-only stops
-        too — a propagated delay IS realtime information — with
-        ``predicted_*`` computed as scheduled + delay wherever the stop's
-        own update supplies no explicit epoch time (explicit times always
-        win). RT-ADDED trips get no propagation: with no static schedule
-        to propagate over, only their explicit StopTimeUpdates surface.
+        schedule-only until a later update states a delay); a SKIPPED
+        StopTimeUpdate suppresses its stop's row entirely (the vehicle will
+        not serve it) and leaves propagation alone; the trip-level
+        ``TripUpdate.delay`` covers stops until the first update that
+        states a delay or is NO_DATA. A row whose departure realtime does
+        not predict stays on the board until its predicted arrival, if
+        later than the scheduled departure. ``realtime`` is True for propagated-only
+        and trip-delay-only stops too -- a propagated delay IS realtime
+        information. RT-ADDED trips get no propagation: with no static
+        schedule to propagate over, only their explicit StopTimeUpdates
+        surface.
 
         Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
         ids materialized from frequencies.txt) match RT via
@@ -1688,11 +1636,10 @@ class TransitFeedHandle:
         strict in both directions: a prediction/cancellation WITHOUT
         start_time never applies to repetitions (which repetition was meant
         is unknowable, and guessing — or applying it to all of them — would
-        be wrong more often than not), a start_time matching no
-        materialized repetition applies to nothing, and plain
-        (non-frequency) rows only match predictions WITHOUT start_time
-        (a producer redundantly sending start_time for a regular trip does
-        not match).
+        be wrong more often than not), and a start_time matching no
+        materialized repetition applies to nothing. A plain (non-frequency)
+        trip's start_time, when given, is its first departure, as GTFS-RT
+        requires; any other value names no run.
 
         ``TripDescriptor.start_date`` picks the SERVICE DAY instance the
         start_time rules then apply within (see :func:`_rt_key_for_row`):
@@ -1977,11 +1924,6 @@ class TransitFeedHandle:
                 if dep.stop_sequence in trip_rt.skipped:
                     continue  # SKIPPED: the vehicle will not serve this stop
                 prediction = trip_rt.predictions.get(dep.stop_sequence)
-            predicted_arrival, predicted_departure = (
-                _predicted_call(prediction, dep.arrival, dep.departure)
-                if prediction
-                else (None, None)
-            )
             arrivals.append(
                 StopArrival(
                     stop_id=dep.stop_id,
@@ -1993,8 +1935,8 @@ class TransitFeedHandle:
                     headsign=dep.headsign,
                     scheduled_arrival=dep.arrival,
                     scheduled_departure=dep.departure,
-                    predicted_arrival=predicted_arrival,
-                    predicted_departure=predicted_departure,
+                    predicted_arrival=prediction.arrival if prediction else None,
+                    predicted_departure=prediction.departure if prediction else None,
                     delay_seconds=prediction.delay_seconds if prediction else None,
                     realtime=prediction is not None,
                     vehicle_id=prediction.vehicle_id if prediction else None,
@@ -2130,18 +2072,22 @@ class TransitFeedHandle:
         whether it serves the destination after the origin cannot be
         determined.
 
-        Delay propagation follows :meth:`get_arrivals` exactly: each end's
-        prediction comes from its own StopTimeUpdate, a propagated
-        last-known delay, or the trip-level fallback — so one early-stop
-        update predicts both ends. ``realtime`` is True whenever either
-        end carries any RT-derived prediction, propagated ones included;
-        ``delay_seconds`` reports the origin's effective delay.
+        Delay propagation follows :meth:`get_arrivals` exactly: an end with
+        its own StopTimeUpdate is predicted at the events that update gives;
+        an end without one takes the propagated or trip-level delay -- so
+        one update before both ends predicts both. ``realtime`` is True
+        whenever either end carries any RT-derived prediction, propagated
+        ones included; ``delay_seconds`` reports the origin's delay. A
+        journey whose origin departure realtime does not predict is ordered
+        and kept by the later of its scheduled departure and the origin's
+        predicted arrival, as boards are.
 
         Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
         ids) match RT via ``TripDescriptor.start_time`` exactly as in
         :meth:`get_arrivals`: aligned start_time applies to that one
         repetition; missing or unmatched start_time applies to no
-        repetition, and plain trips only match start_time-less updates.
+        repetition, and a plain trip's start_time, when given, is its first
+        departure (any other value names no run).
         ``TripDescriptor.start_date`` service-day matching also follows
         :meth:`get_arrivals` exactly: a dated update or cancellation
         affects only its named service day's instance, a date-less one
@@ -2331,21 +2277,12 @@ class TransitFeedHandle:
                     destination_stop_id=trip.destination_stop_id,
                     destination_stop=stops_by_id.get(trip.destination_stop_id),
                     scheduled_departure=trip.departure,
-                    predicted_departure=(
-                        # Only an explicit arrival can push the departure
-                        # later, so the scheduled origin arrival is not read.
-                        _predicted_call(origin_pred, None, trip.departure)[1]
-                        if origin_pred
-                        else None
-                    ),
+                    predicted_departure=origin_pred.departure if origin_pred else None,
+                    origin_predicted_arrival=origin_pred.arrival
+                    if origin_pred
+                    else None,
                     scheduled_arrival=trip.arrival,
-                    predicted_arrival=(
-                        _predicted_time(
-                            dest_pred.arrival, trip.arrival, dest_pred.delay_seconds
-                        )
-                        if dest_pred
-                        else None
-                    ),
+                    predicted_arrival=dest_pred.arrival if dest_pred else None,
                     delay_seconds=(origin_pred.delay_seconds if origin_pred else None),
                     realtime=origin_pred is not None or dest_pred is not None,
                     vehicle_id=vehicle_id,

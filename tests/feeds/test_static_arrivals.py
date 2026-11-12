@@ -284,19 +284,21 @@ def test_dst_fall_back_uses_elapsed_seconds(tmp_path: Path) -> None:
     index.close()
 
 
-def test_trip_stop_calls_ordering_and_empty(tmp_path: Path) -> None:
-    """The RT-propagation seam query: per-trip (stop_sequence, stop_id)
-    calls come back in stop_sequence order, unknown trips are simply
-    absent, and the no-ids fast path returns an empty map without touching
-    SQL (an empty IN () list is a SQLite syntax error).
+def test_instance_trip_calls_ordering_and_empty(tmp_path: Path) -> None:
+    """The RT-propagation seam query: each run's calls come back in
+    stop_sequence order, unknown trips are simply absent, and no instances
+    reads nothing (an empty IN () list is a SQLite syntax error).
     """
     index = _index(tmp_path)
-    calls = index.trip_stop_calls(["T1", "T2", "missing"])
-    assert calls == {
-        "T1": [(1, "S1"), (2, "S2")],
-        "T2": [(1, "S1")],
-    }
-    assert index.trip_stop_calls([]) == {}
+    thursday = date(2026, 7, 30)
+    runs = index.instance_trip_calls(
+        [("T1", thursday), ("T2", thursday), ("missing", thursday)]
+    )
+    assert {
+        run.trip_id: [(call.stop_sequence, call.stop_id) for call in run.calls]
+        for run in runs
+    } == {"T1": [(1, "S1"), (2, "S2")], "T2": [(1, "S1")]}
+    assert index.instance_trip_calls([]) == []
     index.close()
 
 

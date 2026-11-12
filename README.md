@@ -129,7 +129,8 @@ async def main() -> None:
             [ArrivalsQuery([nearby_stops[0].id], limit=2)]
         )
         for arrival in arrivals:
-            when = arrival.predicted_departure or arrival.scheduled_departure
+            # When it leaves, as the board orders it: predicted if known.
+            when = arrival.effective_departure
             live = "live" if arrival.realtime else "scheduled"
             # .stop and .route are the whole static records: platform codes,
             # coordinates, route_type and route colours all come along.
@@ -356,10 +357,23 @@ Notes on direct mode:
   plain trip's `start_time`, when given, is its first departure, as GTFS-RT
   requires; any other value names no run) — a
   "trip X is canceled tomorrow" posting never cancels today's run. A
-  StopTimeUpdate's delay propagates to subsequent stops until newer
-  information, `NO_DATA` makes a stop schedule-only, `SKIPPED` suppresses it
-  (and any origin→destination row boarding or alighting there), and the
-  trip-level delay covers stops no StopTimeUpdate reaches.
+  StopTimeUpdate predicts the events (arrival, departure) it gives by their
+  own time, else their own delay — an event it does not give is not
+  predicted — and its delay (a time, when given, against the schedule:
+  "time will take precedence") propagates to subsequent stops until newer
+  information. The trip-level delay covers stops until the first update
+  that states a delay or is `NO_DATA`; after that, every update except a
+  `SKIPPED` one replaces the delay carried from earlier stops, so one
+  stating none leaves later stops without one. `NO_DATA` cuts
+  propagation: that stop and every later one are schedule-only until an
+  update states a delay. `SKIPPED` suppresses its stop (and any
+  origin→destination row boarding or alighting there) and leaves
+  propagation alone. A stop whose departure realtime does not predict
+  stays listed until its predicted arrival, if that is later. An update
+  naming a stop by `stop_id` alone on a trip that visits it twice names no
+  stop (the spec requires `stop_sequence` there), and one whose
+  `stop_sequence` and `stop_id` disagree names none either, unless the
+  `stop_id` is the update's own `assigned_stop_id`.
 - **Rows carry whole records, not copied columns**: `StopArrival`,
   `UpcomingTrip`, and `VehiclePosition` each expose the full `Stop` and
   `Route` they refer to, so platform codes, coordinates, route colours and

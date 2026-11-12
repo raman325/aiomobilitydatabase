@@ -1571,27 +1571,6 @@ class StaticIndex:
             found.setdefault(source_trip_id, []).append(trip_id)
         return found
 
-    def trip_stop_calls(self, trip_ids: list[str]) -> dict[str, list[tuple[int, str]]]:
-        """Ordered ``(stop_sequence, stop_id)`` calls per trip.
-
-        The RT delay-propagation seam: :mod:`.rt` resolves a trip's
-        StopTimeUpdates against this static stop order. Keys are CONCRETE
-        trip ids (synthetic repetition ids for frequency trips), so
-        propagation stays within one materialized repetition. Trips with
-        no stop_times rows are simply absent from the result.
-        """
-        if not trip_ids:
-            return {}
-        marks = ",".join("?" * len(trip_ids))
-        calls: dict[str, list[tuple[int, str]]] = {}
-        for trip_id, stop_sequence, stop_id in self._conn.execute(
-            "SELECT trip_id, stop_sequence, stop_id FROM stop_times "
-            f"WHERE trip_id IN ({marks}) ORDER BY trip_id, stop_sequence",
-            trip_ids,
-        ):
-            calls.setdefault(trip_id, []).append((stop_sequence, stop_id))
-        return calls
-
     def routes_serving(self, stop_id: str) -> list[Route]:
         """Routes with at least one scheduled stop_time at the stop."""
         return [

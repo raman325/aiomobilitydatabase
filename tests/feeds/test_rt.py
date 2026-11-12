@@ -1,7 +1,8 @@
 """Tests for GTFS-RT fetching (auth, errors) and protobuf parsing."""
 
 import asyncio
-from datetime import UTC, date, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from functools import partial
 
 import aiohttp
@@ -42,6 +43,7 @@ from aiomobilitydatabase.feeds.rt import (
     trip_updates_from_message,
     vehicles_from_message,
 )
+from aiomobilitydatabase.feeds.static_index import TripCall
 
 from tests.feeds.fixtures import (
     ALERTS,
@@ -570,7 +572,7 @@ def test_trip_updates_from_message() -> None:
     (stu,) = entry.stop_updates
     assert stu.stop_id == "S1"
     assert stu.stop_sequence is None  # producer sent stop_id addressing only
-    assert stu.delay_seconds == 300
+    assert (stu.arrival_delay, stu.departure_delay) == (300, 300)
     assert stu.arrival == datetime.fromtimestamp(1_785_500_300, tz=UTC)
     assert stu.departure == datetime.fromtimestamp(1_785_500_330, tz=UTC)
     added = updates.added[0]
@@ -776,10 +778,10 @@ def test_pb_enum_name_and_vocab_leniency() -> None:
     assert _vocab_or_none(CongestionLevel, "FUTURE_LEVEL") is None
 
 
-def test_trip_updates_delay_field_and_departure_preference() -> None:
+def test_trip_updates_delay_field_and_per_event_delays() -> None:
     """TripUpdate.delay is captured only when present, and an STU carrying
-    BOTH delays keeps the departure one (the later event at the stop is the
-    'last known delay' that propagates).
+    both delays keeps each: a StopTimeEvent is "timing information for a
+    single predicted event".
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
@@ -797,7 +799,7 @@ def test_trip_updates_delay_field_and_departure_preference() -> None:
     (parsed,) = entry.stop_updates
     assert parsed.stop_sequence == 2
     assert parsed.stop_id is None
-    assert parsed.delay_seconds == 200
+    assert (parsed.arrival_delay, parsed.departure_delay) == (100, 200)
 
 
 # --- wire-level out-of-range enum totality ----------------------------------
@@ -859,8 +861,32 @@ def test_out_of_range_enums_on_the_wire_never_raise() -> None:
 
 # --- resolve_trip_predictions: the propagation state machine ----------------
 
-_CALLS = [(1, "A"), (2, "B"), (3, "C")]
-_LOOP_CALLS = [(1, "A"), (2, "B"), (3, "A"), (4, "C")]
+_BASE = datetime(2026, 7, 30, 15, 0, tzinfo=UTC)
+
+
+def _calls(*stop_ids: str) -> list[TripCall]:
+    """A run calling at ``stop_ids`` ten minutes apart from 15:00 UTC."""
+    return [
+        TripCall(
+            stop_sequence=i + 1,
+            stop_id=stop_id,
+            arrival=_BASE + timedelta(minutes=10 * i),
+            departure=_BASE + timedelta(minutes=10 * i),
+            pickup_type=None,
+            drop_off_type=None,
+            timepoint_exact=None,
+            stop_headsign=None,
+        )
+        for i, stop_id in enumerate(stop_ids)
+    ]
+
+
+def _at(minute: int, delay: int = 0) -> datetime:
+    return _BASE + timedelta(minutes=minute, seconds=delay)
+
+
+_CALLS = _calls("A", "B", "C")
+_LOOP_CALLS = _calls("A", "B", "A", "C")
 _SKIPPED = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
 _NO_DATA = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
 
@@ -873,14 +899,17 @@ def _stu(
     arrival: datetime | None = None,
     departure: datetime | None = None,
     delay: int | None = None,
+    arrival_delay: int | None = None,
 ) -> TripStopUpdate:
+    """An update; ``delay`` is the departure's."""
     return TripStopUpdate(
         stop_id=stop_id,
         stop_sequence=stop_sequence,
         relationship=relationship,
         arrival=arrival,
         departure=departure,
-        delay_seconds=delay,
+        arrival_delay=arrival_delay,
+        departure_delay=delay,
     )
 
 
@@ -903,10 +932,10 @@ def test_resolve_one_stu_propagates_to_tail() -> None:
         2: 300,
         3: 300,
     }
-    # Propagated stops carry no explicit times (consumers compute
-    # scheduled+delay) but DO carry the trip's vehicle.
-    assert resolved.predictions[2].arrival is None
-    assert resolved.predictions[2].departure is None
+    # Propagated stops carry their scheduled times moved by the delay, and
+    # the trip's vehicle.
+    assert resolved.predictions[2].arrival == _at(10, 300)
+    assert resolved.predictions[2].departure == _at(10, 300)
     assert resolved.predictions[2].vehicle_id == "V1"
 
 
@@ -923,7 +952,7 @@ def test_resolve_zero_delay_propagates() -> None:
 
 def test_resolve_later_stu_overrides_propagation() -> None:
     entry = _entry(_stu(stop_id="A", delay=300), _stu(stop_id="C", delay=60))
-    resolved = resolve_trip_predictions(entry, [*_CALLS, (4, "D")])
+    resolved = resolve_trip_predictions(entry, _calls("A", "B", "C", "D"))
     assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
         1: 300,
         2: 300,
@@ -979,19 +1008,112 @@ def test_resolve_trip_delay_fallback_only_where_uncovered() -> None:
     }
 
 
-def test_resolve_explicit_times_win_and_delay_less_stu_keeps_state() -> None:
-    when = datetime(2026, 7, 30, 15, 30, tzinfo=UTC)
+def test_resolve_time_only_update_propagates_its_computed_delay() -> None:
+    """ "If only time is provided in the update, a delay computed by
+    comparing the time against the GTFS schedule time" is propagated: B is
+    due 15:10 and predicted 15:30, so C runs 1200 s late too -- not A's
+    stale 300."""
     entry = _entry(
         _stu(stop_id="A", delay=300),
-        _stu(stop_id="B", departure=when),
+        _stu(stop_id="B", departure=_at(30)),
     )
     resolved = resolve_trip_predictions(entry, _CALLS)
-    # B keeps its explicit departure AND inherits the last-known delay;
-    # C still sees 300 (a delay-less STU never changes the propagation state).
-    assert resolved.predictions[2].departure == when
-    assert resolved.predictions[2].delay_seconds == 300
-    assert resolved.predictions[3].delay_seconds == 300
-    assert resolved.predictions[3].departure is None
+    assert resolved.predictions[2].departure == _at(30)
+    assert resolved.predictions[2].arrival is None  # B's update gives no arrival
+    assert resolved.predictions[2].delay_seconds == 1200
+    assert resolved.predictions[3].delay_seconds == 1200
+    assert resolved.predictions[3].departure == _at(20, 1200)
+
+
+def test_resolve_each_event_keeps_its_own_delay() -> None:
+    """An arrival delay of 60 s and a departure delay of 120 s at one stop
+    predict each event by its own; the departure's goes on."""
+    entry = _entry(_stu(stop_id="A", arrival_delay=60, delay=120))
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.predictions[1].arrival == _at(0, 60)
+    assert resolved.predictions[1].departure == _at(0, 120)
+    assert resolved.predictions[2].arrival == _at(10, 120)
+
+
+def test_resolve_an_arrival_only_update_carries_its_delay_onward() -> None:
+    entry = _entry(_stu(stop_id="A", arrival_delay=90))
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.predictions[1].arrival == _at(0, 90)
+    assert resolved.predictions[1].departure is None  # not given: not predicted
+    assert resolved.predictions[3].arrival == _at(20, 90)
+
+
+def test_resolve_predicts_only_the_events_an_update_gives() -> None:
+    """A layover: A due 15:00-15:10, B 15:12. Times only: A arrives 15:05,
+    B arrives 15:12. A's departure is not given, so it is not predicted --
+    not worked out from its arrival as 15:15, after the bus reaches B."""
+    calls = [
+        replace(_CALLS[0], departure=_at(10)),
+        replace(_CALLS[1], arrival=_at(12), departure=_at(12)),
+    ]
+    entry = _entry(
+        _stu(stop_id="A", arrival=_at(5)), _stu(stop_id="B", arrival=_at(12))
+    )
+    resolved = resolve_trip_predictions(entry, calls)
+    assert (resolved.predictions[1].arrival, resolved.predictions[1].departure) == (
+        _at(5),
+        None,
+    )
+    assert resolved.predictions[1].delay_seconds == 300
+    assert resolved.predictions[2].arrival == _at(12)
+
+
+def test_resolve_a_time_wins_over_a_disagreeing_delay() -> None:
+    """ "If both time and delay are specified, time will take precedence":
+    a departure time 10 min late with delay 0 is 10 min late, and so is the
+    rest of the trip."""
+    entry = _entry(_stu(stop_id="A", departure=_at(10), delay=0))
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.predictions[1].delay_seconds == 600
+    assert resolved.predictions[2].departure == _at(20)
+
+
+def test_resolve_a_delayless_update_does_not_end_the_trip_delay() -> None:
+    """The trip-level delay "is only propagated until the next stop along
+    the trip with a StopTimeUpdate delay value specified": an update for an
+    untimed stop states none, so the trip's 300 s still reaches C."""
+    untimed = [*_CALLS[:1], replace(_CALLS[1], arrival=None, departure=None), _CALLS[2]]
+    entry = _entry(_stu(stop_id="B", arrival=_at(12)), trip_delay=300)
+    resolved = resolve_trip_predictions(entry, untimed)
+    assert resolved.predictions[1].delay_seconds == 300
+    assert resolved.predictions[2].arrival == _at(12)
+    assert resolved.predictions[3].departure == _at(20, 300)
+
+
+def test_resolve_an_update_predicts_only_its_own_events_under_a_trip_delay() -> None:
+    """A stop's own update decides that stop: under a trip-level 300 s, B's
+    update giving only a 600 s arrival delay predicts B's arrival, and no
+    departure -- neither the trip's 300 s nor anything else fills it."""
+    entry = _entry(_stu(stop_id="B", arrival_delay=600), trip_delay=300)
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert resolved.predictions[1].arrival == _at(0, 300)
+    b = resolved.predictions[2]
+    assert (b.arrival, b.departure, b.delay_seconds) == (_at(10, 600), None, 600)
+    assert resolved.predictions[3].arrival == _at(20, 600)
+
+
+def test_resolve_a_time_at_an_untimed_call_keeps_its_delay() -> None:
+    """With no schedule to compare a time with, the event's delay is what it
+    states: B (untimed) gives a time and a 600 s delay, and C runs 600 s
+    late."""
+    untimed = [*_CALLS[:1], replace(_CALLS[1], arrival=None, departure=None), _CALLS[2]]
+    entry = _entry(_stu(stop_id="B", departure=_at(12), delay=600))
+    resolved = resolve_trip_predictions(entry, untimed)
+    assert resolved.predictions[2].delay_seconds == 600
+    assert resolved.predictions[3].arrival == _at(20, 600)
+
+
+def test_resolve_no_data_ends_the_trip_delay() -> None:
+    """NO_DATA before any stated delay ends the trip-level delay too: "no
+    realtime timing information" from there on."""
+    entry = _entry(_stu(stop_id="B", relationship=_NO_DATA), trip_delay=300)
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert set(resolved.predictions) == {1}
 
 
 def test_resolve_skipped_marks_stop_and_never_alters_propagation() -> None:
@@ -1006,30 +1128,85 @@ def test_resolve_skipped_marks_stop_and_never_alters_propagation() -> None:
     assert resolved.predictions[3].delay_seconds == 300
 
 
-def test_resolve_empty_stu_has_no_content_unless_covered() -> None:
-    """A SCHEDULED STU with no times and no delay contributes nothing on
-    its own, but inside a propagation region it surfaces the inherited
-    last-known delay at its stop.
-    """
-    alone = resolve_trip_predictions(_entry(_stu(stop_id="B")), _CALLS)
-    assert alone.predictions == {}
-    covered = resolve_trip_predictions(
-        _entry(_stu(stop_id="A", delay=300), _stu(stop_id="B")), _CALLS
-    )
-    assert covered.predictions[2].delay_seconds == 300
-
-
-def test_resolve_stop_id_matches_first_call_on_loop_trips() -> None:
-    entry = _entry(_stu(stop_id="A", delay=100))
-    resolved = resolve_trip_predictions(entry, _LOOP_CALLS)
-    # Bare stop_id addresses the FIRST visit to A; propagation then covers
-    # every later call, including the second visit.
+def test_resolve_a_bare_stop_id_on_a_revisited_stop_names_nothing() -> None:
+    """ "stop_sequence is required for trips that visit the same stop_id
+    more than once (e.g., a loop) to disambiguate": a bare A on a trip
+    calling at A twice is not guessed onto either visit, whatever came
+    before it -- a 15:31 meant for the second A would otherwise make the
+    whole trip half an hour late."""
+    alone = _entry(_stu(stop_id="A", arrival=_at(31)))
+    assert resolve_trip_predictions(alone, _LOOP_CALLS).predictions == {}
+    after_b = _entry(_stu(stop_id="B", delay=60), _stu(stop_id="A", delay=120))
+    resolved = resolve_trip_predictions(after_b, _LOOP_CALLS)
     assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
-        1: 100,
-        2: 100,
-        3: 100,
-        4: 100,
+        2: 60,
+        3: 60,
+        4: 60,
     }
+
+
+def test_resolve_an_assigned_stop_agrees_with_its_sequence() -> None:
+    """A stop_id "must match assigned_stop_id" when both are sent: stop 2
+    reassigned to platform B2 still names stop_sequence 2, and its newer
+    delay replaces A's."""
+    reassigned = TripStopUpdate(
+        stop_id="B2",
+        stop_sequence=2,
+        relationship=0,
+        arrival=None,
+        departure=None,
+        departure_delay=600,
+        assigned_stop_id="B2",
+    )
+    entry = _entry(_stu(stop_sequence=1, delay=60), reassigned)
+    resolved = resolve_trip_predictions(entry, _CALLS)
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        1: 60,
+        2: 600,
+        3: 600,
+    }
+
+
+def test_resolve_a_scheduled_update_replaces_the_carried_delay() -> None:
+    """ "Updates with schedule relationships of SCHEDULED ... or NO_DATA
+    will" stop delay propagation. An update for an untimed stop (no
+    schedule to compare its time with) states no delay, so A's 600 s does
+    not reach past it; an update stating nothing at all likewise."""
+    untimed = [*_CALLS[:1], replace(_CALLS[1], arrival=None, departure=None), _CALLS[2]]
+    timed_at_untimed = _entry(
+        _stu(stop_id="A", delay=600), _stu(stop_id="B", arrival=_at(12))
+    )
+    resolved = resolve_trip_predictions(timed_at_untimed, untimed)
+    assert resolved.predictions[2].arrival == _at(12)
+    assert resolved.predictions[2].delay_seconds is None
+    assert 3 not in resolved.predictions
+    empty = _entry(_stu(stop_id="A", delay=300), _stu(stop_id="B"))
+    assert set(resolve_trip_predictions(empty, _CALLS).predictions) == {1}
+    assert resolve_trip_predictions(_entry(_stu(stop_id="B")), _CALLS).predictions == {}
+
+
+def test_resolve_the_specs_example_2() -> None:
+    """trip-updates.md, Example 2, verbatim: 300 s at stop_sequence 3,
+    60 s at 8, NO_DATA at 10 on a 20-stop trip -- 1,2 unknown; 3-7 300 s;
+    8,9 60 s; 10-20 unknown."""
+    calls = _calls(*(f"S{n}" for n in range(1, 21)))
+    entry = _entry(
+        _stu(stop_sequence=3, delay=300, arrival_delay=300),
+        _stu(stop_sequence=8, delay=60, arrival_delay=60),
+        _stu(stop_sequence=10, relationship=_NO_DATA),
+    )
+    resolved = resolve_trip_predictions(entry, calls)
+    assert {seq: p.delay_seconds for seq, p in resolved.predictions.items()} == {
+        **dict.fromkeys(range(3, 8), 300),
+        **dict.fromkeys(range(8, 10), 60),
+    }
+
+
+def test_resolve_disagreeing_sequence_and_stop_name_no_call() -> None:
+    """stop_sequence 1 is A; an update naming it with stop C describes no
+    call of this trip and is ignored, as a StopSelector would be."""
+    entry = _entry(_stu(stop_sequence=1, stop_id="C", delay=300))
+    assert resolve_trip_predictions(entry, _CALLS).predictions == {}
 
 
 def test_resolve_stop_sequence_wins_and_addresses_later_loop_visit() -> None:

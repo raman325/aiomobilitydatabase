@@ -303,7 +303,9 @@ async def test_direct_rt_typed_layers(
     assert not any(trip_id == "T2" for trip_id, _ in by_key)  # canceled by RT
     t1_s1 = by_key[("T1", "S1")]
     assert t1_s1.realtime is True
-    assert t1_s1.delay_seconds == 300
+    # The fixture's departure time is 330 s late (its delay field says 300):
+    # "time will take precedence".
+    assert t1_s1.delay_seconds == 330
     assert ("ADDED-9", "S2") in by_key  # RT-added trip came through
     vehicles = await handle.get_vehicles()
     assert {vehicle.vehicle_id for vehicle in vehicles} == {"V1", "V2"}
