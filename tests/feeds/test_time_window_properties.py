@@ -996,7 +996,7 @@ def _midnight_loop_feed() -> bytes:
 
 
 def test_runs_tied_on_every_sorted_field_keep_the_earlier_run_first() -> None:
-    """Rows the sort key cannot separate come out earlier run first.
+    """Scheduled rows the sort key cannot separate come out earlier run first.
 
     Realtime addresses today's run, so it is read before the scan reaches
     yesterday's; the board must not reflect that reading order -- open-ended

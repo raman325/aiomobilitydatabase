@@ -2010,8 +2010,11 @@ class TransitFeedHandle:
         # ties -- and the scheduled times after them, since the same trip
         # can reach the same stop at the same effective instant on two
         # service days (tomorrow's run predicted early). Even those can tie
-        # (yesterday's 24:00:00 is today's 00:00:00), so the sort is stable
-        # over ``scheduled`` in its canonical order: earlier run first.
+        # (yesterday's 24:00:00 is today's 00:00:00), and a stable sort then
+        # keeps the order rows were appended in: scheduled rows in
+        # ``scheduled``'s canonical order (earlier run first), then RT-added
+        # rows in feed order, then detoured runs in run order. Every part of
+        # that is fixed before the scan, so no tie depends on what it read.
         arrivals.sort(
             key=lambda a: (
                 _effective_departure(a, start),
