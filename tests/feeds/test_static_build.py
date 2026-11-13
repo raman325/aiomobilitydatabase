@@ -157,7 +157,7 @@ def test_build_to_file_cleans_up_building_file_on_failure(tmp_path: Path) -> Non
     with pytest.raises(FeedParseError):
         StaticIndex.build(zip_path, str(db_path), DATASET, TZ)
     assert not db_path.exists()
-    assert not Path(f"{db_path}.building").exists()
+    assert not list(tmp_path.glob("*.building"))
 
 
 def test_build_to_file_reraises_and_cleans_up_on_replace_failure(
@@ -171,7 +171,23 @@ def test_build_to_file_reraises_and_cleans_up_on_replace_failure(
     db_target.mkdir()  # not a plausible DB path: forces Path.replace() to fail
     with pytest.raises(OSError, match="Is a directory"):
         StaticIndex.build(_write_zip(tmp_path), str(db_target), DATASET, TZ)
-    assert not Path(f"{db_target}.building").exists()
+    assert not list(tmp_path.glob("*.building"))
+
+
+def test_a_build_killed_midway_does_not_block_the_next(tmp_path: Path) -> None:
+    """A build killed midway leaves its scratch file, tables and all. The
+    next build must not trip over it ("table meta already exists"): each
+    build writes a scratch file of its own."""
+    db_path = tmp_path / "static.db"
+    for leftover in (Path(f"{db_path}.building"), tmp_path / "static.db.x.building"):
+        conn = sqlite3.connect(leftover)
+        conn.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+        conn.commit()
+        conn.close()
+    StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ).close()
+    reopened = StaticIndex.open_cached(db_path, DATASET)
+    assert reopened is not None
+    reopened.close()
 
 
 def test_routes_for_trips_empty_list_returns_empty_dict(tmp_path: Path) -> None:

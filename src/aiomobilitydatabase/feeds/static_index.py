@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import sqlite3
+import tempfile
 import zipfile
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -637,6 +639,21 @@ class _RunQuery(NamedTuple):
     now: datetime
 
 
+def _scratch_path(db_target: str) -> str:
+    """Create an empty scratch file beside ``db_target``; return its path.
+
+    Unique per build: a fixed name would be left behind by a build killed
+    midway (its tables then make every later build fail), and two builds of
+    one target would share it.
+    """
+    target = Path(db_target)
+    fd, path = tempfile.mkstemp(
+        dir=target.parent, prefix=f"{target.name}.", suffix=".building"
+    )
+    os.close(fd)
+    return path
+
+
 class StaticIndex:
     """Read interface over the built SQLite database."""
 
@@ -668,8 +685,11 @@ class StaticIndex:
         """Parse the GTFS zip into a fresh database.
 
         ``db_target`` is ``":memory:"`` or a filesystem path; file builds
-        write to ``<path>.building`` then atomically replace, so a reader
-        of the old file is never left with a half-built database. ``progress``,
+        write to a scratch file of their own beside it
+        (``<name>.<random>.building``) then atomically replace, so a reader
+        of the old file is never left with a half-built database, a build
+        killed midway never blocks the next one, and two builds of one
+        target never write into each other's file. ``progress``,
         when given, is called with ``(done_bytes, total_bytes)`` as each
         source file is parsed (``total_bytes`` may be ``None``).
 
@@ -704,7 +724,7 @@ class StaticIndex:
                     "No valid agency timezone available (agency.txt or catalog)"
                 )
             in_memory = db_target == ":memory:"
-            build_path = db_target if in_memory else f"{db_target}.building"
+            build_path = db_target if in_memory else _scratch_path(db_target)
             conn = sqlite3.connect(build_path, check_same_thread=False)
             try:
                 conn.executescript(_SCHEMA)
