@@ -725,8 +725,9 @@ class StaticIndex:
                 )
             in_memory = db_target == ":memory:"
             build_path = db_target if in_memory else _scratch_path(db_target)
-            conn = sqlite3.connect(build_path, check_same_thread=False)
+            conn: sqlite3.Connection | None = None
             try:
+                conn = sqlite3.connect(build_path, check_same_thread=False)
                 conn.executescript(_SCHEMA)
                 cls._load_all(conn, archive, names, progress)
                 cls._store_first_departures(conn)
@@ -744,7 +745,8 @@ class StaticIndex:
                 # visible file on disk. Do not add one.
                 conn.commit()
             except BaseException:
-                conn.close()
+                if conn is not None:
+                    conn.close()
                 if not in_memory:
                     Path(build_path).unlink(missing_ok=True)
                 raise
@@ -756,10 +758,20 @@ class StaticIndex:
         except OSError:
             Path(build_path).unlink(missing_ok=True)
             raise
+        conn = sqlite3.connect(db_target, check_same_thread=False)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        except BaseException:
+            conn.close()
+            raise
+        # Reopened by name: a concurrent build of the same target may have
+        # replaced ours since the rename. Label the index with the dataset
+        # the file actually holds, so it is never served as another; a
+        # caller wanting a different one rebuilds.
         return cls(
-            sqlite3.connect(db_target, check_same_thread=False),
-            dataset_id,
-            timezone_name,
+            conn,
+            meta.get("dataset_id", dataset_id),
+            meta.get("timezone", timezone_name),
         )
 
     @classmethod

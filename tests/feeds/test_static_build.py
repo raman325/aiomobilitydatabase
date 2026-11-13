@@ -758,3 +758,48 @@ def test_trip_queries_with_no_ids_do_not_touch_the_database(tmp_path: Path) -> N
     assert built.concrete_trip_ids([]) == {}
     assert built.instance_trip_calls([]) == []
     built.close()
+
+
+def test_a_build_replaced_by_a_concurrent_one_is_labelled_by_its_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two builds of one target can rename into place back to back. The
+    build reopening the target afterwards must report the dataset the file
+    really holds, never claim its own over another build's data."""
+    other = tmp_path / "other.db"
+    StaticIndex.build(_write_zip(tmp_path), str(other), "ds-OTHER", TZ).close()
+    db_path = tmp_path / "static.db"
+    real_replace = Path.replace
+
+    def replace_then_lose_the_race(self: Path, target: Path | str) -> Path:
+        result = real_replace(self, target)
+        if Path(target) == db_path:
+            # The other build renames in right after ours.
+            db_path.write_bytes(other.read_bytes())
+        return result
+
+    monkeypatch.setattr(Path, "replace", replace_then_lose_the_race)
+    index = StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ)
+    try:
+        assert index.dataset_id == "ds-OTHER"
+    finally:
+        index.close()
+
+
+def test_a_scratch_file_is_removed_when_its_connection_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even a build that cannot open its scratch file leaves none behind."""
+    real_connect = sqlite3.connect
+
+    def refuse_scratch(database: str, *args: object, **kwargs: object) -> object:
+        if str(database).endswith(".building"):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(database, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlite3, "connect", refuse_scratch)
+    with pytest.raises(sqlite3.OperationalError):
+        StaticIndex.build(
+            _write_zip(tmp_path), str(tmp_path / "static.db"), DATASET, TZ
+        )
+    assert not list(tmp_path.glob("*.building*"))
