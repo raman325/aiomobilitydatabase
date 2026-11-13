@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from http import HTTPStatus
@@ -639,7 +639,8 @@ class RealtimeCall:
     ``arrival``/``departure`` the predictions: for NEW, ADDED and
     REPLACEMENT calls an event's own time, else its scheduled time moved by
     its own delay; for a copy, as a scheduled trip's resolve (carried and
-    trip-level delays included). ``delay_seconds`` is the delay at the call
+    trip-level delays included) unless its updates state its times, when
+    each call is as a NEW trip's. ``delay_seconds`` is the delay at the call
     (the departure's, else the arrival's). At least one time is set.
     """
 
@@ -1147,6 +1148,36 @@ def realtime_calls(entry: TripUpdateEntry) -> tuple[RealtimeCall, ...]:
     )
 
 
+def stated_copy_calls(
+    entry: TripUpdateEntry, calls: Sequence[TripCall]
+) -> tuple[RealtimeCall, ...]:
+    """Return the calls a DUPLICATED copy's updates state, on its original's stops.
+
+    A copy whose updates state ``scheduled_time`` states its own run and
+    dwell times, but it is still "the same as an existing scheduled trip
+    except for service start date and time": its updates are placed on the
+    original's calls as a scheduled trip's are (by stop_sequence, or a stop
+    visited once), and each stated call is that stop -- its id and
+    descriptors -- at the times the update gives, as a NEW trip's call is.
+    Only the stops its updates name are shown, in the trip's order.
+    """
+    stated: list[RealtimeCall] = []
+    for pos, update in sorted(_placed(entry, calls).items()):
+        call = calls[pos]
+        realtime = _realtime_call(replace(update, stop_id=call.stop_id))
+        if realtime is not None:
+            stated.append(
+                replace(
+                    realtime,
+                    pickup_type=call.pickup_type,
+                    drop_off_type=call.drop_off_type,
+                    timepoint_exact=call.timepoint_exact,
+                    stop_headsign=call.stop_headsign,
+                )
+            )
+    return tuple(stated)
+
+
 def _realtime_trip(record: TripUpdateRecord, *, replaces: bool) -> RealtimeTrip:
     """Build the trip a NEW, ADDED or REPLACEMENT record states in full."""
     return RealtimeTrip(
@@ -1181,13 +1212,23 @@ def _extra_trips(
     descriptor = gtfs_realtime_pb2.TripDescriptor
     # The ADDED-to-DUPLICATED migration guide: consumers ignore an ADDED
     # whose trip_id is a DUPLICATED's trip_id (the original) or its
-    # TripProperties.trip_id (the copy) -- a producer may send both.
+    # TripProperties.trip_id (the copy) -- a producer may send both -- as
+    # long as that DUPLICATED names a copy at all.
     migrated = {
         trip_id
         for record in records
         if record.relationship == descriptor.DUPLICATED
+        and record.copy_trip_id
+        and record.copy_start_date is not None
+        and record.copy_start_secs is not None
         for trip_id in (record.trip_id, record.copy_trip_id)
         if trip_id
+    } | {
+        # "consumers ignore any ADDED trips that have the same trip_id as a
+        # NEW trip trip_id" -- the same guide.
+        record.trip_id
+        for record in records
+        if record.relationship == descriptor.NEW and record.trip_id
     }
     by_id: dict[str, RealtimeTrip | TripUpdateRecord] = {}
     anonymous: list[RealtimeTrip] = []

@@ -76,8 +76,8 @@ from .rt import (
     feed_timestamp,
     fetch_feed_message,
     indexed_trip_updates,
-    realtime_calls,
     resolve_trip_predictions,
+    stated_copy_calls,
     stops_from_message,
     trip_modifications_from_message,
     trip_update_records,
@@ -623,14 +623,22 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
     it skips, or one with no time, is not shown. But an update stating
     ``scheduled_time`` -- "if a duplicated trip runs have different run or
     dwell times compared to the original" -- states the copy's own
-    schedule: the copy is then its updates alone, as a NEW trip is,
-    never a mix of their times and the original's.
+    schedule: the copy is then its updates alone (see
+    :func:`~aiomobilitydatabase.feeds.rt.stated_copy_calls`), never a mix
+    of their times and the original's, on the original's stops and their
+    descriptors.
     """
+    skipped = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
     stated = any(
-        update.scheduled_arrival or update.scheduled_departure
+        (update.scheduled_arrival or update.scheduled_departure)
+        and update.relationship != skipped
         for update in record.entry.stop_updates
     )
-    calls = realtime_calls(record.entry) if stated else _moved_calls(record, run)
+    calls = (
+        stated_copy_calls(record.entry, run.calls)
+        if stated
+        else _moved_calls(record, run)
+    )
     assert record.copy_trip_id is not None
     return RealtimeTrip(
         trip_id=record.copy_trip_id,
@@ -2462,8 +2470,9 @@ class TransitFeedHandle:
         # (yesterday's 24:00:00 is today's 00:00:00), and a stable sort then
         # keeps the order rows were appended in: scheduled rows in
         # ``scheduled``'s canonical order (earlier run first), then realtime-only
-        # rows in feed order, then detoured runs in run order. Every part of
-        # that is fixed before the scan, so no tie depends on what it read.
+        # rows (replacements and NEW/ADDED trips in feed order, then copies),
+        # then detoured runs in run order. Every part of that is fixed before
+        # the scan, so no tie depends on what it read.
         arrivals.sort(
             key=lambda a: (
                 _effective_departure(a, start),

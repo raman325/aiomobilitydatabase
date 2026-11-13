@@ -2079,3 +2079,71 @@ def test_a_copys_trip_short_name_may_differ() -> None:
     message.entity[0].trip_update.trip_properties.trip_short_name = "901"
     board = _run_feeds(files, _board(_EIGHT - timedelta(minutes=30)), [message])
     assert {r.trip_id: r.trip_short_name for r in board} == {"T": "101", "T-2": "901"}
+
+
+def test_a_copy_stating_times_keeps_its_originals_stops_and_rules() -> None:
+    """A copy stating its own times still runs its original's stopping
+    pattern: each stated call is the original's stop, descriptors and all,
+    so no journey boards it where the original allows no pickup; and
+    updates naming stops by stop_sequence alone still name them."""
+    files = _feed(
+        stop_times=(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence,pickup_type\n"
+            "T,08:00:00,08:00:00,S0,1,1\nT,08:10:00,08:10:00,S1,2,0\n"
+        ),
+    )
+    stated = [
+        {"stop": "S0", "scheduled_departure": _at(90)},
+        {"stop": "S1", "scheduled_arrival": _at(100)},
+    ]
+    message = _descriptor_message(
+        _duplicate(("T-2", "20260730", "09:30:00"), stops=stated)
+    )
+    board, (s0_s1,) = _run_feeds(files, _boards_and_journeys(("S0", "S1")), [message])
+    assert [row[:3] for row in board if row[0] == "T-2"] == [
+        ("T-2", "S0", _at(90)),
+        ("T-2", "S1", _at(100)),
+    ]
+    assert s0_s1 == []
+    by_sequence = _descriptor_message(_duplicate(("T-2", "20260730", "09:30:00")))
+    for sequence, minutes, event in ((1, 90, "departure"), (2, 100, "arrival")):
+        stu = by_sequence.entity[0].trip_update.stop_time_update.add()
+        stu.stop_sequence = sequence
+        getattr(stu, event).scheduled_time = int(_at(minutes).timestamp())
+    board, _ = _run_feeds(_DIRECTED, _boards_and_journeys(), [by_sequence])
+    assert [row[:3] for row in board if row[0] == "T-2"] == [
+        ("T-2", "S0", _at(90)),
+        ("T-2", "S1", _at(100)),
+    ]
+
+
+def test_the_migration_guides_added_rules_apply_only_where_due() -> None:
+    """An ADDED is ignored for a DUPLICATED only when that DUPLICATED names
+    a copy; and, per the same guide, for a NEW trip with its trip_id."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    added = {
+        "trip_id": "N",
+        "start_date": "20260730",
+        "relationship": descriptor.ADDED,
+        "calls": [("S0", None, _at(61), False)],
+    }
+    broken_copy = _duplicate(("N", "20260730", ""))  # no start_time: no copy
+    new = {
+        "trip_id": "N",
+        "start_date": "20260730",
+        "relationship": descriptor.NEW,
+        "headsign": "NewSign",
+        "calls": [("S0", None, _at(60), False)],
+    }
+    start = _EIGHT - timedelta(minutes=30)
+    for parts, expected in (
+        ([added, broken_copy], [("N", _at(61), None)]),
+        ([new, added], [("N", _at(60), "NewSign")]),
+        ([added, new], [("N", _at(60), "NewSign")]),
+    ):
+        board = _run_feeds(_DIRECTED, _board(start), [_descriptor_message(*parts)])
+        assert [
+            (r.trip_id, r.predicted_departure, r.headsign)
+            for r in board
+            if r.trip_id == "N"
+        ] == expected
