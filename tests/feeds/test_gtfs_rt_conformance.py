@@ -972,3 +972,27 @@ def test_first_departures_agree_with_trip_spans() -> None:
         assert "ix_trips_route_start" in plan
     finally:
         index.close()
+
+
+def test_one_vehicle_in_two_feeds_is_one_claimant() -> None:
+    """The same vehicle reported by two VehiclePositions feeds (or one url
+    listed twice) still rides its run: one vehicle, not an ambiguous two."""
+    stamp = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    vehicles = gtfs_realtime_pb2.FeedMessage()
+    vehicles.header.gtfs_realtime_version = "2.0"
+    vehicles.header.timestamp = int(stamp.timestamp())
+    entity = vehicles.entity.add()
+    entity.id = "v"
+    entity.vehicle.vehicle.id = "BUS"
+    entity.vehicle.trip.trip_id = "T"
+    entity.vehicle.trip.start_date = "20260730"
+    entity.vehicle.position.latitude = 0
+    entity.vehicle.position.longitude = 0
+    board = _run_feeds(
+        _DIRECTED,
+        _board(stamp, with_vehicles=True),
+        [_descriptor_message(timestamp=stamp)],
+        [vehicles, vehicles],
+    )
+    [t_row] = [row for row in board if row.trip_id == "T"]
+    assert t_row.vehicle is not None and t_row.vehicle.vehicle_id == "BUS"

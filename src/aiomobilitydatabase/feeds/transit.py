@@ -313,7 +313,9 @@ def _vehicle_index(
     :func:`_dated`), as for TripUpdates. An instance entry holds None where
     two of those vehicles claim the same run: that is a genuinely ambiguous
     feed, not a resolvable one, and guessing would put the wrong vehicle on
-    the map. The vehicle itself keeps what it reported.
+    the map. One vehicle reported twice (two feeds, or one url listed
+    twice) is one claimant, not two. The vehicle itself keeps what it
+    reported.
     """
     by_vehicle_id = {
         vehicle.vehicle_id: vehicle for vehicle in positions if vehicle.vehicle_id
@@ -326,7 +328,10 @@ def _vehicle_index(
         held = best.get(key)
         if held is None or precedence > held[0]:
             best[key] = (precedence, [vehicle])
-        elif precedence == held[0]:
+        elif precedence == held[0] and not (
+            vehicle.vehicle_id
+            and any(other.vehicle_id == vehicle.vehicle_id for other in held[1])
+        ):
             held[1].append(vehicle)
     return _Vehicles(
         by_vehicle_id,
@@ -1498,7 +1503,9 @@ class TransitFeedHandle:
         header time -- never at another feed's. ADDED trips are not in the
         schedule and keep their references as sent, as does a cancellation
         or deletion naming no scheduled run (it can still remove an ADDED
-        trip of that id); any other update naming no run is dropped.
+        trip of that id); any other update left without a trip or a date
+        is dropped (a dated one for a day its trip does not run simply
+        matches no row).
         TripUpdates from every TU-capable sibling feed then merge: a
         cancellation or deletion anywhere wins, and of several updates for
         one run the most explicit reference wins, then the later feed in

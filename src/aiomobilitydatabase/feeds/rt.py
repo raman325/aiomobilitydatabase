@@ -701,8 +701,10 @@ class TripUpdates:
     day's instance of a trip; ``start_time`` ONE repetition of a
     frequency-based trip. As parsed from a message
     (:func:`trip_updates_from_message`) keys are the descriptors as sent;
-    once matched against the schedule (see ``transit``) every key names
-    one dated run, so propagation happens within one matched instance.
+    once matched against the schedule (see ``transit``) every key in
+    ``trips`` names one dated run, so propagation happens within one
+    matched instance. A removal naming no scheduled run keeps its key as
+    sent: it matches no run but still removes an ADDED trip of that id.
 
     ``trips`` holds the predictions for runs that operate;
     ``canceled_trips`` the runs that were scheduled but do not operate

@@ -842,11 +842,14 @@ class StaticIndex:
         :meth:`_trip_spans`. Runs once all stop_times, frequency
         repetitions included, are loaded.
         """
-        conn.executescript(
+        # Separate statements, not executescript: that commits first, and the
+        # build must stay one transaction (see build).
+        conn.execute(
+            "CREATE TEMP TABLE first_departures "
+            "(trip_id TEXT PRIMARY KEY, secs INTEGER)"
+        )
+        conn.execute(
             """
-            CREATE TEMP TABLE first_departures (
-                trip_id TEXT PRIMARY KEY, secs INTEGER
-            );
             INSERT INTO first_departures
             SELECT b.trip_id,
                    CASE WHEN b.first = b.last THEN MIN(st.arrival_secs)
@@ -861,13 +864,14 @@ class StaticIndex:
             JOIN stop_times st
               ON st.trip_id = b.trip_id AND st.stop_sequence = b.first
              AND (st.arrival_secs IS NOT NULL OR st.departure_secs IS NOT NULL)
-            GROUP BY b.trip_id;
-            UPDATE trips SET first_secs = (
-                SELECT secs FROM first_departures WHERE trip_id = trips.id
-            );
-            DROP TABLE first_departures;
+            GROUP BY b.trip_id
             """
         )
+        conn.execute(
+            "UPDATE trips SET first_secs = "
+            "(SELECT secs FROM first_departures WHERE trip_id = trips.id)"
+        )
+        conn.execute("DROP TABLE first_departures")
 
     @staticmethod
     def _batched_insert(
@@ -1981,7 +1985,10 @@ class StaticIndex:
         ``start_time`` is the trip's scheduled first departure (see
         :meth:`plain_trip_starts`) and its service must run on
         ``start_date``. A ref matching no trip, or several, names none; a
-        trip with no direction_id matches no direction.
+        trip with no direction_id matches no direction. Frequency
+        repetitions are not candidates (the alternative applies to trips
+        "which are not frequency based"), so one leaving at the same time
+        does not make a plain trip ambiguous.
         """
         active: dict[date, set[str]] = {}
         found: dict[tuple[str, int, date, int], str] = {}
