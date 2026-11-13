@@ -599,11 +599,18 @@ def _replacing(
 
     A TripDescriptor's route and direction only select the trip; they
     cannot move it to another route. The headsign and short name may
-    differ ("when it differs from the original"), else are the trip's.
+    differ ("when it differs from the original"), else are the trip's. A
+    run of headway-based service (:attr:`RealtimeTrip.run`) is its own
+    start's run, under that start's id: its slot's other runs are other
+    vehicles.
     """
     route_id, headsign, direction_id, short_name = summaries.get(
         concrete_trip_id, (trip.route_id or "", None, trip.direction_id, None)
     )
+    if trip.run is not None:
+        source_trip_id, _day, start_secs = trip.run
+        assert start_secs is not None  # a slot is found only by a start
+        concrete_trip_id = repetition_trip_id(source_trip_id, start_secs)
     return replace(
         trip,
         trip_id=concrete_trip_id,
@@ -750,7 +757,8 @@ def _slot_run(
     (:func:`_times_only`). Such service "does not follow a fixed
     schedule", so no delay is reported against the moved one. A run a
     detour rebuilds (``detoured``, differing from the slot's) shows that
-    schedule with no prediction, as a detoured scheduled run does. It
+    schedule with no prediction, as a detoured scheduled run does (its
+    vehicle, matched by its own start, is still shown). It
     stands in for that repetition, and its vehicle names it by its own
     start.
     """
@@ -826,10 +834,10 @@ def _realtime_rows(
     """Board rows for realtime-only trips, at the queried stops.
 
     There is no stop_times row of their own: the times are the update's
-    (its ``scheduled_time`` and predictions; a copy's moved schedule), and
-    the stop_time descriptors are a copy's original's, else unknown --
-    timepoint included, whose absent-means-exact default only applies to
-    rows in stop_times.
+    (its ``scheduled_time`` and predictions; a copy's or a headway-based
+    run's moved schedule), and the stop_time descriptors are those moved
+    calls' own, else unknown -- timepoint included, whose
+    absent-means-exact default only applies to rows in stop_times.
     """
     rows: list[StopArrival] = []
     for trip in trips:
@@ -2096,16 +2104,6 @@ class TransitFeedHandle:
             for trip in updates.realtime_trips
             if not trip.replaces or trip.replaces in runs
         ]
-        # A replacement of a run in a slot is that run, under its own id: the
-        # slot's other runs are other vehicles.
-        updates.realtime_trips = [
-            replace(trip, trip_id=repetition_trip_id(trip.run[0], trip.run[2]))
-            if trip.run is not None
-            and trip.run[2] is not None
-            and trip.run != trip.replaces
-            else trip
-            for trip in updates.realtime_trips
-        ]
         updates.realtime_trips.extend(slot_runs)
         # A DUPLICATED copy is its original's calls, moved to the copy's
         # start and day, with its StopTimeUpdates resolved against them.
@@ -2323,8 +2321,8 @@ class TransitFeedHandle:
         shown in place of the repetition whose headway slot holds it and
         predicted by its updates' times alone, with no delay reported (a
         detour of it is shown as a detoured scheduled run is: rebuilt, with
-        no prediction); a removal or replacement of it is
-        one of that repetition (see :meth:`StaticIndex.slot_runs`). A plain
+        no prediction); a removal or replacement of it is one of that
+        repetition (see :meth:`StaticIndex.slot_runs`). A plain
         (non-frequency) trip's start_time, when given, is its first
         departure, as GTFS-RT requires; any other value names no run.
 

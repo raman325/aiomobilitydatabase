@@ -368,8 +368,9 @@ Notes on direct mode:
   schedule", so its repetitions report `timepoint_exact=False`, and
   realtime names its runs by a `start_time` that "may be arbitrary": a run
   is the trip moved to that start (a detour of it shown as a detoured
-  scheduled run is: rebuilt, with no prediction), shown under its own `{trip_id}#{start_secs}` id in place of
-  the repetition whose headway slot holds it -- one headway from that
+  scheduled run is: rebuilt, with no prediction), shown under its own
+  `{trip_id}#{start_secs}` id in place of the repetition whose headway
+  slot holds it -- one headway from that
   repetition's start, never past the trip's next repetition. Two runs in
   one slot both show. Only its updates' times predict it ("Delay can only
   be used in case the trip update refers to a scheduled GTFS trip, as

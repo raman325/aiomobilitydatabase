@@ -2681,3 +2681,30 @@ def test_a_run_at_a_stop_only_realtime_defines_carries_that_stop() -> None:
         ("T#29520", "Pop-up"),
         ("T#30000", "Pop-up"),
     ]
+
+
+def test_a_detour_naming_start_times_selects_runs_by_their_own_start() -> None:
+    """A detour listing start_times selects "the start times in the
+    real-time trip descriptor": one naming 08:12 rebuilds the 08:12 run
+    (no prediction); one naming only the slot's 08:10 start leaves the
+    08:12 run in that slot as its update predicts it."""
+    files = {
+        **_THREE_STOPS,
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs\nT,08:00:00,08:30:00,600\n"
+        ),
+    }
+    for start_time, s0 in (
+        ("08:12:00", ("T#29520", "S0", _at(12), None, None, False)),
+        ("08:10:00", ("T#29520", "S0", _at(12), None, _at(13), False)),
+    ):
+        message = _descriptor_message(
+            _slot_update("08:12:00", stops=[{"stop": "S0", "departure": _at(13)}])
+        )
+        _detoured(message)
+        message.entity[-1].trip_modifications.start_times.append(start_time)
+        board, _ = _run_feeds(files, _boards_and_journeys(), [message])
+        rows = [row for row in board if row[0] in {"T#29400", "T#29520"}]
+        assert rows[0] == s0
+        # Rebuilt, the run calls at S2 in S1's place; otherwise it keeps S1.
+        assert ("S1" in {row[1] for row in rows}) is (start_time == "08:10:00")
