@@ -44,7 +44,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -81,8 +81,14 @@ CREATE TABLE trips (
     -- would be ambiguous if a real trip id contained "#".
     source_trip_id TEXT NOT NULL, start_secs INTEGER,
     wheelchair_accessible INTEGER, bikes_allowed INTEGER, direction_id INTEGER,
-    short_name TEXT, block_id TEXT
+    short_name TEXT, block_id TEXT,
+    -- The trip's first departure (see StaticIndex._store_first_departures),
+    -- filled once every stop_time is loaded; NULL with no timed call.
+    first_secs INTEGER
 );
+-- GTFS-RT's alternative trip matching names a trip by route, direction and
+-- first departure.
+CREATE INDEX ix_trips_route_start ON trips (route_id, direction_id, first_secs);
 -- Single-record feed metadata (feed_info.txt); dates stay raw YYYYMMDD
 -- text cells, parsed leniently at the model boundary like every other
 -- descriptive value.
@@ -128,6 +134,8 @@ _LONG_REACH = 4 * 86_400
 _EXCEPTION_SERVICE_REMOVED = 2
 # GTFS-RT requires start_date for a trip lasting longer than this.
 _ONE_DAY = 86_400
+# Ids bound per statement: under SQLite's lowest default variable limit (999).
+_ID_SLICE = 500
 
 # A journey needs a time at both ends, a pickup at the origin and a drop-off
 # at the destination: pickup_type/drop_off_type 1 is "No pickup available" /
@@ -701,6 +709,7 @@ class StaticIndex:
             try:
                 conn.executescript(_SCHEMA)
                 cls._load_all(conn, archive, names, progress)
+                cls._store_first_departures(conn)
                 conn.executemany(
                     "INSERT INTO meta (key, value) VALUES (?, ?)",
                     [
@@ -823,6 +832,48 @@ class StaticIndex:
                 progress(completed, total)
 
     @staticmethod
+    def _store_first_departures(conn: sqlite3.Connection) -> None:
+        """Fill every trip's ``first_secs``: its first departure.
+
+        GTFS-RT reads a trip's start as its first departure: the departure
+        of its first TIMED call by stop_sequence (the loader already lets a
+        lone arrival or departure stand for both), the earliest where that
+        sequence repeats; a trip of one call starts at its arrival. Matches
+        :meth:`_trip_spans`. Runs once all stop_times, frequency
+        repetitions included, are loaded.
+        """
+        # Separate statements, not executescript: that commits first, and the
+        # build must stay one transaction (see build).
+        conn.execute(
+            "CREATE TEMP TABLE first_departures "
+            "(trip_id TEXT PRIMARY KEY, secs INTEGER)"
+        )
+        conn.execute(
+            """
+            INSERT INTO first_departures
+            SELECT b.trip_id,
+                   CASE WHEN b.first = b.last THEN MIN(st.arrival_secs)
+                        ELSE MIN(st.departure_secs) END
+            FROM (
+                SELECT trip_id, MIN(stop_sequence) AS first,
+                       MAX(stop_sequence) AS last
+                FROM stop_times
+                WHERE arrival_secs IS NOT NULL OR departure_secs IS NOT NULL
+                GROUP BY trip_id
+            ) AS b
+            JOIN stop_times st
+              ON st.trip_id = b.trip_id AND st.stop_sequence = b.first
+             AND (st.arrival_secs IS NOT NULL OR st.departure_secs IS NOT NULL)
+            GROUP BY b.trip_id
+            """
+        )
+        conn.execute(
+            "UPDATE trips SET first_secs = "
+            "(SELECT secs FROM first_departures WHERE trip_id = trips.id)"
+        )
+        conn.execute("DROP TABLE first_departures")
+
+    @staticmethod
     def _batched_insert(
         conn: sqlite3.Connection, sql: str, rows: list[tuple[object, ...]]
     ) -> None:
@@ -935,7 +986,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)"
         for row in reader:
             rows.append(
                 (
@@ -1882,19 +1933,19 @@ class StaticIndex:
         return self._ceiling_from(rows)
 
     def rt_instances[K: tuple[str, date | None, int | None]](
-        self, keys: Iterable[K], now: datetime
+        self, keys: Iterable[K]
     ) -> list[tuple[tuple[str, date], K]]:
-        """Resolve TripUpdate keys to the concrete runs they address.
+        """Resolve matched TripUpdate keys to the concrete runs they address.
 
-        Each key is ``(source trip id, start_date or None, start_secs or
-        None)``. Its trip resolves the way the merge matches rows: a plain
-        trip only by a key without start_secs, a frequency repetition only
-        by its own start. A dated key addresses that day's run if the
-        trip's service runs that day; a date-less key its current run as of
-        ``now`` (:meth:`current_service_dates`). Returns
+        Each key is ``(source trip id, start_date, start_secs or None)``.
+        Its trip resolves the way the merge matches rows: a plain trip only
+        by a key without start_secs, a frequency repetition only by its own
+        start; the key addresses that day's run if the trip's service runs
+        that day. A key without a date addresses nothing (matching gives
+        every reference that names a run its date first). Returns
         ``((concrete trip id, service date), key)`` pairs.
         """
-        keys = list(keys)
+        keys = [key for key in keys if key[1] is not None]
         if not keys:
             return []
         sources = sorted({source for source, _day, _secs in keys})
@@ -1909,27 +1960,55 @@ class StaticIndex:
         ).fetchall()
         by_identity = {(source, secs): trip_id for trip_id, source, secs, _ in trips}
         service_of = {trip_id: service for trip_id, _, _, service in trips}
-        dateless = [
-            trip_id
-            for source, day, secs in keys
-            if day is None and (trip_id := by_identity.get((source, secs)))
-        ]
-        current = self.current_service_dates(dateless, now)
         active: dict[date, set[str]] = {}
         found: list[tuple[tuple[str, date], K]] = []
         for key in keys:
             source, day, secs = key
             trip_id = by_identity.get((source, secs))
-            if trip_id is None:
-                continue
-            if day is None:
-                if trip_id in current:
-                    found.append(((trip_id, current[trip_id]), key))
+            if trip_id is None or day is None:
                 continue
             if day not in active:
                 active[day] = self.active_service_ids(day)
             if service_of[trip_id] in active[day]:
                 found.append(((trip_id, day), key))
+        return found
+
+    def alternative_trip_ids(
+        self, refs: Iterable[tuple[str, int, date, int]]
+    ) -> dict[tuple[str, int, date, int], str]:
+        """Resolve trip_id-less TripDescriptors to the one trip each names.
+
+        GTFS-RT's alternative trip matching: a trip that is not frequency
+        based "may also be uniquely identified by" ``(route_id,
+        direction_id, start_time, start_date)``, "as long as the
+        combination of ids provided resolves to a unique trip".
+        ``start_time`` is the trip's scheduled first departure (see
+        :meth:`plain_trip_starts`) and its service must run on
+        ``start_date``. A ref matching no trip, or several, names none; a
+        trip with no direction_id matches no direction. Frequency
+        repetitions are not candidates (the alternative applies to trips
+        "which are not frequency based"), so one leaving at the same time
+        does not make a plain trip ambiguous.
+        """
+        active: dict[date, set[str]] = {}
+        found: dict[tuple[str, int, date, int], str] = {}
+        for ref in sorted(set(refs)):
+            route_id, direction_id, day, secs = ref
+            candidates = self._conn.execute(
+                "SELECT id, service_id FROM trips WHERE route_id = ? "
+                "AND direction_id = ? AND first_secs = ? "
+                "AND start_secs IS NULL AND source_trip_id = id",
+                (route_id, direction_id, secs),
+            ).fetchall()
+            if day not in active:
+                active[day] = self.active_service_ids(day)
+            running = [
+                trip_id
+                for trip_id, service_id in candidates
+                if service_id in active[day]
+            ]
+            if len(running) == 1:
+                found[ref] = running[0]
         return found
 
     def current_service_dates(
@@ -2005,24 +2084,21 @@ class StaticIndex:
         no timed call are left out.
         """
         ids = sorted(set(trip_ids))
-        if not ids:
-            return {}
-        marks = ",".join("?" * len(ids))
-        plain = [
-            trip_id
-            for (trip_id,) in self._conn.execute(
-                f"SELECT id FROM trips WHERE id IN ({marks}) "
-                "AND start_secs IS NULL AND source_trip_id = id",
-                ids,
+        starts: dict[str, int] = {}
+        # In slices: realtime can name more trips than SQLite allows bound
+        # variables in one statement.
+        for offset in range(0, len(ids), _ID_SLICE):
+            chunk = ids[offset : offset + _ID_SLICE]
+            starts.update(
+                self._conn.execute(
+                    "SELECT id, first_secs FROM trips "
+                    f"WHERE id IN ({','.join('?' * len(chunk))}) "
+                    "AND start_secs IS NULL AND source_trip_id = id "
+                    "AND first_secs IS NOT NULL",
+                    chunk,
+                ).fetchall()
             )
-        ]
-        if not plain:
-            return {}
-        return {
-            trip_id: start
-            for trip_id, _service, _repetition, start, _end in self._trip_spans(plain)
-            if start is not None
-        }
+        return starts
 
     def _trip_spans(
         self, trip_ids: Sequence[str]

@@ -390,6 +390,12 @@ class StopArrival:
     update does not give is not predicted (None), even when the other event
     is; :attr:`effective_departure` is when the vehicle leaves as the board
     orders it.
+
+    ``canceled`` marks a scheduled run realtime says will not operate
+    (GTFS-RT CANCELED): the row stays on the board, at its scheduled time,
+    so riders see the cancellation, with no prediction and no vehicle;
+    ``realtime`` is True, a cancellation being realtime information. A run
+    realtime DELETES "must not be shown to users" and has no row at all.
     """
 
     stop_id: str
@@ -405,6 +411,7 @@ class StopArrival:
     predicted_departure: datetime | None
     delay_seconds: int | None
     realtime: bool
+    canceled: bool
     vehicle_id: str | None
     vehicle: VehiclePosition | None
     wheelchair_accessible: WheelchairAccess | None
@@ -479,6 +486,10 @@ class UpcomingTrip:
     on :class:`StopArrival`: the id from the origin's realtime prediction,
     and the live :class:`VehiclePosition` when the query asked for
     vehicles and one could be pinned to this trip instance.
+
+    ``canceled`` marks a run realtime says will not operate, kept and
+    ordered at its scheduled departure with no prediction and no vehicle,
+    as on :class:`StopArrival`; it counts toward a query's ``limit``.
     """
 
     trip_id: str
@@ -497,6 +508,7 @@ class UpcomingTrip:
     predicted_arrival: datetime | None
     delay_seconds: int | None
     realtime: bool
+    canceled: bool
     vehicle_id: str | None
     vehicle: VehiclePosition | None
     wheelchair_accessible: WheelchairAccess | None

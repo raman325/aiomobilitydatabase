@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -694,32 +694,54 @@ class TripPredictions:
 
 @dataclass
 class TripUpdates:
-    """Parsed index of a TripUpdates feed.
+    """Indexed TripUpdates: what realtime says about each trip instance.
 
-    Trip entries are keyed by :data:`TripUpdateKey` --
-    ``(trip_id, start_date, start_secs)``, also the cancellation key --
-    where ``start_date`` is the parsed ``TripDescriptor.start_date``
-    (None when absent or unparseable) and ``start_secs`` is the parsed
-    ``TripDescriptor.start_time`` (likewise None). ``start_date`` is how
-    GTFS-RT addresses ONE service day's instance of a trip (an update
-    posted today for tomorrow's instance must not touch today's);
-    ``start_time`` is how it addresses ONE repetition of a
-    frequency-based trip. The consumer-side merge matches both against
-    the static index's per-service-day rows and materialized
-    repetitions; propagation therefore happens within one matched
-    instance only.
+    Keyed by :data:`TripUpdateKey` -- ``(trip_id, start_date,
+    start_secs)``. ``start_date`` is how GTFS-RT addresses ONE service
+    day's instance of a trip; ``start_time`` ONE repetition of a
+    frequency-based trip. As parsed from a message
+    (:func:`trip_updates_from_message`) keys are the descriptors as sent;
+    once matched against the schedule (see ``transit``) every key in
+    ``trips`` names one dated run, so propagation happens within one
+    matched instance. A removal naming no scheduled run keeps its key as
+    sent: it matches no run but still removes an ADDED trip of that id.
 
-    A producer sending several TripUpdate entities for one identity is
-    out of spec ("at most one trip_update per actual trip"); the last
-    entity wins wholesale rather than attempting a field-level merge.
+    ``trips`` holds the predictions for runs that operate;
+    ``canceled_trips`` the runs that were scheduled but do not operate
+    (shown as cancelled); ``deleted_trips`` runs removed outright, which
+    "must not be shown to users"; ``added`` the stop times of RT-added
+    trips absent from the schedule.
     """
 
     trips: dict[TripUpdateKey, TripUpdateEntry] = field(default_factory=dict)
     canceled_trips: set[TripUpdateKey] = field(default_factory=set)
+    deleted_trips: set[TripUpdateKey] = field(default_factory=set)
     added: list[AddedStopTime] = field(default_factory=list)
-    # When the producer built this snapshot (header.timestamp), the instant
-    # "the current service day" is judged at. None when absent or zero.
-    feed_time: datetime | None = None
+
+
+@dataclass(frozen=True)
+class TripUpdateRecord:
+    """One TripUpdate entity as its TripDescriptor names it, before matching.
+
+    ``trip_id`` is ``""`` when the descriptor omits it: such a record names
+    its trip only by ``route_id``, ``direction_id``, ``start_date`` and
+    ``start_secs`` together (GTFS-RT's alternative trip matching), which
+    only the schedule can resolve. ``relationship`` is the raw
+    ``TripDescriptor.schedule_relationship``.
+    """
+
+    trip_id: str
+    start_date: date | None
+    start_secs: int | None
+    route_id: str | None
+    direction_id: int | None
+    relationship: int
+    entry: TripUpdateEntry
+
+    @property
+    def key(self) -> TripUpdateKey:
+        """The (trip_id, start_date, start_secs) identity this record names."""
+        return (self.trip_id, self.start_date, self.start_secs)
 
 
 def _placed(
@@ -891,107 +913,149 @@ def _trip_start_date(trip: gtfs_realtime_pb2.TripDescriptor) -> date | None:
         return None
 
 
-def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpdates:
-    """Index TripUpdate entities by their (trip_id, start_date, start_secs) key."""
-    updates = TripUpdates()
+def feed_timestamp(message: gtfs_realtime_pb2.FeedMessage) -> datetime | None:
+    """When the producer built this message (header.timestamp), if it says.
+
+    The instant its date-less trip references are judged at: the spec's
+    timestamp "identifies the moment when the content of this feed has
+    been created". None when absent, zero or unrepresentable.
+    """
     if message.header.HasField("timestamp") and message.header.timestamp:
-        updates.feed_time = _epoch_to_utc(message.header.timestamp)
-    canceled = gtfs_realtime_pb2.TripDescriptor.CANCELED
-    added = gtfs_realtime_pb2.TripDescriptor.ADDED
+        return _epoch_to_utc(message.header.timestamp)
+    return None
+
+
+def _stop_update(stu: gtfs_realtime_pb2.TripUpdate.StopTimeUpdate) -> TripStopUpdate:
+    """Parse one StopTimeUpdate, each event its own time and delay."""
+    arrival = stu.arrival if stu.HasField("arrival") else None
+    departure = stu.departure if stu.HasField("departure") else None
+    return TripStopUpdate(
+        stop_id=stu.stop_id or None,
+        stop_sequence=stu.stop_sequence if stu.HasField("stop_sequence") else None,
+        relationship=stu.schedule_relationship,
+        arrival=_epoch_to_utc(arrival.time) if arrival is not None else None,
+        departure=_epoch_to_utc(departure.time) if departure is not None else None,
+        arrival_delay=(
+            arrival.delay if arrival is not None and arrival.HasField("delay") else None
+        ),
+        departure_delay=(
+            departure.delay
+            if departure is not None and departure.HasField("delay")
+            else None
+        ),
+        assigned_stop_id=(
+            stu.stop_time_properties.assigned_stop_id or None
+            if stu.HasField("stop_time_properties")
+            else None
+        ),
+    )
+
+
+def trip_update_records(
+    message: gtfs_realtime_pb2.FeedMessage,
+) -> list[TripUpdateRecord]:
+    """Parse every TripUpdate entity of a message, in feed order, unmatched."""
+    records: list[TripUpdateRecord] = []
     for entity in message.entity:
         if not entity.HasField("trip_update"):
             continue
         trip_update = entity.trip_update
-        trip_id = trip_update.trip.trip_id
-        start_date = _trip_start_date(trip_update.trip)
-        start_secs = _trip_start_secs(trip_update.trip)
-        vehicle_id = trip_update.vehicle.id or None
-        if trip_update.trip.schedule_relationship == canceled:
-            updates.canceled_trips.add((trip_id, start_date, start_secs))
+        trip = trip_update.trip
+        records.append(
+            TripUpdateRecord(
+                trip_id=trip.trip_id,
+                start_date=_trip_start_date(trip),
+                start_secs=_trip_start_secs(trip),
+                route_id=trip.route_id or None,
+                direction_id=(
+                    trip.direction_id if trip.HasField("direction_id") else None
+                ),
+                relationship=trip.schedule_relationship,
+                entry=TripUpdateEntry(
+                    stop_updates=tuple(
+                        _stop_update(stu) for stu in trip_update.stop_time_update
+                    ),
+                    delay_seconds=(
+                        trip_update.delay if trip_update.HasField("delay") else None
+                    ),
+                    vehicle_id=trip_update.vehicle.id or None,
+                ),
+            )
+        )
+    return records
+
+
+def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
+    """Index records by the identity each names; a later record wins.
+
+    A record without a trip_id names no scheduled trip here (only the
+    schedule can resolve its route, direction and start; see ``transit``);
+    an ADDED one's stop times are still kept, as sent. DELETED and
+    CANCELED win regardless of order: a producer may send one alongside
+    stale predictions for the same trip in either order, and the result
+    must be self-consistent rather than relying on consumers checking the
+    removal sets first. DELETED wins over CANCELED -- a run removed
+    outright is not shown at all. Predictions match on the full
+    (trip_id, start_date, start_secs) identity; ADDED stop times on bare
+    trip_id -- an added trip is identified by the id the producer minted
+    for it, and dropping its rows on ANY removal of that id is the
+    conservative "removed wins" choice (never show a trip that might not
+    run). A producer sending several updates for one identity is out of
+    spec ("at most one trip_update per actual trip"); the last wins
+    wholesale rather than attempting a field-level merge. Any other
+    relationship -- SCHEDULED, UNSCHEDULED, or one this library does not
+    model yet -- is read as predictions for the trip it names.
+    """
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    updates = TripUpdates()
+    for record in records:
+        key = record.key
+        if record.relationship == descriptor.ADDED:
+            updates.added.extend(
+                AddedStopTime(
+                    trip_id=record.trip_id,
+                    route_id=record.route_id,
+                    stop_id=stop_update.stop_id or "",
+                    arrival=stop_update.arrival,
+                    departure=stop_update.departure,
+                    vehicle_id=record.entry.vehicle_id,
+                    start_date=record.start_date,
+                )
+                for stop_update in record.entry.stop_updates
+            )
+        elif not record.trip_id:
             continue
-        is_added = trip_update.trip.schedule_relationship == added
-        stop_updates: list[TripStopUpdate] = []
-        for stu in trip_update.stop_time_update:
-            arrival = (
-                _epoch_to_utc(stu.arrival.time) if stu.HasField("arrival") else None
-            )
-            departure = (
-                _epoch_to_utc(stu.departure.time) if stu.HasField("departure") else None
-            )
-            arrival_delay = (
-                stu.arrival.delay
-                if stu.HasField("arrival") and stu.arrival.HasField("delay")
-                else None
-            )
-            departure_delay = (
-                stu.departure.delay
-                if stu.HasField("departure") and stu.departure.HasField("delay")
-                else None
-            )
-            if is_added:
-                updates.added.append(
-                    AddedStopTime(
-                        trip_id=trip_id,
-                        route_id=trip_update.trip.route_id or None,
-                        stop_id=stu.stop_id,
-                        arrival=arrival,
-                        departure=departure,
-                        vehicle_id=vehicle_id,
-                        start_date=start_date,
-                    )
-                )
-            else:
-                stop_updates.append(
-                    TripStopUpdate(
-                        stop_id=stu.stop_id or None,
-                        stop_sequence=(
-                            stu.stop_sequence if stu.HasField("stop_sequence") else None
-                        ),
-                        relationship=stu.schedule_relationship,
-                        arrival=arrival,
-                        departure=departure,
-                        arrival_delay=arrival_delay,
-                        departure_delay=departure_delay,
-                        assigned_stop_id=(
-                            stu.stop_time_properties.assigned_stop_id or None
-                            if stu.HasField("stop_time_properties")
-                            else None
-                        ),
-                    )
-                )
-        if not is_added:
+        elif record.relationship == descriptor.CANCELED:
+            updates.canceled_trips.add(key)
+        elif record.relationship == descriptor.DELETED:
+            updates.deleted_trips.add(key)
+        else:
             # An entry is recorded even with zero StopTimeUpdates: a bare
             # TripUpdate.delay with no STUs is a valid trip-wide fallback.
-            updates.trips[(trip_id, start_date, start_secs)] = TripUpdateEntry(
-                stop_updates=tuple(stop_updates),
-                delay_seconds=(
-                    trip_update.delay if trip_update.HasField("delay") else None
-                ),
-                vehicle_id=vehicle_id,
-            )
-    # Cancellation wins regardless of entity order: a producer may send a
-    # CANCELED trip_update alongside stale predictions/added-stop-times for
-    # the same trip in either order within one message. The parsed result
-    # must be self-consistent rather than relying on consumers checking
-    # canceled_trips first. Trip entries are matched on the full
-    # (trip_id, start_date, start_secs) identity; ADDED stop times are
-    # matched on bare trip_id -- an added trip is identified by the id the
-    # producer minted for it, and dropping its rows on ANY cancellation of
-    # that id is the conservative "removed wins" choice (never show a trip
-    # that might not run).
-    if updates.canceled_trips:
+            updates.trips[key] = record.entry
+    updates.canceled_trips -= updates.deleted_trips
+    removed = updates.canceled_trips | updates.deleted_trips
+    if removed:
         updates.trips = {
-            key: entry
-            for key, entry in updates.trips.items()
-            if key not in updates.canceled_trips
+            key: entry for key, entry in updates.trips.items() if key not in removed
         }
-        canceled_ids = {trip_id for trip_id, _, _ in updates.canceled_trips}
+        removed_ids = {trip_id for trip_id, _, _ in removed}
         updates.added = [
             stop_time
             for stop_time in updates.added
-            if stop_time.trip_id not in canceled_ids
+            if stop_time.trip_id not in removed_ids
         ]
     return updates
+
+
+def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpdates:
+    """Index a message's TripUpdates by their descriptors as sent.
+
+    No schedule matching happens here: date-less, trip_id-less and
+    start-time-naming references stay as sent (see ``transit`` for the
+    matched form).
+    """
+    return indexed_trip_updates(trip_update_records(message))
 
 
 def _first_translation(translated: object) -> str | None:

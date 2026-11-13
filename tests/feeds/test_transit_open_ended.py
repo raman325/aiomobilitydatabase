@@ -420,12 +420,13 @@ async def test_a_dateless_cancellation_still_cancels_the_current_run(
     [board] = await handle.get_arrivals(
         [ArrivalsQuery(["S1"], limit=3)], start=_pdt(7, 30, 7, 45)
     )
-    # Today's T1 is gone; tomorrow's T1 is untouched.
+    # Today's T1 is shown cancelled; tomorrow's T1 is untouched.
     assert _times(board) == [
+        ("T1", _pdt(7, 30, 8, 0, 30)),
         ("T2", _pdt(7, 30, 8, 30, 30)),
         ("T3", _pdt(7, 31, 1, 31)),
-        ("T1", _pdt(7, 31, 8, 0, 30)),
     ]
+    assert [row.canceled for row in board] == [True, False, False]
 
 
 async def test_a_dateless_delay_binds_to_last_nights_past_midnight_run(
@@ -529,8 +530,11 @@ async def test_dateless_realtime_is_judged_at_the_feeds_time_not_the_boards(
     query = [ArrivalsQuery(["S1"], route_ids=["R1"], limit=1)]
     [today] = await handle.get_arrivals(query, start=_pdt(7, 30, 7, 45))
     [tomorrow] = await handle.get_arrivals(query, start=_pdt(7, 31, 7, 45))
-    assert _times(today) == [("T2", _pdt(7, 30, 8, 30, 30))]  # Thursday's T1 gone
-    assert _times(tomorrow) == [("T1", _pdt(7, 31, 8, 0, 30))]  # Friday's stays
+    # Thursday's T1 is cancelled; Friday's runs.
+    assert _times(today) == [("T1", _pdt(7, 30, 8, 0, 30))]
+    assert [row.canceled for row in today] == [True]
+    assert _times(tomorrow) == [("T1", _pdt(7, 31, 8, 0, 30))]
+    assert [row.canceled for row in tomorrow] == [False]
 
 
 def _update(*entities: tuple[str, str | None, int | None, int | None]) -> bytes:

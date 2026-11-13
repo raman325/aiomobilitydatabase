@@ -131,7 +131,10 @@ async def main() -> None:
         for arrival in arrivals:
             # When it leaves, as the board orders it: predicted if known.
             when = arrival.effective_departure
-            live = "live" if arrival.realtime else "scheduled"
+            if arrival.canceled:  # shown, so riders see it; it won't run
+                live = "cancelled"
+            else:
+                live = "live" if arrival.realtime else "scheduled"
             # .stop and .route are the whole static records: platform codes,
             # coordinates, route_type and route colours all come along.
             route = arrival.route.display_name if arrival.route else arrival.route_id
@@ -146,7 +149,8 @@ async def main() -> None:
         )
         for trip in trips:
             name = trip.route.display_name if trip.route else trip.route_id
-            print(name, trip.scheduled_departure, trip.is_last)
+            # Cancelled journeys stay listed (and count toward limit).
+            print(name, trip.scheduled_departure, trip.is_last, trip.canceled)
 
         vehicles = await transit.get_vehicles(zone=home)
         alerts = await transit.get_alerts()
@@ -223,8 +227,12 @@ Notes on direct mode:
   SQLite (agencies, stops, routes, trips, stop_times, calendars, frequencies,
   feed_info) in a worker thread — the event loop is never blocked. Arrivals
   work with or without realtime coverage; GTFS-RT TripUpdates overlay delays,
-  cancellations, and added trips when present, with cancellation always
-  winning over stale predictions.
+  cancellations, deletions and added trips when present. A cancelled run
+  stays listed at its scheduled time with `canceled=True` and no prediction
+  (boards and journeys alike, counting toward `limit`), so riders see the
+  cancellation; a deleted one "must not be shown to users" and is gone.
+  Either always wins over stale predictions, and a deletion over a
+  cancellation.
 - **Arrivals are batched and delay-aware**: `get_arrivals()` takes a sequence
   of `ArrivalsQuery` and returns one board per query from a single schedule
   read and a single realtime fetch, so several stops with different
@@ -319,8 +327,9 @@ Notes on direct mode:
   interval, and never extends `no-cache`, `max-age=0`, an expired
   lifetime, `no-store` or a `Vary` mismatch.
 - **Date-less realtime means the current run**: a TripUpdate, cancellation
-  or vehicle with no `start_date` applies to one run, judged at the feed's
-  header timestamp alone (never a query setting): the run scheduled to be
+  or vehicle with no `start_date` applies to one run, judged at its own
+  feed's header timestamp alone (never a query setting, nor another feed's
+  timestamp): the run scheduled to be
   under way (including last night's past-midnight run, and one already
   under way when a spring-forward day starts the evening before its date);
   else the run nearest in time, up to today — a morning update reaches
@@ -356,7 +365,14 @@ Notes on direct mode:
   repetition of a frequency trip and exactly one service-day instance (a
   plain trip's `start_time`, when given, is its first departure, as GTFS-RT
   requires; any other value names no run) — a
-  "trip X is canceled tomorrow" posting never cancels today's run. A
+  "trip X is canceled tomorrow" posting never cancels today's run. An update
+  without a `trip_id` names the one trip its `route_id`, `direction_id`,
+  `start_time` (the first departure) and `start_date` resolve to, if
+  exactly one non-frequency trip matches. A cancellation or deletion of a
+  run wins over any prediction for it; of several predictions for one run,
+  the one naming its date wins over one leaving it to the feed's time, and
+  one omitting a plain trip's own start time over one spelling it out;
+  then the later feed. A
   StopTimeUpdate predicts the events (arrival, departure) it gives by their
   own time, else their own delay — an event it does not give is not
   predicted — and its delay (a time, when given, against the schedule:

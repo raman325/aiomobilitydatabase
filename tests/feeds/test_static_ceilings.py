@@ -115,16 +115,17 @@ def test_realtime_index_helpers_accept_empty_input(tmp_path: Path) -> None:
         calendar="ALL,1,1,1,1,1,1,1,20260101,20261231\n",
         stop_times=_TWO_STOPS,
     )
-    at = datetime(2026, 7, 30, 7, tzinfo=UTC)
-    assert index.rt_instances([], at) == []
+    assert index.rt_instances([]) == []
     assert index.instance_departures([], ["S1"]) == []
     assert index.instance_departures([("T1", date(2026, 7, 30))], []) == []
     assert index.instance_trips([], "S1", "S2") == []
     assert index.instance_trip_calls([]) == []
     # A trip with calls, addressed on a day its service runs and one it doesn't.
     assert index.rt_instances(
-        [("T1", date(2026, 7, 30), None), ("T1", date(2027, 1, 1), None)], at
+        [("T1", date(2026, 7, 30), None), ("T1", date(2027, 1, 1), None)]
     ) == [(("T1", date(2026, 7, 30)), ("T1", date(2026, 7, 30), None))]
+    # A key without a date addresses nothing: matching dates every key first.
+    assert index.rt_instances([("T1", None, None)]) == []
     # A run on a day its service doesn't operate doesn't exist.
     gone = [("T1", date(2027, 1, 1))]
     assert index.instance_departures(gone, ["S1"]) == []
@@ -146,7 +147,6 @@ def test_a_garbage_feed_time_has_no_current_run(tmp_path: Path) -> None:
     )
     at = datetime(9999, 12, 31, 23, tzinfo=UTC)
     assert index.current_service_dates(["T1"], at) == {}
-    assert index.rt_instances([("T1", None, None)], at) == []
 
 
 def test_current_service_dates_edges(tmp_path: Path) -> None:

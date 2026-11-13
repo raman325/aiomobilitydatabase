@@ -185,6 +185,7 @@ async def _uncapped[T](
         wanted_stops: set[str],
         *,
         end: datetime | None,
+        removed: Any,
         rt_stops: Any,
         stops_by_id: Any,
         routes_by_id: Any,
@@ -211,8 +212,9 @@ async def _uncapped[T](
                 and (not mod.start_secs or instance.start_secs in mod.start_secs)
                 for modification in mod.modifications
             ]
-            if not applicable:
-                continue
+            run = (instance.source_trip_id, instance.service_date, instance.start_secs)
+            if not applicable or run in removed:
+                continue  # a cancelled or deleted run is not rebuilt
             calls = transit_module._modified_calls(
                 instance, applicable, rt_stops, stops_by_id
             )
