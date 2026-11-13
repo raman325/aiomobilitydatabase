@@ -2496,3 +2496,107 @@ def test_slot_runs_find_the_slot_holding_a_start() -> None:
         }
     finally:
         index.close()
+
+
+def test_a_frequency_based_run_keeps_its_service_and_states_no_delay() -> None:
+    """A run of headway-based service runs on its trip's service, so it
+    keeps the trip's ``service_id``; it "does not follow a fixed schedule",
+    so no delay is reported against the moved one -- though its time's
+    offset from it still predicts later stops."""
+    message = _descriptor_message(
+        _slot_update("08:03:00", stops=[{"stop": "S0", "departure": _at(4)}])
+    )
+
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S1"], limit=2)],
+            start=_EIGHT - timedelta(minutes=30),
+            end=_EIGHT + timedelta(hours=2),
+        )
+        return [
+            (r.trip_id, r.stop_id, r.service_id, r.delay_seconds, r.predicted_arrival)
+            for r in board
+        ]
+
+    assert _run_feeds(_SLOTS, body, [message]) == [
+        ("T#28980", "S0", "S", None, None),
+        ("T#29400", "S0", "S", None, None),
+    ]
+    trip_rows = _run_feeds(_SLOTS, _boards_and_journeys(), [message])[0]
+    assert ("T#28980", "S1", _at(13), _at(14), _at(14), False) in trip_rows
+
+
+def test_a_frequency_based_run_is_detoured_as_its_repetition_would_be() -> None:
+    """TripModifications apply to the runs they select: a detour of T on
+    the day, listing no start_times, reroutes a run at any start -- S1
+    replaced by S2 ten minutes after S0 -- and the run's time still
+    predicts the detoured calls."""
+    files = {
+        **_THREE_STOPS,
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs\nT,08:00:00,08:30:00,600\n"
+        ),
+    }
+    message = _descriptor_message(
+        _slot_update("08:12:00", stops=[{"stop": "S0", "departure": _at(13)}])
+    )
+    _detoured(message)
+    board, _ = _run_feeds(files, _boards_and_journeys(), [message])
+    assert [row for row in board if row[0] in {"T#29400", "T#29520"}] == [
+        ("T#29520", "S0", _at(12), None, _at(13), False),
+        ("T#29520", "S2", _at(22), _at(23), _at(23), False),
+        ("T#29520", "S2", _at(32), _at(33), _at(33), False),
+    ]
+
+
+def test_a_slot_ends_at_the_next_repetition_whatever_its_kind() -> None:
+    """ "New headways may start at the exact time the previous headway
+    ends": headway-based service to 08:25, then exact times from 08:25.
+    08:25 is a scheduled run of its own, so the 08:20 slot ends there --
+    a cancellation or delay at 08:25 is that run's, never 08:20's -- while
+    08:24:59 still runs in the 08:20 slot."""
+    files = _feed(
+        frequencies=(
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T,08:00:00,08:25:00,600,0\nT,08:25:00,08:40:00,600,1\n"
+        ),
+    )
+    message = _descriptor_message(
+        _slot_update(
+            "08:25:00", relationship=gtfs_realtime_pb2.TripDescriptor.CANCELED
+        ),
+        _slot_update("08:35:00", delay=120, relationship=0),
+        _slot_update("08:24:59", stops=[{"stop": "S0", "departure": _at(26)}]),
+    )
+    board, _ = _run_feeds(files, _boards_and_journeys(), [message])
+    assert [row for row in board if row[1] == "S0"] == [
+        ("T#28800", "S0", _EIGHT, None, None, False),
+        ("T#29400", "S0", _at(10), None, None, False),
+        ("T#30300", "S0", _at(25), None, None, True),
+        ("T#30299", "S0", _at(25) - timedelta(seconds=1), None, _at(26), False),
+        ("T#30900", "S0", _at(35), None, _at(37), False),
+    ]
+
+
+def test_runs_sharing_a_slot_show_one_row_for_it() -> None:
+    """A slot's repetition is one row for the runs it stands for: a run
+    taking it hides it, whatever another feed removes in the same slot,
+    and of a deletion and a cancellation in one slot the deletion wins, as
+    for one run."""
+    removals = _descriptor_message(
+        _slot_update(
+            "08:11:00", relationship=gtfs_realtime_pb2.TripDescriptor.CANCELED
+        ),
+        _slot_update("08:01:00", relationship=gtfs_realtime_pb2.TripDescriptor.DELETED),
+        _slot_update(
+            "08:05:00", relationship=gtfs_realtime_pb2.TripDescriptor.CANCELED
+        ),
+    )
+    running = _descriptor_message(
+        _slot_update("08:14:00", stops=[{"stop": "S0", "departure": _at(14)}])
+    )
+    board, _ = _run_feeds(_SLOTS, _boards_and_journeys(), [removals, running])
+    assert [row for row in board if row[1] == "S0"] == [
+        ("T#29640", "S0", _at(14), None, _at(14), False),
+        ("T#30000", "S0", _at(20), None, None, False),
+    ]

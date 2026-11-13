@@ -367,15 +367,20 @@ Notes on direct mode:
   it. Service with `exact_times` 0 (or empty) "does not follow a fixed
   schedule", so its repetitions report `timepoint_exact=False`, and
   realtime names its runs by a `start_time` that "may be arbitrary": a run
-  is the trip moved to that start, shown under its own
-  `{trip_id}#{start_secs}` id in place of the repetition whose headway
-  slot (`[start, start + headway_secs)`) holds it -- two runs in one slot
-  both show. Only its updates' times predict it: "Delay can only be used
-  in case the trip update refers to a scheduled GTFS trip, as opposed to
-  a frequency-based trip". A cancellation, deletion or replacement of
-  such a run is one of its slot's repetition, and its vehicle is the one
-  naming its own start. A start in no slot, or on a day the trip does not
-  run, names no run.
+  is the trip moved to that start (and detoured as any run of the trip
+  would be), shown under its own `{trip_id}#{start_secs}` id in place of
+  the repetition whose headway slot holds it -- one headway from that
+  repetition's start, never past the trip's next repetition. Two runs in
+  one slot both show. Only its updates' times predict it ("Delay can only
+  be used in case the trip update refers to a scheduled GTFS trip, as
+  opposed to a frequency-based trip"), and no `delay_seconds` is reported
+  against a schedule such service does not keep. A cancellation, deletion
+  or replacement of such a run is one of its slot's repetition, so a slot
+  shows one row for its runs: a running one, else its repetition
+  cancelled, unless any is deleted. A run's vehicle is the one naming
+  its own start; a vehicle alone, with no update for its run, adds no
+  run. A start in no slot, or on a day the trip does not run, names no
+  run.
 - **Schedule data means what GTFS says it means**: stop times are in
   agency.txt's `agency_timezone` (a catalog's zone is only a fallback for
   a dataset naming no usable one). A call timed by only its arrival or only

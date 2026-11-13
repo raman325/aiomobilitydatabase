@@ -1635,15 +1635,19 @@ class StaticIndex:
         trip's start_time "may be arbitrary, and is initially expected to be
         the first departure of the trip", so a run is the trip at that
         start. frequencies.txt gives it no schedule of its own, only
-        headways: the run takes the place of the repetition whose slot
-        ``[start, start + headway)`` holds its start (the latest one, should
-        a feed's slots overlap), and is that repetition's calls moved to
-        its start. A key naming no such slot, or a day the trip's service
-        does not run, names nothing here.
+        headways: the run takes the place of the repetition whose slot holds
+        its start -- from that repetition's start for one headway, but never
+        past the trip's next repetition ("New headways may start at the
+        exact time the previous headway ends", and an exact_times=1 one is
+        a run of its own) -- and is that repetition's calls moved to its
+        start (a call materialization left untimed stays so). A key naming
+        no such slot, or a day the trip's service does not run, names
+        nothing here.
         """
         keys = [key for key in keys if key[1] is not None and key[2] is not None]
         sources = sorted({source for source, _day, _secs in keys})
-        slots: dict[str, list[tuple[int, int, str]]] = {}
+        # Every repetition, in order: a slot ends at the next one.
+        repetitions: dict[str, list[tuple[int, int | None, str]]] = {}
         # In slices: realtime can name more trips than SQLite allows bound
         # variables in one statement.
         for offset in range(0, len(sources), _ID_SLICE):
@@ -1651,21 +1655,24 @@ class StaticIndex:
             for trip_id, source, start, width in self._conn.execute(
                 "SELECT id, source_trip_id, start_secs, slot_secs FROM trips "
                 f"WHERE source_trip_id IN ({','.join('?' * len(chunk))}) "
-                "AND slot_secs IS NOT NULL",
+                "AND start_secs IS NOT NULL ORDER BY source_trip_id, start_secs",
                 chunk,
             ):
-                slots.setdefault(source, []).append((start, width, trip_id))
+                repetitions.setdefault(source, []).append((start, width, trip_id))
         taken: dict[K, tuple[int, str, date]] = {}
         for key in keys:
             source, day, secs = key
             assert day is not None and secs is not None
-            held = [
-                (start, trip_id)
-                for start, width, trip_id in slots.get(source, ())
-                if start <= secs < start + width
-            ]
-            if held:
-                taken[key] = (*max(held), day)
+            runs_of = repetitions.get(source, [])
+            for n, (start, width, trip_id) in enumerate(runs_of):
+                if width is None:
+                    continue  # exact times: a run of its own, no slot
+                end = start + width
+                if n + 1 < len(runs_of):
+                    end = min(end, runs_of[n + 1][0])
+                if start <= secs < end:
+                    taken[key] = (start, trip_id, day)
+                    break
         runs = {
             (run.trip_id, run.service_date): run
             for run in self.instance_trip_calls(

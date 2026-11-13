@@ -85,7 +85,9 @@ async def test_start_time_prediction_and_cancellation_hit_one_repetition(
     assert by_trip["F1#22800"].predicted_departure is None
     predicted = by_trip["F1#22200"]
     assert predicted.realtime is True
-    assert predicted.delay_seconds == 120
+    # Headway-based (exact_times blank): its time stands, but no delay is
+    # reported against a schedule such service does not keep.
+    assert predicted.delay_seconds is None
     assert predicted.predicted_departure == F1_22200_S1_DEPARTURE + timedelta(
         seconds=120
     )
@@ -131,7 +133,9 @@ async def test_start_time_matching_applies_to_upcoming_trips_overlay(
     assert [t.trip_id for t in trips if t.canceled] == ["F1#22800"]
     predicted = next(t for t in trips if t.trip_id == "F1#22200")
     assert predicted.realtime is True
-    assert predicted.delay_seconds == 120
+    # Headway-based (exact_times blank): its time stands, but no delay is
+    # reported against a schedule such service does not keep.
+    assert predicted.delay_seconds is None
     assert predicted.predicted_departure == F1_22200_S1_DEPARTURE + timedelta(
         seconds=120
     )

@@ -4478,13 +4478,14 @@ def test_frequency_rt_start_time_names_one_run(
         # realtime where its update reaches.
         assert row.realtime is (slotted or reached)
         # A run in a slot drops a delay; its time against the run's own
-        # schedule is the delay that propagates.
+        # schedule is the offset that propagates, but no delay is reported
+        # against a schedule such service does not keep.
         stated = (rep + delay - start) if slotted else delay
         if not reached or (slotted and not timed):
             assert row.predicted_departure is None
             assert row.delay_seconds is None
             continue
-        assert row.delay_seconds == stated
+        assert row.delay_seconds == (None if slotted else stated)
         if row.stop_id == stop_id and timed:
             assert row.predicted_departure == explicit_departure
         else:

@@ -399,7 +399,9 @@ class StopArrival:
     realtime run of headway-based (``exact_times`` 0) frequency service is
     built the same way: its trip moved to the run's own start, under the
     ``{trip_id}#{start_secs}`` id of that start, in place of the repetition
-    whose headway slot holds it; only its updates' times predict it.
+    whose headway slot holds it; it keeps its trip's ``service_id``, only
+    its updates' times predict it, and its ``delay_seconds`` is None (such
+    service "does not follow a fixed schedule").
 
     ``predicted_arrival``/``predicted_departure`` are each event's own
     prediction; ``delay_seconds`` is the delay realtime gives this stop --

@@ -701,6 +701,9 @@ class RealtimeTrip:
     wheelchair_accessible: WheelchairAccess | None = None
     bikes_allowed: BikesAllowed | None = None
     trip_short_name: str | None = None
+    # An exact_times=0 run's trip's service: it runs on that service's day.
+    # None for any other realtime-only trip, which no calendar runs.
+    service_id: str | None = None
 
 
 @dataclass(frozen=True)
