@@ -378,10 +378,14 @@ class StopArrival:
     one. ``direction_id`` stays a raw int (0/1 with feed-defined meaning),
     matching :attr:`UpcomingTrip.direction_id`.
     Rows of a trip realtime states in full (NEW, ADDED, or a REPLACEMENT
-    run, whose schedule "isn't used") have no schedule row: their times
-    are the update's predictions, ``service_id`` and the stop_time
-    descriptors are None, and the trip-level ones are what the update (or,
-    for a replacement, the replaced trip) gives.
+    run, whose static schedule "isn't used") have no stop_times row: their
+    scheduled times are the update's own ``scheduled_time`` (None where it
+    gives none) and their predictions its times. ``service_id``, the
+    stop_time descriptors, ``wheelchair_accessible``, ``bikes_allowed``,
+    ``trip_short_name`` and ``block_id`` are None; ``route_id``,
+    ``direction_id`` and ``headsign`` are what the update gives, a
+    replacement's gaps filled from the trip it replaces, whose ``trip_id``
+    (a frequency repetition's own) it shows under.
 
     ``predicted_arrival``/``predicted_departure`` are each event's own
     prediction; ``delay_seconds`` is the delay realtime gives this stop --
@@ -451,9 +455,10 @@ class UpcomingTrip:
     The shape Home Assistant's legacy ``gtfs`` sensor needs: the next
     departure from an origin stop on a trip that later serves the
     destination stop. A scheduled trip always has both scheduled times; a
-    trip realtime states in full (NEW, or a REPLACEMENT run, whose schedule
-    "isn't used") has none -- only its predictions -- and no
-    ``service_id``, and its route only when the update names one.
+    trip realtime states in full (NEW, or a REPLACEMENT run, whose static
+    schedule "isn't used") has only the ones its update gives
+    (``scheduled_time``), and its other fields as on
+    :class:`StopArrival`.
     Realtime predicts the events its updates give:
     ``predicted_departure``/``origin_predicted_arrival`` at the origin and
     ``predicted_arrival`` at the destination, each None when realtime says

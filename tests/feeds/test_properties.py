@@ -3258,15 +3258,20 @@ def _arrivals_rt_message(
         stu = entity.trip_update.stop_time_update.add()
         stu.stop_id = "S1"
         stu.departure.time = int(predicted_at.timestamp())
-    for index, (trip_id, route_id, stop_id, arrival, departure) in enumerate(added):
-        entity = msg.entity.add()
-        entity.id = f"a-{index}"
-        entity.trip_update.trip.trip_id = trip_id
-        if route_id is not None:
-            entity.trip_update.trip.route_id = route_id
-        entity.trip_update.trip.schedule_relationship = (
-            gtfs_realtime_pb2.TripDescriptor.ADDED
-        )
+    # One TripUpdate per added trip ("at most one trip_update per actual
+    # trip"), its calls in order.
+    entities: dict[str, gtfs_realtime_pb2.FeedEntity] = {}
+    for trip_id, route_id, stop_id, arrival, departure in added:
+        entity = entities.get(trip_id)
+        if entity is None:
+            entity = entities[trip_id] = msg.entity.add()
+            entity.id = f"a-{len(entities)}"
+            entity.trip_update.trip.trip_id = trip_id
+            if route_id is not None:
+                entity.trip_update.trip.route_id = route_id
+            entity.trip_update.trip.schedule_relationship = (
+                gtfs_realtime_pb2.TripDescriptor.ADDED
+            )
         stu = entity.trip_update.stop_time_update.add()
         stu.stop_id = stop_id
         if arrival is not None:

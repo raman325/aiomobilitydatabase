@@ -11,6 +11,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from google.transit import gtfs_realtime_pb2
 from hypothesis import given, settings
@@ -424,6 +425,26 @@ _DIRECTED = _feed(
 )
 
 
+def _add_stop(stu: Any, stop: dict[str, Any]) -> None:
+    """Fill a StopTimeUpdate: ``stop``, each event's ``time`` (``arrival``,
+    ``departure``), ``scheduled_*`` and ``*_delay``, ``no_data``/``skipped``."""
+    stu.stop_id = stop["stop"]
+    if stop.get("no_data"):
+        stu.schedule_relationship = _STU.NO_DATA
+    if stop.get("skipped"):
+        stu.schedule_relationship = _STU.SKIPPED
+    for event in ("arrival", "departure"):
+        holder = getattr(stu, event)
+        for part, value in (
+            ("time", stop.get(event)),
+            ("scheduled_time", stop.get(f"scheduled_{event}")),
+        ):
+            if value is not None:
+                setattr(holder, part, int(value.timestamp()))
+        if stop.get(f"{event}_delay") is not None:
+            holder.delay = stop[f"{event}_delay"]
+
+
 def _descriptor_message(
     *descriptors: dict[str, object], timestamp: datetime | None = None
 ) -> gtfs_realtime_pb2.FeedMessage:
@@ -448,15 +469,15 @@ def _descriptor_message(
             stu.departure.delay = fields["delay"]
         if "headsign" in fields:
             entity.trip_update.trip_properties.trip_headsign = fields["headsign"]
-        for stop_id, arrival, departure, skipped in fields.get("calls", ()):
-            stu = entity.trip_update.stop_time_update.add()
-            stu.stop_id = stop_id
-            if arrival is not None:
-                stu.arrival.time = int(arrival.timestamp())
-            if departure is not None:
-                stu.departure.time = int(departure.timestamp())
-            if skipped:
-                stu.schedule_relationship = _STU.SKIPPED
+        stops = [
+            *fields.get("stops", ()),
+            *(
+                {"stop": stop, "arrival": a, "departure": d, "skipped": skipped}
+                for stop, a, d, skipped in fields.get("calls", ())
+            ),
+        ]
+        for stop in stops:
+            _add_stop(entity.trip_update.stop_time_update.add(), stop)
     return message
 
 
@@ -1304,3 +1325,152 @@ def test_a_trip_stated_in_full_is_exactly_its_calls(
         assert sorted((r for r in rows if r[0] == "N"), key=repr) == sorted(
             expected, key=repr
         )
+
+
+def test_a_replacements_no_data_stops_keep_its_schedule() -> None:
+    """For a NEW or REPLACEMENT trip, NO_DATA stops "must still be given
+    with scheduled times, as the StopTimeUpdate defines the stop list of
+    the trip": they show, scheduled, unpredicted -- the run is not lost."""
+    message = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.REPLACEMENT,
+            "stops": [
+                {"stop": "S0", "scheduled_departure": _at(5), "no_data": True},
+                {"stop": "S2", "scheduled_arrival": _at(25), "no_data": True},
+            ],
+        }
+    )
+    board, (s0_s2,) = _run_feeds(
+        _DIRECTED, _boards_and_journeys(("S0", "S2")), [message]
+    )
+    assert [row for row in board if row[0] == "T"] == [
+        ("T", "S0", _at(5), None, None, False),
+        ("T", "S2", _at(25), None, None, False),
+    ]
+    assert s0_s2 == [("T", _at(5), None, None, "Out", "R")]
+
+
+def test_a_new_trips_scheduled_time_and_delay_predict_it() -> None:
+    """A new trip's scheduled_time is its schedule: a delay moves it, as
+    "Real-time prediction delay values are applied to this calculated
+    schedule time"; a time wins over both."""
+    message = _descriptor_message(
+        {
+            "trip_id": "N",
+            "start_date": "20260730",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.NEW,
+            "stops": [
+                {"stop": "S0", "scheduled_departure": _at(30), "departure_delay": 120},
+                {"stop": "S1", "scheduled_arrival": _at(40), "arrival": _at(41)},
+            ],
+        }
+    )
+    board = _run_feeds(_DIRECTED, _board(_EIGHT - timedelta(minutes=30)), [message])
+    assert [
+        (r.scheduled_departure, r.predicted_departure, r.delay_seconds)
+        for r in board
+        if r.trip_id == "N"
+    ] == [(_at(30), _at(32), 120)]
+
+
+def test_one_new_trip_from_two_feeds_is_shown_once() -> None:
+    """The same NEW trip from two feeds is one trip, the later feed's."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+
+    def new(minutes: int) -> gtfs_realtime_pb2.FeedMessage:
+        return _descriptor_message(
+            {
+                "trip_id": "N",
+                "start_date": "20260730",
+                "relationship": descriptor.NEW,
+                "calls": [
+                    ("S0", None, _at(minutes), False),
+                    ("S2", _at(50), None, False),
+                ],
+            }
+        )
+
+    board, (s0_s2,) = _run_feeds(
+        _DIRECTED, _boards_and_journeys(("S0", "S2")), [new(30), new(35)]
+    )
+    assert [row[:5] for row in board if row[0] == "N"] == [
+        ("N", "S0", None, None, _at(35)),
+        ("N", "S2", None, _at(50), None),
+    ]
+    assert s0_s2 == [("N", None, _at(35), _at(50), None, None)]
+
+
+def test_a_replacement_naming_no_run_replaces_nothing() -> None:
+    """A replacement is a scheduled run on a new schedule: one whose
+    descriptor names no run -- here T with a start_time other than its
+    first departure -- replaces nothing and is not shown beside T."""
+    message = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "start_time": "08:05:00",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.REPLACEMENT,
+            "calls": [("S0", None, _at(5), False)],
+        }
+    )
+    board, _ = _run_feeds(_DIRECTED, _boards_and_journeys(), [message])
+    assert [row[:5] for row in board if row[0] == "T"] == [
+        ("T", "S0", _EIGHT, None, None),
+        ("T", "S1", _at(10), None, None),
+    ]
+
+
+def test_a_replaced_repetition_is_that_run() -> None:
+    """A replacement of one frequency repetition hides that repetition only,
+    shows under its trip id, and rides that repetition's vehicle -- not one
+    naming no repetition."""
+    files = _feed(
+        frequencies=(
+            "trip_id,start_time,end_time,headway_secs\nT,08:00:00,09:00:00,1800\n"
+        ),
+    )
+    stamp = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    trip_updates = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "start_time": "08:30:00",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.REPLACEMENT,
+            "calls": [("S0", None, _at(33), False)],
+        },
+        timestamp=stamp,
+    )
+    vehicles = gtfs_realtime_pb2.FeedMessage()
+    vehicles.header.gtfs_realtime_version = "2.0"
+    vehicles.header.timestamp = int(stamp.timestamp())
+    for vehicle_id, start_time, start_date in (
+        ("BUS-0800", "08:00:00", "20260730"),
+        ("BUS-0830", "08:30:00", "20260730"),
+        ("BUS-X", "", ""),
+    ):
+        entity = vehicles.entity.add()
+        entity.id = vehicle_id
+        entity.vehicle.vehicle.id = vehicle_id
+        entity.vehicle.trip.trip_id = "T"
+        if start_time:
+            entity.vehicle.trip.start_time = start_time
+            entity.vehicle.trip.start_date = start_date
+        entity.vehicle.position.latitude = 0
+        entity.vehicle.position.longitude = 0
+    board = _run_feeds(
+        files, _board(stamp, with_vehicles=True), [trip_updates], [vehicles]
+    )
+    assert [
+        (
+            r.trip_id,
+            r.scheduled_departure,
+            r.predicted_departure,
+            r.vehicle.vehicle_id if r.vehicle else None,
+        )
+        for r in board
+    ] == [
+        ("T#28800", _EIGHT, None, "BUS-0800"),
+        ("T#30600", None, _at(33), "BUS-0830"),
+    ]
