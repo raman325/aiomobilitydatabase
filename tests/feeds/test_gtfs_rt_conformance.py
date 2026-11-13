@@ -856,3 +856,119 @@ def test_an_added_trip_without_a_trip_id_keeps_its_stop_times() -> None:
     stu.departure.time = int(_EIGHT.timestamp())
     [added] = trip_updates_from_message(message).added
     assert (added.trip_id, added.stop_id, added.departure) == ("", "S0", _EIGHT)
+
+
+def _detoured(message: gtfs_realtime_pb2.FeedMessage) -> None:
+    """Add a detour of T on 2026-07-30: S1 replaced by S2, 600 s on."""
+    entity = message.entity.add()
+    entity.id = "detour"
+    modification = entity.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 2
+    modification.end_stop_selector.stop_sequence = 2
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = "S2"
+    replacement.travel_time_to_stop = 600
+    entity.trip_modifications.selected_trips.add().trip_ids.append("T")
+    entity.trip_modifications.service_dates.append("20260730")
+
+
+def test_a_removed_run_is_not_rebuilt_by_its_detour() -> None:
+    """A detour of a run realtime cancels or deletes does not bring it back
+    as a live, rerouted trip: the cancelled run is shown cancelled on its
+    scheduled stops, and the deleted one not at all."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    start = _EIGHT - timedelta(minutes=30)
+
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S1", "S2"])],
+            start=start,
+            end=start + timedelta(hours=2),
+        )
+        return [(r.trip_id, r.stop_id, r.canceled) for r in board if r.trip_id == "T"]
+
+    detour_only = _descriptor_message()
+    _detoured(detour_only)
+    assert _run_feeds(_DIRECTED, body, [detour_only]) == [
+        ("T", "S0", False),
+        ("T", "S2", False),
+    ]
+    for relationship, expected in (
+        (descriptor.CANCELED, [("T", "S0", True), ("T", "S1", True)]),
+        (descriptor.DELETED, []),
+    ):
+        message = _descriptor_message(
+            {"trip_id": "T", "start_date": "20260730", "relationship": relationship}
+        )
+        _detoured(message)
+        assert _run_feeds(_DIRECTED, body, [message]) == expected
+
+
+def test_an_added_trip_without_a_trip_id_is_shown_on_its_own() -> None:
+    """An id-less ADDED trip on T's route, direction and start is its own
+    row, never matched onto T."""
+    message = _descriptor_message(
+        {
+            "route_id": "R",
+            "direction_id": 0,
+            "start_time": "08:00:00",
+            "start_date": "20260730",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.ADDED,
+        }
+    )
+    stu = message.entity[0].trip_update.stop_time_update.add()
+    stu.stop_id = "S0"
+    stu.departure.time = int((_EIGHT + timedelta(minutes=5)).timestamp())
+    board = _run_feeds(_DIRECTED, _board(_EIGHT - timedelta(minutes=30)), [message])
+    assert [(r.trip_id, r.predicted_departure, r.delay_seconds) for r in board] == [
+        ("T", None, None),
+        ("", _EIGHT + timedelta(minutes=5), None),
+        ("X", None, None),
+    ]
+
+
+def test_first_departures_agree_with_trip_spans() -> None:
+    """The stored first departure is a trip's start as GTFS-RT reads it --
+    its first timed call's departure, the earliest where that sequence
+    repeats, a one-call trip's arrival -- the same as the span reading; and
+    a route/direction/start lookup reads it through its index."""
+    index = _build_index_from_files(
+        _feed(
+            trips=(
+                "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+                "R,S,A,H,0\nR,S,B,H,0\nR,S,C,H,0\nR,S,D,H,0\nR,S,F,H,0\n"
+            ),
+            stop_times=(
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+                "A,07:59:00,08:00:00,S0,1\nA,08:10:00,08:10:00,S1,2\n"
+                "B,08:20:00,08:25:00,S0,1\n"
+                "C,,,S0,1\nC,09:00:00,09:01:00,S1,2\nC,09:10:00,09:10:00,S0,3\n"
+                "D,09:30:00,09:31:00,S0,1\nD,09:20:00,09:29:00,S0,1\n"
+                "D,09:50:00,09:50:00,S1,2\n"
+                "F,10:00:00,10:00:00,S0,1\nF,10:10:00,10:10:00,S1,2\n"
+            ),
+            frequencies="trip_id,start_time,end_time,headway_secs\nF,10:00:00,10:20:00,600\n",
+        )
+    )
+    try:
+        spans = {
+            trip: start
+            for trip, _service, repetition, start, _end in index._trip_spans(
+                ["A", "B", "C", "D"]
+            )
+            if repetition is None
+        }
+        assert index.plain_trip_starts(["A", "B", "C", "D", "F", "F#36000"]) == spans
+        assert spans == {"A": 28800, "B": 30000, "C": 32460, "D": 34140}
+        plan = " ".join(
+            str(row)
+            for row in index._conn.execute(
+                "EXPLAIN QUERY PLAN SELECT id, service_id FROM trips "
+                "WHERE route_id = ? AND direction_id = ? AND first_secs = ? "
+                "AND start_secs IS NULL AND source_trip_id = id",
+                ("R", 0, 28800),
+            )
+        )
+        assert "ix_trips_route_start" in plan
+    finally:
+        index.close()

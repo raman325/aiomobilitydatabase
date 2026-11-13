@@ -44,7 +44,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -81,8 +81,14 @@ CREATE TABLE trips (
     -- would be ambiguous if a real trip id contained "#".
     source_trip_id TEXT NOT NULL, start_secs INTEGER,
     wheelchair_accessible INTEGER, bikes_allowed INTEGER, direction_id INTEGER,
-    short_name TEXT, block_id TEXT
+    short_name TEXT, block_id TEXT,
+    -- The trip's first departure (see StaticIndex._store_first_departures),
+    -- filled once every stop_time is loaded; NULL with no timed call.
+    first_secs INTEGER
 );
+-- GTFS-RT's alternative trip matching names a trip by route, direction and
+-- first departure.
+CREATE INDEX ix_trips_route_start ON trips (route_id, direction_id, first_secs);
 -- Single-record feed metadata (feed_info.txt); dates stay raw YYYYMMDD
 -- text cells, parsed leniently at the model boundary like every other
 -- descriptive value.
@@ -128,6 +134,8 @@ _LONG_REACH = 4 * 86_400
 _EXCEPTION_SERVICE_REMOVED = 2
 # GTFS-RT requires start_date for a trip lasting longer than this.
 _ONE_DAY = 86_400
+# Ids bound per statement: under SQLite's lowest default variable limit (999).
+_ID_SLICE = 500
 
 # A journey needs a time at both ends, a pickup at the origin and a drop-off
 # at the destination: pickup_type/drop_off_type 1 is "No pickup available" /
@@ -701,6 +709,7 @@ class StaticIndex:
             try:
                 conn.executescript(_SCHEMA)
                 cls._load_all(conn, archive, names, progress)
+                cls._store_first_departures(conn)
                 conn.executemany(
                     "INSERT INTO meta (key, value) VALUES (?, ?)",
                     [
@@ -823,6 +832,44 @@ class StaticIndex:
                 progress(completed, total)
 
     @staticmethod
+    def _store_first_departures(conn: sqlite3.Connection) -> None:
+        """Fill every trip's ``first_secs``: its first departure.
+
+        GTFS-RT reads a trip's start as its first departure: the departure
+        of its first TIMED call by stop_sequence (the loader already lets a
+        lone arrival or departure stand for both), the earliest where that
+        sequence repeats; a trip of one call starts at its arrival. Matches
+        :meth:`_trip_spans`. Runs once all stop_times, frequency
+        repetitions included, are loaded.
+        """
+        conn.executescript(
+            """
+            CREATE TEMP TABLE first_departures (
+                trip_id TEXT PRIMARY KEY, secs INTEGER
+            );
+            INSERT INTO first_departures
+            SELECT b.trip_id,
+                   CASE WHEN b.first = b.last THEN MIN(st.arrival_secs)
+                        ELSE MIN(st.departure_secs) END
+            FROM (
+                SELECT trip_id, MIN(stop_sequence) AS first,
+                       MAX(stop_sequence) AS last
+                FROM stop_times
+                WHERE arrival_secs IS NOT NULL OR departure_secs IS NOT NULL
+                GROUP BY trip_id
+            ) AS b
+            JOIN stop_times st
+              ON st.trip_id = b.trip_id AND st.stop_sequence = b.first
+             AND (st.arrival_secs IS NOT NULL OR st.departure_secs IS NOT NULL)
+            GROUP BY b.trip_id;
+            UPDATE trips SET first_secs = (
+                SELECT secs FROM first_departures WHERE trip_id = trips.id
+            );
+            DROP TABLE first_departures;
+            """
+        )
+
+    @staticmethod
     def _batched_insert(
         conn: sqlite3.Connection, sql: str, rows: list[tuple[object, ...]]
     ) -> None:
@@ -935,7 +982,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)"
         for row in reader:
             rows.append(
                 (
@@ -1940,24 +1987,18 @@ class StaticIndex:
         found: dict[tuple[str, int, date, int], str] = {}
         for ref in sorted(set(refs)):
             route_id, direction_id, day, secs = ref
-            # Only trips with a call at that time can start then: a handful,
-            # however many trips the route has.
-            candidates = dict(
-                self._conn.execute(
-                    "SELECT DISTINCT t.id, t.service_id FROM trips t "
-                    "JOIN stop_times st ON st.trip_id = t.id "
-                    "WHERE t.route_id = ? AND t.direction_id = ? "
-                    "AND t.start_secs IS NULL AND t.source_trip_id = t.id "
-                    "AND (st.departure_secs = ? OR st.arrival_secs = ?)",
-                    (route_id, direction_id, secs, secs),
-                ).fetchall()
-            )
+            candidates = self._conn.execute(
+                "SELECT id, service_id FROM trips WHERE route_id = ? "
+                "AND direction_id = ? AND first_secs = ? "
+                "AND start_secs IS NULL AND source_trip_id = id",
+                (route_id, direction_id, secs),
+            ).fetchall()
             if day not in active:
                 active[day] = self.active_service_ids(day)
             running = [
                 trip_id
-                for trip_id, start in self.plain_trip_starts(candidates).items()
-                if start == secs and candidates[trip_id] in active[day]
+                for trip_id, service_id in candidates
+                if service_id in active[day]
             ]
             if len(running) == 1:
                 found[ref] = running[0]
@@ -2036,24 +2077,21 @@ class StaticIndex:
         no timed call are left out.
         """
         ids = sorted(set(trip_ids))
-        if not ids:
-            return {}
-        marks = ",".join("?" * len(ids))
-        plain = [
-            trip_id
-            for (trip_id,) in self._conn.execute(
-                f"SELECT id FROM trips WHERE id IN ({marks}) "
-                "AND start_secs IS NULL AND source_trip_id = id",
-                ids,
+        starts: dict[str, int] = {}
+        # In slices: realtime can name more trips than SQLite allows bound
+        # variables in one statement.
+        for offset in range(0, len(ids), _ID_SLICE):
+            chunk = ids[offset : offset + _ID_SLICE]
+            starts.update(
+                self._conn.execute(
+                    "SELECT id, first_secs FROM trips "
+                    f"WHERE id IN ({','.join('?' * len(chunk))}) "
+                    "AND start_secs IS NULL AND source_trip_id = id "
+                    "AND first_secs IS NOT NULL",
+                    chunk,
+                ).fetchall()
             )
-        ]
-        if not plain:
-            return {}
-        return {
-            trip_id: start
-            for trip_id, _service, _repetition, start, _end in self._trip_spans(plain)
-            if start is not None
-        }
+        return starts
 
     def _trip_spans(
         self, trip_ids: Sequence[str]

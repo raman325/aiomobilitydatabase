@@ -273,6 +273,9 @@ def _alternative_ref(record: TripUpdateRecord) -> tuple[str, int, date, int] | N
     GTFS-RT: "If the trip_id field can't be provided, then route_id,
     direction_id, start_date, and start_time must all be provided"; a
     record missing any of them (or naming its trip_id) has no such ref.
+    The route_id field adds that such a descriptor should be SCHEDULED; a
+    CANCELED or DELETED one is still read, since it names its run just as
+    uniquely and ignoring it would show a run that does not operate.
     """
     if (
         record.trip_id
@@ -1840,6 +1843,7 @@ class TransitFeedHandle:
                 modifications,
                 set(all_stop_ids),
                 end=end,
+                removed=updates.canceled_trips | updates.deleted_trips,
                 rt_stops=rt_stops,
                 stops_by_id=stops_by_id,
                 routes_by_id=routes_by_id,
@@ -2445,11 +2449,16 @@ class TransitFeedHandle:
         wanted_stops: set[str],
         *,
         end: datetime | None,
+        removed: Collection[TripUpdateKey],
         rt_stops: Mapping[str, Stop],
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
     ) -> tuple[list[StopArrival], set[tuple[str, date]]]:
         """Rebuild every detoured run, whole, around its detours.
+
+        A run realtime cancels or deletes (its matched key in ``removed``)
+        is not rebuilt: it does not operate, so its scheduled rows stay to
+        be shown cancelled, or removed, like any other run's.
 
         Returns the rows the modified runs now produce at the queried stops
         (scheduled no later than ``end``, if given), and the (trip id,
@@ -2541,7 +2550,13 @@ class TransitFeedHandle:
                 # repetitions; one listing none addresses every instance.
                 and (not mod.start_secs or template.start_secs in mod.start_secs)
             )
-            if not applicable:
+            if (
+                not applicable
+                or _run_key(
+                    (template.source_trip_id, template.start_secs), service_date
+                )
+                in removed
+            ):
                 continue
             key = (trip_id, applicable)
             if key not in rebuilt:
