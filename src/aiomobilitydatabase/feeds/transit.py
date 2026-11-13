@@ -223,8 +223,9 @@ class _Vehicles:
     service day, as matching resolved the vehicle's TripDescriptor (see
     :func:`_dated`); a date-less claim naming no scheduled run keeps a None
     day and so matches no run. ``by_trip_id`` maps each trip id some
-    vehicle names to that vehicle, or None where two do: how an extra
-    trip, identified by the id its producer minted, finds its vehicle.
+    vehicle names, and the schedule does not, to that vehicle, or None
+    where two do: how an extra trip, identified by the id its producer
+    minted, finds its vehicle.
     """
 
     by_vehicle_id: Mapping[str, VehiclePosition]
@@ -312,6 +313,7 @@ def _record_trip_id(
 def _vehicle_index(
     claims: Sequence[tuple[_Reference, _Precedence, VehiclePosition]],
     positions: Sequence[VehiclePosition],
+    scheduled_trip_ids: Collection[str],
 ) -> _Vehicles:
     """Index live vehicles for matching, by vehicle id and by matched run.
 
@@ -339,9 +341,11 @@ def _vehicle_index(
             and any(other.vehicle_id == vehicle.vehicle_id for other in held[1])
         ):
             held[1].append(vehicle)
+    # Only ids the schedule does not know: a vehicle on a scheduled trip
+    # rides that trip's run, never an extra trip reusing its id.
     by_trip: dict[str, list[VehiclePosition]] = {}
     for vehicle in positions:
-        if vehicle.trip_id:
+        if vehicle.trip_id and vehicle.trip_id not in scheduled_trip_ids:
             named = by_trip.setdefault(vehicle.trip_id, [])
             if not (
                 vehicle.vehicle_id
@@ -586,18 +590,21 @@ def _replacing(
     concrete_trip_id: str,
     summaries: Mapping[str, tuple[str, str | None, int | None]],
 ) -> RealtimeTrip:
-    """Return a replacement under its run's own trip id, the gaps filled."""
+    """Return a replacement as its run: that trip's id, route and direction.
+
+    A TripDescriptor's route and direction only select the trip; they
+    cannot move it to another route. The headsign may differ ("when it
+    differs from the original"), else is the trip's.
+    """
     route_id, headsign, direction_id = summaries.get(
-        concrete_trip_id, (None, None, None)
+        concrete_trip_id, (trip.route_id or "", None, trip.direction_id)
     )
     return replace(
         trip,
         trip_id=concrete_trip_id,
-        route_id=trip.route_id or route_id,
+        route_id=route_id,
         headsign=trip.headsign or headsign,
-        direction_id=trip.direction_id
-        if trip.direction_id is not None
-        else direction_id,
+        direction_id=direction_id,
     )
 
 
@@ -1826,9 +1833,9 @@ class TransitFeedHandle:
         updates = indexed_trip_updates(record for _, record in ranked)
         # A replacement is the run it replaces, on a new schedule: one
         # naming no run that operates replaces nothing and is dropped, as
-        # predictions for no run are. It shows under that run's own trip id
-        # (a frequency repetition's), and what its update leaves out, that
-        # trip's route, direction and headsign fill in.
+        # predictions for no run are. It shows as that run: its trip id (a
+        # frequency repetition's), route and direction, and its headsign
+        # where the update gives none.
         runs = {
             key: instance
             for instance, key in await self._index_read(
@@ -1847,12 +1854,14 @@ class TransitFeedHandle:
             for trip in updates.realtime_trips
             if not trip.replaces or trip.replaces in runs
         ]
-        return (
-            updates,
-            _vehicle_index(
-                claims, [vehicle for vehicles, _ in vp_feeds for vehicle in vehicles]
-            ),
+        positions = [vehicle for vehicles, _ in vp_feeds for vehicle in vehicles]
+        scheduled_trip_ids = set(
+            await self._index_read(
+                self._index.trip_summaries,
+                sorted({vehicle.trip_id for vehicle in positions if vehicle.trip_id}),
+            )
         )
+        return updates, _vehicle_index(claims, positions, scheduled_trip_ids)
 
     async def _dated_references(
         self,
@@ -2002,9 +2011,9 @@ class TransitFeedHandle:
         own time, else its scheduled time moved by its own delay (a NO_DATA
         call is scheduled only), with no propagation between calls. A
         replacement is the run it replaces on a new schedule: it hides that
-        run (detours of it are not rebuilt), shows under its trip id, takes
-        its vehicle and, where its update gives none, its route, direction
-        and headsign; one naming no run that operates is dropped, as
+        run (detours of it are not rebuilt), shows under its trip id, route
+        and direction, takes its vehicle and, where its update gives none,
+        its headsign; one naming no run that operates is dropped, as
         predictions for no run are. A cancellation or deletion of the run
         wins over its replacement, and any removal naming an extra trip's
         id removes it. An extra trip is its trip_id: the same one from two

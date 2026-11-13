@@ -383,9 +383,10 @@ class StopArrival:
     gives none) and their predictions its times. ``service_id``, the
     stop_time descriptors, ``wheelchair_accessible``, ``bikes_allowed``,
     ``trip_short_name`` and ``block_id`` are None; ``route_id``,
-    ``direction_id`` and ``headsign`` are what the update gives, a
-    replacement's gaps filled from the trip it replaces, whose ``trip_id``
-    (a frequency repetition's own) it shows under.
+    ``direction_id`` and ``headsign`` are what the update gives -- a
+    replacement shows under the trip it replaces (its ``trip_id``, a
+    frequency repetition's own, route and direction; its headsign where
+    the update gives none).
 
     ``predicted_arrival``/``predicted_departure`` are each event's own
     prediction; ``delay_seconds`` is the delay realtime gives this stop --

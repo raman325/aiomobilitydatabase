@@ -655,12 +655,13 @@ class RealtimeTrip:
     for which "the original schedule from the GTFS static isn't used":
     ``replaces`` is then the key of the scheduled run it replaces -- it is
     that run, on a new schedule. ``calls`` are its StopTimeUpdates in feed
-    order ("updates should be sorted by stop_sequence"), less those it
+    order (updates "must be sorted by stop_sequence"), less those it
     skips and those naming no stop or no time. ``route_id``,
     ``direction_id`` and ``headsign`` are what the update says
-    (``TripProperties.trip_headsign`` for the headsign); for a replacement
-    the replaced trip's fill in what it leaves out, and ``trip_id`` is the
-    replaced run's own (a frequency repetition's, once matched).
+    (``TripProperties.trip_headsign`` for the headsign); a replacement,
+    once matched, takes the replaced run's ``trip_id`` (a frequency
+    repetition's own), route and direction, and its headsign where the
+    update gives none.
     """
 
     trip_id: str

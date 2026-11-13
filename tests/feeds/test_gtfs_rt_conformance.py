@@ -1611,3 +1611,56 @@ def test_a_new_trips_vehicle_is_the_one_naming_its_trip() -> None:
         )
         [row] = [r for r in board if r.trip_id == "N"]
         assert (row.vehicle.vehicle_id if row.vehicle else None) == expected
+
+
+def test_an_extra_trip_reusing_a_scheduled_id_never_takes_its_vehicle() -> None:
+    """A vehicle naming a scheduled trip rides that trip's run: an ADDED
+    trip reusing the id (as feeds did before DUPLICATED) does not take it,
+    and one bus never shows on two rows."""
+    stamp = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    trip_updates = _descriptor_message(
+        {
+            "trip_id": "T",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.ADDED,
+            "calls": [("S0", None, _at(40), False)],
+        },
+        timestamp=stamp,
+    )
+    vehicles = gtfs_realtime_pb2.FeedMessage()
+    vehicles.header.gtfs_realtime_version = "2.0"
+    vehicles.header.timestamp = int(stamp.timestamp())
+    entity = vehicles.entity.add()
+    entity.id = "BUS-T"
+    entity.vehicle.vehicle.id = "BUS-T"
+    entity.vehicle.trip.trip_id = "T"
+    entity.vehicle.trip.start_date = "20260730"
+    entity.vehicle.position.latitude = 0
+    entity.vehicle.position.longitude = 0
+    board = _run_feeds(
+        _DIRECTED, _board(stamp, with_vehicles=True), [trip_updates], [vehicles]
+    )
+    assert [
+        (r.trip_id, r.predicted_departure, r.vehicle.vehicle_id if r.vehicle else None)
+        for r in board
+        if r.trip_id == "T"
+    ] == [("T", None, "BUS-T"), ("T", _at(40), None)]
+
+
+def test_a_replacement_keeps_its_trips_route_and_direction() -> None:
+    """A TripDescriptor's route and direction only select the trip: a
+    replacement of T naming another route is still T on T's route and
+    direction, with T's headsign unless its own differs."""
+    message = _descriptor_message(
+        {
+            "trip_id": "T",
+            "route_id": "R2",
+            "direction_id": 1,
+            "start_date": "20260730",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.REPLACEMENT,
+            "calls": [("S0", None, _at(5), False)],
+        }
+    )
+    board = _run_feeds(_DIRECTED, _board(_EIGHT - timedelta(minutes=30)), [message])
+    assert [
+        (r.route_id, r.direction_id, r.headsign) for r in board if r.trip_id == "T"
+    ] == [("R", 0, "Out")]
