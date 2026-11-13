@@ -860,12 +860,21 @@ def test_localized_is_total(value: object) -> None:
 def test_localized_prefers_en_else_first(
     entries: list[dict], en_entry: dict, include_en: bool
 ) -> None:
+    """The preferred language's usable text (a non-empty string), else the
+    first usable entry's; an entry without one is skipped, never shown as
+    "None"."""
     payload = list(entries)
     if include_en:
         payload.insert(len(payload) // 2, en_entry)
-    selected = en_entry if include_en else entries[0]
-    # dict.get: a text-less selected entry maps to None, not "None".
-    assert _localized(payload) == selected.get("text")
+
+    def usable(entry: dict) -> str | None:
+        text = entry.get("text")
+        return text if isinstance(text, str) and text else None
+
+    expected = (usable(en_entry) if include_en else None) or next(
+        (text for entry in payload if (text := usable(entry))), None
+    )
+    assert _localized(payload) == expected
 
 
 def test_localized_entry_without_text_is_none() -> None:
@@ -6114,7 +6123,10 @@ def test_get_stations_total_over_json_documents(
     event(f"stations parsed from arbitrary json: {bool(stations)}")
     ids = [station.id for station in stations]
     assert all(ids)
-    assert "None" not in ids
+    assert not _STRINGIFIED & set(ids)
+    # A position is whole or absent, never half of one.
+    for station in stations:
+        assert (station.latitude is None) is (station.longitude is None)
 
 
 @given(
@@ -7436,17 +7448,16 @@ def test_json_values_that_are_no_id_or_text_are_dropped() -> None:
     is the id ``"7"``, as ``7`` is. A vehicle whose ``station_id`` is
     ``false`` and that has no position is no vehicle; discovery skips an
     entry whose url is not a string."""
-    assert [_record_id(v) for v in ("v1", 7, 7.0, 7.5, 1e16)] == [
-        "v1",
-        "7",
-        "7",
-        "7.5",
-        "10000000000000000",
-    ]
+    assert [_record_id(v) for v in ("v1", 7, 7.0, 7.5)] == ["v1", "7", "7", "7.5"]
     assert {
         _record_id(v) for v in (False, True, {}, [], None, "", math.nan, math.inf)
     } == {None}
-    assert _localized([{"text": False, "language": "en"}]) is None
+    assert _record_id(2.0**53) == str(2**53)
+    assert _record_id(2.0**53 + 2) is None  # past exact: digits invented
+    for empty in ("", [{"text": "", "language": "en"}], [{"text": False}]):
+        assert _localized(empty) is None
+    # An unusable preferred entry yields to a usable one.
+    assert _localized([{"text": 42, "language": "en"}, {"text": "Foo"}]) == "Foo"
     rows = [
         {"vehicle_id": "a", "station_id": False},
         {"vehicle_id": False, "lat": 1.0, "lon": 2.0},

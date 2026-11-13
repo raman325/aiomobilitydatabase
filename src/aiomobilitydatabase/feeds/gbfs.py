@@ -54,14 +54,8 @@ _RFC3339 = re.compile(
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
-def _entry_text(entry: dict[str, Any]) -> str | None:
-    """One localized entry's ``text``: anything but a non-empty string is None.
-
-    ``str(entry.get("text"))`` would render a missing text as the literal
-    string ``"None"`` (and ``false`` as ``"False"``) — the selected entry
-    must instead degrade to "no text available".
-    """
-    return _plain_text(entry.get("text"))
+# Every whole number up to here is exactly a float, and back.
+_EXACT_FLOAT = 2**53
 
 
 def _record_id(value: Any) -> str | None:
@@ -71,16 +65,19 @@ def _record_id(value: Any) -> str | None:
     id-less record — and those synthetic ids COLLIDE across records,
     corrupting any consumer that keys on them (an entity registry, say).
     A blank id collides identically, so it is None too. Same motivation
-    as :func:`_entry_text`: never surface a stringified None. GBFS ids are
+    as :func:`_localized`: never surface a stringified None. GBFS ids are
     strings; a number is read as one -- JSON has one number type, so
     ``7.0`` is the id ``"7"``, as ``7`` is -- but a boolean, object, array
     or non-finite number (``NaN`` would make every such id ``"nan"``) is
-    no id at all.
+    no id at all, nor is a whole float past 2**53, whose digits are no
+    longer the ones the producer wrote.
     """
     if isinstance(value, float):
         if not math.isfinite(value):
             return None
         if value.is_integer():
+            if abs(value) > _EXACT_FLOAT:
+                return None
             value = int(value)
     if isinstance(value, bool) or not isinstance(value, str | int | float):
         return None
@@ -96,19 +93,22 @@ def _localized(value: Any) -> str | None:
     """Normalize GBFS text: 3.x localized lists vs 2.x plain strings.
 
     Also the 3.0 localized URL fields (``terms_url``, ``alerts[].url``):
-    a Localized URL has the same ``{text, language}`` shape.
+    a Localized URL has the same ``{text, language}`` shape. Text is a
+    non-empty string or nothing -- ``str()`` would show a missing text as
+    ``"None"`` and ``false`` as ``"False"`` -- in either version. The
+    preferred language's usable text wins, else the first usable entry's.
     """
-    if value is None or isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        for entry in value:
-            if isinstance(entry, dict) and _is_preferred_language(
-                entry.get("language")
-            ):
-                return _entry_text(entry)
-        if value and isinstance(value[0], dict):
-            return _entry_text(value[0])
-    return None
+    if not isinstance(value, list):
+        return _plain_text(value)
+    texts = [
+        (entry.get("language"), text)
+        for entry in value
+        if isinstance(entry, dict) and (text := _plain_text(entry.get("text")))
+    ]
+    for language, text in texts:
+        if _is_preferred_language(language):
+            return text
+    return texts[0][1] if texts else None
 
 
 def _version_key(version: str | None) -> tuple[int, ...]:
