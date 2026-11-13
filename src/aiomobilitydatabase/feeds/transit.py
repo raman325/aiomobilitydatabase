@@ -628,15 +628,12 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
     of their times and the original's, on the original's stops and their
     descriptors.
     """
-    skipped = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
-    stated = any(
-        (update.scheduled_arrival or update.scheduled_departure)
-        and update.relationship != skipped
-        for update in record.entry.stop_updates
-    )
+    # Only updates that land on the trip's own stops (and are not SKIPPED)
+    # can state its times.
+    stated = stated_copy_calls(record.entry, run.calls)
     calls = (
-        stated_copy_calls(record.entry, run.calls)
-        if stated
+        stated
+        if any(call.scheduled_arrival or call.scheduled_departure for call in stated)
         else _moved_calls(record, run)
     )
     assert record.copy_trip_id is not None
@@ -651,7 +648,6 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
         wheelchair_accessible=run.wheelchair_accessible,
         bikes_allowed=run.bikes_allowed,
         trip_short_name=record.trip_short_name or run.trip_short_name,
-        block_id=run.block_id,
     )
 
 

@@ -2147,3 +2147,42 @@ def test_the_migration_guides_added_rules_apply_only_where_due() -> None:
             for r in board
             if r.trip_id == "N"
         ] == expected
+
+
+def test_a_copy_has_no_block_and_an_unplaced_stated_time_is_ignored() -> None:
+    """A copy is no part of its original's block -- a vehicle's sequence of
+    scheduled trips -- so it carries none; and an update stating a time at
+    a stop the trip does not visit names no call, so it does not switch the
+    copy to stated times (which would lose every other stop)."""
+    files = _feed(
+        trips="route_id,service_id,trip_id,trip_headsign,block_id\nR,S,T,Out,B\n",
+    )
+    message = _descriptor_message(
+        _duplicate(
+            ("T-2", "20260730", "09:30:00"),
+            stops=[
+                {"stop": "S0", "departure_delay": 120},
+                {"stop": "ZZ", "scheduled_arrival": _at(95)},
+            ],
+        )
+    )
+    board = _run_feeds(files, _board(_EIGHT - timedelta(minutes=30)), [message])
+    assert [
+        (r.trip_id, r.block_id, r.scheduled_departure, r.predicted_departure)
+        for r in board
+    ] == [("T", "B", _EIGHT, None), ("T-2", None, _at(90), _at(92))]
+
+
+def test_a_new_trips_short_name_is_its_trip_properties() -> None:
+    """TripProperties.trip_short_name names a NEW trip too."""
+    message = _descriptor_message(
+        {
+            "trip_id": "N",
+            "start_date": "20260730",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.NEW,
+            "calls": [("S0", None, _at(30), False)],
+        }
+    )
+    message.entity[0].trip_update.trip_properties.trip_short_name = "777"
+    board = _run_feeds(_DIRECTED, _board(_EIGHT - timedelta(minutes=30)), [message])
+    assert [r.trip_short_name for r in board if r.trip_id == "N"] == ["777"]

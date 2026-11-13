@@ -688,8 +688,9 @@ class RealtimeTrip:
     vehicle_id: str | None
     calls: tuple[RealtimeCall, ...]
     replaces: TripUpdateKey | None = None
-    # A DUPLICATED copy's trip descriptors, its original's; unknown (None)
-    # otherwise.
+    # A DUPLICATED copy's trip descriptors, its original's (a short name
+    # also from TripProperties, for any extra trip); unknown (None)
+    # otherwise. A copy has no block: it is no part of its original's.
     wheelchair_accessible: WheelchairAccess | None = None
     bikes_allowed: BikesAllowed | None = None
     trip_short_name: str | None = None
