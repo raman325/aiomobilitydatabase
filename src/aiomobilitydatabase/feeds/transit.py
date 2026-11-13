@@ -921,7 +921,12 @@ def _inherited_rt_stops(
 
 
 def _serialized[T](lock: threading.Lock, call: Callable[[], T]) -> T:
-    """Run ``call`` holding ``lock`` (on the calling worker thread)."""
+    """Run ``call`` holding ``lock`` (on the calling worker thread).
+
+    A threading lock, taken by the thread doing the read, is released only
+    when that read finishes -- even if its caller was cancelled long
+    before -- so no later read can reach the connection while it runs.
+    """
     with lock:
         return call()
 
@@ -929,7 +934,9 @@ def _serialized[T](lock: threading.Lock, call: Callable[[], T]) -> T:
 class _IndexGuard:
     """Readers-writer gate around the live :class:`StaticIndex`.
 
-    Queries enter as readers and may overlap freely. The index swap in
+    Queries enter as readers and may overlap freely (their SQLite work
+    still takes turns on the one connection; see
+    :meth:`TransitFeedHandle._index_read`). The index swap in
     :meth:`TransitFeedHandle.refresh_static` enters as the writer: it
     parks new readers, waits for in-flight ones to drain, swaps and closes
     the old index, then releases. Only the swap itself blocks; the
