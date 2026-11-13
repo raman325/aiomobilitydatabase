@@ -793,4 +793,4 @@ def test_a_failed_file_build_leaves_no_partial_database(tmp_path: Path) -> None:
     with pytest.raises(FeedParseError):
         StaticIndex.build(zip_path, str(db_path), "ds", None)
     assert not db_path.exists()
-    assert not Path(f"{db_path}.building").exists()
+    assert not list(tmp_path.glob("*.building"))
