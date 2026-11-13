@@ -986,8 +986,9 @@ def trip_update_records(
 def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
     """Index records by the identity each names; a later record wins.
 
-    A record without a trip_id names no trip here (only the schedule can
-    resolve its route, direction and start; see ``transit``). DELETED and
+    A record without a trip_id names no scheduled trip here (only the
+    schedule can resolve its route, direction and start; see ``transit``);
+    an ADDED one's stop times are still kept, as sent. DELETED and
     CANCELED win regardless of order: a producer may send one alongside
     stale predictions for the same trip in either order, and the result
     must be self-consistent rather than relying on consumers checking the
@@ -1006,14 +1007,8 @@ def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
     descriptor = gtfs_realtime_pb2.TripDescriptor
     updates = TripUpdates()
     for record in records:
-        if not record.trip_id:
-            continue
         key = record.key
-        if record.relationship == descriptor.CANCELED:
-            updates.canceled_trips.add(key)
-        elif record.relationship == descriptor.DELETED:
-            updates.deleted_trips.add(key)
-        elif record.relationship == descriptor.ADDED:
+        if record.relationship == descriptor.ADDED:
             updates.added.extend(
                 AddedStopTime(
                     trip_id=record.trip_id,
@@ -1026,6 +1021,12 @@ def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
                 )
                 for stop_update in record.entry.stop_updates
             )
+        elif not record.trip_id:
+            continue
+        elif record.relationship == descriptor.CANCELED:
+            updates.canceled_trips.add(key)
+        elif record.relationship == descriptor.DELETED:
+            updates.deleted_trips.add(key)
         else:
             # An entry is recorded even with zero StopTimeUpdates: a bare
             # TripUpdate.delay with no STUs is a valid trip-wide fallback.

@@ -131,7 +131,10 @@ async def main() -> None:
         for arrival in arrivals:
             # When it leaves, as the board orders it: predicted if known.
             when = arrival.effective_departure
-            live = "live" if arrival.realtime else "scheduled"
+            if arrival.canceled:  # shown, so riders see it; it won't run
+                live = "cancelled"
+            else:
+                live = "live" if arrival.realtime else "scheduled"
             # .stop and .route are the whole static records: platform codes,
             # coordinates, route_type and route colours all come along.
             route = arrival.route.display_name if arrival.route else arrival.route_id
@@ -146,7 +149,8 @@ async def main() -> None:
         )
         for trip in trips:
             name = trip.route.display_name if trip.route else trip.route_id
-            print(name, trip.scheduled_departure, trip.is_last)
+            # Cancelled journeys stay listed (and count toward limit).
+            print(name, trip.scheduled_departure, trip.is_last, trip.canceled)
 
         vehicles = await transit.get_vehicles(zone=home)
         alerts = await transit.get_alerts()
@@ -364,7 +368,8 @@ Notes on direct mode:
   "trip X is canceled tomorrow" posting never cancels today's run. An update
   without a `trip_id` names the one trip its `route_id`, `direction_id`,
   `start_time` (the first departure) and `start_date` resolve to, if
-  exactly one non-frequency trip matches. Of several updates for one run,
+  exactly one non-frequency trip matches. A cancellation or deletion of a
+  run wins over any prediction for it; of several predictions for one run,
   the one naming its date wins over one leaving it to the feed's time, and
   one omitting a plain trip's own start time over one spelling it out;
   then the later feed. A

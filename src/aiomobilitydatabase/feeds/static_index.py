@@ -1936,36 +1936,28 @@ class StaticIndex:
         ``start_date``. A ref matching no trip, or several, names none; a
         trip with no direction_id matches no direction.
         """
-        refs = sorted(set(refs))
-        if not refs:
-            return {}
-        routes = sorted({route for route, _direction, _day, _secs in refs})
-        trips = self._conn.execute(
-            "SELECT id, route_id, direction_id, service_id FROM trips "
-            f"WHERE route_id IN ({','.join('?' * len(routes))}) "
-            "AND start_secs IS NULL AND source_trip_id = id",
-            routes,
-        ).fetchall()
-        starts = self.plain_trip_starts(trip_id for trip_id, *_ in trips)
-        by_slot: dict[tuple[str, int, int], list[tuple[str, str]]] = {}
-        for trip_id, route_id, direction_id, service_id in trips:
-            if direction_id is None or trip_id not in starts:
-                continue
-            by_slot.setdefault((route_id, direction_id, starts[trip_id]), []).append(
-                (trip_id, service_id)
-            )
         active: dict[date, set[str]] = {}
         found: dict[tuple[str, int, date, int], str] = {}
-        for ref in refs:
+        for ref in sorted(set(refs)):
             route_id, direction_id, day, secs = ref
+            # Only trips with a call at that time can start then: a handful,
+            # however many trips the route has.
+            candidates = dict(
+                self._conn.execute(
+                    "SELECT DISTINCT t.id, t.service_id FROM trips t "
+                    "JOIN stop_times st ON st.trip_id = t.id "
+                    "WHERE t.route_id = ? AND t.direction_id = ? "
+                    "AND t.start_secs IS NULL AND t.source_trip_id = t.id "
+                    "AND (st.departure_secs = ? OR st.arrival_secs = ?)",
+                    (route_id, direction_id, secs, secs),
+                ).fetchall()
+            )
             if day not in active:
                 active[day] = self.active_service_ids(day)
             running = [
                 trip_id
-                for trip_id, service_id in by_slot.get(
-                    (route_id, direction_id, secs), []
-                )
-                if service_id in active[day]
+                for trip_id, start in self.plain_trip_starts(candidates).items()
+                if start == secs and candidates[trip_id] in active[day]
             ]
             if len(running) == 1:
                 found[ref] = running[0]

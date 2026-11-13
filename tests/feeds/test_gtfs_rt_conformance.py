@@ -8,6 +8,7 @@ the spec states outright.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 
@@ -765,3 +766,93 @@ def test_a_unique_trip_id_less_descriptor_reads_as_its_trip_id(
     assert _run_feeds(_DIRECTED, body, [by_route]) == _run_feeds(
         _DIRECTED, body, [by_id]
     )
+
+
+def test_trip_id_less_matching_is_bounded_by_the_references_not_the_route() -> None:
+    """Resolving a route/direction/start reference reads only the trips with
+    a call at that time: a route with more trips than SQLite allows bound
+    variables still resolves (the limit is lowered here to stand in for a
+    very large route)."""
+    many = "".join(f"R,S,M{n},Out,0\n" for n in range(40))
+    calls = "".join(
+        f"M{n},10:{n:02d}:00,10:{n:02d}:00,S0,1\nM{n},11:{n:02d}:00,11:{n:02d}:00,S1,2\n"
+        for n in range(40)
+    )
+    files = {
+        **_DIRECTED,
+        "trips.txt": _DIRECTED["trips.txt"] + many,
+        "stop_times.txt": _DIRECTED["stop_times.txt"] + calls,
+    }
+    message = _descriptor_message(
+        {
+            "route_id": "R",
+            "direction_id": 0,
+            "start_time": "08:00:00",
+            "start_date": "20260730",
+            "delay": 60,
+        }
+    )
+
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        handle._index._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 30)
+        board = await _board(_EIGHT - timedelta(minutes=30))(handle)
+        return [(row.trip_id, row.delay_seconds) for row in board]
+
+    assert _run_feeds(files, body, [message]) == [("T", 60), ("X", None)]
+
+
+def test_a_canceled_run_carries_no_vehicle() -> None:
+    """A cancelled run is shown "with no prediction and no vehicle", even
+    when a vehicle claims it -- boards and journeys alike."""
+    stamp = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    trip_updates = _descriptor_message(
+        {"trip_id": "T", "start_date": "20260730", "relationship": descriptor.CANCELED},
+        timestamp=stamp,
+    )
+    vehicles = gtfs_realtime_pb2.FeedMessage()
+    vehicles.header.gtfs_realtime_version = "2.0"
+    vehicles.header.timestamp = int(stamp.timestamp())
+    entity = vehicles.entity.add()
+    entity.id = "v"
+    entity.vehicle.vehicle.id = "BUS"
+    entity.vehicle.trip.trip_id = "T"
+    entity.vehicle.trip.start_date = "20260730"
+    entity.vehicle.position.latitude = 0
+    entity.vehicle.position.longitude = 0
+
+    async def body(handle: TransitFeedHandle) -> tuple[object, ...]:
+        [[row]] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0"], limit=1)], start=stamp, with_vehicles=True
+        )
+        [[trip]] = await handle.get_upcoming_trips(
+            [TripQuery("S0", "S1", limit=1)], start=stamp, with_vehicles=True
+        )
+        return (row.trip_id, row.canceled, row.vehicle), (
+            trip.trip_id,
+            trip.canceled,
+            trip.vehicle,
+        )
+
+    assert _run_feeds(_DIRECTED, body, [trip_updates], [vehicles]) == (
+        ("T", True, None),
+        ("T", True, None),
+    )
+
+
+def test_an_added_trip_without_a_trip_id_keeps_its_stop_times() -> None:
+    """Only a SCHEDULED-style reference needs the schedule to resolve it; an
+    ADDED trip's stop times stand on their own, trip_id or not."""
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "a"
+    entity.trip_update.trip.route_id = "R"
+    entity.trip_update.trip.schedule_relationship = (
+        gtfs_realtime_pb2.TripDescriptor.ADDED
+    )
+    stu = entity.trip_update.stop_time_update.add()
+    stu.stop_id = "S0"
+    stu.departure.time = int(_EIGHT.timestamp())
+    [added] = trip_updates_from_message(message).added
+    assert (added.trip_id, added.stop_id, added.departure) == ("", "S0", _EIGHT)
