@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from http import HTTPStatus
@@ -769,7 +769,9 @@ class TripUpdates:
     (shown as cancelled); ``deleted_trips`` runs removed outright, which
     "must not be shown to users"; ``realtime_trips`` the realtime-only
     trips (NEW, ADDED, REPLACEMENT), a replacement also naming the
-    scheduled run it replaces (see :attr:`replaced_trips`).
+    scheduled run it replaces (see :attr:`replaced_trips`); ``duplicates``
+    the DUPLICATED records, whose copies ``transit`` builds from the
+    schedule and adds to ``realtime_trips``.
     """
 
     trips: dict[TripUpdateKey, TripUpdateEntry] = field(default_factory=dict)
@@ -857,6 +859,27 @@ def _placed(
         if pos is not None:
             placed[pos] = stu
     return placed
+
+
+def scheduled_overrides(
+    entry: TripUpdateEntry, calls: Sequence[TripCall]
+) -> list[TripCall]:
+    """Return ``calls`` with each update's ``scheduled_time`` in place.
+
+    For NEW, REPLACEMENT and DUPLICATED trips a StopTimeEvent may carry the
+    trip's own ``scheduled_time`` -- for a copy, "if a duplicated trip runs
+    have different run or dwell times compared to the original". Where an
+    update placed on a call gives one, it is that call's schedule (a lone
+    one both its times, as in stop_times); the call keeps its own times
+    elsewhere.
+    """
+    overridden = list(calls)
+    for pos, stu in _placed(entry, calls).items():
+        arrival = stu.scheduled_arrival or stu.scheduled_departure
+        departure = stu.scheduled_departure or stu.scheduled_arrival
+        if arrival is not None:
+            overridden[pos] = replace(calls[pos], arrival=arrival, departure=departure)
+    return overridden
 
 
 def _moved(when: datetime | None, delay: int | None) -> datetime | None:
@@ -1162,10 +1185,12 @@ def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
     shown at all. Predictions and replacements match on the full
     (trip_id, start_date, start_secs) identity, and of the two for one run
     the later wins; NEW and ADDED trips on bare trip_id (one without a
-    trip_id stands alone) -- an extra trip is identified by the id the
-    producer minted for it, and dropping it on
-    ANY removal of that id is the conservative "removed wins" choice (never
-    show a trip that might not run). A producer sending several updates
+    trip_id stands alone), and DUPLICATED copies on their own
+    ``TripProperties.trip_id`` -- an extra trip is identified by the id the
+    producer minted for it, and dropping it on ANY removal of that id is
+    the conservative "removed wins" choice (never show a trip that might
+    not run). A DUPLICATED record lacking any of TripProperties' trip_id,
+    start_date and start_time names no copy. A producer sending several updates
     for one identity is out of spec ("at most one trip_update per actual
     trip"); the last wins wholesale rather than attempting a field-level
     merge. Any other relationship -- SCHEDULED, UNSCHEDULED, or one this

@@ -77,6 +77,7 @@ from .rt import (
     fetch_feed_message,
     indexed_trip_updates,
     resolve_trip_predictions,
+    scheduled_overrides,
     stops_from_message,
     trip_modifications_from_message,
     trip_update_records,
@@ -614,14 +615,18 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
 
     "This new trip is a copy of an existing trip in static GTFS except for
     the service start date and time": every descriptor is the original's
-    (the headsign may differ, from TripProperties), and its StopTimeUpdates
-    predict against the moved schedule -- "Real-time prediction delay
-    values are applied to this calculated schedule time", and a time
+    (the headsign may differ, from TripProperties), its schedule the moved
+    one but where an update states a stop's ``scheduled_time``, and its
+    StopTimeUpdates predict against that schedule -- "Real-time prediction
+    delay values are applied to this calculated schedule time", and a time
     stands as given. A call it skips, or one with no time, is not shown.
     """
-    resolved = resolve_trip_predictions(record.entry, run.calls)
+    # A stop's own scheduled_time, where its update gives one, is the
+    # copy's schedule there: its run or dwell may differ from the original's.
+    scheduled = scheduled_overrides(record.entry, run.calls)
+    resolved = resolve_trip_predictions(record.entry, scheduled)
     calls: list[RealtimeCall] = []
-    for call in run.calls:
+    for call in scheduled:
         if call.stop_sequence in resolved.skipped:
             continue
         predicted = resolved.predictions.get(call.stop_sequence)
@@ -1796,8 +1801,9 @@ class TransitFeedHandle:
         start time and date (:meth:`StaticIndex.alternative_trip_ids`); a
         plain trip's own start time is dropped and a date-less reference
         given its day (:func:`_dated`), each feed's at that feed's own
-        header time -- never at another feed's. NEW and ADDED trips are not
-        in the schedule and keep their references as sent, as do a
+        header time -- never at another feed's. NEW, ADDED and DUPLICATED
+        trips are not in the schedule (a copy's original is found below)
+        and keep their references as sent, as do a
         cancellation or deletion naming no scheduled run (it can still
         remove an extra trip of that id); any other update left without a
         trip or a date is dropped (a dated one for a day its trip does not

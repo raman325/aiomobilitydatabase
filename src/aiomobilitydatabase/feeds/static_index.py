@@ -16,7 +16,7 @@ import zipfile
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
@@ -47,7 +47,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -92,6 +92,8 @@ CREATE TABLE trips (
 -- GTFS-RT's alternative trip matching names a trip by route, direction and
 -- first departure.
 CREATE INDEX ix_trips_route_start ON trips (route_id, direction_id, first_secs);
+-- Realtime names trips by their GTFS id and repetition start.
+CREATE INDEX ix_trips_source ON trips (source_trip_id, start_secs);
 -- Single-record feed metadata (feed_info.txt); dates stay raw YYYYMMDD
 -- text cells, parsed leniently at the model boundary like every other
 -- descriptive value.
@@ -1567,7 +1569,13 @@ class StaticIndex:
         found = self._instance_calls_on(
             service_date, day_start, [trip_id], {service_id}
         )
-        return found[0] if found else None
+        # The calls are placed from the moved instant; the run's day starts
+        # where the copy's service day does.
+        return (
+            replace(found[0], day_start_utc=self._service_day_start(service_date))
+            if found
+            else None
+        )
 
     def instance_trip_calls(
         self, instances: Iterable[tuple[str, date]]
