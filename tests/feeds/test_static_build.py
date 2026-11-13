@@ -632,9 +632,25 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         )
     }
+    indexes = sorted(
+        name
+        for (name,) in built._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name NOT LIKE 'sqlite_%'"
+        )
+    )
     built.close()
+    # Indexes are part of the shape too: a cache from before one was added
+    # would serve every query, but slowly, until the next dataset.
+    assert indexes == [
+        "ix_calendar_dates_date",
+        "ix_stop_times_stop_departure",
+        "ix_stop_times_trip_sequence",
+        "ix_trips_route_start",
+        "ix_trips_source",
+    ], "indexes changed: bump SCHEMA_VERSION and update this list"
     assert (SCHEMA_VERSION, fingerprint) == (
-        7,
+        8,
         {
             "agencies": [
                 "email",

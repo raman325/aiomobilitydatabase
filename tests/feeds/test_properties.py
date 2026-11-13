@@ -1159,8 +1159,8 @@ def _maybe_fill_trip_update_entity(
 ]:
     """Fill a trip_update entity; return ``(eligible, canceled, deleted,
     replaced)``: the (trip_id, start_date, start_secs) key it contributes as
-    a trip entry, a cancellation, a deletion or a replacement (NEW and ADDED
-    entities, and any without a trip_id, contribute none). Tracking every
+    a trip entry, a cancellation, a deletion or a replacement (NEW, ADDED and
+    DUPLICATED entities, and any without a trip_id, contribute none). Tracking every
     set lets the property assert the parsed trips index EXACTLY (a subset
     check would pass on an empty parse). Draws exercise the full
     StopTimeUpdate surface: per-stop schedule_relationship (all valid
@@ -1206,8 +1206,10 @@ def _maybe_fill_trip_update_entity(
         set(),
         set(),
     )
-    # NEW and ADDED trips, and any without a trip_id, name no scheduled run.
-    if trip_id and relationship not in (descriptor.ADDED, descriptor.NEW):
+    # NEW, ADDED and DUPLICATED trips (a copy is its own trip), and any
+    # without a trip_id, name no scheduled run.
+    extras = (descriptor.ADDED, descriptor.NEW, descriptor.DUPLICATED)
+    if trip_id and relationship not in extras:
         keys[by_relationship.get(relationship, 0)].add(key)
     return keys  # type: ignore[return-value]
 

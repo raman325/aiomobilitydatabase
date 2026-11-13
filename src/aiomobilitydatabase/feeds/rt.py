@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from http import HTTPStatus
@@ -23,9 +23,11 @@ from .models import (
     AlertEffect,
     AlertImage,
     AlertSeverity,
+    BikesAllowed,
     CarriageDetail,
     CongestionLevel,
     OccupancyStatus,
+    PickupDropOffType,
     Route,
     ServiceAlert,
     Stop,
@@ -631,11 +633,15 @@ class RealtimeCall:
 
     ``scheduled_arrival``/``scheduled_departure`` are the events'
     ``scheduled_time`` (the new or replacement trip's own schedule, which a
-    NO_DATA stop still gives; a lone one is both, as in stop_times);
-    ``arrival``/``departure`` the predictions:
-    an event's own time, else its scheduled time moved by its own delay.
-    ``delay_seconds`` is the departure's delay, else the arrival's (a
-    prediction against its scheduled time). At least one time is set.
+    NO_DATA stop still gives; a lone one is both, as in stop_times), or a
+    DUPLICATED copy's (its original's, moved, unless its updates state
+    times of their own);
+    ``arrival``/``departure`` the predictions: for NEW, ADDED and
+    REPLACEMENT calls an event's own time, else its scheduled time moved by
+    its own delay; for a copy, as a scheduled trip's resolve (carried and
+    trip-level delays included) unless its updates state its times, when
+    each call is as a NEW trip's. ``delay_seconds`` is the delay at the call
+    (the departure's, else the arrival's). At least one time is set.
     """
 
     stop_id: str
@@ -644,11 +650,21 @@ class RealtimeCall:
     arrival: datetime | None
     departure: datetime | None
     delay_seconds: int | None
+    # A DUPLICATED copy's stop_time descriptors, its original's; unknown
+    # (None) for NEW, ADDED and REPLACEMENT calls.
+    pickup_type: PickupDropOffType | None = None
+    drop_off_type: PickupDropOffType | None = None
+    timepoint_exact: bool | None = None
+    stop_headsign: str | None = None
 
 
 @dataclass(frozen=True)
 class RealtimeTrip:
     """A trip whose whole journey realtime states, absent from the schedule.
+
+    A DUPLICATED copy is built the same way from its original (see
+    ``transit``): its own trip_id, the original's moved calls, and the
+    original's descriptors.
 
     A NEW trip ("an extra trip unrelated to any existing trips"; ADDED, its
     deprecated predecessor, is read the same way) or a REPLACEMENT run,
@@ -672,6 +688,13 @@ class RealtimeTrip:
     vehicle_id: str | None
     calls: tuple[RealtimeCall, ...]
     replaces: TripUpdateKey | None = None
+    # A DUPLICATED copy's trip descriptors, its original's (a short name
+    # also from TripProperties, for any extra trip); unknown (None)
+    # otherwise. No realtime-only trip has a block: a block is a vehicle's
+    # sequence of scheduled trips.
+    wheelchair_accessible: WheelchairAccess | None = None
+    bikes_allowed: BikesAllowed | None = None
+    trip_short_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -697,7 +720,8 @@ class TripStopUpdate:
     # StopTimeProperties.assigned_stop_id: a real-time platform assignment,
     # which a stop_id sent alongside "must match".
     assigned_stop_id: str | None = None
-    # StopTimeEvent.scheduled_time: a NEW or REPLACEMENT trip's own schedule.
+    # StopTimeEvent.scheduled_time: a NEW, REPLACEMENT or DUPLICATED trip's
+    # own schedule.
     scheduled_arrival: datetime | None = None
     scheduled_departure: datetime | None = None
 
@@ -750,13 +774,18 @@ class TripUpdates:
     (shown as cancelled); ``deleted_trips`` runs removed outright, which
     "must not be shown to users"; ``realtime_trips`` the realtime-only
     trips (NEW, ADDED, REPLACEMENT), a replacement also naming the
-    scheduled run it replaces (see :attr:`replaced_trips`).
+    scheduled run it replaces (see :attr:`replaced_trips`); ``duplicates``
+    the DUPLICATED records, whose copies ``transit`` builds from the
+    schedule and adds to ``realtime_trips``.
     """
 
     trips: dict[TripUpdateKey, TripUpdateEntry] = field(default_factory=dict)
     canceled_trips: set[TripUpdateKey] = field(default_factory=set)
     deleted_trips: set[TripUpdateKey] = field(default_factory=set)
     realtime_trips: list[RealtimeTrip] = field(default_factory=list)
+    # DUPLICATED records, one per copy trip_id: the copy's calls come from
+    # the schedule (see ``transit``), so they are built there.
+    duplicates: list[TripUpdateRecord] = field(default_factory=list)
 
     @property
     def replaced_trips(self) -> set[TripUpdateKey]:
@@ -787,6 +816,14 @@ class TripUpdateRecord:
     # TripProperties.trip_headsign: "the headsign for this trip when it
     # differs from the original".
     trip_headsign: str | None = None
+    # TripProperties.trip_id/start_date/start_time: a DUPLICATED trip's
+    # copy -- its own id, and the service day and start it runs at.
+    copy_trip_id: str | None = None
+    copy_start_date: date | None = None
+    copy_start_secs: int | None = None
+    # TripProperties.trip_short_name: "the name for this trip when it
+    # differs from the original" -- a copy's own train number, say.
+    trip_short_name: str | None = None
 
     @property
     def key(self) -> TripUpdateKey:
@@ -930,7 +967,13 @@ def resolve_trip_predictions(
     return TripPredictions(predictions=predictions, skipped=frozenset(skipped))
 
 
-def _trip_start_secs(trip: gtfs_realtime_pb2.TripDescriptor) -> int | None:
+# A TripDescriptor, or TripProperties naming a duplicate's start alike.
+_Started = (
+    gtfs_realtime_pb2.TripDescriptor | gtfs_realtime_pb2.TripUpdate.TripProperties
+)
+
+
+def _trip_start_secs(trip: _Started) -> int | None:
     """Parse TripDescriptor.start_time (hours may exceed 24) to seconds.
 
     Absent or unparseable start_time becomes None: RT payloads are
@@ -944,7 +987,7 @@ def _trip_start_secs(trip: gtfs_realtime_pb2.TripDescriptor) -> int | None:
         return None
 
 
-def _trip_start_date(trip: gtfs_realtime_pb2.TripDescriptor) -> date | None:
+def _trip_start_date(trip: _Started) -> date | None:
     """Parse TripDescriptor.start_date (``YYYYMMDD``) to a date.
 
     Absent or garbage start_date becomes None -- the same leniency
@@ -1021,6 +1064,7 @@ def trip_update_records(
             continue
         trip_update = entity.trip_update
         trip = trip_update.trip
+        properties = trip_update.trip_properties
         records.append(
             TripUpdateRecord(
                 trip_id=trip.trip_id,
@@ -1031,11 +1075,11 @@ def trip_update_records(
                     trip.direction_id if trip.HasField("direction_id") else None
                 ),
                 relationship=trip.schedule_relationship,
-                trip_headsign=(
-                    trip_update.trip_properties.trip_headsign or None
-                    if trip_update.HasField("trip_properties")
-                    else None
-                ),
+                trip_headsign=properties.trip_headsign or None,
+                copy_trip_id=properties.trip_id or None,
+                copy_start_date=_trip_start_date(properties),
+                copy_start_secs=_trip_start_secs(properties),
+                trip_short_name=properties.trip_short_name or None,
                 entry=TripUpdateEntry(
                     stop_updates=tuple(
                         _stop_update(stu) for stu in trip_update.stop_time_update
@@ -1098,6 +1142,43 @@ def _realtime_call(update: TripStopUpdate) -> RealtimeCall | None:
     )
 
 
+def realtime_calls(entry: TripUpdateEntry) -> tuple[RealtimeCall, ...]:
+    """Return the calls a trip's StopTimeUpdates state in full, in order."""
+    return tuple(
+        call for update in entry.stop_updates if (call := _realtime_call(update))
+    )
+
+
+def stated_copy_calls(
+    entry: TripUpdateEntry, calls: Sequence[TripCall]
+) -> tuple[RealtimeCall, ...]:
+    """Return the calls a DUPLICATED copy's updates state, on its original's stops.
+
+    A copy whose updates state ``scheduled_time`` states its own run and
+    dwell times, but it is still "the same as an existing scheduled trip
+    except for service start date and time": its updates are placed on the
+    original's calls as a scheduled trip's are (by stop_sequence, or a stop
+    visited once), and each stated call is that stop -- its id and
+    descriptors -- at the times the update gives, as a NEW trip's call is.
+    Only the stops its updates name are shown, in the trip's order.
+    """
+    stated: list[RealtimeCall] = []
+    for pos, update in sorted(_placed(entry, calls).items()):
+        call = calls[pos]
+        realtime = _realtime_call(replace(update, stop_id=call.stop_id))
+        if realtime is not None:
+            stated.append(
+                replace(
+                    realtime,
+                    pickup_type=call.pickup_type,
+                    drop_off_type=call.drop_off_type,
+                    timepoint_exact=call.timepoint_exact,
+                    stop_headsign=call.stop_headsign,
+                )
+            )
+    return tuple(stated)
+
+
 def _realtime_trip(record: TripUpdateRecord, *, replaces: bool) -> RealtimeTrip:
     """Build the trip a NEW, ADDED or REPLACEMENT record states in full."""
     return RealtimeTrip(
@@ -1107,13 +1188,79 @@ def _realtime_trip(record: TripUpdateRecord, *, replaces: bool) -> RealtimeTrip:
         headsign=record.trip_headsign,
         start_date=record.start_date,
         vehicle_id=record.entry.vehicle_id,
-        calls=tuple(
-            call
-            for update in record.entry.stop_updates
-            if (call := _realtime_call(update)) is not None
-        ),
+        calls=realtime_calls(record.entry),
         replaces=record.key if replaces else None,
+        trip_short_name=record.trip_short_name,
     )
+
+
+def _extra_trips(
+    records: Sequence[TripUpdateRecord], removed_ids: Collection[str]
+) -> tuple[list[RealtimeTrip], list[TripUpdateRecord]]:
+    """Return the NEW/ADDED trips and DUPLICATED copies records add.
+
+    An extra trip -- NEW, ADDED, or a copy under its own
+    ``TripProperties.trip_id`` -- is that id, the one the producer minted,
+    as removals read it too: the same trip from two feeds (or one url
+    listed twice) is one trip, the last sent winning whatever its kind, and
+    any removal naming the id drops it. One with no id stands alone. A
+    DUPLICATED record lacking any of TripProperties' trip_id, start_date
+    and start_time ("required if schedule_relationship is DUPLICATED")
+    names no copy. An ADDED naming a DUPLICATED's original or copy is the
+    pre-migration form of that copy and is ignored, as the migration guide
+    tells consumers to.
+    """
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    # The ADDED-to-DUPLICATED migration guide: consumers ignore an ADDED
+    # whose trip_id is a DUPLICATED's trip_id (the original) or its
+    # TripProperties.trip_id (the copy) -- a producer may send both -- as
+    # long as that DUPLICATED names a copy at all.
+    migrated = {
+        trip_id
+        for record in records
+        if record.relationship == descriptor.DUPLICATED
+        and record.copy_trip_id
+        and record.copy_start_date is not None
+        and record.copy_start_secs is not None
+        for trip_id in (record.trip_id, record.copy_trip_id)
+        if trip_id
+    } | {
+        # "consumers ignore any ADDED trips that have the same trip_id as a
+        # NEW trip trip_id" -- the same guide.
+        record.trip_id
+        for record in records
+        if record.relationship == descriptor.NEW and record.trip_id
+    }
+    by_id: dict[str, RealtimeTrip | TripUpdateRecord] = {}
+    anonymous: list[RealtimeTrip] = []
+    for record in records:
+        if record.relationship == descriptor.ADDED and record.trip_id in migrated:
+            continue
+        if record.relationship in (descriptor.NEW, descriptor.ADDED):
+            trip = _realtime_trip(record, replaces=False)
+            if record.trip_id:
+                by_id[record.trip_id] = trip
+            else:
+                anonymous.append(trip)
+        elif (
+            record.relationship == descriptor.DUPLICATED
+            and record.trip_id
+            and record.copy_trip_id
+            and record.copy_start_date is not None
+            and record.copy_start_secs is not None
+        ):
+            by_id[record.copy_trip_id] = record
+    trips = [
+        extra
+        for trip_id, extra in by_id.items()
+        if trip_id not in removed_ids and isinstance(extra, RealtimeTrip)
+    ]
+    copies = [
+        extra
+        for trip_id, extra in by_id.items()
+        if trip_id not in removed_ids and isinstance(extra, TripUpdateRecord)
+    ]
+    return [*trips, *anonymous], copies
 
 
 def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
@@ -1129,10 +1276,12 @@ def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
     shown at all. Predictions and replacements match on the full
     (trip_id, start_date, start_secs) identity, and of the two for one run
     the later wins; NEW and ADDED trips on bare trip_id (one without a
-    trip_id stands alone) -- an extra trip is identified by the id the
-    producer minted for it, and dropping it on
-    ANY removal of that id is the conservative "removed wins" choice (never
-    show a trip that might not run). A producer sending several updates
+    trip_id stands alone), and DUPLICATED copies on their own
+    ``TripProperties.trip_id`` -- an extra trip is identified by the id the
+    producer minted for it, and dropping it on ANY removal of that id is
+    the conservative "removed wins" choice (never show a trip that might
+    not run). A DUPLICATED record lacking any of TripProperties' trip_id,
+    start_date and start_time names no copy. A producer sending several updates
     for one identity is out of spec ("at most one trip_update per actual
     trip"); the last wins wholesale rather than attempting a field-level
     merge. Any other relationship -- SCHEDULED, UNSCHEDULED, or one this
@@ -1141,14 +1290,13 @@ def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
     """
     descriptor = gtfs_realtime_pb2.TripDescriptor
     updates = TripUpdates()
-    extra: list[RealtimeTrip] = []
+    records = list(records)
+    extras = (descriptor.NEW, descriptor.ADDED, descriptor.DUPLICATED)
     # Per run, its predictions or its replacement, whichever came last.
     runs: dict[TripUpdateKey, TripUpdateEntry | RealtimeTrip] = {}
     for record in records:
         key = record.key
-        if record.relationship in (descriptor.NEW, descriptor.ADDED):
-            extra.append(_realtime_trip(record, replaces=False))
-        elif not record.trip_id:
+        if record.relationship in extras or not record.trip_id:
             continue
         elif record.relationship == descriptor.CANCELED:
             updates.canceled_trips.add(key)
@@ -1170,15 +1318,8 @@ def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
             updates.realtime_trips.append(run)
         else:
             updates.trips[key] = run
-    # An extra trip is its trip_id -- the id the producer minted for it, as
-    # removals read it too: the same trip from two feeds (or one url listed
-    # twice) is one trip, the last sent. One with no trip_id has no
-    # identity to merge on, and stands alone.
-    by_id = {trip.trip_id: trip for trip in extra if trip.trip_id}
-    updates.realtime_trips.extend(
-        trip for trip in by_id.values() if trip.trip_id not in removed_ids
-    )
-    updates.realtime_trips.extend(trip for trip in extra if not trip.trip_id)
+    extra, updates.duplicates = _extra_trips(records, removed_ids)
+    updates.realtime_trips.extend(extra)
     return updates
 
 

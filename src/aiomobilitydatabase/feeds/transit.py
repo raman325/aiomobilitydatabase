@@ -49,6 +49,7 @@ from .models import (
     Agency,
     ArrivalsQuery,
     FeedInfo,
+    PickupDropOffType,
     Route,
     ServiceAlert,
     StaticBuildProgress,
@@ -76,6 +77,7 @@ from .rt import (
     fetch_feed_message,
     indexed_trip_updates,
     resolve_trip_predictions,
+    stated_copy_calls,
     stops_from_message,
     trip_modifications_from_message,
     trip_update_records,
@@ -588,16 +590,16 @@ def _detoured_rows(
 def _replacing(
     trip: RealtimeTrip,
     concrete_trip_id: str,
-    summaries: Mapping[str, tuple[str, str | None, int | None]],
+    summaries: Mapping[str, tuple[str, str | None, int | None, str | None]],
 ) -> RealtimeTrip:
     """Return a replacement as its run: that trip's id, route and direction.
 
     A TripDescriptor's route and direction only select the trip; they
-    cannot move it to another route. The headsign may differ ("when it
-    differs from the original"), else is the trip's.
+    cannot move it to another route. The headsign and short name may
+    differ ("when it differs from the original"), else are the trip's.
     """
-    route_id, headsign, direction_id = summaries.get(
-        concrete_trip_id, (trip.route_id or "", None, trip.direction_id)
+    route_id, headsign, direction_id, short_name = summaries.get(
+        concrete_trip_id, (trip.route_id or "", None, trip.direction_id, None)
     )
     return replace(
         trip,
@@ -605,7 +607,86 @@ def _replacing(
         route_id=route_id,
         headsign=trip.headsign or headsign,
         direction_id=direction_id,
+        trip_short_name=trip.trip_short_name or short_name,
     )
+
+
+def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
+    """Build a DUPLICATED copy of its original's moved run.
+
+    "This new trip is a copy of an existing trip in static GTFS except for
+    the service start date and time": its trip descriptors are the
+    original's (headsign and short name may differ, from TripProperties).
+    Its calls are the original's moved, each with the original's stop
+    descriptors, and its StopTimeUpdates predict against them as a
+    scheduled trip's do -- "Real-time prediction delay values are applied
+    to this calculated schedule time", and a time stands as given; a call
+    it skips, or one with no time, is not shown. But an update stating
+    ``scheduled_time`` -- "if a duplicated trip runs have different run or
+    dwell times compared to the original" -- states the copy's own
+    schedule: the copy is then its updates alone (see
+    :func:`~aiomobilitydatabase.feeds.rt.stated_copy_calls`), never a mix
+    of their times and the original's, on the original's stops and their
+    descriptors.
+    """
+    # Only updates that land on the trip's own stops (and are not SKIPPED)
+    # can state its times.
+    stated = stated_copy_calls(record.entry, run.calls)
+    calls = (
+        stated
+        if any(call.scheduled_arrival or call.scheduled_departure for call in stated)
+        else _moved_calls(record, run)
+    )
+    if record.trip_headsign:
+        # The original's stop headsigns would override the headsign the
+        # copy now shows (a stop's headsign is the one shown there).
+        calls = tuple(replace(call, stop_headsign=None) for call in calls)
+    assert record.copy_trip_id is not None
+    return RealtimeTrip(
+        trip_id=record.copy_trip_id,
+        route_id=run.route_id,
+        direction_id=run.direction_id,
+        headsign=record.trip_headsign or run.headsign,
+        start_date=record.copy_start_date,
+        vehicle_id=record.entry.vehicle_id,
+        calls=calls,
+        wheelchair_accessible=run.wheelchair_accessible,
+        bikes_allowed=run.bikes_allowed,
+        trip_short_name=record.trip_short_name or run.trip_short_name,
+    )
+
+
+def _moved_calls(
+    record: TripUpdateRecord, run: TripInstanceCalls
+) -> tuple[RealtimeCall, ...]:
+    """Return a copy's calls: its original's moved, its updates resolved."""
+    resolved = resolve_trip_predictions(record.entry, run.calls)
+    calls: list[RealtimeCall] = []
+    for call in run.calls:
+        if call.stop_sequence in resolved.skipped:
+            continue
+        predicted = resolved.predictions.get(call.stop_sequence)
+        arrival = predicted.arrival if predicted else None
+        departure = predicted.departure if predicted else None
+        if all(
+            when is None for when in (call.arrival, call.departure, arrival, departure)
+        ):
+            continue
+        calls.append(
+            RealtimeCall(
+                stop_id=call.stop_id,
+                scheduled_arrival=call.arrival,
+                scheduled_departure=call.departure,
+                arrival=arrival,
+                departure=departure,
+                delay_seconds=predicted.delay_seconds if predicted else None,
+                pickup_type=call.pickup_type,
+                drop_off_type=call.drop_off_type,
+                timepoint_exact=call.timepoint_exact,
+                stop_headsign=call.stop_headsign,
+            )
+        )
+    return tuple(calls)
 
 
 def _realtime_vehicle(
@@ -653,10 +734,11 @@ def _realtime_rows(
 ) -> list[StopArrival]:
     """Board rows for realtime-only trips, at the queried stops.
 
-    There is no schedule row: the times are the update's own (its
-    ``scheduled_time`` and predictions), and every stop_time descriptor --
+    There is no stop_times row of their own: the times are the update's
+    (its ``scheduled_time`` and predictions; a copy's moved schedule), and
+    the stop_time descriptors are a copy's original's, else unknown --
     timepoint included, whose absent-means-exact default only applies to
-    rows in stop_times -- is unknown.
+    rows in stop_times.
     """
     rows: list[StopArrival] = []
     for trip in trips:
@@ -682,15 +764,15 @@ def _realtime_rows(
                     canceled=False,
                     vehicle_id=trip.vehicle_id,
                     vehicle=vehicle,
-                    wheelchair_accessible=None,
-                    bikes_allowed=None,
+                    wheelchair_accessible=trip.wheelchair_accessible,
+                    bikes_allowed=trip.bikes_allowed,
                     direction_id=trip.direction_id,
-                    pickup_type=None,
-                    drop_off_type=None,
-                    timepoint_exact=None,
-                    stop_headsign=None,
-                    trip_short_name=None,
-                    block_id=None,
+                    pickup_type=call.pickup_type,
+                    drop_off_type=call.drop_off_type,
+                    timepoint_exact=call.timepoint_exact,
+                    stop_headsign=call.stop_headsign,
+                    trip_short_name=trip.trip_short_name,
+                    block_id=None,  # no realtime-only trip is part of a block
                 )
             )
     return rows
@@ -710,20 +792,27 @@ def _realtime_journeys(
 
     A trip's calls are in journey order, so each call at the origin pairs
     with the next call at the destination after it. The times are the
-    update's own (its ``scheduled_time`` and predictions); pickup and
-    drop-off are unknown rather than refused.
+    update's own (its ``scheduled_time`` and predictions; a copy's moved
+    schedule). A copy never boards where its original allows no pickup nor
+    alights where it allows no drop-off; elsewhere pickup and drop-off are
+    unknown rather than refused.
     """
     journeys: list[UpcomingTrip] = []
     for trip in trips:
         vehicle = _realtime_vehicle(trip, vehicles)
         for index, board in enumerate(trip.calls):
-            if board.stop_id != origin_stop_id or not _in_window(board, end):
+            if (
+                board.stop_id != origin_stop_id
+                or board.pickup_type is PickupDropOffType.NONE
+                or not _in_window(board, end)
+            ):
                 continue
             alight = next(
                 (
                     call
                     for call in trip.calls[index + 1 :]
                     if call.stop_id == destination_stop_id
+                    and call.drop_off_type is not PickupDropOffType.NONE
                 ),
                 None,
             )
@@ -750,21 +839,21 @@ def _realtime_journeys(
                     canceled=False,
                     vehicle_id=trip.vehicle_id,
                     vehicle=vehicle,
-                    wheelchair_accessible=None,
-                    bikes_allowed=None,
+                    wheelchair_accessible=trip.wheelchair_accessible,
+                    bikes_allowed=trip.bikes_allowed,
                     direction_id=trip.direction_id,
-                    origin_pickup_type=None,
-                    origin_drop_off_type=None,
-                    origin_timepoint_exact=None,
-                    origin_stop_headsign=None,
-                    destination_pickup_type=None,
-                    destination_drop_off_type=None,
-                    destination_timepoint_exact=None,
-                    destination_stop_headsign=None,
+                    origin_pickup_type=board.pickup_type,
+                    origin_drop_off_type=board.drop_off_type,
+                    origin_timepoint_exact=board.timepoint_exact,
+                    origin_stop_headsign=board.stop_headsign,
+                    destination_pickup_type=alight.pickup_type,
+                    destination_drop_off_type=alight.drop_off_type,
+                    destination_timepoint_exact=alight.timepoint_exact,
+                    destination_stop_headsign=alight.stop_headsign,
                     is_first=False,
                     is_last=False,
-                    trip_short_name=None,
-                    block_id=None,
+                    trip_short_name=trip.trip_short_name,
+                    block_id=None,  # no realtime-only trip is part of a block
                 )
             )
     return journeys
@@ -1738,8 +1827,9 @@ class TransitFeedHandle:
         start time and date (:meth:`StaticIndex.alternative_trip_ids`); a
         plain trip's own start time is dropped and a date-less reference
         given its day (:func:`_dated`), each feed's at that feed's own
-        header time -- never at another feed's. NEW and ADDED trips are not
-        in the schedule and keep their references as sent, as do a
+        header time -- never at another feed's. NEW, ADDED and DUPLICATED
+        trips are not in the schedule (a copy's original is found below)
+        and keep their references as sent, as do a
         cancellation or deletion naming no scheduled run (it can still
         remove an extra trip of that id); any other update left without a
         trip or a date is dropped (a dated one for a day its trip does not
@@ -1755,8 +1845,9 @@ class TransitFeedHandle:
         """
         descriptor = gtfs_realtime_pb2.TripDescriptor
         removals = (descriptor.CANCELED, descriptor.DELETED)
-        # Not in the schedule: kept as sent.
-        extras = (descriptor.NEW, descriptor.ADDED)
+        # Not in the schedule (a DUPLICATED copy's original is found below):
+        # kept as sent.
+        extras = (descriptor.NEW, descriptor.ADDED, descriptor.DUPLICATED)
         tu_feeds = [
             (trip_update_records(message), feed_timestamp(message))
             for message in tu_messages
@@ -1866,6 +1957,20 @@ class TransitFeedHandle:
             for trip in updates.realtime_trips
             if not trip.replaces or trip.replaces in runs
         ]
+        # A DUPLICATED copy is its original's calls, moved to the copy's
+        # start and day, with its StopTimeUpdates resolved against them.
+        for record in updates.duplicates:
+            assert record.copy_start_date is not None
+            assert record.copy_start_secs is not None
+            run = await self._index_read(
+                self._index.copied_run,
+                record.trip_id,
+                record.start_secs,
+                record.copy_start_date,
+                record.copy_start_secs,
+            )
+            if run is not None:
+                updates.realtime_trips.append(_copy(record, run))
         positions = [vehicle for vehicles, _ in vp_feeds for vehicle in vehicles]
         scheduled_trip_ids = set(
             await self._index_read(
@@ -2030,8 +2135,28 @@ class TransitFeedHandle:
         wins over its replacement, and any removal naming an extra trip's
         id removes it. An extra trip is its trip_id: the same one from two
         feeds is shown once, the last sent (one with no trip_id stands
-        alone); its vehicle is its own vehicle id's, else the one vehicle
-        naming that trip id.
+        alone) -- except that, per the ADDED-to-DUPLICATED migration guide,
+        an ADDED sharing its trip_id with a NEW trip or with a DUPLICATED's
+        original or copy is ignored whatever the order. Its vehicle (a
+        copy's too) is its own vehicle id's, else the one vehicle naming
+        that trip id.
+
+        A DUPLICATED copy ("a new trip that is the same as an existing
+        scheduled trip except for service start date and time") is also an
+        extra trip, under ``TripProperties.trip_id``: the original's calls,
+        each keeping its offset from the original's first departure, moved
+        so the copy starts at ``TripProperties.start_time`` on its
+        ``start_date`` -- whether or not the original's service runs that
+        day -- with the original's descriptors (headsign and short name
+        may differ, from TripProperties; a copy with its own headsign
+        drops the original's stop headsigns; no block or service), and its
+        updates resolved
+        against that schedule as a scheduled trip's are ("delay values are
+        applied to this calculated schedule time"). A copy whose updates
+        state ``scheduled_time`` states its own schedule and is those
+        updates alone, as a NEW trip is. The original is untouched. A copy
+        naming no run, or lacking any of
+        TripProperties' trip_id, start_date and start_time, is not shown.
 
         Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
         ids materialized from frequencies.txt) match RT via
@@ -2351,8 +2476,9 @@ class TransitFeedHandle:
         # (yesterday's 24:00:00 is today's 00:00:00), and a stable sort then
         # keeps the order rows were appended in: scheduled rows in
         # ``scheduled``'s canonical order (earlier run first), then realtime-only
-        # rows in feed order, then detoured runs in run order. Every part of
-        # that is fixed before the scan, so no tie depends on what it read.
+        # rows (replacements and NEW/ADDED trips in feed order, then copies),
+        # then detoured runs in run order. Every part of that is fixed before
+        # the scan, so no tie depends on what it read.
         arrivals.sort(
             key=lambda a: (
                 _effective_departure(a, start),
@@ -2402,12 +2528,14 @@ class TransitFeedHandle:
         before the limit applies -- a skipped origin or skipped destination
         kills the row (the rider cannot board or alight there), while a
         skipped intermediate stop changes nothing. A realtime-only trip
-        (NEW, ADDED, REPLACEMENT; see :meth:`get_arrivals`) is a journey
+        (NEW, ADDED, REPLACEMENT, DUPLICATED; see :meth:`get_arrivals`) is
+        a journey
         from each call at the origin to the next call at the destination,
         in the order its updates give them, at their times (as on boards);
-        it is neither ``is_first`` nor ``is_last``, and is
-        offered even between stops no scheduled trip links. A replaced
-        run's static schedule is not offered.
+        it is neither ``is_first`` nor ``is_last``, is offered even
+        between stops no scheduled trip links, and never boards where a
+        copy's original allows no pickup or alights where it allows no
+        drop-off. A replaced run's static schedule is not offered.
 
         Delay propagation follows :meth:`get_arrivals` exactly: an end with
         its own StopTimeUpdate is predicted at the events that update gives;

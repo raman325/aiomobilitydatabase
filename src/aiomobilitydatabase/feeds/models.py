@@ -295,8 +295,10 @@ class ArrivalsQuery:
     matches the headsign shown at the stop -- the stop_time's
     ``stop_headsign`` where set, else the trip's headsign; the same values
     :meth:`TransitFeedHandle.get_headsigns_serving` offers -- so a realtime-only
-    trip passes one only by the headsign its update
-    gives (``TripProperties.trip_headsign``, or a replaced trip's own).
+    trip passes one only by the headsign its update gives
+    (``TripProperties.trip_headsign``, or a replaced trip's own), or, for a
+    DUPLICATED copy with no headsign of its own, by its original's trip and
+    stop headsigns.
     ``limit``
     caps the merged, filtered result for this query as a whole,
     nearest effective departure first; zero asks for an empty board and
@@ -381,12 +383,19 @@ class StopArrival:
     run, whose static schedule "isn't used") have no stop_times row: their
     scheduled times are the update's own ``scheduled_time`` (None where it
     gives none) and their predictions its times. ``service_id``, the
-    stop_time descriptors, ``wheelchair_accessible``, ``bikes_allowed``,
-    ``trip_short_name`` and ``block_id`` are None; ``route_id``,
-    ``direction_id`` and ``headsign`` are what the update gives -- a
-    replacement shows under the trip it replaces (its ``trip_id``, a
-    frequency repetition's own, route and direction; its headsign where
-    the update gives none).
+    stop_time descriptors, ``wheelchair_accessible``, ``bikes_allowed``
+    and ``block_id`` are None; ``route_id``, ``direction_id``,
+    ``headsign`` and ``trip_short_name`` are what the update gives
+    (TripProperties for the last two) -- a replacement shows under the
+    trip it replaces (its ``trip_id``, a frequency repetition's own, route
+    and direction; its headsign where the update gives none). A
+    DUPLICATED copy is its original moved to the copy's start: its own
+    ``trip_id`` (``TripProperties.trip_id``), the original's schedule
+    shifted -- or, where its updates state ``scheduled_time``, those
+    updates' stops and times -- and the original's descriptors (headsign
+    and short name unless TripProperties gives them), but no
+    ``service_id`` and no ``block_id``: a block is the vehicle's sequence
+    of scheduled trips, which a copy at another time is not part of.
 
     ``predicted_arrival``/``predicted_departure`` are each event's own
     prediction; ``delay_seconds`` is the delay realtime gives this stop --
@@ -458,8 +467,9 @@ class UpcomingTrip:
     destination stop. A scheduled trip always has both scheduled times; a
     realtime-only trip (NEW, or a REPLACEMENT run, whose static
     schedule "isn't used") has only the ones its update gives
-    (``scheduled_time``), and its other fields as on
-    :class:`StopArrival`.
+    (``scheduled_time``), a DUPLICATED copy its original's moved to its
+    start (or its updates' own, where they state ``scheduled_time``), and
+    its other fields as on :class:`StopArrival`.
     Realtime predicts the events its updates give:
     ``predicted_departure``/``origin_predicted_arrival`` at the origin and
     ``predicted_arrival`` at the destination, each None when realtime says

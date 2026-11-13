@@ -16,7 +16,7 @@ import zipfile
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
@@ -47,7 +47,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -92,6 +92,8 @@ CREATE TABLE trips (
 -- GTFS-RT's alternative trip matching names a trip by route, direction and
 -- first departure.
 CREATE INDEX ix_trips_route_start ON trips (route_id, direction_id, first_secs);
+-- Realtime names trips by their GTFS id and repetition start.
+CREATE INDEX ix_trips_source ON trips (source_trip_id, start_secs);
 -- Single-record feed metadata (feed_info.txt); dates stay raw YYYYMMDD
 -- text cells, parsed leniently at the model boundary like every other
 -- descriptive value.
@@ -1509,18 +1511,71 @@ class StaticIndex:
 
     def trip_summaries(
         self, trip_ids: Sequence[str]
-    ) -> dict[str, tuple[str, str | None, int | None]]:
-        """Map each trip to its (route_id, headsign, direction_id)."""
-        found: dict[str, tuple[str, str | None, int | None]] = {}
+    ) -> dict[str, tuple[str, str | None, int | None, str | None]]:
+        """Map each trip to its (route_id, headsign, direction_id, short_name)."""
+        found: dict[str, tuple[str, str | None, int | None, str | None]] = {}
         for offset in range(0, len(trip_ids), _ID_SLICE):
             chunk = list(trip_ids[offset : offset + _ID_SLICE])
-            for trip_id, route_id, headsign, direction_id in self._conn.execute(
-                "SELECT id, route_id, headsign, direction_id FROM trips "
+            for trip_id, route_id, headsign, direction_id, short in self._conn.execute(
+                "SELECT id, route_id, headsign, direction_id, short_name FROM trips "
                 f"WHERE id IN ({','.join('?' * len(chunk))})",
                 chunk,
             ):
-                found[trip_id] = (route_id, headsign, direction_id)
+                found[trip_id] = (route_id, headsign, direction_id, short)
         return found
+
+    def copied_run(
+        self,
+        source_trip_id: str,
+        start_secs: int | None,
+        service_date: date,
+        copy_start_secs: int,
+    ) -> TripInstanceCalls | None:
+        """Return a trip's calls copied onto a day, starting at ``copy_start_secs``.
+
+        GTFS-RT DUPLICATED: "Scheduled arrival and departure times for the
+        duplicated trip are calculated based on the offset between the
+        original trip departure_time and this field". The original is the
+        run a TripDescriptor names -- a plain trip (``start_secs`` None or
+        its own first departure) or one frequency repetition -- and every
+        call keeps its offset from that trip's first departure. The copy
+        runs whether or not the original's service runs that day. None for
+        a trip naming no run, or one with no timed call.
+        """
+        rows = self._conn.execute(
+            "SELECT id, service_id, start_secs, first_secs FROM trips "
+            "WHERE source_trip_id = ? AND first_secs IS NOT NULL",
+            (source_trip_id,),
+        ).fetchall()
+        named = [
+            (trip_id, service_id, first)
+            for trip_id, service_id, repetition, first in rows
+            if (repetition is not None and repetition == start_secs)
+            or (
+                repetition is None
+                and trip_id == source_trip_id
+                and start_secs in (None, first)
+            )
+        ]
+        if len(named) != 1:
+            return None
+        [(trip_id, service_id, first)] = named
+        try:
+            day_start = self._service_day_start(service_date) + timedelta(
+                seconds=copy_start_secs - first
+            )
+        except OverflowError:
+            return None
+        found = self._instance_calls_on(
+            service_date, day_start, [trip_id], {service_id}
+        )
+        # The calls are placed from the moved instant; the run's day starts
+        # where the copy's service day does.
+        return (
+            replace(found[0], day_start_utc=self._service_day_start(service_date))
+            if found
+            else None
+        )
 
     def instance_trip_calls(
         self, instances: Iterable[tuple[str, date]]
