@@ -711,10 +711,11 @@ def _realtime_rows(
 ) -> list[StopArrival]:
     """Board rows for realtime-only trips, at the queried stops.
 
-    There is no schedule row: the times are the update's own (its
-    ``scheduled_time`` and predictions), and every stop_time descriptor --
+    There is no stop_times row of their own: the times are the update's
+    (its ``scheduled_time`` and predictions; a copy's moved schedule), and
+    the stop_time descriptors are a copy's original's, else unknown --
     timepoint included, whose absent-means-exact default only applies to
-    rows in stop_times -- is unknown.
+    rows in stop_times.
     """
     rows: list[StopArrival] = []
     for trip in trips:
@@ -768,8 +769,10 @@ def _realtime_journeys(
 
     A trip's calls are in journey order, so each call at the origin pairs
     with the next call at the destination after it. The times are the
-    update's own (its ``scheduled_time`` and predictions); pickup and
-    drop-off are unknown rather than refused.
+    update's own (its ``scheduled_time`` and predictions; a copy's moved
+    schedule). A copy never boards where its original allows no pickup nor
+    alights where it allows no drop-off; elsewhere pickup and drop-off are
+    unknown rather than refused.
     """
     journeys: list[UpcomingTrip] = []
     for trip in trips:

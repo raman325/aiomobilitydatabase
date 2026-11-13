@@ -1978,3 +1978,105 @@ def test_copied_run_names_one_run_and_moves_it() -> None:
         assert index.copied_run("NOPE", None, day, 37800) is None
     finally:
         index.close()
+
+
+_DWELL = _feed(
+    stops="stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\nS2,C,0,0\n",
+    stop_times=(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T,08:00:00,08:00:00,S0,1\nT,08:10:00,08:15:00,S1,2\n"
+        "T,08:25:00,08:25:00,S2,3\n"
+    ),
+)
+
+
+def _copy_at_s1(stops: list[dict[str, Any]]) -> list[tuple[object, ...]]:
+    """The copy of T at 09:30 (S1 due 09:40, leaving 09:45): its rows."""
+    message = _descriptor_message(
+        _duplicate(("T-2", "20260730", "09:30:00"), stops=stops)
+    )
+
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        start = _EIGHT - timedelta(minutes=30)
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S1", "S2"], limit=None)],
+            start=start,
+            end=start + timedelta(hours=3),
+        )
+        return [
+            (
+                r.stop_id,
+                r.scheduled_arrival,
+                r.scheduled_departure,
+                r.predicted_departure,
+                r.delay_seconds,
+            )
+            for r in board
+            if r.trip_id == "T-2"
+        ]
+
+    return _run_feeds(_DWELL, body, [message])
+
+
+def test_a_copys_lone_scheduled_time_keeps_the_originals_dwell() -> None:
+    """A stated arrival scheduled_time moves the arrival only: the copy's
+    departure keeps its own (moved) time -- a 5 minute dwell is not erased
+    -- and is never before the arrival."""
+    rows = _copy_at_s1(
+        [
+            {
+                "stop": "S1",
+                "scheduled_arrival": _at(101),
+                "arrival_delay": 0,
+                "departure_delay": 0,
+            }
+        ]
+    )
+    assert rows[1] == ("S1", _at(101), _at(105), _at(105), 0)
+    late = _copy_at_s1([{"stop": "S1", "scheduled_arrival": _at(107)}])
+    assert late[1][1:3] == (_at(107), _at(107))  # departure brought up to it
+
+
+def test_a_copys_skipped_and_no_data_stops() -> None:
+    """A stop the copy skips is not shown; a NO_DATA stop keeps its stated
+    schedule, unpredicted, and cuts the delay from carrying on."""
+    assert [row[0] for row in _copy_at_s1([{"stop": "S1", "skipped": True}])] == [
+        "S0",
+        "S2",
+    ]
+    rows = _copy_at_s1(
+        [
+            {"stop": "S0", "departure_delay": 120},
+            {"stop": "S1", "scheduled_arrival": _at(102), "no_data": True},
+        ]
+    )
+    assert rows == [
+        ("S0", _at(90), _at(90), _at(92), 120),
+        ("S1", _at(102), _at(105), None, None),
+        ("S2", _at(115), _at(115), None, None),
+    ]
+
+
+def test_a_new_trip_and_a_copy_sharing_an_id_are_one_trip() -> None:
+    """An extra trip is its id, whatever its kind: a NEW trip and a copy
+    under one trip_id are one trip, the last sent."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    new = {
+        "trip_id": "N",
+        "start_date": "20260730",
+        "relationship": descriptor.NEW,
+        "calls": [("S0", None, _at(60), False)],
+    }
+    copy = _duplicate(("N", "20260730", "09:30:00"))
+    for parts, expected in (
+        ([new, copy], [("N", _at(90))]),
+        ([copy, new], [("N", None)]),
+    ):
+        board = _run_feeds(
+            _DIRECTED,
+            _board(_EIGHT - timedelta(minutes=30)),
+            [_descriptor_message(*parts)],
+        )
+        assert [
+            (r.trip_id, r.scheduled_departure) for r in board if r.trip_id == "N"
+        ] == expected
