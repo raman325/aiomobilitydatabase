@@ -237,7 +237,9 @@ Notes on direct mode:
   as a copy of its original, under the copy's own trip id, moved to the
   copy's start date and time, with its updates predicting against that
   schedule (one whose updates state `scheduled_time` is shown by those
-  updates alone, as a NEW trip is); the original is untouched. A cancelled run
+  updates alone, as a NEW trip is); the original is untouched. A trip whose
+  frequencies.txt service is headway-based (`exact_times` 0 or empty)
+  "cannot be duplicated", and such a copy is ignored. A cancelled run
   stays listed at its scheduled time with `canceled=True` and no prediction
   (boards and journeys alike, counting toward `limit`), so riders see the
   cancellation; a deleted one "must not be shown to users" and is gone.
@@ -363,7 +365,17 @@ Notes on direct mode:
   origin→destination, routes-serving — sees them as ordinary trips. Each
   repetition departs its first stop at its start, as `start_time` defines
   it. Service with `exact_times` 0 (or empty) "does not follow a fixed
-  schedule", so its repetitions report `timepoint_exact=False`.
+  schedule", so its repetitions report `timepoint_exact=False`, and
+  realtime names its runs by a `start_time` that "may be arbitrary": a run
+  is the trip moved to that start, shown under its own
+  `{trip_id}#{start_secs}` id in place of the repetition whose headway
+  slot (`[start, start + headway_secs)`) holds it -- two runs in one slot
+  both show. Only its updates' times predict it: "Delay can only be used
+  in case the trip update refers to a scheduled GTFS trip, as opposed to
+  a frequency-based trip". A cancellation, deletion or replacement of
+  such a run is one of its slot's repetition, and its vehicle is the one
+  naming its own start. A start in no slot, or on a day the trip does not
+  run, names no run.
 - **Schedule data means what GTFS says it means**: stop times are in
   agency.txt's `agency_timezone` (a catalog's zone is only a fallback for
   a dataset naming no usable one). A call timed by only its arrival or only
@@ -377,7 +389,8 @@ Notes on direct mode:
   alone: two stops that only share a name stay apart.
 - **Spec-correct realtime matching**: GTFS-RT updates are matched by
   `(trip_id, start_date, start_time)`, so an update addresses exactly one
-  repetition of a frequency trip and exactly one service-day instance (a
+  run of a frequency trip (an `exact_times` 1 repetition by its own start;
+  see above for headway-based service) and exactly one service-day instance (a
   plain trip's `start_time`, when given, is its first departure, as GTFS-RT
   requires; any other value names no run) — a
   "trip X is canceled tomorrow" posting never cancels today's run. An update

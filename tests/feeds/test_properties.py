@@ -4348,8 +4348,12 @@ def _run_frequencies_rt_scenario(
     return asyncio.run(scenario())
 
 
-# The frequencies fixture zip's F1 repetition starts (see fixtures.py).
-_F1_REP_STARTS = (21600, 22200, 22800, 25200, 25800)
+# The frequencies fixture zip's F1 repetition starts (see fixtures.py):
+# 06:00-06:30 every 600 s with exact_times blank (frequency-based: each
+# repetition stands for a headway slot), then 07:00-07:20 with exact times.
+_F1_SLOT_STARTS = (21600, 22200, 22800)
+_F1_EXACT_STARTS = (25200, 25800)
+_F1_REP_STARTS = (*_F1_SLOT_STARTS, *_F1_EXACT_STARTS)
 
 
 # The frequencies fixture's F1 template offsets from a repetition start
@@ -4361,9 +4365,42 @@ _F1_DEP_OFFSETS = {"S1": 0, "S2": 630, "S3": 1200}
 _F1_DAY_ANCHOR = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
 
 
-# 40+ examples: the drawn space is ~90 discrete combos (5 reps x 3 modes x
-# 2 kinds x 3 stops), so 12 examples left most of it unvisited.
-@settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def _f1_message(
+    start: int | None,
+    *,
+    canceled: bool,
+    stop_id: str,
+    delay: int,
+    departure: datetime | None,
+) -> gtfs_realtime_pb2.FeedMessage:
+    """One TripUpdate for F1 on 2026-07-30 at ``start``: a cancellation, or
+    one StopTimeUpdate at ``stop_id`` with a departure delay and time."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    entity = msg.entity.add()
+    entity.id = "tu-gen"
+    entity.trip_update.trip.trip_id = "F1"
+    # A frequency trip's update needs its start_date (GTFS-RT); the
+    # property using this is about start_time.
+    entity.trip_update.trip.start_date = "20260730"
+    if start is not None:
+        entity.trip_update.trip.start_time = _format_gtfs_time(start)
+    if canceled:
+        entity.trip_update.trip.schedule_relationship = (
+            gtfs_realtime_pb2.TripDescriptor.CANCELED
+        )
+        return msg
+    stu = entity.trip_update.stop_time_update.add()
+    stu.stop_id = stop_id
+    stu.departure.delay = delay
+    if departure is not None:
+        stu.departure.time = int(departure.timestamp())
+    return msg
+
+
+# 60+ examples: the drawn space is ~360 discrete combos (5 reps x 3 modes
+# x 2 kinds x 3 stops x 2 event forms).
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     rep=st.sampled_from(_F1_REP_STARTS),
     mode=st.sampled_from(["aligned", "misaligned", "missing"]),
@@ -4371,91 +4408,92 @@ _F1_DAY_ANCHOR = datetime(2026, 7, 30, 7, 0, tzinfo=UTC)
     stop_id=st.sampled_from(["S1", "S2", "S3"]),
     delay=st.integers(-600, 1800),
     misalign=st.integers(1, 599),
+    timed=st.booleans(),
 )
-def test_frequency_rt_start_time_matches_exactly_one_repetition(
-    *, rep: int, mode: str, kind: str, stop_id: str, delay: int, misalign: int
+def test_frequency_rt_start_time_names_one_run(
+    *,
+    rep: int,
+    mode: str,
+    kind: str,
+    stop_id: str,
+    delay: int,
+    misalign: int,
+    timed: bool,
 ) -> None:
-    """Over generated updates against the frequencies fixture: a prediction
-    or cancellation whose start_time is ALIGNED to a materialized
-    repetition affects exactly that one repetition -- the STU stop plus
-    propagation to that repetition's SUBSEQUENT stops, never a sibling
-    repetition and never a stop before the STU; a MISALIGNED start_time
-    (off by 1..599s -- repetitions are >=600s apart, so it never lands on
-    a sibling) or a MISSING start_time affects none. The window holds 15
-    synthetic rows (5 F1 repetitions x 3 stops), a cancelled repetition's
-    shown flagged.
+    """Over generated updates against the frequencies fixture, the run a
+    start_time names. An exact_times=1 repetition is a scheduled run: only
+    a start_time ALIGNED to it names it, and its update predicts the STU
+    stop and, propagated, that repetition's SUBSEQUENT stops -- never a
+    sibling, never an earlier stop. An exact_times=0 repetition stands for
+    the headway slot [start, start + 600): a start_time anywhere in it
+    names a run that "may be arbitrary" -- the trip moved to that start,
+    under its own id, in the repetition's place -- predicted by its
+    update's time alone ("Delay can only be used in case the trip update
+    refers to a scheduled GTFS trip"), and a cancellation there cancels the
+    repetition, shown flagged. A MISALIGNED start_time (off by 1..599 s, so
+    never on a sibling) names no exact repetition, and a MISSING one names
+    nothing. The window holds 15 rows (5 runs x 3 stops) either way.
     """
-    msg = gtfs_realtime_pb2.FeedMessage()
-    msg.header.gtfs_realtime_version = "2.0"
-    entity = msg.entity.add()
-    entity.id = "tu-gen"
-    entity.trip_update.trip.trip_id = "F1"
-    # A frequency trip's update needs its start_date (GTFS-RT); this
-    # property is about start_time.
-    entity.trip_update.trip.start_date = "20260730"
-    if mode == "aligned":
-        entity.trip_update.trip.start_time = _format_gtfs_time(rep)
-    elif mode == "misaligned":
-        entity.trip_update.trip.start_time = _format_gtfs_time(rep + misalign)
-    # The time agrees with the delay ("time should be equal to scheduled
-    # time + delay"): this property is about which repetition it reaches.
-    explicit_departure_epoch = int(
-        (
-            _F1_DAY_ANCHOR + timedelta(seconds=rep + _F1_DEP_OFFSETS[stop_id] + delay)
-        ).timestamp()
+    slotted = rep in _F1_SLOT_STARTS
+    named = mode == "aligned" or (mode == "misaligned" and slotted)
+    start = rep + misalign if mode == "misaligned" else rep
+    # The time agrees with the delay against the REPETITION's schedule
+    # ("time should be equal to scheduled time + delay").
+    explicit_departure = _F1_DAY_ANCHOR + timedelta(
+        seconds=rep + _F1_DEP_OFFSETS[stop_id] + delay
     )
-    if kind == "cancellation":
-        entity.trip_update.trip.schedule_relationship = (
-            gtfs_realtime_pb2.TripDescriptor.CANCELED
-        )
-    else:
-        stu = entity.trip_update.stop_time_update.add()
-        stu.stop_id = stop_id
-        stu.departure.delay = delay
-        stu.departure.time = explicit_departure_epoch
+    msg = _f1_message(
+        None if mode == "missing" else start,
+        canceled=kind == "cancellation",
+        stop_id=stop_id,
+        delay=delay,
+        departure=explicit_departure if timed else None,
+    )
     arrivals = _run_frequencies_rt_scenario(msg)
-    all_ids = {f"F1#{start}" for start in _F1_REP_STARTS}
+    all_ids = {f"F1#{secs}" for secs in _F1_REP_STARTS}
     got_ids = {row.trip_id for row in arrivals}
+    assert len(arrivals) == 15
     if kind == "cancellation":
-        canceled = {f"F1#{rep}"} if mode == "aligned" else set()
+        canceled = {f"F1#{rep}"} if named else set()
         assert got_ids == all_ids
-        assert len(arrivals) == 15
         for row in arrivals:
             assert row.canceled is (row.trip_id in canceled)
             assert row.realtime is row.canceled
             assert row.predicted_departure is None
         return
-    assert got_ids == all_ids
-    assert len(arrivals) == 15
+    run_id = f"F1#{start}" if named else None
+    assert got_ids == (all_ids - {f"F1#{rep}"}) | {run_id} if named else all_ids
     for row in arrivals:
         assert row.stop_id is not None
-        # Realtime iff this row is the matched repetition's STU stop or a
-        # LATER stop of that same repetition (propagation): siblings and
-        # earlier stops never gain predictions.
-        expected_rt = (
-            mode == "aligned"
-            and row.trip_id == f"F1#{rep}"
-            and _F1_STOP_POS[row.stop_id] >= _F1_STOP_POS[stop_id]
-        )
-        assert row.realtime is expected_rt
-        if not expected_rt:
+        if row.trip_id != run_id:
+            assert row.realtime is False
             assert row.predicted_departure is None
             assert row.delay_seconds is None
             continue
-        assert row.delay_seconds == delay
-        if row.stop_id == stop_id:
-            # The STU's own stop keeps its explicit epoch prediction.
-            assert row.predicted_departure == datetime.fromtimestamp(
-                explicit_departure_epoch, tz=UTC
-            )
+        assert row.scheduled_departure == _F1_DAY_ANCHOR + timedelta(
+            seconds=start + _F1_DEP_OFFSETS[row.stop_id]
+        )
+        reached = _F1_STOP_POS[row.stop_id] >= _F1_STOP_POS[stop_id]
+        # A run in a slot is realtime's own row; a repetition's row is
+        # realtime where its update reaches.
+        assert row.realtime is (slotted or reached)
+        # A run in a slot drops a delay; its time against the run's own
+        # schedule is the delay that propagates.
+        stated = (rep + delay - start) if slotted else delay
+        if not reached or (slotted and not timed):
+            assert row.predicted_departure is None
+            assert row.delay_seconds is None
+            continue
+        assert row.delay_seconds == stated
+        if row.stop_id == stop_id and timed:
+            assert row.predicted_departure == explicit_departure
         else:
-            # Propagated stops predict scheduled + delay on this
-            # repetition's own timeline.
             assert row.predicted_departure == _F1_DAY_ANCHOR + timedelta(
-                seconds=rep + _F1_DEP_OFFSETS[row.stop_id] + delay
+                seconds=start + _F1_DEP_OFFSETS[row.stop_id] + stated
             )
+        if row.stop_id != stop_id:
             assert row.predicted_arrival == _F1_DAY_ANCHOR + timedelta(
-                seconds=rep + _F1_ARR_OFFSETS[row.stop_id] + delay
+                seconds=start + _F1_ARR_OFFSETS[row.stop_id] + stated
             )
 
 
@@ -5165,9 +5203,11 @@ def _two_instance_zip() -> bytes:
             "start_date,end_date\nTWO,1,1,1,1,1,1,1,20260730,20260731\n"
         ),
         # Repetitions 09:00:00 (32400) and 09:10:00 (33000); 09:20:00 lands
-        # on end_time and does not run.
+        # on end_time and does not run. Exact times: each repetition is a
+        # scheduled run, predicted by delay like any other.
         "frequencies.txt": (
-            "trip_id,start_time,end_time,headway_secs\nFQ,09:00:00,09:20:00,600\n"
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "FQ,09:00:00,09:20:00,600,1\n"
         ),
     }
     buf = io.BytesIO()

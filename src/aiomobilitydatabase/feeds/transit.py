@@ -68,6 +68,7 @@ from .rt import (
     RealtimeTrip,
     TripModifications,
     TripPredictions,
+    TripUpdateEntry,
     TripUpdateKey,
     TripUpdateRecord,
     TripUpdates,
@@ -88,6 +89,7 @@ from .static_index import (
     _LATEST_INSTANT,
     ScheduledDeparture,
     ScheduledTrip,
+    SlotRun,
     StaticIndex,
     TripCall,
     TripInstanceCalls,
@@ -635,7 +637,7 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
     calls = (
         stated
         if any(call.scheduled_arrival or call.scheduled_departure for call in stated)
-        else _moved_calls(record, run)
+        else _moved_calls(record.entry, run)
     )
     if record.trip_headsign:
         # The original's stop headsigns would override the headsign the
@@ -657,10 +659,10 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
 
 
 def _moved_calls(
-    record: TripUpdateRecord, run: TripInstanceCalls
+    entry: TripUpdateEntry, run: TripInstanceCalls
 ) -> tuple[RealtimeCall, ...]:
-    """Return a copy's calls: its original's moved, its updates resolved."""
-    resolved = resolve_trip_predictions(record.entry, run.calls)
+    """Return a moved run's calls, its updates resolved against them."""
+    resolved = resolve_trip_predictions(entry, run.calls)
     calls: list[RealtimeCall] = []
     for call in run.calls:
         if call.stop_sequence in resolved.skipped:
@@ -689,18 +691,64 @@ def _moved_calls(
     return tuple(calls)
 
 
+def _times_only(entry: TripUpdateEntry) -> TripUpdateEntry:
+    """Return an exact_times=0 run's updates without their delays.
+
+    "Delay can only be used in case the trip update refers to a scheduled
+    GTFS trip, as opposed to a frequency-based trip": such a trip "does not
+    follow a fixed schedule", so a delay states nothing about it. Its times
+    stand, and a call an update gives none is not predicted from it.
+    """
+    return replace(
+        entry,
+        delay_seconds=None,
+        stop_updates=tuple(
+            replace(update, arrival_delay=None, departure_delay=None)
+            for update in entry.stop_updates
+        ),
+    )
+
+
+def _slot_run(
+    key: TripUpdateKey, entry: TripUpdateEntry, slot: SlotRun
+) -> RealtimeTrip:
+    """Build an exact_times=0 run from the repetition whose slot it takes.
+
+    It is its trip at its own start (see :meth:`StaticIndex.slot_runs`),
+    the trip's descriptors its own, its updates' times alone predicting it
+    (:func:`_times_only`). It stands in for that repetition, and its
+    vehicle names it by its own start.
+    """
+    run = slot.run
+    return RealtimeTrip(
+        trip_id=run.trip_id,
+        route_id=run.route_id,
+        direction_id=run.direction_id,
+        headsign=run.headsign,
+        start_date=run.service_date,
+        vehicle_id=entry.vehicle_id,
+        calls=_moved_calls(_times_only(entry), run),
+        replaces=(run.source_trip_id, run.service_date, slot.slot_start),
+        run=key,
+        wheelchair_accessible=run.wheelchair_accessible,
+        bikes_allowed=run.bikes_allowed,
+        trip_short_name=run.trip_short_name,
+    )
+
+
 def _realtime_vehicle(
     trip: RealtimeTrip, vehicles: _Vehicles
 ) -> VehiclePosition | None:
     """Return the vehicle running a realtime-only trip.
 
     A replacement is the run it replaces, matched exactly as that run is:
-    by its trip, repetition and service day. An extra trip by its own
-    vehicle id, else the one vehicle naming the trip id its producer
-    minted for it.
+    by its trip, repetition and service day -- an exact_times=0 run by its
+    own start (:attr:`RealtimeTrip.run`). An extra trip by its own vehicle
+    id, else the one vehicle naming the trip id its producer minted for it.
     """
-    if trip.replaces is not None:
-        source_trip_id, service_date, start_secs = trip.replaces
+    named = trip.run or trip.replaces
+    if named is not None:
+        source_trip_id, service_date, start_secs = named
         return _match_vehicle(
             trip.vehicle_id,
             source_trip_id,
@@ -1835,7 +1883,9 @@ class TransitFeedHandle:
         trip or a date is dropped (a dated one for a day its trip does not
         run simply matches no row), and so is a replacement naming no run
         that operates (see below) -- it is a scheduled run on a new
-        schedule, and replaces nothing.
+        schedule, and replaces nothing. A run of an exact_times=0 trip, at
+        whatever start, stands in for the repetition whose headway slot
+        holds it (see :meth:`StaticIndex.slot_runs`).
         TripUpdates from every TU-capable sibling feed then merge: a
         cancellation or deletion anywhere wins, and of several updates for
         one run the most explicit reference wins, then the later feed in
@@ -1934,6 +1984,41 @@ class TransitFeedHandle:
                 )
             )
         updates = indexed_trip_updates(record for _, record in ranked)
+        # An exact_times=0 run is named by a start that "may be arbitrary":
+        # it takes the place of the repetition whose headway slot holds that
+        # start. A removal or replacement of the run is one of that
+        # repetition; the run's predictions are the run itself, shown in its
+        # place (see _slot_run). Done after the merge, so a removal of a run
+        # still wins over its predictions.
+        slots = await self._index_read(
+            self._index.slot_runs,
+            [
+                *updates.trips,
+                *updates.canceled_trips,
+                *updates.deleted_trips,
+                *(trip.replaces for trip in updates.realtime_trips if trip.replaces),
+            ],
+        )
+
+        def slotted(key: TripUpdateKey) -> TripUpdateKey:
+            slot = slots.get(key)
+            return key if slot is None else (key[0], key[1], slot.slot_start)
+
+        updates.deleted_trips = {slotted(key) for key in updates.deleted_trips}
+        updates.canceled_trips = {
+            slotted(key) for key in updates.canceled_trips
+        } - updates.deleted_trips
+        updates.realtime_trips = [
+            replace(trip, replaces=slotted(trip.replaces), run=trip.replaces)
+            if trip.replaces is not None and trip.replaces in slots
+            else trip
+            for trip in updates.realtime_trips
+        ]
+        slot_runs = [
+            _slot_run(key, updates.trips.pop(key), slots[key])
+            for key in list(updates.trips)
+            if key in slots
+        ]
         # A replacement is the run it replaces, on a new schedule: one
         # naming no run that operates replaces nothing and is dropped, as
         # predictions for no run are. It shows as that run: its trip id (a
@@ -1957,6 +2042,7 @@ class TransitFeedHandle:
             for trip in updates.realtime_trips
             if not trip.replaces or trip.replaces in runs
         ]
+        updates.realtime_trips.extend(slot_runs)
         # A DUPLICATED copy is its original's calls, moved to the copy's
         # start and day, with its StopTimeUpdates resolved against them.
         for record in updates.duplicates:

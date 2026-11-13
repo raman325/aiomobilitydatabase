@@ -650,7 +650,7 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
         "ix_trips_source",
     ], "indexes changed: bump SCHEMA_VERSION and update this list"
     assert (SCHEMA_VERSION, fingerprint) == (
-        8,
+        9,
         {
             "agencies": [
                 "email",
@@ -734,6 +734,7 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
                 "route_id",
                 "service_id",
                 "short_name",
+                "slot_secs",
                 "source_trip_id",
                 "start_secs",
                 "wheelchair_accessible",
