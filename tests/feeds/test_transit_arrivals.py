@@ -590,8 +590,9 @@ async def test_with_vehicles_attaches_the_matching_position(
     assert t3.vehicle_id is None
     assert t3.vehicle is not None
     assert t3.vehicle.vehicle_id == "V2"
-    # RT-added row that no position claims.
-    assert by_trip["ADDED-9"].vehicle is None
+    # The RT-added trip is predicted after ``end`` (it has no schedule):
+    # outside the window.
+    assert "ADDED-9" not in by_trip
 
 
 async def test_vehicles_are_not_fetched_unless_asked(

@@ -63,6 +63,7 @@ from .models import (
 )
 from .rt import (
     Modification,
+    RealtimeCall,
     RealtimeTrip,
     TripModifications,
     TripPredictions,
@@ -220,12 +221,15 @@ class _Vehicles:
     ``by_instance`` is keyed by (trip id, start seconds, service date) --
     the trip, the repetition of a frequency-based trip, and the run's
     service day, as matching resolved the vehicle's TripDescriptor (see
-    :func:`_dated`). A date-less claim keeps a None day only where it names
-    no scheduled run: it can then ride a NEW (or ADDED) trip of that id.
+    :func:`_dated`); a date-less claim naming no scheduled run keeps a None
+    day and so matches no run. ``by_trip_id`` maps each trip id some
+    vehicle names to that vehicle, or None where two do: how an extra
+    trip, identified by the id its producer minted, finds its vehicle.
     """
 
     by_vehicle_id: Mapping[str, VehiclePosition]
     by_instance: Mapping[tuple[str, int | None, date | None], VehiclePosition | None]
+    by_trip_id: Mapping[str, VehiclePosition | None]
 
 
 # A trip reference as a TripDescriptor sends it: (trip_id, start_date,
@@ -335,11 +339,24 @@ def _vehicle_index(
             and any(other.vehicle_id == vehicle.vehicle_id for other in held[1])
         ):
             held[1].append(vehicle)
+    by_trip: dict[str, list[VehiclePosition]] = {}
+    for vehicle in positions:
+        if vehicle.trip_id:
+            named = by_trip.setdefault(vehicle.trip_id, [])
+            if not (
+                vehicle.vehicle_id
+                and any(other.vehicle_id == vehicle.vehicle_id for other in named)
+            ):
+                named.append(vehicle)
     return _Vehicles(
         by_vehicle_id,
         {
             key: vehicles[0] if len(vehicles) == 1 else None
             for key, (_precedence, vehicles) in best.items()
+        },
+        {
+            trip_id: vehicles[0] if len(vehicles) == 1 else None
+            for trip_id, vehicles in by_trip.items()
         },
     )
 
@@ -351,7 +368,6 @@ def _match_vehicle(
     *,
     service_date: date | None,
     vehicles: _Vehicles,
-    scheduled: bool = True,
 ) -> VehiclePosition | None:
     """Return the vehicle serving a row, or None if it is not pinnable.
 
@@ -367,23 +383,14 @@ def _match_vehicle(
     GTFS-RT requires both start_time and start_date for a frequencies.txt
     trip, so a vehicle lacking either names no repetition, exactly as a
     TripUpdate lacking either does.
-    ``scheduled=False`` is a row of a trip realtime states in full: it
-    matches a vehicle naming its ``service_date`` (the trip's own
-    start_date, possibly None) or naming no day at all.
     """
     if vehicle_id and (vehicle := vehicles.by_vehicle_id.get(vehicle_id)) is not None:
         return vehicle
     if not plain_trip_id:
         return None
-    if service_date is not None and (
-        dated := vehicles.by_instance.get((plain_trip_id, start_secs, service_date))
-    ):
-        return dated
-    if not scheduled and (
-        dateless := vehicles.by_instance.get((plain_trip_id, start_secs, None))
-    ):
-        return dateless
-    return None
+    if service_date is None:
+        return None
+    return vehicles.by_instance.get((plain_trip_id, start_secs, service_date))
 
 
 def _selector_index(
@@ -597,11 +604,12 @@ def _replacing(
 def _realtime_vehicle(
     trip: RealtimeTrip, vehicles: _Vehicles
 ) -> VehiclePosition | None:
-    """Return the vehicle running a trip realtime states in full.
+    """Return the vehicle running a realtime-only trip.
 
     A replacement is the run it replaces, matched exactly as that run is:
-    by its trip, repetition and service day. An extra trip is matched by
-    the id the producer minted for it (see :func:`_match_vehicle`).
+    by its trip, repetition and service day. An extra trip by its own
+    vehicle id, else the one vehicle naming the trip id its producer
+    minted for it.
     """
     if trip.replaces is not None:
         source_trip_id, service_date, start_secs = trip.replaces
@@ -612,25 +620,31 @@ def _realtime_vehicle(
             service_date=service_date,
             vehicles=vehicles,
         )
-    return _match_vehicle(
-        trip.vehicle_id,
-        trip.trip_id,
-        None,
-        service_date=trip.start_date,
-        vehicles=vehicles,
-        scheduled=False,
-    )
+    if trip.vehicle_id and (vehicle := vehicles.by_vehicle_id.get(trip.vehicle_id)):
+        return vehicle
+    return vehicles.by_trip_id.get(trip.trip_id) if trip.trip_id else None
+
+
+def _in_window(call: RealtimeCall, end: datetime | None) -> bool:
+    """Whether a realtime-only call falls in a query's window.
+
+    The one rule every row follows: its scheduled time, else (with no
+    schedule) its predicted time, at or before ``end``.
+    """
+    when = call.scheduled_departure or call.departure or call.arrival
+    return end is None or when is None or when <= end
 
 
 def _realtime_rows(
     trips: Sequence[RealtimeTrip],
     wanted_stops: Collection[str],
     *,
+    end: datetime | None,
     stops_by_id: Mapping[str, Stop],
     routes_by_id: Mapping[str, Route],
     vehicles: _Vehicles,
 ) -> list[StopArrival]:
-    """Board rows for trips realtime states in full, at the queried stops.
+    """Board rows for realtime-only trips, at the queried stops.
 
     There is no schedule row: the times are the update's own (its
     ``scheduled_time`` and predictions), and every stop_time descriptor --
@@ -641,7 +655,7 @@ def _realtime_rows(
     for trip in trips:
         vehicle = _realtime_vehicle(trip, vehicles)
         for call in trip.calls:
-            if call.stop_id not in wanted_stops:
+            if call.stop_id not in wanted_stops or not _in_window(call, end):
                 continue
             rows.append(
                 StopArrival(
@@ -680,11 +694,12 @@ def _realtime_journeys(
     origin_stop_id: str,
     destination_stop_id: str,
     *,
+    end: datetime | None,
     stops_by_id: Mapping[str, Stop],
     routes_by_id: Mapping[str, Route],
     vehicles: _Vehicles,
 ) -> list[UpcomingTrip]:
-    """Journeys on trips realtime states in full, origin then destination.
+    """Journeys on realtime-only trips, origin then destination.
 
     A trip's calls are in journey order, so each call at the origin pairs
     with the next call at the destination after it. The times are the
@@ -695,7 +710,7 @@ def _realtime_journeys(
     for trip in trips:
         vehicle = _realtime_vehicle(trip, vehicles)
         for index, board in enumerate(trip.calls):
-            if board.stop_id != origin_stop_id:
+            if board.stop_id != origin_stop_id or not _in_window(board, end):
                 continue
             alight = next(
                 (
@@ -1926,9 +1941,10 @@ class TransitFeedHandle:
         per stop. Returns one list per query, in order.
 
         The window opens at ``start`` (default: now) and closes at ``end``
-        for SCHEDULED departures. A delayed trip scheduled inside the window
-        can be predicted after ``end``, and a trip realtime states in full
-        has no schedule at all; both are kept. With ``end=None`` the window is
+        for SCHEDULED departures: a realtime-only trip's calls by their
+        ``scheduled_time``, else (with none) their predicted time. A delayed
+        trip scheduled inside the window can be predicted after ``end``,
+        and is kept. With ``end=None`` the window is
         open-ended: each board fills to its ``limit`` however far ahead the
         departures are -- overnight, over a weekend, past a holiday.
 
@@ -1975,9 +1991,9 @@ class TransitFeedHandle:
         not predict stays on the board until its predicted arrival, if
         later than the scheduled departure. ``realtime`` is True for propagated-only
         and trip-delay-only stops too -- a propagated delay IS realtime
-        information.
+        information, and every row of a realtime-only trip is realtime.
 
-        A trip realtime states in full -- NEW ("an extra trip unrelated to
+        A realtime-only trip -- NEW ("an extra trip unrelated to
         any existing trips"; ADDED, deprecated, is read the same way) or a
         REPLACEMENT, for which "the original schedule from the GTFS static
         isn't used for the replaced instance" -- is shown by its updates
@@ -1991,7 +2007,10 @@ class TransitFeedHandle:
         and headsign; one naming no run that operates is dropped, as
         predictions for no run are. A cancellation or deletion of the run
         wins over its replacement, and any removal naming an extra trip's
-        id removes it. One extra trip per identity is shown, the last sent.
+        id removes it. An extra trip is its trip_id: the same one from two
+        feeds is shown once, the last sent (one with no trip_id stands
+        alone); its vehicle is its own vehicle id's, else the one vehicle
+        naming that trip id.
 
         Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
         ids materialized from frequencies.txt) match RT via
@@ -2139,6 +2158,7 @@ class TransitFeedHandle:
                     [scheduled[key] for key in sorted(scheduled)],
                     all_stop_ids,
                     start=start,
+                    end=end,
                     updates=updates,
                     modified_rows=modified_rows,
                     modified_instances=modified_instances,
@@ -2185,6 +2205,7 @@ class TransitFeedHandle:
         all_stop_ids: list[str],
         *,
         start: datetime,
+        end: datetime | None,
         updates: TripUpdates,
         modified_rows: Sequence[StopArrival],
         modified_instances: Collection[tuple[str, date]],
@@ -2197,8 +2218,7 @@ class TransitFeedHandle:
 
         ``scheduled`` is every scheduled row read so far. Adds the detoured
         runs' rebuilt rows (``modified_rows``, replacing those runs'
-        schedule), the realtime overlay and rows of trips realtime states in
-        full; rows whose
+        schedule), the realtime overlay and rows of realtime-only trips; rows whose
         effective departure is before ``start`` are dropped. Caller holds
         the reader guard and applies per-query filters and limits. Runs
         once per horizon of :meth:`get_arrivals`, with RT already fetched.
@@ -2289,6 +2309,7 @@ class TransitFeedHandle:
             _realtime_rows(
                 updates.realtime_trips,
                 set(all_stop_ids),
+                end=end,
                 stops_by_id=stops_by_id,
                 routes_by_id=routes_by_id,
                 vehicles=vehicles,
@@ -2359,11 +2380,11 @@ class TransitFeedHandle:
         the limit, as on boards; DELETED runs and SKIPPED stops are removed
         before the limit applies -- a skipped origin or skipped destination
         kills the row (the rider cannot board or alight there), while a
-        skipped intermediate stop changes nothing. A trip realtime states
-        in full (NEW, ADDED, REPLACEMENT; see :meth:`get_arrivals`) is a
-        journey from each call at the origin to the next call at the
-        destination, in the order its updates give them, at their times (as
-        on boards); it is neither ``is_first`` nor ``is_last``, and is
+        skipped intermediate stop changes nothing. A realtime-only trip
+        (NEW, ADDED, REPLACEMENT; see :meth:`get_arrivals`) is a journey
+        from each call at the origin to the next call at the destination,
+        in the order its updates give them, at their times (as on boards);
+        it is neither ``is_first`` nor ``is_last``, and is
         offered even between stops no scheduled trip links. A replaced
         run's static schedule is not offered.
 
@@ -2372,7 +2393,8 @@ class TransitFeedHandle:
         an end without one takes the propagated or trip-level delay -- so
         one update before both ends predicts both. ``realtime`` is True
         whenever either end carries any RT-derived prediction, propagated
-        ones included; ``delay_seconds`` reports the origin's delay. A
+        ones included, for a cancelled run, and for every realtime-only
+        trip; ``delay_seconds`` reports the origin's delay. A
         journey whose origin departure realtime does not predict is ordered
         and kept by the later of its scheduled departure and the origin's
         predicted arrival, as boards are.
@@ -2422,7 +2444,7 @@ class TransitFeedHandle:
                 rows: list[UpcomingTrip] = []
                 # The last origin departure any scheduled journey between the
                 # pair can have; None means none can ever occur, leaving one
-                # pass for journeys on trips realtime states in full.
+                # pass for journeys on realtime-only trips.
                 ceiling = await self._index_read(
                     self._index.journeys_ceiling,
                     query.origin_stop_id,
@@ -2460,6 +2482,7 @@ class TransitFeedHandle:
                             query.origin_stop_id,
                             query.destination_stop_id,
                             start=start,
+                            end=end,
                             updates=updates,
                             stops_by_id=stops_by_id,
                             routes_by_id=routes_by_id,
@@ -2483,6 +2506,7 @@ class TransitFeedHandle:
         destination_stop_id: str,
         *,
         start: datetime,
+        end: datetime | None,
         updates: TripUpdates,
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
@@ -2518,6 +2542,7 @@ class TransitFeedHandle:
             updates.realtime_trips,
             origin_stop_id,
             destination_stop_id,
+            end=end,
             stops_by_id=stops_by_id,
             routes_by_id=routes_by_id,
             vehicles=vehicles,

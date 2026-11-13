@@ -227,7 +227,7 @@ Notes on direct mode:
   SQLite (agencies, stops, routes, trips, stop_times, calendars, frequencies,
   feed_info) in a worker thread — the event loop is never blocked. Arrivals
   work with or without realtime coverage; GTFS-RT TripUpdates overlay delays,
-  cancellations, deletions and trips realtime states in full when present.
+  cancellations, deletions and realtime-only trips when present.
   NEW (or ADDED) trips and REPLACEMENT runs show at their stops and as
   origin→destination journeys, at the times their updates give; a
   replacement hides the scheduled run it replaces. A cancelled run
@@ -272,8 +272,9 @@ Notes on direct mode:
   (timezone-less) or unrepresentable `start`/`end`, and a `start` (less
   `grace`) outside 0001-01-03 to 9999-12-01 UTC, where service days can
   be dated, and a negative `grace`.
-  `end` bounds scheduled times; a delayed trip predicted past it, and
-  trips realtime states in full (which have no schedule), still show.
+  `end` bounds scheduled times (a realtime-only trip's `scheduled_time`,
+  or its predicted time where it gives none); a delayed trip predicted
+  past it still shows.
 - **Producers decide how fresh is fresh**: realtime and GBFS fetches
   follow HTTP caching strictly (RFC 9111, as a private cache). Inside a
   response's declared lifetime (`Cache-Control: max-age`, or

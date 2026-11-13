@@ -1474,3 +1474,140 @@ def test_a_replaced_repetition_is_that_run() -> None:
         ("T#28800", _EIGHT, None, "BUS-0800"),
         ("T#30600", None, _at(33), "BUS-0830"),
     ]
+
+
+def test_extra_trips_without_a_trip_id_never_merge() -> None:
+    """A trip without a trip_id has no identity to merge on: two such
+    added trips leaving at once on different routes both show."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    message = _descriptor_message(
+        *(
+            {
+                "route_id": route,
+                "direction_id": direction,
+                "start_date": "20260730",
+                "start_time": "08:30:00",
+                "relationship": descriptor.ADDED,
+                "calls": [("S0", None, _at(minutes), False)],
+            }
+            for route, direction, minutes in (("R", 0, 30), ("R2", 1, 31))
+        )
+    )
+    board = _run_feeds(_DIRECTED, _board(_EIGHT - timedelta(minutes=30)), [message])
+    assert [(r.route_id, r.predicted_departure) for r in board if not r.trip_id] == [
+        ("R", _at(30)),
+        ("R2", _at(31)),
+    ]
+
+
+def test_a_new_trip_is_one_trip_however_its_feeds_date_it() -> None:
+    """An extra trip is its trip_id: one feed dating it and another not is
+    still one trip, the later feed's."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    dated = _descriptor_message(
+        {
+            "trip_id": "N",
+            "start_date": "20260730",
+            "relationship": descriptor.NEW,
+            "calls": [("S0", None, _at(30), False)],
+        }
+    )
+    undated = _descriptor_message(
+        {
+            "trip_id": "N",
+            "relationship": descriptor.NEW,
+            "calls": [("S0", None, _at(35), False)],
+        }
+    )
+    board = _run_feeds(
+        _DIRECTED, _board(_EIGHT - timedelta(minutes=30)), [dated, undated]
+    )
+    assert [r.predicted_departure for r in board if r.trip_id == "N"] == [_at(35)]
+
+
+def test_end_bounds_realtime_only_trips_as_scheduled_ones() -> None:
+    """One window rule for every row: a scheduled time -- a realtime-only
+    trip's scheduled_time, else its predicted time -- at or before ``end``.
+    A NEW trip at 13:00 is not on an 07:30-08:30 board, nor tomorrow's
+    replacement of T on today's."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    message = _descriptor_message(
+        {
+            "trip_id": "N",
+            "start_date": "20260730",
+            "relationship": descriptor.NEW,
+            "stops": [
+                {"stop": "S0", "scheduled_departure": _at(300), "departure": _at(300)},
+                {"stop": "S2", "scheduled_arrival": _at(320)},
+            ],
+        },
+        {
+            "trip_id": "P",
+            "start_date": "20260730",
+            "relationship": descriptor.NEW,
+            "calls": [("S0", None, _at(200), False)],  # predicted only
+        },
+        {
+            "trip_id": "T",
+            "start_date": "20260731",
+            "relationship": descriptor.REPLACEMENT,
+            "calls": [("S0", None, _at(24 * 60 + 5), False)],
+        },
+    )
+
+    async def body(handle: TransitFeedHandle) -> tuple[object, ...]:
+        start = _EIGHT - timedelta(minutes=30)
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S2"], limit=None)],
+            start=start,
+            end=start + timedelta(hours=1),
+        )
+        [journeys] = await handle.get_upcoming_trips(
+            [TripQuery("S0", "S2", limit=None)],
+            start=start,
+            end=start + timedelta(hours=1),
+        )
+        return [r.trip_id for r in board], [j.trip_id for j in journeys]
+
+    assert _run_feeds(_DIRECTED, body, [message]) == (["T", "U"], [])
+
+
+def test_a_new_trips_vehicle_is_the_one_naming_its_trip() -> None:
+    """A NEW trip's vehicle is the one VehiclePosition naming its trip_id,
+    however that position spells the start; two naming it make neither."""
+    stamp = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    trip_updates = _descriptor_message(
+        {
+            "trip_id": "N",
+            "start_date": "20260730",
+            "start_time": "08:30:00",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.NEW,
+            "calls": [("S0", None, _at(30), False)],
+        },
+        timestamp=stamp,
+    )
+
+    def positions(*vehicle_ids: str) -> gtfs_realtime_pb2.FeedMessage:
+        message = gtfs_realtime_pb2.FeedMessage()
+        message.header.gtfs_realtime_version = "2.0"
+        message.header.timestamp = int(stamp.timestamp())
+        for vehicle_id in vehicle_ids:
+            entity = message.entity.add()
+            entity.id = vehicle_id
+            entity.vehicle.vehicle.id = vehicle_id
+            entity.vehicle.trip.trip_id = "N"
+            entity.vehicle.trip.start_date = "20260730"
+            entity.vehicle.trip.start_time = "08:30:00"
+            entity.vehicle.position.latitude = 0
+            entity.vehicle.position.longitude = 0
+        return message
+
+    for vehicles, expected in (
+        (positions("BUS-N"), "BUS-N"),
+        (positions("BUS-N", "BUS-M"), None),
+    ):
+        board = _run_feeds(
+            _DIRECTED, _board(stamp, with_vehicles=True), [trip_updates], [vehicles]
+        )
+        [row] = [r for r in board if r.trip_id == "N"]
+        assert (row.vehicle.vehicle_id if row.vehicle else None) == expected

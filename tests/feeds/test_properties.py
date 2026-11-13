@@ -7208,8 +7208,21 @@ def test_trip_updates_parse_is_entity_order_independent(data: st.DataObject) -> 
     shuffled = trip_updates_from_message(_tu_message([specs[i] for i in order]))
     assert shuffled.trips == baseline.trips
     assert shuffled.canceled_trips == baseline.canceled_trips
-    assert sorted(shuffled.realtime_trips, key=repr) == sorted(
-        baseline.realtime_trips, key=repr
+    # An extra trip is its trip_id, the last sent: of extras sharing one id
+    # (on different days) which survives is order -- the documented
+    # last-wins exception -- so only the ids are order-free.
+    assert {trip.trip_id for trip in shuffled.realtime_trips} == {
+        trip.trip_id for trip in baseline.realtime_trips
+    }
+    sent = [
+        spec["trip_id"]
+        for spec in specs
+        if spec["relationship"] == gtfs_realtime_pb2.TripDescriptor.ADDED
+    ]
+    assert sorted(
+        (t for t in shuffled.realtime_trips if sent.count(t.trip_id) == 1), key=repr
+    ) == sorted(
+        (t for t in baseline.realtime_trips if sent.count(t.trip_id) == 1), key=repr
     )
 
 

@@ -294,8 +294,8 @@ class ArrivalsQuery:
     the rows; ``None`` or an empty list means no narrowing. ``headsigns``
     matches the headsign shown at the stop -- the stop_time's
     ``stop_headsign`` where set, else the trip's headsign; the same values
-    :meth:`TransitFeedHandle.get_headsigns_serving` offers -- so a trip
-    realtime states in full passes one only by the headsign its update
+    :meth:`TransitFeedHandle.get_headsigns_serving` offers -- so a realtime-only
+    trip passes one only by the headsign its update
     gives (``TripProperties.trip_headsign``, or a replaced trip's own).
     ``limit``
     caps the merged, filtered result for this query as a whole,
@@ -377,7 +377,7 @@ class StopArrival:
     absent from routes.txt leaves ``route`` None rather than inventing
     one. ``direction_id`` stays a raw int (0/1 with feed-defined meaning),
     matching :attr:`UpcomingTrip.direction_id`.
-    Rows of a trip realtime states in full (NEW, ADDED, or a REPLACEMENT
+    Rows of a realtime-only trip (NEW, ADDED, or a REPLACEMENT
     run, whose static schedule "isn't used") have no stop_times row: their
     scheduled times are the update's own ``scheduled_time`` (None where it
     gives none) and their predictions its times. ``service_id``, the
@@ -455,7 +455,7 @@ class UpcomingTrip:
     The shape Home Assistant's legacy ``gtfs`` sensor needs: the next
     departure from an origin stop on a trip that later serves the
     destination stop. A scheduled trip always has both scheduled times; a
-    trip realtime states in full (NEW, or a REPLACEMENT run, whose static
+    realtime-only trip (NEW, or a REPLACEMENT run, whose static
     schedule "isn't used") has only the ones its update gives
     (``scheduled_time``), and its other fields as on
     :class:`StopArrival`.
@@ -490,7 +490,7 @@ class UpcomingTrip:
     ``is_first``/``is_last`` mark whether this departure is the first/last
     scheduled departure OF ITS SERVICE DAY for this origin->destination
     pair -- legacy ``gtfs`` sensor parity; they describe the static
-    schedule, so a trip realtime states in full is neither. A
+    schedule, so a realtime-only trip is neither. A
     past-midnight departure (>24:00:00) is flagged relative to the
     service day it belongs to, not the clock day it happens on, and
     frequency-materialized repetitions count as ordinary trips (the day's

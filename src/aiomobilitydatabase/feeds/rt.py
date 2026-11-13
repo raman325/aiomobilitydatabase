@@ -627,7 +627,7 @@ class StopPrediction:
 
 @dataclass(frozen=True)
 class RealtimeCall:
-    """One call of a trip realtime states in full: its stop and times.
+    """One call of a realtime-only trip: its stop and times.
 
     ``scheduled_arrival``/``scheduled_departure`` are the events'
     ``scheduled_time`` (the new or replacement trip's own schedule, which a
@@ -747,8 +747,8 @@ class TripUpdates:
     ``trips`` holds the predictions for runs that operate;
     ``canceled_trips`` the runs that were scheduled but do not operate
     (shown as cancelled); ``deleted_trips`` runs removed outright, which
-    "must not be shown to users"; ``realtime_trips`` the trips realtime
-    states in full (NEW, ADDED, REPLACEMENT), a replacement also naming the
+    "must not be shown to users"; ``realtime_trips`` the realtime-only
+    trips (NEW, ADDED, REPLACEMENT), a replacement also naming the
     scheduled run it replaces (see :attr:`replaced_trips`).
     """
 
@@ -1127,8 +1127,9 @@ def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
     sets first. DELETED wins over CANCELED -- a run removed outright is not
     shown at all. Predictions and replacements match on the full
     (trip_id, start_date, start_secs) identity, and of the two for one run
-    the later wins; NEW and ADDED trips on bare trip_id -- an extra trip is
-    identified by the id the producer minted for it, and dropping it on
+    the later wins; NEW and ADDED trips on bare trip_id (one without a
+    trip_id stands alone) -- an extra trip is identified by the id the
+    producer minted for it, and dropping it on
     ANY removal of that id is the conservative "removed wins" choice (never
     show a trip that might not run). A producer sending several updates
     for one identity is out of spec ("at most one trip_update per actual
@@ -1139,15 +1140,13 @@ def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
     """
     descriptor = gtfs_realtime_pb2.TripDescriptor
     updates = TripUpdates()
-    # One extra trip per identity, the last sent: the same trip from two
-    # feeds (or one url listed twice) is one trip.
-    extra: dict[TripUpdateKey, RealtimeTrip] = {}
+    extra: list[RealtimeTrip] = []
     # Per run, its predictions or its replacement, whichever came last.
     runs: dict[TripUpdateKey, TripUpdateEntry | RealtimeTrip] = {}
     for record in records:
         key = record.key
         if record.relationship in (descriptor.NEW, descriptor.ADDED):
-            extra[key] = _realtime_trip(record, replaces=False)
+            extra.append(_realtime_trip(record, replaces=False))
         elif not record.trip_id:
             continue
         elif record.relationship == descriptor.CANCELED:
@@ -1170,9 +1169,15 @@ def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
             updates.realtime_trips.append(run)
         else:
             updates.trips[key] = run
+    # An extra trip is its trip_id -- the id the producer minted for it, as
+    # removals read it too: the same trip from two feeds (or one url listed
+    # twice) is one trip, the last sent. One with no trip_id has no
+    # identity to merge on, and stands alone.
+    by_id = {trip.trip_id: trip for trip in extra if trip.trip_id}
     updates.realtime_trips.extend(
-        trip for trip in extra.values() if trip.trip_id not in removed_ids
+        trip for trip in by_id.values() if trip.trip_id not in removed_ids
     )
+    updates.realtime_trips.extend(trip for trip in extra if not trip.trip_id)
     return updates
 
 

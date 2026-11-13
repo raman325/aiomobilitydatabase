@@ -744,7 +744,9 @@ def test_scheduled_departures_do_not_depend_on_how_they_were_scanned(
             )
             return rows
 
-        reference = max(_BEYOND_SERVICE, start)
+        # Past every scheduled time, and every realtime-only one (added
+        # trips are drawn up to 30h after start; see _ENTITY).
+        reference = max(_BEYOND_SERVICE, start + timedelta(hours=31))
         whole = await _uncapped(handle, reference, lambda: board(None, reference))
         open_ended = await board(limit, None)
         assert _keys([open_ended]) == _keys([whole[:limit]])
@@ -813,7 +815,9 @@ def test_arrivals_do_not_depend_on_how_they_were_scanned(
             )
             return rows
 
-        reference = max(_BEYOND_SERVICE, start)
+        # Past every scheduled time, and every realtime-only one (added
+        # trips are drawn up to 30h after start; see _ENTITY).
+        reference = max(_BEYOND_SERVICE, start + timedelta(hours=31))
         whole = await _uncapped(handle, reference, lambda: board(None, reference))
         open_ended = await board(limit, None)
         assert _keys([open_ended]) == _keys([whole[:limit]])
@@ -890,7 +894,9 @@ def test_upcoming_trips_do_not_depend_on_how_they_were_scanned(
         def keys(rows: list[UpcomingTrip]) -> list[tuple[object, ...]]:
             return [_trip_key(row) for row in rows]
 
-        reference = max(_BEYOND_SERVICE, start)
+        # Past every scheduled time, and every realtime-only one (added
+        # trips are drawn up to 30h after start; see _ENTITY).
+        reference = max(_BEYOND_SERVICE, start + timedelta(hours=31))
         whole = await _uncapped(handle, reference, lambda: trips(None, reference))
         open_ended = await trips(limit, None)
         assert keys(open_ended) == keys(whole[:limit])
