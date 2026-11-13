@@ -575,11 +575,13 @@ def test_trip_updates_from_message() -> None:
     assert (stu.arrival_delay, stu.departure_delay) == (300, 300)
     assert stu.arrival == datetime.fromtimestamp(1_785_500_300, tz=UTC)
     assert stu.departure == datetime.fromtimestamp(1_785_500_330, tz=UTC)
-    added = updates.added[0]
+    [added] = updates.realtime_trips
     assert added.trip_id == "ADDED-9"
     assert added.route_id == "R1"
-    assert added.stop_id == "S2"
-    assert added.departure == datetime.fromtimestamp(1_785_500_630, tz=UTC)
+    assert added.replaces is None
+    [call] = added.calls
+    assert call.stop_id == "S2"
+    assert call.departure == datetime.fromtimestamp(1_785_500_630, tz=UTC)
     assert ("ADDED-9", None, None) not in updates.trips  # ADDED rows never form entries
 
 
@@ -643,7 +645,7 @@ def test_trip_updates_cancellation_wins_regardless_of_entity_order(
     updates = trip_updates_from_message(msg)
     assert updates.canceled_trips == {("STALE-TRIP", None, None)}
     assert ("STALE-TRIP", None, None) not in updates.trips
-    assert all(added.trip_id != "STALE-TRIP" for added in updates.added)
+    assert all(trip.trip_id != "STALE-TRIP" for trip in updates.realtime_trips)
 
 
 def test_trip_updates_start_time_keys() -> None:
@@ -856,7 +858,7 @@ def test_out_of_range_enums_on_the_wire_never_raise() -> None:
     assert parsed.relationship == gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SCHEDULED
     assert parsed.stop_sequence == 1
     assert updates.canceled_trips == set()
-    assert updates.added == []
+    assert updates.realtime_trips == []
 
 
 # --- resolve_trip_predictions: the propagation state machine ----------------

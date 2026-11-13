@@ -118,7 +118,7 @@ async def main() -> None:
         routes = await transit.get_routes_serving(stations[0].stop_ids[0])
 
         # Scheduled arrivals merged with realtime (delays, cancellations,
-        # RT-added trips) when the feed publishes GTFS-RT TripUpdates.
+        # new and replacement trips) when the feed publishes TripUpdates.
         # Pass several ArrivalsQuery objects to get several boards (each
         # with its own stops, route/headsign filters, and limit) from one
         # realtime fetch; the result has one list per query, in order.
@@ -227,7 +227,10 @@ Notes on direct mode:
   SQLite (agencies, stops, routes, trips, stop_times, calendars, frequencies,
   feed_info) in a worker thread — the event loop is never blocked. Arrivals
   work with or without realtime coverage; GTFS-RT TripUpdates overlay delays,
-  cancellations, deletions and added trips when present. A cancelled run
+  cancellations, deletions and trips realtime states in full when present.
+  NEW (or ADDED) trips and REPLACEMENT runs show at their stops and as
+  origin→destination journeys, at the times their updates give; a
+  replacement hides the scheduled run it replaces. A cancelled run
   stays listed at its scheduled time with `canceled=True` and no prediction
   (boards and journeys alike, counting toward `limit`), so riders see the
   cancellation; a deleted one "must not be shown to users" and is gone.
@@ -270,7 +273,7 @@ Notes on direct mode:
   `grace`) outside 0001-01-03 to 9999-12-01 UTC, where service days can
   be dated, and a negative `grace`.
   `end` bounds scheduled times; a delayed trip predicted past it, and
-  RT-added trips, still show.
+  trips realtime states in full (which have no schedule), still show.
 - **Producers decide how fresh is fresh**: realtime and GBFS fetches
   follow HTTP caching strictly (RFC 9111, as a private cache). Inside a
   response's declared lifetime (`Cache-Control: max-age`, or
@@ -341,7 +344,7 @@ Notes on direct mode:
   frequencies.txt trip, so a date-less update or vehicle for either applies
   to no run — nor does a frequency vehicle missing its `start_time`, nor
   an update for a trip whose times decrease (arriving before it departs). A dated
-  one applies to exactly its day, including an RT-added trip's vehicle.
+  one applies to exactly its day, including a NEW trip's vehicle.
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic
   `{trip_id}#{start_secs}` ids, so every schedule query — arrivals,

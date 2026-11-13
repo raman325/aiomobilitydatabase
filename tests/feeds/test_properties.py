@@ -1155,16 +1155,18 @@ def _maybe_fill_trip_update_entity(
     set[tuple[str, date | None, int | None]],
     set[tuple[str, date | None, int | None]],
     set[tuple[str, date | None, int | None]],
+    set[tuple[str, date | None, int | None]],
 ]:
-    """Fill a trip_update entity; return ``(eligible, canceled, deleted)``:
-    the (trip_id, start_date, start_secs) key it contributes as a trip
-    entry, as a cancellation, or as a deletion (ADDED entities, and any
-    without a trip_id, contribute none). Tracking BOTH sets lets the property assert the
-    parsed trips index EXACTLY (a subset check would pass on an empty
-    parse). Draws exercise the full StopTimeUpdate surface: per-stop
-    schedule_relationship (all valid values), stop_id and/or stop_sequence
-    presence, delays, explicit times, the trip-level TripUpdate.delay, and
-    start_date/start_time cells across valid, invalid, and absent forms.
+    """Fill a trip_update entity; return ``(eligible, canceled, deleted,
+    replaced)``: the (trip_id, start_date, start_secs) key it contributes as
+    a trip entry, a cancellation, a deletion or a replacement (NEW and ADDED
+    entities, and any without a trip_id, contribute none). Tracking every
+    set lets the property assert the parsed trips index EXACTLY (a subset
+    check would pass on an empty parse). Draws exercise the full
+    StopTimeUpdate surface: per-stop schedule_relationship (all valid
+    values), stop_id and/or stop_sequence presence, delays, explicit times,
+    the trip-level TripUpdate.delay, and start_date/start_time cells across
+    valid, invalid, and absent forms.
     """
     trip_id = data.draw(st.text(max_size=6))
     entity.trip_update.trip.trip_id = trip_id
@@ -1192,15 +1194,22 @@ def _maybe_fill_trip_update_entity(
         if data.draw(st.booleans()):
             stu.departure.delay = data.draw(st.integers(-3600, 3600))
     key = (trip_id, start_date, start_secs)
-    if not trip_id:  # names its trip only through the schedule
-        return set(), set(), set()
-    if relationship == gtfs_realtime_pb2.TripDescriptor.CANCELED:
-        return set(), {key}, set()
-    if relationship == gtfs_realtime_pb2.TripDescriptor.DELETED:
-        return set(), set(), {key}
-    if relationship == gtfs_realtime_pb2.TripDescriptor.ADDED:
-        return set(), set(), set()
-    return {key}, set(), set()
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    by_relationship = {
+        descriptor.CANCELED: 1,
+        descriptor.DELETED: 2,
+        descriptor.REPLACEMENT: 3,
+    }
+    keys: tuple[set[tuple[str, date | None, int | None]], ...] = (
+        set(),
+        set(),
+        set(),
+        set(),
+    )
+    # NEW and ADDED trips, and any without a trip_id, name no scheduled run.
+    if trip_id and relationship not in (descriptor.ADDED, descriptor.NEW):
+        keys[by_relationship.get(relationship, 0)].add(key)
+    return keys  # type: ignore[return-value]
 
 
 def _maybe_fill_alert_entity(
@@ -1245,15 +1254,22 @@ def _assert_trip_update_keys(
     eligible: set[tuple[str, date | None, int | None]],
     canceled: set[tuple[str, date | None, int | None]],
     deleted: set[tuple[str, date | None, int | None]],
+    replaced: set[tuple[str, date | None, int | None]],
 ) -> None:
     """EXACT key-set equalities (a `<=` check passed even on an empty
     parse): every eligible entity's key survives unless removed, a deletion
     wins over a cancellation, and the removal sets are exactly the drawn
-    keys."""
+    keys. A run takes one update: one both predicted and replaced keeps
+    whichever came later, so only a replaced key nothing else names must
+    surface as replaced."""
     assert updates.canceled_trips.isdisjoint(set(updates.trips))
     assert updates.deleted_trips == deleted
     assert updates.canceled_trips == canceled - deleted
-    assert set(updates.trips) == eligible - canceled - deleted
+    operating = eligible - canceled - deleted
+    assert set(updates.trips) | updates.replaced_trips >= operating
+    assert set(updates.trips) <= operating
+    assert updates.replaced_trips <= replaced
+    assert replaced - eligible - canceled - deleted <= updates.replaced_trips
 
 
 @given(data=st.data())
@@ -1277,6 +1293,7 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
     eligible_keys: set[tuple[str, date | None, int | None]] = set()
     canceled_keys: set[tuple[str, date | None, int | None]] = set()
     deleted_keys: set[tuple[str, date | None, int | None]] = set()
+    replaced_keys: set[tuple[str, date | None, int | None]] = set()
     for i in range(data.draw(st.integers(0, 4))):
         entity = msg.entity.add()
         entity.id = f"e{i}"
@@ -1289,10 +1306,11 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
             if result is not None:
                 expected_vehicles.append(result)  # type: ignore[arg-type]
         elif kind == "trip_update":
-            entity_eligible, entity_canceled, entity_deleted = result  # type: ignore[misc]
-            eligible_keys |= entity_eligible
-            canceled_keys |= entity_canceled
-            deleted_keys |= entity_deleted
+            entity_keys = result  # type: ignore[misc]
+            eligible_keys |= entity_keys[0]
+            canceled_keys |= entity_keys[1]
+            deleted_keys |= entity_keys[2]
+            replaced_keys |= entity_keys[3]
         elif kind == "alert":
             expected_alert_trip_ids.append(result)  # type: ignore[arg-type]
     vehicles = vehicles_from_message(
@@ -1313,7 +1331,9 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
         assert vehicle.current_stop_sequence == expected["current_stop_sequence"]
         assert vehicle.license_plate == expected["license_plate"]
     updates = trip_updates_from_message(msg)
-    _assert_trip_update_keys(updates, eligible_keys, canceled_keys, deleted_keys)
+    _assert_trip_update_keys(
+        updates, eligible_keys, canceled_keys, deleted_keys, replaced_keys
+    )
     # Resolution totality: any entry against any stop order never raises,
     # and its outcomes never leave that order.
     stop_calls = [
@@ -3707,12 +3727,11 @@ def test_arrivals_sort_order_is_total(
 ) -> None:
     """Every returned board is in ``(effective departure, trip_id or "",
     stop_id)`` order under the FULL fallback chain -- including arrival-only
-    RT-added rows and rows with no time at all, which sort at ``now`` and so
-    survive the past-row drop.
+    RT-added rows. An RT-added call with no time at all has nowhere on a
+    board to go and is not shown.
 
-    The expected board is modelled end to end, so a timeless row silently
-    falling back to something other than ``now`` (dropping it, or parking it
-    at the end) fails here rather than passing an order-only check.
+    The expected board is modelled end to end, so a timeless row showing up
+    anywhere fails here rather than passing an order-only check.
     """
     msg, added = scenario
     now = _MERGE_NOW
@@ -3722,7 +3741,11 @@ def test_arrivals_sort_order_is_total(
     [[board]] = boards
     candidates = [
         *_MERGE_SCHEDULE,
-        *((trip_id, stop_id, when or now) for trip_id, stop_id, when in added),
+        *(
+            (trip_id, stop_id, when)
+            for trip_id, stop_id, when in added
+            if when is not None
+        ),
     ]
     expected = sorted(
         (row for row in candidates if row[2] >= now),
@@ -7134,7 +7157,7 @@ def test_trip_updates_cancellation_wins_as_an_invariant(data: st.DataObject) -> 
     updates = trip_updates_from_message(_tu_message(specs))
     assert updates.canceled_trips.isdisjoint(set(updates.trips))
     canceled_ids = {trip_id for trip_id, _, _ in updates.canceled_trips}
-    assert all(row.trip_id not in canceled_ids for row in updates.added)
+    assert all(trip.trip_id not in canceled_ids for trip in updates.realtime_trips)
     # Exactness, so the law cannot pass on an empty parse: every drawn
     # cancellation key is present, and every uncanceled non-ADDED entity
     # keeps its entry.
@@ -7165,7 +7188,7 @@ def _trip_start_date_of(spec: dict[str, object]) -> date | None:
 @given(data=st.data())
 def test_trip_updates_parse_is_entity_order_independent(data: st.DataObject) -> None:
     """For a message whose TripUpdateKeys are pairwise distinct, parsing is
-    invariant under shuffling the entity list (``added`` rows modulo
+    invariant under shuffling the entity list (``realtime_trips`` modulo
     order, since they are a list).
 
     This documents where order DOES matter as the single intentional
@@ -7180,7 +7203,9 @@ def test_trip_updates_parse_is_entity_order_independent(data: st.DataObject) -> 
     shuffled = trip_updates_from_message(_tu_message([specs[i] for i in order]))
     assert shuffled.trips == baseline.trips
     assert shuffled.canceled_trips == baseline.canceled_trips
-    assert sorted(shuffled.added, key=repr) == sorted(baseline.added, key=repr)
+    assert sorted(shuffled.realtime_trips, key=repr) == sorted(
+        baseline.realtime_trips, key=repr
+    )
 
 
 # HTTP token characters only, so one name strategy is legal as a header name

@@ -903,7 +903,8 @@ def test_upcoming_trips_do_not_depend_on_how_they_were_scanned(
             "a run beyond the first horizon leads, predicted early"
             if leading
             and leading[0].scheduled_departure > start + timedelta(hours=2)
-            and _effective_trip_departure(leading[0]) < leading[0].scheduled_departure
+            and _effective_trip_departure(leading[0], start)
+            < leading[0].scheduled_departure
             else "no early lead"
         )
 
