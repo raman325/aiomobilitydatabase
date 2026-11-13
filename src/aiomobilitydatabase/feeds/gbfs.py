@@ -55,14 +55,13 @@ _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
 def _entry_text(entry: dict[str, Any]) -> str | None:
-    """One localized entry's ``text``: an absent/null text is None.
+    """One localized entry's ``text``: anything but a non-empty string is None.
 
     ``str(entry.get("text"))`` would render a missing text as the literal
-    string ``"None"`` — the selected entry must instead degrade to "no
-    text available".
+    string ``"None"`` (and ``false`` as ``"False"``) — the selected entry
+    must instead degrade to "no text available".
     """
-    text = entry.get("text")
-    return None if text is None else str(text)
+    return _plain_text(entry.get("text"))
 
 
 def _record_id(value: Any) -> str | None:
@@ -73,9 +72,16 @@ def _record_id(value: Any) -> str | None:
     corrupting any consumer that keys on them (an entity registry, say).
     A blank id collides identically, so it is None too. Same motivation
     as :func:`_entry_text`: never surface a stringified None. GBFS ids are
-    strings; a number is read as one, but a boolean, object or array is
-    no id at all (``false`` would otherwise become the id ``"False"``).
+    strings; a number is read as one -- JSON has one number type, so
+    ``7.0`` is the id ``"7"``, as ``7`` is -- but a boolean, object, array
+    or non-finite number (``NaN`` would make every such id ``"nan"``) is
+    no id at all.
     """
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value.is_integer():
+            value = int(value)
     if isinstance(value, bool) or not isinstance(value, str | int | float):
         return None
     return str(value) or None
@@ -394,9 +400,11 @@ def _endpoints_from_discovery(document: Any) -> dict[str, str]:
             if candidates:
                 feeds = candidates[0]["feeds"]
     endpoints = {
-        str(feed["name"]): str(feed["url"])
+        feed["name"]: feed["url"]
         for feed in (feeds if isinstance(feeds, list) else [])
-        if isinstance(feed, Mapping) and feed.get("name") and feed.get("url")
+        if isinstance(feed, Mapping)
+        and _plain_text(feed.get("name"))
+        and _plain_text(feed.get("url"))
     }
     if not endpoints:
         raise FeedParseError("GBFS discovery document lists no usable feeds")
@@ -736,6 +744,8 @@ class GbfsFeedHandle:
         for info in info_rows:
             latitude = _coordinate(info.get("lat"))
             longitude = _coordinate(info.get("lon"))
+            if latitude is None or longitude is None:
+                latitude = longitude = None  # half a position is no position
             if zone is not None and (
                 latitude is None
                 or longitude is None
@@ -856,8 +866,9 @@ class GbfsFeedHandle:
             vehicles.append(
                 GbfsVehicle(
                     id=vehicle_id,
-                    latitude=latitude,
-                    longitude=longitude,
+                    # Half a position is no position.
+                    latitude=latitude if located else None,
+                    longitude=longitude if located else None,
                     is_reserved=_as_bool(row.get("is_reserved")),
                     is_disabled=_as_bool(row.get("is_disabled")),
                     # _record_id, matching _vehicle_types and

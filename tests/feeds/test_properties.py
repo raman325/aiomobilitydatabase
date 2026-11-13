@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import pytest
 from google.transit import gtfs_realtime_pb2
-from hypothesis import HealthCheck, event, given, settings
+from hypothesis import HealthCheck, event, example, given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds import TripQuery
@@ -37,6 +37,7 @@ from aiomobilitydatabase.feeds.gbfs import (
     _coordinate,
     _endpoints_from_discovery,
     _localized,
+    _record_id,
     _ttl_seconds,
     _vehicle_types,
     _version_key,
@@ -3785,8 +3786,13 @@ def _gbfs_id_text(max_size: int) -> st.SearchStrategy[str]:
     filtered so no draw is rejected.
     """
     return st.text(min_size=1, max_size=max_size).map(
-        lambda value: "id" if value == "None" else value
+        lambda value: "id" if value in _STRINGIFIED else value
     )
+
+
+# What stringifying a non-id JSON value spells: None, a boolean, a
+# non-finite number. Properties assert no id reads as one of these.
+_STRINGIFIED = frozenset({"None", "True", "False", "nan", "inf", "-inf"})
 
 
 @st.composite
@@ -6117,6 +6123,15 @@ def test_get_stations_total_over_json_documents(
     zone=st.none() | st.just(_GBFS_ZONE),
 )
 @settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+# Half a position beside a station: shown at the station, not half-placed.
+@example(
+    document={
+        "vehicles": [{"vehicle_id": "v", "station_id": "s", "lat": 1.5, "lon": "x"}],
+        "bikes": [{"bike_id": "v", "station_id": "s", "lat": 1.5, "lon": "x"}],
+    },
+    endpoint="vehicle_status",
+    zone=None,
+)
 def test_get_vehicles_total_over_json_documents(
     document: object, endpoint: str, zone: Circle | None
 ) -> None:
@@ -6130,7 +6145,7 @@ def test_get_vehicles_total_over_json_documents(
     event(f"vehicles parsed from arbitrary json: {bool(vehicles)}")
     ids = [vehicle.id for vehicle in vehicles]
     assert all(ids)
-    assert not {"None", "True", "False"} & set(ids)
+    assert not _STRINGIFIED & set(ids)
     for vehicle in vehicles:
         located = isinstance(vehicle.latitude, float) and isinstance(
             vehicle.longitude, float
@@ -6138,7 +6153,8 @@ def test_get_vehicles_total_over_json_documents(
         assert located or (
             vehicle.latitude is None
             and vehicle.longitude is None
-            and vehicle.station_id not in (None, "True", "False")
+            and vehicle.station_id is not None
+            and vehicle.station_id not in _STRINGIFIED
         )
 
 
@@ -7411,3 +7427,44 @@ def test_rt_auth_knob_placement(case: _RtAuthCase) -> None:
     assert _rt_header_variants(wire.headers, case.api_key_name) == [
         (case.api_key_name, case.api_key)
     ]
+
+
+def test_json_values_that_are_no_id_or_text_are_dropped() -> None:
+    """A boolean, object, array or non-finite number is no GBFS id, and
+    no localized text: ``false`` never becomes ``"False"``, nor ``NaN``
+    ``"nan"`` (json.loads accepts it). JSON has one number type, so ``7.0``
+    is the id ``"7"``, as ``7`` is. A vehicle whose ``station_id`` is
+    ``false`` and that has no position is no vehicle; discovery skips an
+    entry whose url is not a string."""
+    assert [_record_id(v) for v in ("v1", 7, 7.0, 7.5, 1e16)] == [
+        "v1",
+        "7",
+        "7",
+        "7.5",
+        "10000000000000000",
+    ]
+    assert {
+        _record_id(v) for v in (False, True, {}, [], None, "", math.nan, math.inf)
+    } == {None}
+    assert _localized([{"text": False, "language": "en"}]) is None
+    rows = [
+        {"vehicle_id": "a", "station_id": False},
+        {"vehicle_id": False, "lat": 1.0, "lon": 2.0},
+        {"vehicle_id": "b", "station_id": 7.0, "lat": True, "lon": 2.0},
+    ]
+    vehicles = asyncio.run(
+        _gbfs_handle({"vehicle_status": {"vehicles": rows}}).get_vehicles()
+    )
+    assert [(v.id, v.station_id, v.latitude, v.longitude) for v in vehicles] == [
+        ("b", "7", None, None)
+    ]
+    assert _endpoints_from_discovery(
+        {
+            "data": {
+                "feeds": [
+                    {"name": "vehicle_status", "url": True},
+                    {"name": "free_bike_status", "url": "https://e.com/f.json"},
+                ]
+            }
+        }
+    ) == {"free_bike_status": "https://e.com/f.json"}
