@@ -3,6 +3,7 @@
 from datetime import UTC, datetime
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
+from aiomobilitydatabase.feeds.gbfs import _record_id
 from aiomobilitydatabase.feeds.geo import Circle
 
 from tests.feeds.fixtures import (
@@ -219,3 +220,13 @@ async def test_numeric_vehicle_type_id_joins_against_vehicle_types(
     # scalar at this boundary rather than raising OverflowError.
     assert vehicle.current_range_m is None
     assert vehicle.current_fuel_percent is None
+
+
+def test_only_strings_and_numbers_are_ids() -> None:
+    """GBFS ids are strings, and a number reads as one; a JSON boolean,
+    object or array is no id -- ``false`` must not become ``"False"``, a
+    vehicle parked at a station of that name."""
+    assert [_record_id(value) for value in ("v1", 7, 7.5)] == ["v1", "7", "7.5"]
+    assert [_record_id(value) for value in (False, True, {}, [], None, "")] == [
+        None
+    ] * 6
