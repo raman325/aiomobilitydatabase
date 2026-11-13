@@ -870,22 +870,44 @@ def scheduled_overrides(
 
     A copy's StopTimeEvent may carry its own ``scheduled_time`` "if a
     duplicated trip runs have different run or dwell times compared to the
-    original". Each event's replaces that event only: the copy has a
-    schedule already (its original's, moved), so an event an update leaves
-    out keeps its own time -- never the other event's -- and only a
-    departure that would come before its arrival is brought up to it.
+    original". Each stated event replaces that event only -- the copy has a
+    schedule already, its original's moved -- and at a stop the original
+    leaves untimed a lone stated time is both, as in stop_times. Within a
+    stop the event left unstated yields to the stated one (an arrival is
+    never after its departure); along the trip, times never run backwards:
+    one earlier than the stop before it is raised to it.
     """
     overridden = list(calls)
     for pos, stu in _placed(entry, calls).items():
         call = calls[pos]
-        arrival = stu.scheduled_arrival or call.arrival
-        departure = stu.scheduled_departure or call.departure
+        stated_arrival, stated_departure = (
+            stu.scheduled_arrival,
+            stu.scheduled_departure,
+        )
+        if stated_arrival is None and stated_departure is None:
+            continue
+        if call.arrival is None and call.departure is None:
+            stated_arrival = stated_arrival or stated_departure
+            stated_departure = stated_departure or stated_arrival
+        arrival = stated_arrival or call.arrival
+        departure = stated_departure or call.departure
         if arrival is not None and departure is not None and departure < arrival:
-            if stu.scheduled_departure is not None and stu.scheduled_arrival is None:
+            if stated_departure is not None and stated_arrival is None:
                 arrival = departure
             else:
                 departure = arrival
         overridden[pos] = replace(call, arrival=arrival, departure=departure)
+    latest: datetime | None = None
+    for pos, call in enumerate(overridden):
+        arrival, departure = call.arrival, call.departure
+        if latest is not None:
+            arrival = max(arrival, latest) if arrival is not None else None
+            departure = max(departure, latest) if departure is not None else None
+        if arrival is not None and departure is not None and departure < arrival:
+            departure = arrival
+        if (arrival, departure) != (call.arrival, call.departure):
+            overridden[pos] = replace(call, arrival=arrival, departure=departure)
+        latest = departure or arrival or latest
     return overridden
 
 
@@ -1191,12 +1213,26 @@ def _extra_trips(
     any removal naming the id drops it. One with no id stands alone. A
     DUPLICATED record lacking any of TripProperties' trip_id, start_date
     and start_time ("required if schedule_relationship is DUPLICATED")
-    names no copy.
+    names no copy. An ADDED naming a DUPLICATED's original or copy is the
+    pre-migration form of that copy and is ignored, as the migration guide
+    tells consumers to.
     """
     descriptor = gtfs_realtime_pb2.TripDescriptor
+    # The ADDED-to-DUPLICATED migration guide: consumers ignore an ADDED
+    # whose trip_id is a DUPLICATED's trip_id (the original) or its
+    # TripProperties.trip_id (the copy) -- a producer may send both.
+    migrated = {
+        trip_id
+        for record in records
+        if record.relationship == descriptor.DUPLICATED
+        for trip_id in (record.trip_id, record.copy_trip_id)
+        if trip_id
+    }
     by_id: dict[str, RealtimeTrip | TripUpdateRecord] = {}
     anonymous: list[RealtimeTrip] = []
     for record in records:
+        if record.relationship == descriptor.ADDED and record.trip_id in migrated:
+            continue
         if record.relationship in (descriptor.NEW, descriptor.ADDED):
             trip = _realtime_trip(record, replaces=False)
             if record.trip_id:

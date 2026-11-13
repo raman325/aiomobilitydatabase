@@ -2080,3 +2080,81 @@ def test_a_new_trip_and_a_copy_sharing_an_id_are_one_trip() -> None:
         assert [
             (r.trip_id, r.scheduled_departure) for r in board if r.trip_id == "N"
         ] == expected
+
+
+def test_an_added_paired_with_its_duplicate_is_ignored() -> None:
+    """The ADDED-to-DUPLICATED migration guide: a producer may send both,
+    and consumers ignore the ADDED whose trip_id is the DUPLICATED's
+    trip_id (the original) or its TripProperties.trip_id (the copy) --
+    whichever comes first. One bus is listed once, on its copy schedule."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    copy = _duplicate(("T-2", "20260730", "09:30:00"))
+    for added_id in ("T", "T-2"):
+        added = {
+            "trip_id": added_id,
+            "start_date": "20260730",
+            "relationship": descriptor.ADDED,
+            "calls": [("S0", None, _at(90), False), ("S1", _at(100), None, False)],
+        }
+        for parts in ([added, copy], [copy, added]):
+            board = _run_feeds(
+                _DIRECTED,
+                _board(_EIGHT - timedelta(minutes=30)),
+                [_descriptor_message(*parts)],
+            )
+            assert [
+                (r.trip_id, r.scheduled_departure, r.predicted_departure)
+                for r in board
+                if r.predicted_departure is not None or r.trip_id == "T-2"
+            ] == [("T-2", _at(90), None)], (added_id, parts[0]["relationship"])
+
+
+def test_a_lone_stated_time_on_an_untimed_stop_is_both() -> None:
+    """At a stop the original leaves untimed, a lone stated scheduled_time is
+    both times, as in stop_times: the row is ordered and windowed by it,
+    and a journey from it has a departure."""
+    files = _feed(
+        stops="stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\nS2,C,0,0\n",
+        stop_times=(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence,timepoint\n"
+            "T,08:00:00,08:00:00,S0,1,1\nT,,,S1,2,0\nT,08:25:00,08:25:00,S2,3,1\n"
+        ),
+    )
+
+    def run(minutes: int) -> tuple[object, ...]:
+        message = _descriptor_message(
+            _duplicate(
+                ("T-2", "20260730", "09:30:00"),
+                stops=[{"stop": "S1", "scheduled_arrival": _at(minutes)}],
+            )
+        )
+        return _run_feeds(files, _boards_and_journeys(("S1", "S2")), [message])
+
+    board, (s1_s2,) = run(100)
+    assert [row[:3] for row in board if row[0] == "T-2"] == [
+        ("T-2", "S0", _at(90)),
+        ("T-2", "S1", _at(100)),
+        ("T-2", "S2", _at(115)),
+    ]
+    assert ("T-2", _at(100), None, None, "Downtown", "R") in s1_s2
+    late, _ = run(300)  # 13:00: outside the 07:30-10:30 window
+    assert [row[1] for row in late if row[0] == "T-2"] == ["S0"]
+
+
+def test_a_copys_times_never_run_backwards() -> None:
+    """A stated time later than the next stop's moved one raises it: S1
+    leaving at 10:00 brings S2 (moved 09:55) up to 10:00, so no stop comes
+    before the one before it and no journey arrives before it departs."""
+    rows = _copy_at_s1([{"stop": "S1", "scheduled_departure": _at(120)}])
+    assert rows == [
+        ("S0", _at(90), _at(90), None, None),
+        ("S1", _at(100), _at(120), None, None),
+        ("S2", _at(120), _at(120), None, None),
+    ]
+
+
+def test_a_stated_departure_pulls_its_arrival_back() -> None:
+    """Within a stop the unstated event yields to the stated one: a stated
+    departure before the moved arrival brings the arrival back to it."""
+    rows = _copy_at_s1([{"stop": "S1", "scheduled_departure": _at(98)}])
+    assert rows[1] == ("S1", _at(98), _at(98), None, None)
