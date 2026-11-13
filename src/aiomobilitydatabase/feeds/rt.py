@@ -679,7 +679,8 @@ class RealtimeTrip:
     ``direction_id`` and ``headsign`` are what the update says
     (``TripProperties.trip_headsign`` for the headsign); a replacement,
     once matched, takes the replaced run's ``trip_id`` (a frequency
-    repetition's own), route and direction, and its headsign where the
+    repetition's own; a headway-based run's, its own start's), route and
+    direction, and its headsign where the
     update gives none.
     """
 

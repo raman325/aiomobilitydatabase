@@ -387,7 +387,8 @@ class StopArrival:
     and ``block_id`` are None; ``route_id``, ``direction_id``,
     ``headsign`` and ``trip_short_name`` are what the update gives
     (TripProperties for the last two) -- a replacement shows under the
-    trip it replaces (its ``trip_id``, a frequency repetition's own, route
+    trip it replaces (its ``trip_id``, a frequency repetition's own -- a
+    headway-based run's, its own start's -- route
     and direction; its headsign where the update gives none). A
     DUPLICATED copy is its original moved to the copy's start: its own
     ``trip_id`` (``TripProperties.trip_id``), the original's schedule

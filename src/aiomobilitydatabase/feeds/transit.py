@@ -89,9 +89,11 @@ from .static_index import (
     _LATEST_INSTANT,
     ScheduledDeparture,
     ScheduledTrip,
+    SlotRun,
     StaticIndex,
     TripCall,
     TripInstanceCalls,
+    repetition_trip_id,
 )
 
 if TYPE_CHECKING:
@@ -658,10 +660,22 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
 
 
 def _moved_calls(
-    entry: TripUpdateEntry, run: TripInstanceCalls
+    entry: TripUpdateEntry,
+    run: TripInstanceCalls,
+    predictable: Collection[int] | None = None,
 ) -> tuple[RealtimeCall, ...]:
-    """Return a moved run's calls, its updates resolved against them."""
-    resolved = resolve_trip_predictions(entry, run.calls)
+    """Return a moved run's calls, its updates resolved against them.
+
+    With ``predictable``, only the calls of those stop_sequences are what
+    the updates address; any other (a detour's replacement stop) is
+    schedule-only, and a carried-on time passes over it.
+    """
+    resolved = resolve_trip_predictions(
+        entry,
+        run.calls
+        if predictable is None
+        else [call for call in run.calls if call.stop_sequence in predictable],
+    )
     calls: list[RealtimeCall] = []
     for call in run.calls:
         if call.stop_sequence in resolved.skipped:
@@ -736,17 +750,25 @@ def _detoured(
 
 
 def _slot_run(
-    key: TripUpdateKey, entry: TripUpdateEntry, run: TripInstanceCalls, slot_start: int
+    key: TripUpdateKey,
+    entry: TripUpdateEntry,
+    slot: SlotRun,
+    detoured: TripInstanceCalls,
 ) -> RealtimeTrip:
     """Build an exact_times=0 run from the repetition whose slot it takes.
 
     It is its trip at its own start (see :meth:`StaticIndex.slot_runs`),
-    detoured as given, the trip's descriptors its own, its updates' times
-    alone predicting it (:func:`_times_only`). Such service "does not
-    follow a fixed schedule", so no delay is reported against the moved
-    one. It stands in for that repetition, and its vehicle names it by its
-    own start.
+    ``detoured`` its calls with the detours that select it applied, the
+    trip's descriptors its own, its updates' times alone predicting it
+    (:func:`_times_only`) -- never at a detour's replacement stop: "a
+    TripUpdate with a ModifiedTripSelector is the only way to create
+    predictions at replacement stops", and none is read. Such service
+    "does not follow a fixed schedule", so no delay is reported against
+    the moved one. It stands in for that repetition, and its vehicle
+    names it by its own start.
     """
+    run = detoured
+    own = {call.stop_sequence for call in slot.run.calls}
     return RealtimeTrip(
         trip_id=run.trip_id,
         route_id=run.route_id,
@@ -756,9 +778,9 @@ def _slot_run(
         vehicle_id=entry.vehicle_id,
         calls=tuple(
             replace(call, delay_seconds=None)
-            for call in _moved_calls(_times_only(entry), run)
+            for call in _moved_calls(_times_only(entry), run, own)
         ),
-        replaces=(run.source_trip_id, run.service_date, slot_start),
+        replaces=(run.source_trip_id, run.service_date, slot.slot_start),
         run=key,
         wheelchair_accessible=run.wheelchair_accessible,
         bikes_allowed=run.bikes_allowed,
@@ -2055,8 +2077,8 @@ class TransitFeedHandle:
             _slot_run(
                 key,
                 updates.trips.pop(key),
+                slots[key],
                 _detoured(slots[key].run, modifications, rt_stops or {}, stops_by_id),
-                slots[key].slot_start,
             )
             for key in list(updates.trips)
             if key in slots
@@ -2083,6 +2105,16 @@ class TransitFeedHandle:
             else trip
             for trip in updates.realtime_trips
             if not trip.replaces or trip.replaces in runs
+        ]
+        # A replacement of a run in a slot is that run, under its own id: the
+        # slot's other runs are other vehicles.
+        updates.realtime_trips = [
+            replace(trip, trip_id=repetition_trip_id(trip.run[0], trip.run[2]))
+            if trip.run is not None
+            and trip.run[2] is not None
+            and trip.run != trip.replaces
+            else trip
+            for trip in updates.realtime_trips
         ]
         updates.realtime_trips.extend(slot_runs)
         # A DUPLICATED copy is its original's calls, moved to the copy's
@@ -2449,6 +2481,7 @@ class TransitFeedHandle:
                     modified_rows=modified_rows,
                     modified_instances=modified_instances,
                     stops_by_id=stops_by_id,
+                    rt_stops=rt_stops,
                     routes_by_id=routes_by_id,
                     vehicles=vehicles,
                     memo=memo,
@@ -2496,6 +2529,7 @@ class TransitFeedHandle:
         modified_rows: Sequence[StopArrival],
         modified_instances: Collection[tuple[str, date]],
         stops_by_id: Mapping[str, Stop],
+        rt_stops: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
         vehicles: _Vehicles,
         memo: _PredictionMemo,
@@ -2596,7 +2630,8 @@ class TransitFeedHandle:
                 updates.realtime_trips,
                 set(all_stop_ids),
                 end=end,
-                stops_by_id=stops_by_id,
+                # A stop realtime defines (a detour's) is defined only there.
+                stops_by_id={**stops_by_id, **rt_stops},
                 routes_by_id=routes_by_id,
                 vehicles=vehicles,
             )

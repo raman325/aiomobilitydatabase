@@ -375,9 +375,10 @@ Notes on direct mode:
   be used in case the trip update refers to a scheduled GTFS trip, as
   opposed to a frequency-based trip"), and no `delay_seconds` is reported
   against a schedule such service does not keep. A cancellation, deletion
-  or replacement of such a run is one of its slot's repetition, so a slot
-  shows one row for its runs: a running one, else its repetition
-  cancelled, unless any is deleted. A run's vehicle is the one naming
+  or replacement of such a run is one of its slot's repetition: the
+  slot's running and replacing runs are shown in its place, and only with
+  none is the repetition itself shown cancelled (or, if any run in the
+  slot is deleted, not at all). A run's vehicle is the one naming
   its own start; a vehicle alone, with no update for its run, adds no
   run. A start in no slot, or on a day the trip does not run, names no
   run.
