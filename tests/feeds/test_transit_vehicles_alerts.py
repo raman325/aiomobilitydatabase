@@ -222,6 +222,7 @@ async def test_refresh_static_overtaken_by_another_build(
             await handle.refresh_static()
         assert handle.static_dataset == served
     assert closed == overtaken  # every overtaken index closed
+    handle.close()
 
 
 async def test_stops_in_zone(

@@ -5,6 +5,7 @@ import os
 import sqlite3
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -838,10 +839,37 @@ def test_a_reopened_file_that_is_no_index_is_refused(
         return result
 
     monkeypatch.setattr(Path, "replace", replace_with_a_stranger)
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracked(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracked)
     with pytest.raises(FeedParseError):
         StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ)
     if stranger == "purged":
         assert not db_path.exists()
+    for conn in opened:  # every connection the build opened is closed
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_a_build_reopens_a_target_whose_path_needs_quoting(tmp_path: Path) -> None:
+    """The reopen goes through a file: URI: a path with spaces, percent
+    signs and URI punctuation still names the file."""
+    folder = tmp_path / "a b%20c#d?e;f&g"
+    folder.mkdir()
+    index = StaticIndex.build(
+        _write_zip(tmp_path), str(folder / "static.db"), DATASET, TZ
+    )
+    try:
+        assert index.dataset_id == DATASET
+        assert index.stops()
+    finally:
+        index.close()
 
 
 def test_a_scratch_file_is_removed_when_its_connection_fails(

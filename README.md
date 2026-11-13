@@ -565,7 +565,7 @@ each define their own subtree beneath it, so you can catch broadly
 | `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
 | `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, or a malformed scalar in a structural GTFS column |
-| `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset |
+| `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
 
 The GBFS and GTFS-RT parse paths are **total** with respect to this table:
 any producer document, however malformed, either returns a typed result or
