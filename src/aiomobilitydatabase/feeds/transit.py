@@ -63,6 +63,8 @@ from .models import (
 )
 from .rt import (
     Modification,
+    RealtimeCall,
+    RealtimeTrip,
     TripModifications,
     TripPredictions,
     TripUpdateKey,
@@ -206,8 +208,8 @@ def _run_key(identity: _RtIdentity, service_date: date) -> TripUpdateKey:
 def _effective_departure(arrival: StopArrival, fallback: datetime) -> datetime:
     """Return a row's :attr:`StopArrival.effective_departure`, else ``fallback``.
 
-    ``fallback`` is for a row with no time at all (an RT-added row that
-    announces neither arrival nor departure), which sorts at ``start``.
+    ``fallback`` stands in where it is None, which no row a query builds
+    is (a realtime call with no time is not shown).
     """
     return arrival.effective_departure or fallback
 
@@ -219,12 +221,16 @@ class _Vehicles:
     ``by_instance`` is keyed by (trip id, start seconds, service date) --
     the trip, the repetition of a frequency-based trip, and the run's
     service day, as matching resolved the vehicle's TripDescriptor (see
-    :func:`_dated`). A date-less claim keeps a None day only where it names
-    no scheduled run: it can then ride an RT-added trip of that id.
+    :func:`_dated`); a date-less claim naming no scheduled run keeps a None
+    day and so matches no run. ``by_trip_id`` maps each trip id some
+    vehicle names, and the schedule does not, to that vehicle, or None
+    where two do: how an extra trip, identified by the id its producer
+    minted, finds its vehicle.
     """
 
     by_vehicle_id: Mapping[str, VehiclePosition]
     by_instance: Mapping[tuple[str, int | None, date | None], VehiclePosition | None]
+    by_trip_id: Mapping[str, VehiclePosition | None]
 
 
 # A trip reference as a TripDescriptor sends it: (trip_id, start_date,
@@ -307,6 +313,7 @@ def _record_trip_id(
 def _vehicle_index(
     claims: Sequence[tuple[_Reference, _Precedence, VehiclePosition]],
     positions: Sequence[VehiclePosition],
+    scheduled_trip_ids: Collection[str],
 ) -> _Vehicles:
     """Index live vehicles for matching, by vehicle id and by matched run.
 
@@ -334,11 +341,26 @@ def _vehicle_index(
             and any(other.vehicle_id == vehicle.vehicle_id for other in held[1])
         ):
             held[1].append(vehicle)
+    # Only ids the schedule does not know: a vehicle on a scheduled trip
+    # rides that trip's run, never an extra trip reusing its id.
+    by_trip: dict[str, list[VehiclePosition]] = {}
+    for vehicle in positions:
+        if vehicle.trip_id and vehicle.trip_id not in scheduled_trip_ids:
+            named = by_trip.setdefault(vehicle.trip_id, [])
+            if not (
+                vehicle.vehicle_id
+                and any(other.vehicle_id == vehicle.vehicle_id for other in named)
+            ):
+                named.append(vehicle)
     return _Vehicles(
         by_vehicle_id,
         {
             key: vehicles[0] if len(vehicles) == 1 else None
             for key, (_precedence, vehicles) in best.items()
+        },
+        {
+            trip_id: vehicles[0] if len(vehicles) == 1 else None
+            for trip_id, vehicles in by_trip.items()
         },
     )
 
@@ -350,7 +372,6 @@ def _match_vehicle(
     *,
     service_date: date | None,
     vehicles: _Vehicles,
-    scheduled: bool = True,
 ) -> VehiclePosition | None:
     """Return the vehicle serving a row, or None if it is not pinnable.
 
@@ -366,23 +387,14 @@ def _match_vehicle(
     GTFS-RT requires both start_time and start_date for a frequencies.txt
     trip, so a vehicle lacking either names no repetition, exactly as a
     TripUpdate lacking either does.
-    ``scheduled=False`` is an RT-added row: it matches a vehicle naming
-    its ``service_date`` (the added trip's own start_date, possibly None)
-    or naming no day at all.
     """
     if vehicle_id and (vehicle := vehicles.by_vehicle_id.get(vehicle_id)) is not None:
         return vehicle
     if not plain_trip_id:
         return None
-    if service_date is not None and (
-        dated := vehicles.by_instance.get((plain_trip_id, start_secs, service_date))
-    ):
-        return dated
-    if not scheduled and (
-        dateless := vehicles.by_instance.get((plain_trip_id, start_secs, None))
-    ):
-        return dateless
-    return None
+    if service_date is None:
+        return None
+    return vehicles.by_instance.get((plain_trip_id, start_secs, service_date))
 
 
 def _selector_index(
@@ -573,9 +585,198 @@ def _detoured_rows(
     return rows
 
 
-def _effective_trip_departure(trip: UpcomingTrip) -> datetime:
-    """Return a journey's :attr:`UpcomingTrip.effective_departure`."""
-    return trip.effective_departure
+def _replacing(
+    trip: RealtimeTrip,
+    concrete_trip_id: str,
+    summaries: Mapping[str, tuple[str, str | None, int | None]],
+) -> RealtimeTrip:
+    """Return a replacement as its run: that trip's id, route and direction.
+
+    A TripDescriptor's route and direction only select the trip; they
+    cannot move it to another route. The headsign may differ ("when it
+    differs from the original"), else is the trip's.
+    """
+    route_id, headsign, direction_id = summaries.get(
+        concrete_trip_id, (trip.route_id or "", None, trip.direction_id)
+    )
+    return replace(
+        trip,
+        trip_id=concrete_trip_id,
+        route_id=route_id,
+        headsign=trip.headsign or headsign,
+        direction_id=direction_id,
+    )
+
+
+def _realtime_vehicle(
+    trip: RealtimeTrip, vehicles: _Vehicles
+) -> VehiclePosition | None:
+    """Return the vehicle running a realtime-only trip.
+
+    A replacement is the run it replaces, matched exactly as that run is:
+    by its trip, repetition and service day. An extra trip by its own
+    vehicle id, else the one vehicle naming the trip id its producer
+    minted for it.
+    """
+    if trip.replaces is not None:
+        source_trip_id, service_date, start_secs = trip.replaces
+        return _match_vehicle(
+            trip.vehicle_id,
+            source_trip_id,
+            start_secs,
+            service_date=service_date,
+            vehicles=vehicles,
+        )
+    if trip.vehicle_id and (vehicle := vehicles.by_vehicle_id.get(trip.vehicle_id)):
+        return vehicle
+    return vehicles.by_trip_id.get(trip.trip_id) if trip.trip_id else None
+
+
+def _in_window(call: RealtimeCall, end: datetime | None) -> bool:
+    """Whether a realtime-only call falls in a query's window.
+
+    The one rule every row follows: its scheduled time, else (with no
+    schedule) its predicted time, at or before ``end``.
+    """
+    when = call.scheduled_departure or call.departure or call.arrival
+    return end is None or when is None or when <= end
+
+
+def _realtime_rows(
+    trips: Sequence[RealtimeTrip],
+    wanted_stops: Collection[str],
+    *,
+    end: datetime | None,
+    stops_by_id: Mapping[str, Stop],
+    routes_by_id: Mapping[str, Route],
+    vehicles: _Vehicles,
+) -> list[StopArrival]:
+    """Board rows for realtime-only trips, at the queried stops.
+
+    There is no schedule row: the times are the update's own (its
+    ``scheduled_time`` and predictions), and every stop_time descriptor --
+    timepoint included, whose absent-means-exact default only applies to
+    rows in stop_times -- is unknown.
+    """
+    rows: list[StopArrival] = []
+    for trip in trips:
+        vehicle = _realtime_vehicle(trip, vehicles)
+        for call in trip.calls:
+            if call.stop_id not in wanted_stops or not _in_window(call, end):
+                continue
+            rows.append(
+                StopArrival(
+                    stop_id=call.stop_id,
+                    stop=stops_by_id.get(call.stop_id),
+                    route_id=trip.route_id,
+                    route=routes_by_id.get(trip.route_id) if trip.route_id else None,
+                    trip_id=trip.trip_id,
+                    service_id=None,
+                    headsign=trip.headsign,
+                    scheduled_arrival=call.scheduled_arrival,
+                    scheduled_departure=call.scheduled_departure,
+                    predicted_arrival=call.arrival,
+                    predicted_departure=call.departure,
+                    delay_seconds=call.delay_seconds,
+                    realtime=True,
+                    canceled=False,
+                    vehicle_id=trip.vehicle_id,
+                    vehicle=vehicle,
+                    wheelchair_accessible=None,
+                    bikes_allowed=None,
+                    direction_id=trip.direction_id,
+                    pickup_type=None,
+                    drop_off_type=None,
+                    timepoint_exact=None,
+                    stop_headsign=None,
+                    trip_short_name=None,
+                    block_id=None,
+                )
+            )
+    return rows
+
+
+def _realtime_journeys(
+    trips: Sequence[RealtimeTrip],
+    origin_stop_id: str,
+    destination_stop_id: str,
+    *,
+    end: datetime | None,
+    stops_by_id: Mapping[str, Stop],
+    routes_by_id: Mapping[str, Route],
+    vehicles: _Vehicles,
+) -> list[UpcomingTrip]:
+    """Journeys on realtime-only trips, origin then destination.
+
+    A trip's calls are in journey order, so each call at the origin pairs
+    with the next call at the destination after it. The times are the
+    update's own (its ``scheduled_time`` and predictions); pickup and
+    drop-off are unknown rather than refused.
+    """
+    journeys: list[UpcomingTrip] = []
+    for trip in trips:
+        vehicle = _realtime_vehicle(trip, vehicles)
+        for index, board in enumerate(trip.calls):
+            if board.stop_id != origin_stop_id or not _in_window(board, end):
+                continue
+            alight = next(
+                (
+                    call
+                    for call in trip.calls[index + 1 :]
+                    if call.stop_id == destination_stop_id
+                ),
+                None,
+            )
+            if alight is None:
+                continue
+            journeys.append(
+                UpcomingTrip(
+                    trip_id=trip.trip_id,
+                    route_id=trip.route_id,
+                    service_id=None,
+                    route=routes_by_id.get(trip.route_id) if trip.route_id else None,
+                    headsign=trip.headsign,
+                    origin_stop_id=origin_stop_id,
+                    origin_stop=stops_by_id.get(origin_stop_id),
+                    destination_stop_id=destination_stop_id,
+                    destination_stop=stops_by_id.get(destination_stop_id),
+                    scheduled_departure=board.scheduled_departure,
+                    predicted_departure=board.departure,
+                    origin_predicted_arrival=board.arrival,
+                    scheduled_arrival=alight.scheduled_arrival,
+                    predicted_arrival=alight.arrival,
+                    delay_seconds=board.delay_seconds,
+                    realtime=True,
+                    canceled=False,
+                    vehicle_id=trip.vehicle_id,
+                    vehicle=vehicle,
+                    wheelchair_accessible=None,
+                    bikes_allowed=None,
+                    direction_id=trip.direction_id,
+                    origin_pickup_type=None,
+                    origin_drop_off_type=None,
+                    origin_timepoint_exact=None,
+                    origin_stop_headsign=None,
+                    destination_pickup_type=None,
+                    destination_drop_off_type=None,
+                    destination_timepoint_exact=None,
+                    destination_stop_headsign=None,
+                    is_first=False,
+                    is_last=False,
+                    trip_short_name=None,
+                    block_id=None,
+                )
+            )
+    return journeys
+
+
+def _effective_trip_departure(trip: UpcomingTrip, fallback: datetime) -> datetime:
+    """Return a journey's :attr:`UpcomingTrip.effective_departure`.
+
+    ``fallback`` stands in where it is None, which no journey a query
+    builds is (each has an origin time).
+    """
+    return trip.effective_departure or fallback
 
 
 # Open-ended queries read the schedule over a growing horizon: the first
@@ -1537,12 +1738,14 @@ class TransitFeedHandle:
         start time and date (:meth:`StaticIndex.alternative_trip_ids`); a
         plain trip's own start time is dropped and a date-less reference
         given its day (:func:`_dated`), each feed's at that feed's own
-        header time -- never at another feed's. ADDED trips are not in the
-        schedule and keep their references as sent, as does a cancellation
-        or deletion naming no scheduled run (it can still remove an ADDED
-        trip of that id); any other update left without a trip or a date
-        is dropped (a dated one for a day its trip does not run simply
-        matches no row).
+        header time -- never at another feed's. NEW and ADDED trips are not
+        in the schedule and keep their references as sent, as do a
+        cancellation or deletion naming no scheduled run (it can still
+        remove an extra trip of that id); any other update left without a
+        trip or a date is dropped (a dated one for a day its trip does not
+        run simply matches no row), and so is a replacement naming no run
+        that operates (see below) -- it is a scheduled run on a new
+        schedule, and replaces nothing.
         TripUpdates from every TU-capable sibling feed then merge: a
         cancellation or deletion anywhere wins, and of several updates for
         one run the most explicit reference wins, then the later feed in
@@ -1552,6 +1755,8 @@ class TransitFeedHandle:
         """
         descriptor = gtfs_realtime_pb2.TripDescriptor
         removals = (descriptor.CANCELED, descriptor.DELETED)
+        # Not in the schedule: kept as sent.
+        extras = (descriptor.NEW, descriptor.ADDED)
         tu_feeds = [
             (trip_update_records(message), feed_timestamp(message))
             for message in tu_messages
@@ -1607,7 +1812,7 @@ class TransitFeedHandle:
             for record, ((trip_id, day, secs), precedence) in zip(
                 records, dated, strict=True
             ):
-                if record.relationship == descriptor.ADDED:
+                if record.relationship in extras:
                     ranked.append(((True, True), record))
                 elif trip_id and day is not None:
                     ranked.append(
@@ -1620,8 +1825,9 @@ class TransitFeedHandle:
                     )
                 elif record.relationship in removals:
                     # Names no scheduled run, so as sent it removes none --
-                    # but it still removes an ADDED trip of that id.
+                    # but it still removes an extra trip of that id.
                     ranked.append((precedence, record))
+
         # Stable: least explicit first, so the most explicit (then the
         # later feed, then the later entity) wins.
         ranked.sort(key=lambda item: item[0])
@@ -1636,12 +1842,38 @@ class TransitFeedHandle:
                     strict=True,
                 )
             )
-        return (
-            indexed_trip_updates(record for _, record in ranked),
-            _vehicle_index(
-                claims, [vehicle for vehicles, _ in vp_feeds for vehicle in vehicles]
-            ),
+        updates = indexed_trip_updates(record for _, record in ranked)
+        # A replacement is the run it replaces, on a new schedule: one
+        # naming no run that operates replaces nothing and is dropped, as
+        # predictions for no run are. It shows as that run: its trip id (a
+        # frequency repetition's), route and direction, and its headsign
+        # where the update gives none.
+        runs = {
+            key: instance
+            for instance, key in await self._index_read(
+                self._index.rt_instances,
+                [trip.replaces for trip in updates.realtime_trips if trip.replaces],
+            )
+        }
+        summaries = await self._index_read(
+            self._index.trip_summaries,
+            sorted({trip_id for trip_id, _day in runs.values()}),
         )
+        updates.realtime_trips = [
+            _replacing(trip, runs[trip.replaces][0], summaries)
+            if trip.replaces
+            else trip
+            for trip in updates.realtime_trips
+            if not trip.replaces or trip.replaces in runs
+        ]
+        positions = [vehicle for vehicles, _ in vp_feeds for vehicle in vehicles]
+        scheduled_trip_ids = set(
+            await self._index_read(
+                self._index.trip_summaries,
+                sorted({vehicle.trip_id for vehicle in positions if vehicle.trip_id}),
+            )
+        )
+        return updates, _vehicle_index(claims, positions, scheduled_trip_ids)
 
     async def _dated_references(
         self,
@@ -1727,15 +1959,13 @@ class TransitFeedHandle:
         filters and ``limit`` apply to the merged rows, so a filter can
         never see an empty board because other routes crowded out the
         limit. ``limit`` caps each query's merged result as a whole, not
-        per stop. RT-added rows carry no headsign and so never pass a
-        headsign filter; a row that announces neither arrival nor
-        departure keeps every time field ``None`` and sorts at ``start``.
-        Returns one list per query, in order.
+        per stop. Returns one list per query, in order.
 
         The window opens at ``start`` (default: now) and closes at ``end``
-        for SCHEDULED departures. A delayed trip scheduled inside the window
-        can be predicted after ``end``, and RT-added rows have no schedule
-        at all; both are kept, as before. With ``end=None`` the window is
+        for SCHEDULED departures: a realtime-only trip's calls by their
+        ``scheduled_time``, else (with none) their predicted time. A delayed
+        trip scheduled inside the window can be predicted after ``end``,
+        and is kept. With ``end=None`` the window is
         open-ended: each board fills to its ``limit`` however far ahead the
         departures are -- overnight, over a weekend, past a holiday.
 
@@ -1782,9 +2012,26 @@ class TransitFeedHandle:
         not predict stays on the board until its predicted arrival, if
         later than the scheduled departure. ``realtime`` is True for propagated-only
         and trip-delay-only stops too -- a propagated delay IS realtime
-        information. RT-ADDED trips get no propagation: with no static
-        schedule to propagate over, only their explicit StopTimeUpdates
-        surface.
+        information, and every row of a realtime-only trip is realtime.
+
+        A realtime-only trip -- NEW ("an extra trip unrelated to
+        any existing trips"; ADDED, deprecated, is read the same way) or a
+        REPLACEMENT, for which "the original schedule from the GTFS static
+        isn't used for the replaced instance" -- is shown by its updates
+        alone: one row per call that has a stop and a time and is not
+        SKIPPED, scheduled at its ``scheduled_time`` and predicted at its
+        own time, else its scheduled time moved by its own delay (a NO_DATA
+        call is scheduled only), with no propagation between calls. A
+        replacement is the run it replaces on a new schedule: it hides that
+        run (detours of it are not rebuilt), shows under its trip id, route
+        and direction, takes its vehicle and, where its update gives none,
+        its headsign; one naming no run that operates is dropped, as
+        predictions for no run are. A cancellation or deletion of the run
+        wins over its replacement, and any removal naming an extra trip's
+        id removes it. An extra trip is its trip_id: the same one from two
+        feeds is shown once, the last sent (one with no trip_id stands
+        alone); its vehicle is its own vehicle id's, else the one vehicle
+        naming that trip id.
 
         Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
         ids materialized from frequencies.txt) match RT via
@@ -1887,7 +2134,11 @@ class TransitFeedHandle:
                 modifications,
                 set(all_stop_ids),
                 end=end,
-                removed=updates.canceled_trips | updates.deleted_trips,
+                removed=(
+                    updates.canceled_trips
+                    | updates.deleted_trips
+                    | updates.replaced_trips
+                ),
                 rt_stops=rt_stops,
                 stops_by_id=stops_by_id,
                 routes_by_id=routes_by_id,
@@ -1928,6 +2179,7 @@ class TransitFeedHandle:
                     [scheduled[key] for key in sorted(scheduled)],
                     all_stop_ids,
                     start=start,
+                    end=end,
                     updates=updates,
                     modified_rows=modified_rows,
                     modified_instances=modified_instances,
@@ -1974,6 +2226,7 @@ class TransitFeedHandle:
         all_stop_ids: list[str],
         *,
         start: datetime,
+        end: datetime | None,
         updates: TripUpdates,
         modified_rows: Sequence[StopArrival],
         modified_instances: Collection[tuple[str, date]],
@@ -1986,22 +2239,23 @@ class TransitFeedHandle:
 
         ``scheduled`` is every scheduled row read so far. Adds the detoured
         runs' rebuilt rows (``modified_rows``, replacing those runs'
-        schedule), the realtime overlay and RT-added rows; rows whose
+        schedule), the realtime overlay and rows of realtime-only trips; rows whose
         effective departure is before ``start`` are dropped. Caller holds
         the reader guard and applies per-query filters and limits. Runs
         once per horizon of :meth:`get_arrivals`, with RT already fetched.
         """
-        added_rows = updates.added
         # The unmodified schedule for these instances describes a route the
         # vehicle is no longer taking. Keyed by INSTANCE, not by trip: a
         # detour dated yesterday must not delete today's run of the trip.
-        # A deleted run "must not be shown to users" at all.
+        # A deleted run "must not be shown to users" at all, and a replaced
+        # one's schedule "isn't used": its replacement's rows stand instead.
+        hidden = updates.deleted_trips | updates.replaced_trips
         scheduled = [
             dep
             for dep in scheduled
             if (dep.trip_id, dep.service_date) not in modified_instances
             and _run_key((dep.source_trip_id, dep.start_secs), dep.service_date)
-            not in updates.deleted_trips
+            not in hidden
         ]
         # Per-row RT matching: each scheduled row's run has exactly one
         # matched key (see _matched_realtime).
@@ -2072,50 +2326,16 @@ class TransitFeedHandle:
                     block_id=dep.block_id,
                 )
             )
-        wanted_stops = set(all_stop_ids)
-        for row in added_rows:
-            if row.stop_id not in wanted_stops:
-                continue
-            arrivals.append(
-                StopArrival(
-                    stop_id=row.stop_id,
-                    stop=stops_by_id.get(row.stop_id),
-                    route_id=row.route_id,
-                    route=routes_by_id.get(row.route_id) if row.route_id else None,
-                    trip_id=row.trip_id,
-                    service_id=None,
-                    vehicle=_match_vehicle(
-                        row.vehicle_id,
-                        row.trip_id,
-                        None,
-                        service_date=row.start_date,
-                        vehicles=vehicles,
-                        scheduled=False,
-                    ),
-                    headsign=None,
-                    scheduled_arrival=None,
-                    scheduled_departure=None,
-                    predicted_arrival=row.arrival,
-                    predicted_departure=row.departure,
-                    delay_seconds=None,
-                    realtime=True,
-                    canceled=False,
-                    vehicle_id=row.vehicle_id,
-                    # RT-added trips have no static schedule row, so every
-                    # descriptive field is unknown — including timepoint,
-                    # whose absent-means-exact default only applies to rows
-                    # that exist in stop_times.
-                    wheelchair_accessible=None,
-                    bikes_allowed=None,
-                    direction_id=None,
-                    pickup_type=None,
-                    drop_off_type=None,
-                    timepoint_exact=None,
-                    stop_headsign=None,
-                    trip_short_name=None,
-                    block_id=None,
-                )
+        arrivals.extend(
+            _realtime_rows(
+                updates.realtime_trips,
+                set(all_stop_ids),
+                end=end,
+                stops_by_id=stops_by_id,
+                routes_by_id=routes_by_id,
+                vehicles=vehicles,
             )
+        )
         arrivals.extend(modified_rows)
         # The grace window admitted scheduled rows before `now` so their
         # predictions could attach; now only rows still ahead survive.
@@ -2130,7 +2350,7 @@ class TransitFeedHandle:
         # service days (tomorrow's run predicted early). Even those can tie
         # (yesterday's 24:00:00 is today's 00:00:00), and a stable sort then
         # keeps the order rows were appended in: scheduled rows in
-        # ``scheduled``'s canonical order (earlier run first), then RT-added
+        # ``scheduled``'s canonical order (earlier run first), then realtime-only
         # rows in feed order, then detoured runs in run order. Every part of
         # that is fixed before the scan, so no tie depends on what it read.
         arrivals.sort(
@@ -2181,17 +2401,21 @@ class TransitFeedHandle:
         the limit, as on boards; DELETED runs and SKIPPED stops are removed
         before the limit applies -- a skipped origin or skipped destination
         kills the row (the rider cannot board or alight there), while a
-        skipped intermediate stop changes nothing. RT-added trips
-        (schedule_relationship ADDED) are never included: an added trip's
-        full stop sequence is unknown, so whether it serves the destination
-        after the origin cannot be determined.
+        skipped intermediate stop changes nothing. A realtime-only trip
+        (NEW, ADDED, REPLACEMENT; see :meth:`get_arrivals`) is a journey
+        from each call at the origin to the next call at the destination,
+        in the order its updates give them, at their times (as on boards);
+        it is neither ``is_first`` nor ``is_last``, and is
+        offered even between stops no scheduled trip links. A replaced
+        run's static schedule is not offered.
 
         Delay propagation follows :meth:`get_arrivals` exactly: an end with
         its own StopTimeUpdate is predicted at the events that update gives;
         an end without one takes the propagated or trip-level delay -- so
         one update before both ends predicts both. ``realtime`` is True
         whenever either end carries any RT-derived prediction, propagated
-        ones included; ``delay_seconds`` reports the origin's delay. A
+        ones included, for a cancelled run, and for every realtime-only
+        trip; ``delay_seconds`` reports the origin's delay. A
         journey whose origin departure realtime does not predict is ordered
         and kept by the later of its scheduled departure and the origin's
         predicted arrival, as boards are.
@@ -2239,17 +2463,14 @@ class TransitFeedHandle:
             results: list[list[UpcomingTrip]] = []
             for query in queries:
                 rows: list[UpcomingTrip] = []
-                # The last origin departure any journey between the pair can
-                # have; None means no journey can ever occur (RT-added trips
-                # are never journeys: their stop order is unknown).
+                # The last origin departure any scheduled journey between the
+                # pair can have; None means none can ever occur, leaving one
+                # pass for journeys on realtime-only trips.
                 ceiling = await self._index_read(
                     self._index.journeys_ceiling,
                     query.origin_stop_id,
                     query.destination_stop_id,
                 )
-                if ceiling is None:
-                    results.append([])
-                    continue
                 scheduled: dict[_RowKey, ScheduledTrip] = {
                     _journey_key(trip): trip
                     for trip in await self._index_read(
@@ -2279,7 +2500,10 @@ class TransitFeedHandle:
                         await self._merged_trips(
                             # Canonical order, as in get_arrivals.
                             [scheduled[key] for key in sorted(scheduled)],
+                            query.origin_stop_id,
+                            query.destination_stop_id,
                             start=start,
+                            end=end,
                             updates=updates,
                             stops_by_id=stops_by_id,
                             routes_by_id=routes_by_id,
@@ -2288,7 +2512,7 @@ class TransitFeedHandle:
                         )
                     )[: query.limit]
                     if final or _board_settles(
-                        [_effective_trip_departure(row) for row in rows],
+                        [_effective_trip_departure(row, start) for row in rows],
                         query.limit,
                         horizon,
                     ):
@@ -2299,8 +2523,11 @@ class TransitFeedHandle:
     async def _merged_trips(
         self,
         scheduled: list[ScheduledTrip],
+        origin_stop_id: str,
+        destination_stop_id: str,
         *,
         start: datetime,
+        end: datetime | None,
         updates: TripUpdates,
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
@@ -2331,11 +2558,20 @@ class TransitFeedHandle:
             },
             memo,
         )
-        trips: list[UpcomingTrip] = []
+        hidden = updates.deleted_trips | updates.replaced_trips
+        trips: list[UpcomingTrip] = _realtime_journeys(
+            updates.realtime_trips,
+            origin_stop_id,
+            destination_stop_id,
+            end=end,
+            stops_by_id=stops_by_id,
+            routes_by_id=routes_by_id,
+            vehicles=vehicles,
+        )
         for trip in scheduled:
             key = _run_key((trip.source_trip_id, trip.start_secs), trip.service_date)
-            if key in updates.deleted_trips:
-                continue  # "must not be shown to users"
+            if key in hidden:
+                continue  # deleted ("must not be shown") or replaced
             # Shown as cancelled: no prediction, no vehicle.
             canceled = key in updates.canceled_trips
             trip_rt = (
@@ -2408,7 +2644,7 @@ class TransitFeedHandle:
                     block_id=trip.block_id,
                 )
             )
-        trips = [row for row in trips if _effective_trip_departure(row) >= start]
+        trips = [row for row in trips if _effective_trip_departure(row, start) >= start]
         # Sort key matching get_arrivals: origin predictions can reorder
         # rows relative to the scheduled ordering, and trip_id and the
         # scheduled times break effective-departure ties (the same trip on
@@ -2416,10 +2652,10 @@ class TransitFeedHandle:
         # ``scheduled``'s canonical order (earlier run first).
         trips.sort(
             key=lambda row: (
-                _effective_trip_departure(row),
+                _effective_trip_departure(row, start),
                 row.trip_id,
-                row.scheduled_departure,
-                row.scheduled_arrival,
+                row.scheduled_departure or start,
+                row.scheduled_arrival or start,
             )
         )
         return trips

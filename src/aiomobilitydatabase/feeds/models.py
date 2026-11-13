@@ -294,8 +294,10 @@ class ArrivalsQuery:
     the rows; ``None`` or an empty list means no narrowing. ``headsigns``
     matches the headsign shown at the stop -- the stop_time's
     ``stop_headsign`` where set, else the trip's headsign; the same values
-    :meth:`TransitFeedHandle.get_headsigns_serving` offers -- so RT-added
-    trips, which announce no headsign, never pass a headsign filter. ``limit``
+    :meth:`TransitFeedHandle.get_headsigns_serving` offers -- so a realtime-only
+    trip passes one only by the headsign its update
+    gives (``TripProperties.trip_headsign``, or a replaced trip's own).
+    ``limit``
     caps the merged, filtered result for this query as a whole,
     nearest effective departure first; zero asks for an empty board and
     ``None`` means unlimited (only allowed with an explicit ``end``).
@@ -375,8 +377,16 @@ class StopArrival:
     absent from routes.txt leaves ``route`` None rather than inventing
     one. ``direction_id`` stays a raw int (0/1 with feed-defined meaning),
     matching :attr:`UpcomingTrip.direction_id`.
-    RT-added rows have no static schedule row, so every descriptive field
-    is None.
+    Rows of a realtime-only trip (NEW, ADDED, or a REPLACEMENT
+    run, whose static schedule "isn't used") have no stop_times row: their
+    scheduled times are the update's own ``scheduled_time`` (None where it
+    gives none) and their predictions its times. ``service_id``, the
+    stop_time descriptors, ``wheelchair_accessible``, ``bikes_allowed``,
+    ``trip_short_name`` and ``block_id`` are None; ``route_id``,
+    ``direction_id`` and ``headsign`` are what the update gives -- a
+    replacement shows under the trip it replaces (its ``trip_id``, a
+    frequency repetition's own, route and direction; its headsign where
+    the update gives none).
 
     ``predicted_arrival``/``predicted_departure`` are each event's own
     prediction; ``delay_seconds`` is the delay realtime gives this stop --
@@ -441,13 +451,16 @@ class StopArrival:
 
 @dataclass(frozen=True)
 class UpcomingTrip:
-    """An upcoming origin-to-destination journey on one scheduled trip.
+    """An upcoming origin-to-destination journey on one trip.
 
     The shape Home Assistant's legacy ``gtfs`` sensor needs: the next
     departure from an origin stop on a trip that later serves the
-    destination stop. Scheduled times are non-optional because the
-    producing query requires an origin departure time and a destination
-    arrival time. Realtime predicts the events its updates give:
+    destination stop. A scheduled trip always has both scheduled times; a
+    realtime-only trip (NEW, or a REPLACEMENT run, whose static
+    schedule "isn't used") has only the ones its update gives
+    (``scheduled_time``), and its other fields as on
+    :class:`StopArrival`.
+    Realtime predicts the events its updates give:
     ``predicted_departure``/``origin_predicted_arrival`` at the origin and
     ``predicted_arrival`` at the destination, each None when realtime says
     nothing about that event (a feed sending only arrivals predicts no
@@ -476,11 +489,13 @@ class UpcomingTrip:
     what callers passed in and what RT rows key on.
 
     ``is_first``/``is_last`` mark whether this departure is the first/last
-    departure OF ITS SERVICE DAY for this origin->destination pair --
-    legacy ``gtfs`` sensor parity. A past-midnight departure (>24:00:00)
-    is flagged relative to the service day it belongs to, not the clock
-    day it happens on, and frequency-materialized repetitions count as
-    ordinary trips (the day's first repetition is the first departure).
+    scheduled departure OF ITS SERVICE DAY for this origin->destination
+    pair -- legacy ``gtfs`` sensor parity; they describe the static
+    schedule, so a realtime-only trip is neither. A
+    past-midnight departure (>24:00:00) is flagged relative to the
+    service day it belongs to, not the clock day it happens on, and
+    frequency-materialized repetitions count as ordinary trips (the day's
+    first repetition is the first departure).
 
     ``vehicle_id``/``vehicle`` identify the vehicle running this trip, as
     on :class:`StopArrival`: the id from the origin's realtime prediction,
@@ -493,18 +508,18 @@ class UpcomingTrip:
     """
 
     trip_id: str
-    route_id: str
-    service_id: str
+    route_id: str | None
+    service_id: str | None
     route: Route | None
     headsign: str | None
     origin_stop_id: str
     origin_stop: Stop | None
     destination_stop_id: str
     destination_stop: Stop | None
-    scheduled_departure: datetime
+    scheduled_departure: datetime | None
     predicted_departure: datetime | None
     origin_predicted_arrival: datetime | None
-    scheduled_arrival: datetime
+    scheduled_arrival: datetime | None
     predicted_arrival: datetime | None
     delay_seconds: int | None
     realtime: bool
@@ -528,20 +543,18 @@ class UpcomingTrip:
     block_id: str | None
 
     @property
-    def effective_departure(self) -> datetime:
+    def effective_departure(self) -> datetime | None:
         """When the trip leaves its origin, as journeys are ordered and kept.
 
         The predicted departure if realtime gives one; else the later of
         the scheduled departure and the origin's predicted arrival -- a
-        vehicle does not leave before it arrives.
+        vehicle does not leave before it arrives. Never None for a journey
+        a query returns.
         """
-        return (
-            _effective_departure(
-                self.predicted_departure,
-                self.scheduled_departure,
-                self.origin_predicted_arrival,
-            )
-            or self.scheduled_departure
+        return _effective_departure(
+            self.predicted_departure,
+            self.scheduled_departure,
+            self.origin_predicted_arrival,
         )
 
 

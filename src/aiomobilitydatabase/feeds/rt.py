@@ -626,16 +626,52 @@ class StopPrediction:
 
 
 @dataclass(frozen=True)
-class AddedStopTime:
-    """A stop event on an RT-added trip absent from the schedule."""
+class RealtimeCall:
+    """One call of a realtime-only trip: its stop and times.
+
+    ``scheduled_arrival``/``scheduled_departure`` are the events'
+    ``scheduled_time`` (the new or replacement trip's own schedule, which a
+    NO_DATA stop still gives; a lone one is both, as in stop_times);
+    ``arrival``/``departure`` the predictions:
+    an event's own time, else its scheduled time moved by its own delay.
+    ``delay_seconds`` is the departure's delay, else the arrival's (a
+    prediction against its scheduled time). At least one time is set.
+    """
+
+    stop_id: str
+    scheduled_arrival: datetime | None
+    scheduled_departure: datetime | None
+    arrival: datetime | None
+    departure: datetime | None
+    delay_seconds: int | None
+
+
+@dataclass(frozen=True)
+class RealtimeTrip:
+    """A trip whose whole journey realtime states, absent from the schedule.
+
+    A NEW trip ("an extra trip unrelated to any existing trips"; ADDED, its
+    deprecated predecessor, is read the same way) or a REPLACEMENT run,
+    for which "the original schedule from the GTFS static isn't used":
+    ``replaces`` is then the key of the scheduled run it replaces -- it is
+    that run, on a new schedule. ``calls`` are its StopTimeUpdates in feed
+    order (updates "must be sorted by stop_sequence"), less those it
+    skips and those naming no stop or no time. ``route_id``,
+    ``direction_id`` and ``headsign`` are what the update says
+    (``TripProperties.trip_headsign`` for the headsign); a replacement,
+    once matched, takes the replaced run's ``trip_id`` (a frequency
+    repetition's own), route and direction, and its headsign where the
+    update gives none.
+    """
 
     trip_id: str
     route_id: str | None
-    stop_id: str
-    arrival: datetime | None
-    departure: datetime | None
+    direction_id: int | None
+    headsign: str | None
+    start_date: date | None
     vehicle_id: str | None
-    start_date: date | None = None
+    calls: tuple[RealtimeCall, ...]
+    replaces: TripUpdateKey | None = None
 
 
 @dataclass(frozen=True)
@@ -661,6 +697,9 @@ class TripStopUpdate:
     # StopTimeProperties.assigned_stop_id: a real-time platform assignment,
     # which a stop_id sent alongside "must match".
     assigned_stop_id: str | None = None
+    # StopTimeEvent.scheduled_time: a NEW or REPLACEMENT trip's own schedule.
+    scheduled_arrival: datetime | None = None
+    scheduled_departure: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -704,19 +743,27 @@ class TripUpdates:
     once matched against the schedule (see ``transit``) every key in
     ``trips`` names one dated run, so propagation happens within one
     matched instance. A removal naming no scheduled run keeps its key as
-    sent: it matches no run but still removes an ADDED trip of that id.
+    sent: it matches no run but still removes an extra trip of that id.
 
     ``trips`` holds the predictions for runs that operate;
     ``canceled_trips`` the runs that were scheduled but do not operate
     (shown as cancelled); ``deleted_trips`` runs removed outright, which
-    "must not be shown to users"; ``added`` the stop times of RT-added
-    trips absent from the schedule.
+    "must not be shown to users"; ``realtime_trips`` the realtime-only
+    trips (NEW, ADDED, REPLACEMENT), a replacement also naming the
+    scheduled run it replaces (see :attr:`replaced_trips`).
     """
 
     trips: dict[TripUpdateKey, TripUpdateEntry] = field(default_factory=dict)
     canceled_trips: set[TripUpdateKey] = field(default_factory=set)
     deleted_trips: set[TripUpdateKey] = field(default_factory=set)
-    added: list[AddedStopTime] = field(default_factory=list)
+    realtime_trips: list[RealtimeTrip] = field(default_factory=list)
+
+    @property
+    def replaced_trips(self) -> set[TripUpdateKey]:
+        """The scheduled runs a REPLACEMENT stands in for, not shown."""
+        return {
+            trip.replaces for trip in self.realtime_trips if trip.replaces is not None
+        }
 
 
 @dataclass(frozen=True)
@@ -737,6 +784,9 @@ class TripUpdateRecord:
     direction_id: int | None
     relationship: int
     entry: TripUpdateEntry
+    # TripProperties.trip_headsign: "the headsign for this trip when it
+    # differs from the original".
+    trip_headsign: str | None = None
 
     @property
     def key(self) -> TripUpdateKey:
@@ -948,6 +998,16 @@ def _stop_update(stu: gtfs_realtime_pb2.TripUpdate.StopTimeUpdate) -> TripStopUp
             if stu.HasField("stop_time_properties")
             else None
         ),
+        scheduled_arrival=(
+            _epoch_to_utc(arrival.scheduled_time)
+            if arrival is not None and arrival.HasField("scheduled_time")
+            else None
+        ),
+        scheduled_departure=(
+            _epoch_to_utc(departure.scheduled_time)
+            if departure is not None and departure.HasField("scheduled_time")
+            else None
+        ),
     )
 
 
@@ -971,6 +1031,11 @@ def trip_update_records(
                     trip.direction_id if trip.HasField("direction_id") else None
                 ),
                 relationship=trip.schedule_relationship,
+                trip_headsign=(
+                    trip_update.trip_properties.trip_headsign or None
+                    if trip_update.HasField("trip_properties")
+                    else None
+                ),
                 entry=TripUpdateEntry(
                     stop_updates=tuple(
                         _stop_update(stu) for stu in trip_update.stop_time_update
@@ -985,66 +1050,135 @@ def trip_update_records(
     return records
 
 
+def _realtime_call(update: TripStopUpdate) -> RealtimeCall | None:
+    """Return the call one StopTimeUpdate of a new or replacement trip states.
+
+    None for a call the vehicle skips, or one naming no stop or no time. A
+    NO_DATA call has its scheduled times only: "real-time prediction
+    information is not available yet".
+    """
+    relationships = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate
+    if update.relationship == relationships.SKIPPED or not update.stop_id:
+        return None
+    # scheduled_time is defined as stop_times' times are, and there a lone
+    # arrival or departure is both.
+    scheduled_arrival = update.scheduled_arrival or update.scheduled_departure
+    scheduled_departure = update.scheduled_departure or update.scheduled_arrival
+    predicted = update.relationship != relationships.NO_DATA
+    arrival = (
+        update.arrival or _moved(scheduled_arrival, update.arrival_delay)
+        if predicted
+        else None
+    )
+    departure = (
+        update.departure or _moved(scheduled_departure, update.departure_delay)
+        if predicted
+        else None
+    )
+    if all(
+        when is None
+        for when in (scheduled_arrival, scheduled_departure, arrival, departure)
+    ):
+        return None
+    delays = [
+        round((when - scheduled).total_seconds())
+        for when, scheduled in (
+            (departure, scheduled_departure),
+            (arrival, scheduled_arrival),
+        )
+        if when is not None and scheduled is not None
+    ]
+    return RealtimeCall(
+        stop_id=update.stop_id,
+        scheduled_arrival=scheduled_arrival,
+        scheduled_departure=scheduled_departure,
+        arrival=arrival,
+        departure=departure,
+        delay_seconds=delays[0] if delays else None,
+    )
+
+
+def _realtime_trip(record: TripUpdateRecord, *, replaces: bool) -> RealtimeTrip:
+    """Build the trip a NEW, ADDED or REPLACEMENT record states in full."""
+    return RealtimeTrip(
+        trip_id=record.trip_id,
+        route_id=record.route_id,
+        direction_id=record.direction_id,
+        headsign=record.trip_headsign,
+        start_date=record.start_date,
+        vehicle_id=record.entry.vehicle_id,
+        calls=tuple(
+            call
+            for update in record.entry.stop_updates
+            if (call := _realtime_call(update)) is not None
+        ),
+        replaces=record.key if replaces else None,
+    )
+
+
 def indexed_trip_updates(records: Iterable[TripUpdateRecord]) -> TripUpdates:
     """Index records by the identity each names; a later record wins.
 
     A record without a trip_id names no scheduled trip here (only the
     schedule can resolve its route, direction and start; see ``transit``);
-    an ADDED one's stop times are still kept, as sent. DELETED and
-    CANCELED win regardless of order: a producer may send one alongside
-    stale predictions for the same trip in either order, and the result
-    must be self-consistent rather than relying on consumers checking the
-    removal sets first. DELETED wins over CANCELED -- a run removed
-    outright is not shown at all. Predictions match on the full
-    (trip_id, start_date, start_secs) identity; ADDED stop times on bare
-    trip_id -- an added trip is identified by the id the producer minted
-    for it, and dropping its rows on ANY removal of that id is the
-    conservative "removed wins" choice (never show a trip that might not
-    run). A producer sending several updates for one identity is out of
-    spec ("at most one trip_update per actual trip"); the last wins
-    wholesale rather than attempting a field-level merge. Any other
-    relationship -- SCHEDULED, UNSCHEDULED, or one this library does not
-    model yet -- is read as predictions for the trip it names.
+    a NEW or ADDED one's trip is still kept, as sent. DELETED and CANCELED
+    win regardless of order: a producer may send one alongside stale
+    predictions for the same trip in either order, and the result must be
+    self-consistent rather than relying on consumers checking the removal
+    sets first. DELETED wins over CANCELED -- a run removed outright is not
+    shown at all. Predictions and replacements match on the full
+    (trip_id, start_date, start_secs) identity, and of the two for one run
+    the later wins; NEW and ADDED trips on bare trip_id (one without a
+    trip_id stands alone) -- an extra trip is identified by the id the
+    producer minted for it, and dropping it on
+    ANY removal of that id is the conservative "removed wins" choice (never
+    show a trip that might not run). A producer sending several updates
+    for one identity is out of spec ("at most one trip_update per actual
+    trip"); the last wins wholesale rather than attempting a field-level
+    merge. Any other relationship -- SCHEDULED, UNSCHEDULED, or one this
+    library does not model yet -- is read as predictions for the trip it
+    names.
     """
     descriptor = gtfs_realtime_pb2.TripDescriptor
     updates = TripUpdates()
+    extra: list[RealtimeTrip] = []
+    # Per run, its predictions or its replacement, whichever came last.
+    runs: dict[TripUpdateKey, TripUpdateEntry | RealtimeTrip] = {}
     for record in records:
         key = record.key
-        if record.relationship == descriptor.ADDED:
-            updates.added.extend(
-                AddedStopTime(
-                    trip_id=record.trip_id,
-                    route_id=record.route_id,
-                    stop_id=stop_update.stop_id or "",
-                    arrival=stop_update.arrival,
-                    departure=stop_update.departure,
-                    vehicle_id=record.entry.vehicle_id,
-                    start_date=record.start_date,
-                )
-                for stop_update in record.entry.stop_updates
-            )
+        if record.relationship in (descriptor.NEW, descriptor.ADDED):
+            extra.append(_realtime_trip(record, replaces=False))
         elif not record.trip_id:
             continue
         elif record.relationship == descriptor.CANCELED:
             updates.canceled_trips.add(key)
         elif record.relationship == descriptor.DELETED:
             updates.deleted_trips.add(key)
+        elif record.relationship == descriptor.REPLACEMENT:
+            runs[key] = _realtime_trip(record, replaces=True)
         else:
             # An entry is recorded even with zero StopTimeUpdates: a bare
             # TripUpdate.delay with no STUs is a valid trip-wide fallback.
-            updates.trips[key] = record.entry
+            runs[key] = record.entry
     updates.canceled_trips -= updates.deleted_trips
     removed = updates.canceled_trips | updates.deleted_trips
-    if removed:
-        updates.trips = {
-            key: entry for key, entry in updates.trips.items() if key not in removed
-        }
-        removed_ids = {trip_id for trip_id, _, _ in removed}
-        updates.added = [
-            stop_time
-            for stop_time in updates.added
-            if stop_time.trip_id not in removed_ids
-        ]
+    removed_ids = {trip_id for trip_id, _, _ in removed}
+    for key, run in runs.items():
+        if key in removed:
+            continue
+        if isinstance(run, RealtimeTrip):
+            updates.realtime_trips.append(run)
+        else:
+            updates.trips[key] = run
+    # An extra trip is its trip_id -- the id the producer minted for it, as
+    # removals read it too: the same trip from two feeds (or one url listed
+    # twice) is one trip, the last sent. One with no trip_id has no
+    # identity to merge on, and stands alone.
+    by_id = {trip.trip_id: trip for trip in extra if trip.trip_id}
+    updates.realtime_trips.extend(
+        trip for trip in by_id.values() if trip.trip_id not in removed_ids
+    )
+    updates.realtime_trips.extend(trip for trip in extra if not trip.trip_id)
     return updates
 
 
