@@ -402,7 +402,12 @@ class StopArrival:
     ``{trip_id}#{start_secs}`` id of that start, in place of the repetition
     whose headway slot holds it; it keeps its trip's ``service_id``, only
     its updates' times predict it, and its ``delay_seconds`` is None (such
-    service "does not follow a fixed schedule").
+    service "does not follow a fixed schedule"). A run a TripModifications
+    detour rebuilds is shown the same way, as realtime's: still its own
+    trip -- id, descriptors, ``service_id`` and ``block_id`` -- on its
+    rebuilt calls, a replacement stop with stop_times' defaults and no
+    prediction, and a kept stop's ``delay_seconds`` only where the detour
+    left its schedule alone.
 
     ``predicted_arrival``/``predicted_departure`` are each event's own
     prediction; ``delay_seconds`` is the delay realtime gives this stop --

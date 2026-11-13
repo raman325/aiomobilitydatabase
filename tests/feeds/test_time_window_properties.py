@@ -39,6 +39,7 @@ from aiomobilitydatabase.feeds.models import (
     TripQuery,
     UpcomingTrip,
 )
+from aiomobilitydatabase.feeds.rt import TripUpdateEntry
 from aiomobilitydatabase.feeds.static_index import StaticIndex
 from aiomobilitydatabase.feeds.transit import (
     TransitFeedHandle,
@@ -181,19 +182,23 @@ async def _uncapped[T](
         return set()
 
     async def naive_detours(
+        updates: Any,
         modifications: Sequence[Any],
-        wanted_stops: set[str],
         *,
-        end: datetime | None,
-        removed: Any,
         rt_stops: Any,
         stops_by_id: Any,
-        routes_by_id: Any,
-    ) -> tuple[list[StopArrival], set[tuple[str, date]]]:
+        wanted_stops: Any,
+    ) -> list[Any]:
         # Every named run, rebuilt on its own day: no relevance filter, no
         # template, no shifting.
+        if not modifications:
+            return []
+        removed = (
+            updates.canceled_trips | updates.deleted_trips | updates.replaced_trips
+        )
         source_ids = sorted({trip for mod in modifications for trip in mod.trip_ids})
         concrete = index.concrete_trip_ids(source_ids)
+        plain_starts = index.plain_trip_starts(source_ids)
         runs = {
             (trip_id, service_date)
             for mod in modifications
@@ -201,48 +206,37 @@ async def _uncapped[T](
             for trip_id in concrete.get(source_id, ())
             for service_date in mod.service_dates
         }
-        rows: list[StopArrival] = []
-        touched: set[tuple[str, date]] = set()
+        no_update = TripUpdateEntry(
+            stop_updates=(), delay_seconds=None, vehicle_id=None
+        )
+        trips: list[Any] = []
         for instance in index.instance_trip_calls(sorted(runs)):
-            applicable = [
-                modification
-                for mod in modifications
-                if instance.source_trip_id in mod.trip_ids
-                and instance.service_date in mod.service_dates
-                and (not mod.start_secs or instance.start_secs in mod.start_secs)
-                for modification in mod.modifications
-            ]
-            run = (instance.source_trip_id, instance.service_date, instance.start_secs)
+            source = instance.source_trip_id
+            applicable = transit_module._applicable(
+                modifications,
+                source,
+                instance.service_date,
+                instance.start_secs
+                if instance.start_secs is not None
+                else plain_starts.get(source),
+            )
+            run = (source, instance.service_date, instance.start_secs)
             if not applicable or run in removed:
-                continue  # a cancelled or deleted run is not rebuilt
+                continue  # a removed or replaced run is not rebuilt
             calls = transit_module._modified_calls(
                 instance, applicable, rt_stops, stops_by_id
             )
             if calls == instance.calls:
                 continue
-            touched.add((instance.trip_id, instance.service_date))
-            rows.extend(
-                transit_module._detoured_rows(
-                    instance,
-                    calls,
-                    timedelta(0),
-                    wanted_stops=wanted_stops,
-                    end=None,  # the reference applies ``end`` itself
-                    rt_stops=rt_stops,
-                    stops_by_id=stops_by_id,
-                    route=routes_by_id.get(instance.route_id),
+            trips.append(
+                transit_module._detoured_run(
+                    instance, calls, updates.trips.pop(run, no_update)
                 )
             )
-        rows = [
-            row
-            for row in rows
-            if end is None
-            or (row.scheduled_departure is not None and row.scheduled_departure <= end)
-        ]
-        return rows, touched
+        return trips
 
     handle._addressed_runs = nothing_up_front  # type: ignore[method-assign]
-    handle._apply_trip_modifications = naive_detours  # type: ignore[method-assign]
+    handle._detoured_runs = naive_detours  # type: ignore[method-assign]
     index._scan_start = generous_look_back  # type: ignore[method-assign]
     index._long_reach_days = no_long_reach  # type: ignore[method-assign]
     transit_module._horizons = one_pass
@@ -252,7 +246,7 @@ async def _uncapped[T](
         index.departures_ceiling, index.journeys_ceiling = saved
         transit_module._horizons = _horizons
         del handle._addressed_runs
-        del handle._apply_trip_modifications
+        del handle._detoured_runs
         del index._scan_start
         del index._long_reach_days
 
