@@ -5,6 +5,7 @@ import os
 import sqlite3
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -758,3 +759,133 @@ def test_trip_queries_with_no_ids_do_not_touch_the_database(tmp_path: Path) -> N
     assert built.concrete_trip_ids([]) == {}
     assert built.instance_trip_calls([]) == []
     built.close()
+
+
+def test_a_build_replaced_by_a_concurrent_one_is_labelled_by_its_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two builds of one target can rename into place back to back. The
+    build reopening the target afterwards must report the dataset the file
+    really holds, never claim its own over another build's data."""
+    other = tmp_path / "other.db"
+    StaticIndex.build(_write_zip(tmp_path), str(other), "ds-OTHER", TZ).close()
+    with sqlite3.connect(other) as conn:  # the other dataset's own zone
+        conn.execute("UPDATE meta SET value = 'Europe/Paris' WHERE key = 'timezone'")
+    conn.close()
+    db_path = tmp_path / "static.db"
+    real_replace = Path.replace
+
+    def replace_then_lose_the_race(self: Path, target: Path | str) -> Path:
+        result = real_replace(self, target)
+        if Path(target) == db_path:
+            # The other build renames in right after ours.
+            db_path.write_bytes(other.read_bytes())
+        return result
+
+    monkeypatch.setattr(Path, "replace", replace_then_lose_the_race)
+    index = StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ)
+    try:
+        assert (index.dataset_id, index.timezone_name) == ("ds-OTHER", "Europe/Paris")
+    finally:
+        index.close()
+
+
+@pytest.mark.parametrize(
+    "stranger",
+    [
+        "no keys",
+        "no timezone",
+        "unknown timezone",
+        "older schema",
+        "not a database",
+        "purged",
+    ],
+)
+def test_a_reopened_file_that_is_no_index_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stranger: str
+) -> None:
+    """Whatever lands on the target between the rename and the reopen, a
+    file that is not one of this version's built indexes -- or none at all
+    -- is refused as such, never labelled with the caller's dataset, and a
+    purged target is not recreated as an empty file."""
+    db_path = tmp_path / "static.db"
+    real_replace = Path.replace
+    meta = {
+        "no keys": [],
+        "no timezone": [("dataset_id", "ds"), ("schema_version", str(SCHEMA_VERSION))],
+        "unknown timezone": [
+            ("dataset_id", "ds"),
+            ("timezone", "Mars/Olympus"),
+            ("schema_version", str(SCHEMA_VERSION)),
+        ],
+        "older schema": [
+            ("dataset_id", "ds"),
+            ("timezone", TZ),
+            ("schema_version", str(SCHEMA_VERSION - 1)),
+        ],
+    }
+
+    def replace_with_a_stranger(self: Path, target: Path | str) -> Path:
+        result = real_replace(self, target)
+        if Path(target) == db_path:
+            db_path.unlink()
+            if stranger == "not a database":
+                db_path.write_bytes(b"not a database at all, just bytes " * 100)
+            elif stranger != "purged":
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+                    conn.executemany("INSERT INTO meta VALUES (?, ?)", meta[stranger])
+                conn.close()
+        return result
+
+    monkeypatch.setattr(Path, "replace", replace_with_a_stranger)
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracked(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracked)
+    with pytest.raises(FeedParseError):
+        StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ)
+    if stranger == "purged":
+        assert not db_path.exists()
+    for conn in opened:  # every connection the build opened is closed
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_a_build_reopens_a_target_whose_path_needs_quoting(tmp_path: Path) -> None:
+    """The reopen goes through a file: URI: a path with spaces, percent
+    signs and URI punctuation still names the file."""
+    folder = tmp_path / "a b%20c#d?e;f&g"
+    folder.mkdir()
+    index = StaticIndex.build(
+        _write_zip(tmp_path), str(folder / "static.db"), DATASET, TZ
+    )
+    try:
+        assert index.dataset_id == DATASET
+        assert index.stops()
+    finally:
+        index.close()
+
+
+def test_a_scratch_file_is_removed_when_its_connection_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even a build that cannot open its scratch file leaves none behind."""
+    real_connect = sqlite3.connect
+
+    def refuse_scratch(database: str, *args: object, **kwargs: object) -> object:
+        if str(database).endswith(".building"):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(database, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlite3, "connect", refuse_scratch)
+    with pytest.raises(sqlite3.OperationalError):
+        StaticIndex.build(
+            _write_zip(tmp_path), str(tmp_path / "static.db"), DATASET, TZ
+        )
+    assert not list(tmp_path.glob("*.building*"))

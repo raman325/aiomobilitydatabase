@@ -21,6 +21,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
 from typing import IO, Any, NamedTuple
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .exceptions import FeedParseError
@@ -639,6 +640,20 @@ class _RunQuery(NamedTuple):
     now: datetime
 
 
+def _file_uri(path: str) -> str:
+    """Return a ``file:`` URI for ``path`` with an empty authority.
+
+    SQLite refuses any URI authority but ``localhost``; ``Path.as_uri()``
+    gives a Windows network path (a UNC share) one. An empty
+    authority before the full path (``file:////server/share/...``) is the
+    form SQLite passes on unchanged.
+    """
+    posix = Path(path).absolute().as_posix()
+    if not posix.startswith("/"):
+        posix = f"/{posix}"  # a drive letter: file:///C:/...
+    return "file://" + quote(posix, safe="/:")
+
+
 def _scratch_path(db_target: str) -> str:
     """Create an empty scratch file beside ``db_target``; return its path.
 
@@ -725,8 +740,9 @@ class StaticIndex:
                 )
             in_memory = db_target == ":memory:"
             build_path = db_target if in_memory else _scratch_path(db_target)
-            conn = sqlite3.connect(build_path, check_same_thread=False)
+            conn: sqlite3.Connection | None = None
             try:
+                conn = sqlite3.connect(build_path, check_same_thread=False)
                 conn.executescript(_SCHEMA)
                 cls._load_all(conn, archive, names, progress)
                 cls._store_first_departures(conn)
@@ -744,7 +760,8 @@ class StaticIndex:
                 # visible file on disk. Do not add one.
                 conn.commit()
             except BaseException:
-                conn.close()
+                if conn is not None:
+                    conn.close()
                 if not in_memory:
                     Path(build_path).unlink(missing_ok=True)
                 raise
@@ -756,11 +773,34 @@ class StaticIndex:
         except OSError:
             Path(build_path).unlink(missing_ok=True)
             raise
-        return cls(
-            sqlite3.connect(db_target, check_same_thread=False),
-            dataset_id,
-            timezone_name,
-        )
+        # Reopened by name: a concurrent build of the same target may have
+        # replaced ours since the rename. Label the index with the dataset
+        # the file actually holds, so it is never served as another (the
+        # caller decides what a different one means). mode=rw: a target
+        # purged meanwhile is an error, not a new empty file.
+        try:
+            conn = sqlite3.connect(
+                f"{_file_uri(db_target)}?mode=rw", uri=True, check_same_thread=False
+            )
+        except sqlite3.Error as err:
+            raise FeedParseError(
+                f"{db_target} could not be reopened after its build"
+            ) from err
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            if (
+                not isinstance(meta.get("dataset_id"), str)
+                or not isinstance(meta.get("timezone"), str)
+                or meta.get("schema_version") != str(SCHEMA_VERSION)
+            ):
+                raise FeedParseError(f"{db_target} is not a built static index")
+            return cls(conn, meta["dataset_id"], meta["timezone"])
+        except (sqlite3.Error, ZoneInfoNotFoundError, ValueError, OSError) as err:
+            conn.close()
+            raise FeedParseError(f"{db_target} is not a built static index") from err
+        except BaseException:
+            conn.close()
+            raise
 
     @classmethod
     def open_cached(cls, db_path: Path, dataset_id: str) -> StaticIndex | None:
