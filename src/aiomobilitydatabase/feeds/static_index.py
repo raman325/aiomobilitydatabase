@@ -1511,17 +1511,17 @@ class StaticIndex:
 
     def trip_summaries(
         self, trip_ids: Sequence[str]
-    ) -> dict[str, tuple[str, str | None, int | None]]:
-        """Map each trip to its (route_id, headsign, direction_id)."""
-        found: dict[str, tuple[str, str | None, int | None]] = {}
+    ) -> dict[str, tuple[str, str | None, int | None, str | None]]:
+        """Map each trip to its (route_id, headsign, direction_id, short_name)."""
+        found: dict[str, tuple[str, str | None, int | None, str | None]] = {}
         for offset in range(0, len(trip_ids), _ID_SLICE):
             chunk = list(trip_ids[offset : offset + _ID_SLICE])
-            for trip_id, route_id, headsign, direction_id in self._conn.execute(
-                "SELECT id, route_id, headsign, direction_id FROM trips "
+            for trip_id, route_id, headsign, direction_id, short in self._conn.execute(
+                "SELECT id, route_id, headsign, direction_id, short_name FROM trips "
                 f"WHERE id IN ({','.join('?' * len(chunk))})",
                 chunk,
             ):
-                found[trip_id] = (route_id, headsign, direction_id)
+                found[trip_id] = (route_id, headsign, direction_id, short)
         return found
 
     def copied_run(

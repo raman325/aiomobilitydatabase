@@ -2222,3 +2222,50 @@ def test_a_copys_own_headsign_is_not_overridden_by_stop_headsigns() -> None:
         [("T-2", "Airport", None)],
         [("T", "Downtown", "Downtown via Main")],
     ]
+
+
+def test_a_replacement_keeps_its_trips_short_name_unless_renamed() -> None:
+    """TripProperties.trip_short_name is "the name for this trip when it
+    differs from the original": without it, a replacement keeps its
+    trip's."""
+    files = _feed(
+        trips=(
+            "route_id,service_id,trip_id,trip_headsign,trip_short_name\nR,S,T,Out,101\n"
+        ),
+    )
+    message = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.REPLACEMENT,
+            "calls": [("S0", None, _at(5), False)],
+        }
+    )
+    board = _run_feeds(files, _board(_EIGHT - timedelta(minutes=30)), [message])
+    assert [(r.trip_id, r.trip_short_name) for r in board] == [("T", "101")]
+
+
+def test_a_copys_trip_delay_moves_its_moved_schedule() -> None:
+    """A trip-level delay covers a moved copy as a scheduled trip's covers
+    it: every call, dwell included, is predicted that much later."""
+    message = _descriptor_message(_duplicate(("T-2", "20260730", "09:30:00")))
+    message.entity[0].trip_update.delay = 300
+
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        start = _EIGHT + timedelta(minutes=80)
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S1", "S2"], limit=None)],
+            start=start,
+            end=start + timedelta(hours=1),
+        )
+        return [
+            (r.stop_id, r.predicted_arrival, r.predicted_departure, r.delay_seconds)
+            for r in board
+            if r.trip_id == "T-2"
+        ]
+
+    assert _run_feeds(_DWELL, body, [message]) == [
+        ("S0", _at(95), _at(95), 300),
+        ("S1", _at(105), _at(110), 300),
+        ("S2", _at(120), _at(120), 300),
+    ]

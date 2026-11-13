@@ -295,8 +295,10 @@ class ArrivalsQuery:
     matches the headsign shown at the stop -- the stop_time's
     ``stop_headsign`` where set, else the trip's headsign; the same values
     :meth:`TransitFeedHandle.get_headsigns_serving` offers -- so a realtime-only
-    trip passes one only by the headsign its update
-    gives (``TripProperties.trip_headsign``, or a replaced trip's own).
+    trip passes one only by the headsign its update gives
+    (``TripProperties.trip_headsign``, or a replaced trip's own), or, for a
+    DUPLICATED copy with no headsign of its own, by its original's trip and
+    stop headsigns.
     ``limit``
     caps the merged, filtered result for this query as a whole,
     nearest effective departure first; zero asks for an empty board and

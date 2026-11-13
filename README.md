@@ -230,7 +230,10 @@ Notes on direct mode:
   cancellations, deletions and realtime-only trips when present.
   NEW (or ADDED) trips and REPLACEMENT runs show at their stops and as
   origin→destination journeys, at the times their updates give; a
-  replacement hides the scheduled run it replaces. A DUPLICATED trip shows
+  replacement hides the scheduled run it replaces. One extra trip per
+  trip_id is shown, the last sent -- but an ADDED sharing its id with a NEW
+  trip or a DUPLICATED's original or copy is ignored, as the
+  ADDED-to-DUPLICATED migration guide says. A DUPLICATED trip shows
   as a copy of its original, under the copy's own trip id, moved to the
   copy's start date and time, with its updates predicting against that
   schedule (one whose updates state `scheduled_time` is shown by those
@@ -349,10 +352,11 @@ Notes on direct mode:
   frequencies.txt trip, so a date-less update or vehicle for either applies
   to no run — nor does a frequency vehicle missing its `start_time`, nor
   an update for a trip whose times decrease (arriving before it departs). A dated
-  one applies to exactly its day. A NEW (or ADDED) trip's vehicle is the
-  one its update names by vehicle id, else the single position naming its
-  trip_id -- an id the schedule does not use -- whatever day it names (two
-  such positions: none).
+  one applies to exactly its day. A NEW (or ADDED) trip's vehicle -- and a
+  DUPLICATED copy's, by its own trip id -- is the one its update names by
+  vehicle id, else the single position naming its trip_id -- an id the
+  schedule does not use -- whatever day it names (two such positions:
+  none).
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic
   `{trip_id}#{start_secs}` ids, so every schedule query — arrivals,

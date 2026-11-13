@@ -590,16 +590,16 @@ def _detoured_rows(
 def _replacing(
     trip: RealtimeTrip,
     concrete_trip_id: str,
-    summaries: Mapping[str, tuple[str, str | None, int | None]],
+    summaries: Mapping[str, tuple[str, str | None, int | None, str | None]],
 ) -> RealtimeTrip:
     """Return a replacement as its run: that trip's id, route and direction.
 
     A TripDescriptor's route and direction only select the trip; they
-    cannot move it to another route. The headsign may differ ("when it
-    differs from the original"), else is the trip's.
+    cannot move it to another route. The headsign and short name may
+    differ ("when it differs from the original"), else are the trip's.
     """
-    route_id, headsign, direction_id = summaries.get(
-        concrete_trip_id, (trip.route_id or "", None, trip.direction_id)
+    route_id, headsign, direction_id, short_name = summaries.get(
+        concrete_trip_id, (trip.route_id or "", None, trip.direction_id, None)
     )
     return replace(
         trip,
@@ -607,6 +607,7 @@ def _replacing(
         route_id=route_id,
         headsign=trip.headsign or headsign,
         direction_id=direction_id,
+        trip_short_name=trip.trip_short_name or short_name,
     )
 
 
@@ -2134,8 +2135,11 @@ class TransitFeedHandle:
         wins over its replacement, and any removal naming an extra trip's
         id removes it. An extra trip is its trip_id: the same one from two
         feeds is shown once, the last sent (one with no trip_id stands
-        alone); its vehicle is its own vehicle id's, else the one vehicle
-        naming that trip id.
+        alone) -- except that, per the ADDED-to-DUPLICATED migration guide,
+        an ADDED sharing its trip_id with a NEW trip or with a DUPLICATED's
+        original or copy is ignored whatever the order. Its vehicle (a
+        copy's too) is its own vehicle id's, else the one vehicle naming
+        that trip id.
 
         A DUPLICATED copy ("a new trip that is the same as an existing
         scheduled trip except for service start date and time") is also an
