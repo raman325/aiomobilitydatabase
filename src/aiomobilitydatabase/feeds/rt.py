@@ -402,6 +402,11 @@ def trip_modifications_from_message(
                 ],
             )
             for modification in modifications.modifications
+            # A StopSelector's fields "cannot be both empty": an end selector
+            # sent empty names no end, and the modification no span.
+            if not modification.HasField("end_stop_selector")
+            or modification.end_stop_selector.HasField("stop_sequence")
+            or modification.end_stop_selector.stop_id
         ]
         if not parsed:
             continue

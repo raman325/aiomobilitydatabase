@@ -2981,3 +2981,25 @@ def test_a_detour_modifies_only_days_its_trip_runs() -> None:
     _detour(message, start=2, end=2, replacements=[("S3", 300)])
     message.entity[-1].trip_modifications.service_dates.append("20280105")
     assert [row[0] for row in _detoured_board(message)] == ["S0", "S3", "S2"]
+
+
+def test_a_modification_with_an_empty_end_selector_is_dropped() -> None:
+    """A StopSelector's fields "cannot be both empty": an end selector sent
+    empty names no end, so the modification names no span and is not
+    applied (half a detour would be worse than none); a deleted run is not
+    rebuilt either."""
+    message = _descriptor_message()
+    _detour(message, start=2, end=2, replacements=[("S3", 300)])
+    message.entity[-1].trip_modifications.modifications[0].end_stop_selector.ClearField(
+        "stop_sequence"
+    )
+    assert [row[0] for row in _detoured_board(message)] == ["S0", "S1", "S2"]
+    deleted = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.DELETED,
+        }
+    )
+    _detour(deleted, start=2, end=2, replacements=[("S3", 300)])
+    assert _detoured_board(deleted) == []

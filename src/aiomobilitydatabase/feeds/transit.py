@@ -575,6 +575,24 @@ def _applicable(
     ]
 
 
+def _run_reaches(
+    calls: Sequence[TripCall], window: tuple[datetime, datetime | None] | None
+) -> bool:
+    """Whether a run's calls span any of ``window``.
+
+    ``window`` is (earliest, latest or None): the bounds a query reads
+    scheduled rows within, its grace included. A run wholly outside them
+    has no row there, as no scheduled run does.
+    """
+    if window is None:
+        return True
+    times = [when for call in calls for when in (call.arrival, call.departure) if when]
+    if not times:
+        return False
+    earliest, latest = window
+    return min(times) <= (latest or _LATEST_INSTANT) and max(times) >= earliest
+
+
 def _shifted_calls(calls: Sequence[TripCall], shift: timedelta) -> list[TripCall]:
     """Return calls moved by ``shift`` (a call moved past datetime goes untimed)."""
     seconds = round(shift.total_seconds())
@@ -855,8 +873,8 @@ def _realtime_rows(
 
     There is no stop_times row of their own: the times are the update's
     (its ``scheduled_time`` and predictions; a copy's or a headway-based
-    run's moved schedule), and the stop_time descriptors are those moved
-    calls' own, else unknown -- timepoint included, whose
+    run's moved schedule, a detoured run's rebuilt one), and the stop_time
+    descriptors are those calls' own, else unknown -- timepoint included, whose
     absent-means-exact default only applies to rows in stop_times.
     """
     rows: list[StopArrival] = []
@@ -1943,6 +1961,7 @@ class TransitFeedHandle:
         modifications: Sequence[TripModifications] = (),
         rt_stops: Mapping[str, Stop] | None = None,
         wanted_stops: Collection[str] | None = None,
+        window: tuple[datetime, datetime | None] | None = None,
     ) -> tuple[TripUpdates, _Vehicles]:
         """Match every realtime trip reference to the dated run it names.
 
@@ -1963,7 +1982,8 @@ class TransitFeedHandle:
         holds it (see :meth:`StaticIndex.slot_runs`). A run the detours of
         ``modifications`` select is rebuilt (see :meth:`_detoured_runs`;
         ``rt_stops`` define any stop only realtime does, and only runs that
-        can reach ``wanted_stops``, when given, are rebuilt).
+        can reach ``wanted_stops`` within ``window``, when given, are
+        rebuilt).
         TripUpdates from every TU-capable sibling feed then merge: a
         cancellation or deletion anywhere wins, and of several updates for
         one run the most explicit reference wins, then the later feed in
@@ -2143,6 +2163,7 @@ class TransitFeedHandle:
                 rt_stops=realtime_stops,
                 stops_by_id=stops_by_id,
                 wanted_stops=wanted_stops,
+                window=window,
             )
         )
         # A DUPLICATED copy is its original's calls, moved to the copy's
@@ -2436,12 +2457,13 @@ class TransitFeedHandle:
                 modifications=modifications,
                 rt_stops=rt_stops,
                 wanted_stops=all_stop_ids,
+                window=(start - grace, end),
             )
-            # Realtime moves exactly the runs it names: those a TripUpdate
-            # addresses and those a detour rebuilds. Both are read whole,
-            # here, with the window applied to their scheduled times -- so
-            # every row realtime can move is present from the first pass,
-            # and the scan below only adds rows that sort at their
+            # Realtime moves exactly the runs TripUpdates address (a detoured
+            # run is realtime's own trip, already built). They are read
+            # whole, here, with the window applied to their scheduled times
+            # -- so every row realtime can move is present from the first
+            # pass, and the scan below only adds rows that sort at their
             # scheduled time.
             batch_stops, batch_routes, batch_headsigns = _pushdown(queries)
             addressed = [
@@ -2792,6 +2814,7 @@ class TransitFeedHandle:
                     for query in queries
                     for stop_id in (query.origin_stop_id, query.destination_stop_id)
                 },
+                window=(start - grace, end),
             )
             # As in get_arrivals: the runs realtime addresses are read whole
             # up front, so the scan only adds rows at their scheduled time.
@@ -3071,6 +3094,7 @@ class TransitFeedHandle:
         rt_stops: Mapping[str, Stop],
         stops_by_id: Mapping[str, Stop],
         wanted_stops: Collection[str] | None,
+        window: tuple[datetime, datetime | None] | None,
     ) -> list[RealtimeTrip]:
         """Rebuild every scheduled run its detours select, whole.
 
@@ -3082,10 +3106,12 @@ class TransitFeedHandle:
         replaces is not rebuilt: it does not operate as scheduled, and its
         removal or replacement stands. A detour can route a trip through a
         stop it never served, so with ``wanted_stops`` the trips rebuilt are
-        those calling at one or naming one as a replacement stop. Each
-        trip is rebuilt once per set of modifications and moved to every
-        day it runs (GTFS times are offsets from the day's start, and a
-        detour only adds offsets). Caller holds the reader guard.
+        those calling at one or naming one as a replacement stop, and with
+        ``window`` only the runs with a scheduled time in it
+        (:func:`_run_reaches`). Each trip is rebuilt once per set of
+        modifications and moved to every day it runs (GTFS times are
+        offsets from the day's start, and a detour only adds offsets).
+        Caller holds the reader guard.
         """
         if not modifications:
             return []
@@ -3162,19 +3188,16 @@ class TransitFeedHandle:
             if detoured is None:
                 continue
             shift = day_start - template.day_start_utc
+            today = _shifted_calls(detoured, shift)
+            if not _run_reaches(today, window):
+                continue
             run = replace(
                 template,
                 service_date=service_date,
                 day_start_utc=day_start,
                 calls=_shifted_calls(template.calls, shift),
             )
-            trips.append(
-                _detoured_run(
-                    run,
-                    _shifted_calls(detoured, shift),
-                    updates.trips.pop(key, no_update),
-                )
-            )
+            trips.append(_detoured_run(run, today, updates.trips.pop(key, no_update)))
         return trips
 
     async def get_scheduled_departures(

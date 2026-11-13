@@ -188,6 +188,7 @@ async def _uncapped[T](
         rt_stops: Any,
         stops_by_id: Any,
         wanted_stops: Any,
+        window: Any,
     ) -> list[Any]:
         # Every named run, rebuilt on its own day: no relevance filter, no
         # template, no shifting.
@@ -226,7 +227,9 @@ async def _uncapped[T](
             calls = transit_module._modified_calls(
                 instance, applicable, rt_stops, stops_by_id
             )
-            if calls == instance.calls:
+            if calls == instance.calls or not transit_module._run_reaches(
+                calls, window
+            ):
                 continue
             trips.append(
                 transit_module._detoured_run(
