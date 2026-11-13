@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import shutil
 import tempfile
+import threading
 from collections.abc import (
     AsyncIterator,
     Callable,
@@ -911,10 +912,23 @@ def _inherited_rt_stops(
     return {stop_id: resolve(stop_id, frozenset({stop_id})) for stop_id in rt_stops}
 
 
+def _serialized[T](lock: threading.Lock, call: Callable[[], T]) -> T:
+    """Run ``call`` holding ``lock`` (on the calling worker thread).
+
+    A threading lock, taken by the thread doing the read, is released only
+    when that read finishes -- even if its caller was cancelled long
+    before -- so no later read can reach the connection while it runs.
+    """
+    with lock:
+        return call()
+
+
 class _IndexGuard:
     """Readers-writer gate around the live :class:`StaticIndex`.
 
-    Queries enter as readers and may overlap freely. The index swap in
+    Queries enter as readers and may overlap freely (their SQLite work
+    still takes turns on the one connection; see
+    :meth:`TransitFeedHandle._index_read`). The index swap in
     :meth:`TransitFeedHandle.refresh_static` enters as the writer: it
     parks new readers, waits for in-flight ones to drain, swaps and closes
     the old index, then releases. Only the swap itself blocks; the
@@ -1016,6 +1030,9 @@ class TransitFeedHandle:
         self._index = index
         self._api_key = api_key
         self._guard = _IndexGuard()
+        # One SQLite connection serves every read: worker threads take turns
+        # on it (see _index_read).
+        self._read_lock = threading.Lock()
         self._refresh_lock = asyncio.Lock()
         # Per-url parsed messages, reused only as the producer allows: within
         # its declared freshness (RFC 9111), after a 304, or -- opted into
@@ -1036,10 +1053,18 @@ class TransitFeedHandle:
     ) -> T:
         """Run one index read on a worker thread, tracked by the guard.
 
+        Reads take turns: the index's one SQLite connection is shared by
+        every worker thread, and two queries interleaved on it return each
+        other's rows -- or empty ones -- so concurrent calls (an arrivals
+        and a vehicles coordinator polling together) would read garbage.
         Shielded so a cancelled caller returns at once while the guard keeps
         waiting for the thread; see :meth:`_IndexGuard.track`.
         """
-        worker = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+        worker = asyncio.ensure_future(
+            asyncio.to_thread(
+                _serialized, self._read_lock, partial(fn, *args, **kwargs)
+            )
+        )
         self._guard.track(worker)
         return await asyncio.shield(worker)
 
