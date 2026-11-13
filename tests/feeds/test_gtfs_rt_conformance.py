@@ -1664,3 +1664,42 @@ def test_a_replacement_keeps_its_trips_route_and_direction() -> None:
     assert [
         (r.route_id, r.direction_id, r.headsign) for r in board if r.trip_id == "T"
     ] == [("R", 0, "Out")]
+
+
+def test_filters_see_realtime_only_trips_by_what_their_updates_give() -> None:
+    """Route and headsign filters apply to realtime-only rows: a NEW trip
+    passes by its route and TripProperties headsign, a replacement by its
+    run's route and headsign."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    message = _descriptor_message(
+        {
+            "trip_id": "N",
+            "route_id": "R",
+            "start_date": "20260730",
+            "relationship": descriptor.NEW,
+            "headsign": "Extra",
+            "calls": [("S0", None, _at(30), False)],
+        },
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "relationship": descriptor.REPLACEMENT,
+            "calls": [("S0", None, _at(5), False)],
+        },
+    )
+
+    async def body(handle: TransitFeedHandle) -> list[list[str | None]]:
+        start = _EIGHT - timedelta(minutes=30)
+        boards = await handle.get_arrivals(
+            [
+                ArrivalsQuery(["S0"], headsigns=["Extra"]),
+                ArrivalsQuery(["S0"], headsigns=["Out"]),
+                ArrivalsQuery(["S0"], route_ids=["R"]),
+                ArrivalsQuery(["S0"], route_ids=["NOPE"]),
+            ],
+            start=start,
+            end=start + timedelta(hours=1),
+        )
+        return [[row.trip_id for row in board] for board in boards]
+
+    assert _run_feeds(_DIRECTED, body, [message]) == [["N"], ["T"], ["T", "N"], []]

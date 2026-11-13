@@ -1730,10 +1730,10 @@ class TransitFeedHandle:
         in the schedule and keep their references as sent, as do a
         cancellation or deletion naming no scheduled run (it can still
         remove an extra trip of that id); any other update left without a
-        trip or a date is dropped, a replacement too -- it is a scheduled
-        run on a new schedule, and one naming no run that operates (see
-        below) replaces nothing (a dated one for a day its trip does not run simply
-        matches no row).
+        trip or a date is dropped (a dated one for a day its trip does not
+        run simply matches no row), and so is a replacement naming no run
+        that operates (see below) -- it is a scheduled run on a new
+        schedule, and replaces nothing.
         TripUpdates from every TU-capable sibling feed then merge: a
         cancellation or deletion anywhere wins, and of several updates for
         one run the most explicit reference wins, then the later feed in

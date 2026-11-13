@@ -345,8 +345,10 @@ Notes on direct mode:
   frequencies.txt trip, so a date-less update or vehicle for either applies
   to no run — nor does a frequency vehicle missing its `start_time`, nor
   an update for a trip whose times decrease (arriving before it departs). A dated
-  one applies to exactly its day. A NEW trip's vehicle is the one naming
-  its trip_id (an id the schedule does not use), whatever day it names.
+  one applies to exactly its day. A NEW (or ADDED) trip's vehicle is the
+  one its update names by vehicle id, else the single position naming its
+  trip_id -- an id the schedule does not use -- whatever day it names (two
+  such positions: none).
 - **frequencies.txt is materialized at build time**: headway-based trips
   (common for metro/BRT) expand into concrete repetitions under synthetic
   `{trip_id}#{start_secs}` ids, so every schedule query — arrivals,
