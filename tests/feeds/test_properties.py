@@ -6122,15 +6122,24 @@ def test_get_vehicles_total_over_json_documents(
 ) -> None:
     """get_vehicles is TOTAL over arbitrary JSON ``data`` envelopes on both
     the 3.x and 2.x endpoint, and every surfaced vehicle has a real id (never
-    the synthesized literal "None") and real float coordinates.
+    the synthesized literal "None", nor one stringified from a JSON boolean)
+    and a place: real float coordinates, or -- lat/lon being "REQUIRED if
+    station_id is not provided" -- the station it is at.
     """
     vehicles = asyncio.run(_gbfs_handle({endpoint: document}).get_vehicles(zone))
     event(f"vehicles parsed from arbitrary json: {bool(vehicles)}")
     ids = [vehicle.id for vehicle in vehicles]
     assert all(ids)
-    assert "None" not in ids
-    assert all(isinstance(vehicle.latitude, float) for vehicle in vehicles)
-    assert all(isinstance(vehicle.longitude, float) for vehicle in vehicles)
+    assert not {"None", "True", "False"} & set(ids)
+    for vehicle in vehicles:
+        located = isinstance(vehicle.latitude, float) and isinstance(
+            vehicle.longitude, float
+        )
+        assert located or (
+            vehicle.latitude is None
+            and vehicle.longitude is None
+            and vehicle.station_id not in (None, "True", "False")
+        )
 
 
 @given(document=_GBFS_JSON)

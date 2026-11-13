@@ -72,9 +72,11 @@ def _record_id(value: Any) -> str | None:
     id-less record — and those synthetic ids COLLIDE across records,
     corrupting any consumer that keys on them (an entity registry, say).
     A blank id collides identically, so it is None too. Same motivation
-    as :func:`_entry_text`: never surface a stringified None.
+    as :func:`_entry_text`: never surface a stringified None. GBFS ids are
+    strings; a number is read as one, but a boolean, object or array is
+    no id at all (``false`` would otherwise become the id ``"False"``).
     """
-    if value is None:
+    if isinstance(value, bool) or not isinstance(value, str | int | float):
         return None
     return str(value) or None
 
