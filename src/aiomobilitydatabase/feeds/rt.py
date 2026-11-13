@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from http import HTTPStatus
@@ -634,7 +634,8 @@ class RealtimeCall:
     ``scheduled_arrival``/``scheduled_departure`` are the events'
     ``scheduled_time`` (the new or replacement trip's own schedule, which a
     NO_DATA stop still gives; a lone one is both, as in stop_times), or a
-    DUPLICATED copy's moved schedule;
+    DUPLICATED copy's (its original's, moved, unless its updates state
+    times of their own);
     ``arrival``/``departure`` the predictions: for NEW, ADDED and
     REPLACEMENT calls an event's own time, else its scheduled time moved by
     its own delay; for a copy, as a scheduled trip's resolve (carried and
@@ -818,6 +819,9 @@ class TripUpdateRecord:
     copy_trip_id: str | None = None
     copy_start_date: date | None = None
     copy_start_secs: int | None = None
+    # TripProperties.trip_short_name: "the name for this trip when it
+    # differs from the original" -- a copy's own train number, say.
+    trip_short_name: str | None = None
 
     @property
     def key(self) -> TripUpdateKey:
@@ -861,54 +865,6 @@ def _placed(
         if pos is not None:
             placed[pos] = stu
     return placed
-
-
-def scheduled_overrides(
-    entry: TripUpdateEntry, calls: Sequence[TripCall]
-) -> list[TripCall]:
-    """Return a DUPLICATED copy's moved ``calls`` with stated times in place.
-
-    A copy's StopTimeEvent may carry its own ``scheduled_time`` "if a
-    duplicated trip runs have different run or dwell times compared to the
-    original". Each stated event replaces that event only -- the copy has a
-    schedule already, its original's moved -- and at a stop the original
-    leaves untimed a lone stated time is both, as in stop_times. Within a
-    stop the event left unstated yields to the stated one (an arrival is
-    never after its departure); along the trip, times never run backwards:
-    one earlier than the stop before it is raised to it.
-    """
-    overridden = list(calls)
-    for pos, stu in _placed(entry, calls).items():
-        call = calls[pos]
-        stated_arrival, stated_departure = (
-            stu.scheduled_arrival,
-            stu.scheduled_departure,
-        )
-        if stated_arrival is None and stated_departure is None:
-            continue
-        if call.arrival is None and call.departure is None:
-            stated_arrival = stated_arrival or stated_departure
-            stated_departure = stated_departure or stated_arrival
-        arrival = stated_arrival or call.arrival
-        departure = stated_departure or call.departure
-        if arrival is not None and departure is not None and departure < arrival:
-            if stated_departure is not None and stated_arrival is None:
-                arrival = departure
-            else:
-                departure = arrival
-        overridden[pos] = replace(call, arrival=arrival, departure=departure)
-    latest: datetime | None = None
-    for pos, call in enumerate(overridden):
-        arrival, departure = call.arrival, call.departure
-        if latest is not None:
-            arrival = max(arrival, latest) if arrival is not None else None
-            departure = max(departure, latest) if departure is not None else None
-        if arrival is not None and departure is not None and departure < arrival:
-            departure = arrival
-        if (arrival, departure) != (call.arrival, call.departure):
-            overridden[pos] = replace(call, arrival=arrival, departure=departure)
-        latest = departure or arrival or latest
-    return overridden
 
 
 def _moved(when: datetime | None, delay: int | None) -> datetime | None:
@@ -1121,6 +1077,7 @@ def trip_update_records(
                 copy_trip_id=properties.trip_id or None,
                 copy_start_date=_trip_start_date(properties),
                 copy_start_secs=_trip_start_secs(properties),
+                trip_short_name=properties.trip_short_name or None,
                 entry=TripUpdateEntry(
                     stop_updates=tuple(
                         _stop_update(stu) for stu in trip_update.stop_time_update
@@ -1183,6 +1140,13 @@ def _realtime_call(update: TripStopUpdate) -> RealtimeCall | None:
     )
 
 
+def realtime_calls(entry: TripUpdateEntry) -> tuple[RealtimeCall, ...]:
+    """Return the calls a trip's StopTimeUpdates state in full, in order."""
+    return tuple(
+        call for update in entry.stop_updates if (call := _realtime_call(update))
+    )
+
+
 def _realtime_trip(record: TripUpdateRecord, *, replaces: bool) -> RealtimeTrip:
     """Build the trip a NEW, ADDED or REPLACEMENT record states in full."""
     return RealtimeTrip(
@@ -1192,12 +1156,9 @@ def _realtime_trip(record: TripUpdateRecord, *, replaces: bool) -> RealtimeTrip:
         headsign=record.trip_headsign,
         start_date=record.start_date,
         vehicle_id=record.entry.vehicle_id,
-        calls=tuple(
-            call
-            for update in record.entry.stop_updates
-            if (call := _realtime_call(update)) is not None
-        ),
+        calls=realtime_calls(record.entry),
         replaces=record.key if replaces else None,
+        trip_short_name=record.trip_short_name,
     )
 
 

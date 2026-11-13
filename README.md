@@ -233,7 +233,8 @@ Notes on direct mode:
   replacement hides the scheduled run it replaces. A DUPLICATED trip shows
   as a copy of its original, under the copy's own trip id, moved to the
   copy's start date and time, with its updates predicting against that
-  schedule; the original is untouched. A cancelled run
+  schedule (one whose updates state `scheduled_time` is shown by those
+  updates alone, as a NEW trip is); the original is untouched. A cancelled run
   stays listed at its scheduled time with `canceled=True` and no prediction
   (boards and journeys alike, counting toward `limit`), so riders see the
   cancellation; a deleted one "must not be shown to users" and is gone.

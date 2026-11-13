@@ -1867,52 +1867,6 @@ def test_a_duplicate_keeps_its_originals_pickup_rules() -> None:
     assert s0_s1 == []
 
 
-def test_a_duplicates_scheduled_time_is_its_schedule_there() -> None:
-    """ "If a duplicated trip runs have different run or dwell times
-    compared to the original, scheduled_time can also be used to specify
-    them": a stop's stated scheduled_time is the copy's schedule there, so
-    a vehicle on time against it is on time -- here and onward."""
-    files = _feed(
-        stops="stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\nS2,C,0,0\n",
-        stop_times=(
-            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
-            "T,08:00:00,08:00:00,S0,1\nT,08:10:00,08:10:00,S1,2\n"
-            "T,08:20:00,08:20:00,S2,3\n"
-        ),
-    )
-    message = _descriptor_message(
-        _duplicate(
-            ("T-2", "20260730", "09:30:00"),
-            stops=[
-                {
-                    "stop": "S1",
-                    "scheduled_arrival": _at(105),
-                    "arrival": _at(105),
-                    "departure": _at(105),
-                }
-            ],
-        )
-    )
-
-    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
-        start = _EIGHT - timedelta(minutes=30)
-        [board] = await handle.get_arrivals(
-            [ArrivalsQuery(["S1", "S2"], limit=None)],
-            start=start,
-            end=start + timedelta(hours=3),
-        )
-        return [
-            (r.stop_id, r.scheduled_departure, r.predicted_departure, r.delay_seconds)
-            for r in board
-            if r.trip_id == "T-2"
-        ]
-
-    assert _run_feeds(files, body, [message]) == [
-        ("S1", _at(105), _at(105), 0),
-        ("S2", _at(110), _at(110), 0),
-    ]
-
-
 def test_cancelling_the_original_leaves_its_copy() -> None:
     """ "If a producer wants to cancel the original trip, it must publish a
     separate TripUpdate with the value of CANCELED": the copy still runs."""
@@ -2018,45 +1972,6 @@ def _copy_at_s1(stops: list[dict[str, Any]]) -> list[tuple[object, ...]]:
     return _run_feeds(_DWELL, body, [message])
 
 
-def test_a_copys_lone_scheduled_time_keeps_the_originals_dwell() -> None:
-    """A stated arrival scheduled_time moves the arrival only: the copy's
-    departure keeps its own (moved) time -- a 5 minute dwell is not erased
-    -- and is never before the arrival."""
-    rows = _copy_at_s1(
-        [
-            {
-                "stop": "S1",
-                "scheduled_arrival": _at(101),
-                "arrival_delay": 0,
-                "departure_delay": 0,
-            }
-        ]
-    )
-    assert rows[1] == ("S1", _at(101), _at(105), _at(105), 0)
-    late = _copy_at_s1([{"stop": "S1", "scheduled_arrival": _at(107)}])
-    assert late[1][1:3] == (_at(107), _at(107))  # departure brought up to it
-
-
-def test_a_copys_skipped_and_no_data_stops() -> None:
-    """A stop the copy skips is not shown; a NO_DATA stop keeps its stated
-    schedule, unpredicted, and cuts the delay from carrying on."""
-    assert [row[0] for row in _copy_at_s1([{"stop": "S1", "skipped": True}])] == [
-        "S0",
-        "S2",
-    ]
-    rows = _copy_at_s1(
-        [
-            {"stop": "S0", "departure_delay": 120},
-            {"stop": "S1", "scheduled_arrival": _at(102), "no_data": True},
-        ]
-    )
-    assert rows == [
-        ("S0", _at(90), _at(90), _at(92), 120),
-        ("S1", _at(102), _at(105), None, None),
-        ("S2", _at(115), _at(115), None, None),
-    ]
-
-
 def test_a_new_trip_and_a_copy_sharing_an_id_are_one_trip() -> None:
     """An extra trip is its id, whatever its kind: a NEW trip and a copy
     under one trip_id are one trip, the last sent."""
@@ -2109,52 +2024,58 @@ def test_an_added_paired_with_its_duplicate_is_ignored() -> None:
             ] == [("T-2", _at(90), None)], (added_id, parts[0]["relationship"])
 
 
-def test_a_lone_stated_time_on_an_untimed_stop_is_both() -> None:
-    """At a stop the original leaves untimed, a lone stated scheduled_time is
-    both times, as in stop_times: the row is ordered and windowed by it,
-    and a journey from it has a departure."""
-    files = _feed(
-        stops="stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\nS2,C,0,0\n",
-        stop_times=(
-            "trip_id,arrival_time,departure_time,stop_id,stop_sequence,timepoint\n"
-            "T,08:00:00,08:00:00,S0,1,1\nT,,,S1,2,0\nT,08:25:00,08:25:00,S2,3,1\n"
-        ),
+def test_a_copy_stating_its_own_times_is_its_updates_alone() -> None:
+    """An update stating scheduled_time -- "if a duplicated trip runs have
+    different run or dwell times compared to the original" -- states the
+    copy's own schedule: the copy is then its updates alone, as a NEW trip
+    is, never a mix of their times and the original's. A copy stated to
+    run faster is on time where it says so."""
+    rows = _copy_at_s1(
+        [
+            {"stop": "S0", "scheduled_departure": _at(90)},
+            {"stop": "S1", "scheduled_arrival": _at(95)},
+            {"stop": "S2", "scheduled_arrival": _at(100), "arrival": _at(100)},
+        ]
     )
-
-    def run(minutes: int) -> tuple[object, ...]:
-        message = _descriptor_message(
-            _duplicate(
-                ("T-2", "20260730", "09:30:00"),
-                stops=[{"stop": "S1", "scheduled_arrival": _at(minutes)}],
-            )
-        )
-        return _run_feeds(files, _boards_and_journeys(("S1", "S2")), [message])
-
-    board, (s1_s2,) = run(100)
-    assert [row[:3] for row in board if row[0] == "T-2"] == [
-        ("T-2", "S0", _at(90)),
-        ("T-2", "S1", _at(100)),
-        ("T-2", "S2", _at(115)),
-    ]
-    assert ("T-2", _at(100), None, None, "Downtown", "R") in s1_s2
-    late, _ = run(300)  # 13:00: outside the 07:30-10:30 window
-    assert [row[1] for row in late if row[0] == "T-2"] == ["S0"]
-
-
-def test_a_copys_times_never_run_backwards() -> None:
-    """A stated time later than the next stop's moved one raises it: S1
-    leaving at 10:00 brings S2 (moved 09:55) up to 10:00, so no stop comes
-    before the one before it and no journey arrives before it departs."""
-    rows = _copy_at_s1([{"stop": "S1", "scheduled_departure": _at(120)}])
     assert rows == [
         ("S0", _at(90), _at(90), None, None),
-        ("S1", _at(100), _at(120), None, None),
-        ("S2", _at(120), _at(120), None, None),
+        ("S1", _at(95), _at(95), None, None),
+        ("S2", _at(100), _at(100), None, 0),
+    ]
+    # Only the stops its updates state.
+    assert [
+        row[0] for row in _copy_at_s1([{"stop": "S1", "scheduled_arrival": _at(101)}])
+    ] == ["S1"]
+
+
+def test_a_moved_copys_skipped_and_no_data_stops() -> None:
+    """On its original's moved schedule, a stop the copy skips is not shown,
+    and a NO_DATA stop cuts its delay from carrying on."""
+    assert [row[0] for row in _copy_at_s1([{"stop": "S1", "skipped": True}])] == [
+        "S0",
+        "S2",
+    ]
+    assert _copy_at_s1(
+        [
+            {"stop": "S0", "departure_delay": 120},
+            {"stop": "S1", "no_data": True},
+        ]
+    ) == [
+        ("S0", _at(90), _at(90), _at(92), 120),
+        ("S1", _at(100), _at(105), None, None),
+        ("S2", _at(115), _at(115), None, None),
     ]
 
 
-def test_a_stated_departure_pulls_its_arrival_back() -> None:
-    """Within a stop the unstated event yields to the stated one: a stated
-    departure before the moved arrival brings the arrival back to it."""
-    rows = _copy_at_s1([{"stop": "S1", "scheduled_departure": _at(98)}])
-    assert rows[1] == ("S1", _at(98), _at(98), None, None)
+def test_a_copys_trip_short_name_may_differ() -> None:
+    """TripProperties.trip_short_name: "the name for this trip when it
+    differs from the original" -- a copy's own train number."""
+    files = _feed(
+        trips=(
+            "route_id,service_id,trip_id,trip_headsign,trip_short_name\nR,S,T,Out,101\n"
+        ),
+    )
+    message = _descriptor_message(_duplicate(("T-2", "20260730", "09:30:00")))
+    message.entity[0].trip_update.trip_properties.trip_short_name = "901"
+    board = _run_feeds(files, _board(_EIGHT - timedelta(minutes=30)), [message])
+    assert {r.trip_id: r.trip_short_name for r in board} == {"T": "101", "T-2": "901"}
