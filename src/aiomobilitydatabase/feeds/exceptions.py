@@ -32,4 +32,9 @@ class FeedParseError(MobilityFeedsError):
 
 
 class StaticDataUnavailableError(MobilityFeedsError):
-    """The feed has no usable hosted static dataset."""
+    """The feed has no usable hosted static dataset.
+
+    Also raised, rarely, when concurrent builds of another dataset into the
+    same cache keep replacing this one's: that passes, and a later attempt
+    succeeds.
+    """

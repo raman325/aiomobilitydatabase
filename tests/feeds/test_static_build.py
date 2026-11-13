@@ -789,26 +789,59 @@ def test_a_build_replaced_by_a_concurrent_one_is_labelled_by_its_file(
         index.close()
 
 
+@pytest.mark.parametrize(
+    "stranger",
+    [
+        "no keys",
+        "no timezone",
+        "unknown timezone",
+        "older schema",
+        "not a database",
+        "purged",
+    ],
+)
 def test_a_reopened_file_that_is_no_index_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stranger: str
 ) -> None:
-    """A file renamed in that carries no dataset id is not labelled with the
-    caller's: it is no index of ours."""
+    """Whatever lands on the target between the rename and the reopen, a
+    file that is not one of this version's built indexes -- or none at all
+    -- is refused as such, never labelled with the caller's dataset, and a
+    purged target is not recreated as an empty file."""
     db_path = tmp_path / "static.db"
     real_replace = Path.replace
+    meta = {
+        "no keys": [],
+        "no timezone": [("dataset_id", "ds"), ("schema_version", str(SCHEMA_VERSION))],
+        "unknown timezone": [
+            ("dataset_id", "ds"),
+            ("timezone", "Mars/Olympus"),
+            ("schema_version", str(SCHEMA_VERSION)),
+        ],
+        "older schema": [
+            ("dataset_id", "ds"),
+            ("timezone", TZ),
+            ("schema_version", str(SCHEMA_VERSION - 1)),
+        ],
+    }
 
     def replace_with_a_stranger(self: Path, target: Path | str) -> Path:
         result = real_replace(self, target)
         if Path(target) == db_path:
             db_path.unlink()
-            with sqlite3.connect(db_path) as conn:
-                conn.execute("CREATE TABLE meta (key TEXT, value TEXT)")
-            conn.close()
+            if stranger == "not a database":
+                db_path.write_bytes(b"not a database at all, just bytes " * 100)
+            elif stranger != "purged":
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+                    conn.executemany("INSERT INTO meta VALUES (?, ?)", meta[stranger])
+                conn.close()
         return result
 
     monkeypatch.setattr(Path, "replace", replace_with_a_stranger)
-    with pytest.raises(FeedParseError, match="not a built static index"):
+    with pytest.raises(FeedParseError):
         StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ)
+    if stranger == "purged":
+        assert not db_path.exists()
 
 
 def test_a_scratch_file_is_removed_when_its_connection_fails(

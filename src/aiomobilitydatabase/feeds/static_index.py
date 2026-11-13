@@ -758,16 +758,31 @@ class StaticIndex:
         except OSError:
             Path(build_path).unlink(missing_ok=True)
             raise
-        conn = sqlite3.connect(db_target, check_same_thread=False)
+        # Reopened by name: a concurrent build of the same target may have
+        # replaced ours since the rename. Label the index with the dataset
+        # the file actually holds, so it is never served as another (the
+        # caller decides what a different one means). mode=rw: a target
+        # purged meanwhile is an error, not a new empty file.
         try:
-            # Reopened by name: a concurrent build of the same target may
-            # have replaced ours since the rename. Label the index with the
-            # dataset the file actually holds, so it is never served as
-            # another; a caller wanting a different one rebuilds.
+            conn = sqlite3.connect(
+                f"{Path(db_target).absolute().as_uri()}?mode=rw",
+                uri=True,
+                check_same_thread=False,
+            )
+        except sqlite3.Error as err:
+            raise FeedParseError(f"{db_target} vanished after its build") from err
+        try:
             meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
-            if "dataset_id" not in meta or "timezone" not in meta:
+            if (
+                "dataset_id" not in meta
+                or "timezone" not in meta
+                or meta.get("schema_version") != str(SCHEMA_VERSION)
+            ):
                 raise FeedParseError(f"{db_target} is not a built static index")
             return cls(conn, meta["dataset_id"], meta["timezone"])
+        except (sqlite3.Error, ZoneInfoNotFoundError, ValueError) as err:
+            conn.close()
+            raise FeedParseError(f"{db_target} is not a built static index") from err
         except BaseException:
             conn.close()
             raise

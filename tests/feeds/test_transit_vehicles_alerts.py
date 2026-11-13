@@ -168,15 +168,19 @@ async def test_refresh_static_rebuilds_on_new_dataset(
     assert {s.id for s in handle.stops} == {"S1", "S2", "S3", "ST1"}
 
 
-async def test_refresh_static_overtaken_by_another_build_keeps_its_dataset(
+@pytest.mark.parametrize("races", [1, 2])
+async def test_refresh_static_overtaken_by_another_build(
     mock_api: MockApi,
     feeds_client: MobilityFeedsClient,
     monkeypatch: pytest.MonkeyPatch,
+    races: int,
 ) -> None:
     """A refresh whose build is replaced on disk by a concurrent build of
     another dataset gets an index truthfully labelled with that dataset --
-    not the one the catalog record describes. It raises rather than pair
-    the two, and the handle keeps serving what it served, record and all."""
+    not the one the catalog record describes. It is closed, never paired
+    with the record; the race passes, so the build is tried once more. Lost
+    twice, the refresh raises and the handle keeps serving what it served,
+    record and all."""
     _mock_catalog(mock_api)
     handle = await feeds_client.get_transit_feed("mdb-100")
     served = handle.static_dataset
@@ -184,22 +188,40 @@ async def test_refresh_static_overtaken_by_another_build_keeps_its_dataset(
     newer = with_base(GTFS_FEED, base)
     newer["latest_dataset"] = {**newer["latest_dataset"], "id": "mdb-100-202608010000"}
     mock_api.get("/v1/gtfs_feeds/mdb-100", payload=newer)
-    mock_api.get(ZIP_PATH, body=build_gtfs_zip_bytes(), content_type="application/zip")
+    for _ in range(races + 1):
+        mock_api.get(
+            ZIP_PATH, body=build_gtfs_zip_bytes(), content_type="application/zip"
+        )
     real = TransitFeedHandle._ensure_index_from_source.__func__  # type: ignore[attr-defined]
+    overtaken: list[StaticIndex] = []
+    closed: list[StaticIndex] = []
 
-    async def overtaken(cls: type, *args: object, **kwargs: object) -> StaticIndex:
+    async def racing(cls: type, *args: object, **kwargs: object) -> StaticIndex:
         index: StaticIndex = await real(cls, *args, **kwargs)
-        index.dataset_id = "mdb-100-OTHER"  # what the file now holds
+        if len(overtaken) < races:
+            index.dataset_id = "mdb-100-OTHER"  # what the file now holds
+            overtaken.append(index)
+            close = index.close
+
+            def recorded_close(index: StaticIndex = index) -> None:
+                closed.append(index)
+                close()
+
+            index.close = recorded_close  # type: ignore[method-assign]
         return index
 
     monkeypatch.setattr(
-        TransitFeedHandle, "_ensure_index_from_source", classmethod(overtaken)
+        TransitFeedHandle, "_ensure_index_from_source", classmethod(racing)
     )
-    with pytest.raises(StaticDataUnavailableError, match="concurrent build"):
-        await handle.refresh_static()
-    assert handle.static_dataset == served
-    assert handle.static_dataset is not None
-    assert handle.static_dataset.id == "mdb-100-202607310000"
+    if races == 1:
+        assert await handle.refresh_static() is True
+        assert handle.static_dataset is not None
+        assert handle.static_dataset.id == "mdb-100-202608010000"
+    else:
+        with pytest.raises(StaticDataUnavailableError, match="concurrent builds"):
+            await handle.refresh_static()
+        assert handle.static_dataset == served
+    assert closed == overtaken  # every overtaken index closed
 
 
 async def test_stops_in_zone(
