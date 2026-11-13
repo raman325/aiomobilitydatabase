@@ -367,8 +367,8 @@ Notes on direct mode:
   it. Service with `exact_times` 0 (or empty) "does not follow a fixed
   schedule", so its repetitions report `timepoint_exact=False`, and
   realtime names its runs by a `start_time` that "may be arbitrary": a run
-  is the trip moved to that start (and detoured as any run of the trip
-  would be), shown under its own `{trip_id}#{start_secs}` id in place of
+  is the trip moved to that start (a detour of it shown as a detoured
+  scheduled run is: rebuilt, with no prediction), shown under its own `{trip_id}#{start_secs}` id in place of
   the repetition whose headway slot holds it -- one headway from that
   repetition's start, never past the trip's next repetition. Two runs in
   one slot both show. Only its updates' times predict it ("Delay can only

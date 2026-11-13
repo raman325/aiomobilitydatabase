@@ -2529,26 +2529,45 @@ def test_a_frequency_based_run_keeps_its_service_and_states_no_delay() -> None:
 def test_a_frequency_based_run_is_detoured_as_its_repetition_would_be() -> None:
     """TripModifications apply to the runs they select: a detour of T on
     the day, listing no start_times, reroutes a run at any start -- S1
-    replaced by S2 ten minutes after S0. "TripUpdates for the original
-    trip_id will apply to the modified trip": the run's time predicts its
-    own stops after the detour, but "a TripUpdate with a
-    ModifiedTripSelector is the only way to create predictions at
-    replacement stops", so the replacement stop is schedule-only."""
+    replaced by S2 ten minutes after S0 -- shown as a detoured scheduled
+    run is: its rebuilt schedule, with no prediction. The stop_sequences
+    start at 0, where a detour's replacement calls are numbered 1, 2, ...
+    like the trip's own."""
     files = {
         **_THREE_STOPS,
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T,08:00:00,08:00:00,S0,0\nT,08:10:00,08:10:00,S1,1\n"
+            "T,08:20:00,08:20:00,S2,2\n"
+        ),
         "frequencies.txt": (
             "trip_id,start_time,end_time,headway_secs\nT,08:00:00,08:30:00,600\n"
         ),
     }
     message = _descriptor_message(
-        _slot_update("08:12:00", stops=[{"stop": "S0", "departure": _at(13)}])
+        _slot_update(
+            "08:12:00",
+            stops=[
+                {"stop": "S0", "departure": _at(14)},
+                {"stop": "S2", "departure": _at(36)},
+            ],
+        )
     )
-    _detoured(message)
+    entity = message.entity.add()
+    entity.id = "detour"
+    modification = entity.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = "S2"
+    replacement.travel_time_to_stop = 600
+    entity.trip_modifications.selected_trips.add().trip_ids.append("T")
+    entity.trip_modifications.service_dates.append("20260730")
     board, _ = _run_feeds(files, _boards_and_journeys(), [message])
     assert [row for row in board if row[0] in {"T#29400", "T#29520"}] == [
-        ("T#29520", "S0", _at(12), None, _at(13), False),
+        ("T#29520", "S0", _at(12), None, None, False),
         ("T#29520", "S2", _at(22), None, None, False),
-        ("T#29520", "S2", _at(32), _at(33), _at(33), False),
+        ("T#29520", "S2", _at(32), None, None, False),
     ]
 
 

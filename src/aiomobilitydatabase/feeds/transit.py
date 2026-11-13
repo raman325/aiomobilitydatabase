@@ -660,22 +660,10 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
 
 
 def _moved_calls(
-    entry: TripUpdateEntry,
-    run: TripInstanceCalls,
-    predictable: Collection[int] | None = None,
+    entry: TripUpdateEntry, run: TripInstanceCalls
 ) -> tuple[RealtimeCall, ...]:
-    """Return a moved run's calls, its updates resolved against them.
-
-    With ``predictable``, only the calls of those stop_sequences are what
-    the updates address; any other (a detour's replacement stop) is
-    schedule-only, and a carried-on time passes over it.
-    """
-    resolved = resolve_trip_predictions(
-        entry,
-        run.calls
-        if predictable is None
-        else [call for call in run.calls if call.stop_sequence in predictable],
-    )
+    """Return a moved run's calls, its updates resolved against them."""
+    resolved = resolve_trip_predictions(entry, run.calls)
     calls: list[RealtimeCall] = []
     for call in run.calls:
         if call.stop_sequence in resolved.skipped:
@@ -758,17 +746,19 @@ def _slot_run(
     """Build an exact_times=0 run from the repetition whose slot it takes.
 
     It is its trip at its own start (see :meth:`StaticIndex.slot_runs`),
-    ``detoured`` its calls with the detours that select it applied, the
-    trip's descriptors its own, its updates' times alone predicting it
-    (:func:`_times_only`) -- never at a detour's replacement stop: "a
-    TripUpdate with a ModifiedTripSelector is the only way to create
-    predictions at replacement stops", and none is read. Such service
-    "does not follow a fixed schedule", so no delay is reported against
-    the moved one. It stands in for that repetition, and its vehicle
-    names it by its own start.
+    the trip's descriptors its own, its updates' times alone predicting it
+    (:func:`_times_only`). Such service "does not follow a fixed
+    schedule", so no delay is reported against the moved one. A run a
+    detour rebuilds (``detoured``, differing from the slot's) shows that
+    schedule with no prediction, as a detoured scheduled run does. It
+    stands in for that repetition, and its vehicle names it by its own
+    start.
     """
     run = detoured
-    own = {call.stop_sequence for call in slot.run.calls}
+    if run.calls != slot.run.calls:
+        entry = TripUpdateEntry(
+            stop_updates=(), delay_seconds=None, vehicle_id=entry.vehicle_id
+        )
     return RealtimeTrip(
         trip_id=run.trip_id,
         route_id=run.route_id,
@@ -778,7 +768,7 @@ def _slot_run(
         vehicle_id=entry.vehicle_id,
         calls=tuple(
             replace(call, delay_seconds=None)
-            for call in _moved_calls(_times_only(entry), run, own)
+            for call in _moved_calls(_times_only(entry), run)
         ),
         replaces=(run.source_trip_id, run.service_date, slot.slot_start),
         run=key,
@@ -2330,9 +2320,10 @@ class TransitFeedHandle:
         exact_times=1 repetition applies to none of them. Headway-based
         (exact_times=0) service has no fixed schedule, and its start_time
         "may be arbitrary": a run at any start is the trip moved there,
-        shown in place of the repetition whose headway slot holds it,
-        detoured as that run would be and predicted by its updates' times
-        alone, with no delay reported; a removal or replacement of it is
+        shown in place of the repetition whose headway slot holds it and
+        predicted by its updates' times alone, with no delay reported (a
+        detour of it is shown as a detoured scheduled run is: rebuilt, with
+        no prediction); a removal or replacement of it is
         one of that repetition (see :meth:`StaticIndex.slot_runs`). A plain
         (non-frequency) trip's start_time, when given, is its first
         departure, as GTFS-RT requires; any other value names no run.
