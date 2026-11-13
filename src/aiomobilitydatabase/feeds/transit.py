@@ -636,6 +636,10 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
         if any(call.scheduled_arrival or call.scheduled_departure for call in stated)
         else _moved_calls(record, run)
     )
+    if record.trip_headsign:
+        # The original's stop headsigns would override the headsign the
+        # copy now shows (a stop's headsign is the one shown there).
+        calls = tuple(replace(call, stop_headsign=None) for call in calls)
     assert record.copy_trip_id is not None
     return RealtimeTrip(
         trip_id=record.copy_trip_id,
@@ -767,7 +771,7 @@ def _realtime_rows(
                     timepoint_exact=call.timepoint_exact,
                     stop_headsign=call.stop_headsign,
                     trip_short_name=trip.trip_short_name,
-                    block_id=trip.block_id,
+                    block_id=None,  # no realtime-only trip is part of a block
                 )
             )
     return rows
@@ -848,7 +852,7 @@ def _realtime_journeys(
                     is_first=False,
                     is_last=False,
                     trip_short_name=trip.trip_short_name,
-                    block_id=trip.block_id,
+                    block_id=None,  # no realtime-only trip is part of a block
                 )
             )
     return journeys
@@ -2139,8 +2143,10 @@ class TransitFeedHandle:
         each keeping its offset from the original's first departure, moved
         so the copy starts at ``TripProperties.start_time`` on its
         ``start_date`` -- whether or not the original's service runs that
-        day -- with every descriptor the original's (headsign and short
-        name may differ, from TripProperties), and its updates resolved
+        day -- with the original's descriptors (headsign and short name
+        may differ, from TripProperties; a copy with its own headsign
+        drops the original's stop headsigns; no block or service), and its
+        updates resolved
         against that schedule as a scheduled trip's are ("delay values are
         applied to this calculated schedule time"). A copy whose updates
         state ``scheduled_time`` states its own schedule and is those

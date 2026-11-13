@@ -2186,3 +2186,39 @@ def test_a_new_trips_short_name_is_its_trip_properties() -> None:
     message.entity[0].trip_update.trip_properties.trip_short_name = "777"
     board = _run_feeds(_DIRECTED, _board(_EIGHT - timedelta(minutes=30)), [message])
     assert [r.trip_short_name for r in board if r.trip_id == "N"] == ["777"]
+
+
+def test_a_copys_own_headsign_is_not_overridden_by_stop_headsigns() -> None:
+    """A stop's headsign is the one shown there, so a copy TripProperties
+    renames does not keep its original's stop headsigns: it is found, and
+    shown, by its own headsign only."""
+    files = _feed(
+        stop_times=(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence,stop_headsign\n"
+            "T,08:00:00,08:00:00,S0,1,Downtown via Main\n"
+            "T,08:10:00,08:10:00,S1,2,\n"
+        ),
+    )
+    message = _descriptor_message(
+        {**_duplicate(("T-2", "20260730", "09:30:00")), "headsign": "Airport"}
+    )
+
+    async def body(handle: TransitFeedHandle) -> list[list[tuple[object, ...]]]:
+        start = _EIGHT - timedelta(minutes=30)
+        boards = await handle.get_arrivals(
+            [
+                ArrivalsQuery(["S0"], headsigns=["Airport"]),
+                ArrivalsQuery(["S0"], headsigns=["Downtown via Main"]),
+            ],
+            start=start,
+            end=start + timedelta(hours=3),
+        )
+        return [
+            [(r.trip_id, r.headsign, r.stop_headsign) for r in board]
+            for board in boards
+        ]
+
+    assert _run_feeds(files, body, [message]) == [
+        [("T-2", "Airport", None)],
+        [("T", "Downtown", "Downtown via Main")],
+    ]

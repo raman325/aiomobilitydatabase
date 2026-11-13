@@ -690,11 +690,11 @@ class RealtimeTrip:
     replaces: TripUpdateKey | None = None
     # A DUPLICATED copy's trip descriptors, its original's (a short name
     # also from TripProperties, for any extra trip); unknown (None)
-    # otherwise. A copy has no block: it is no part of its original's.
+    # otherwise. No realtime-only trip has a block: a block is a vehicle's
+    # sequence of scheduled trips.
     wheelchair_accessible: WheelchairAccess | None = None
     bikes_allowed: BikesAllowed | None = None
     trip_short_name: str | None = None
-    block_id: str | None = None
 
 
 @dataclass(frozen=True)
