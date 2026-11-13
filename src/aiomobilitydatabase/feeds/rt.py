@@ -664,7 +664,10 @@ class RealtimeTrip:
 
     A DUPLICATED copy is built the same way from its original (see
     ``transit``): its own trip_id, the original's moved calls, and the
-    original's descriptors.
+    original's descriptors. So is a run of an exact_times=0 frequency trip,
+    which has no schedule of its own: the trip's calls moved to the run's
+    start, ``replaces`` naming the repetition whose headway slot it takes,
+    and ``run`` its own (trip_id, start_date, start_secs).
 
     A NEW trip ("an extra trip unrelated to any existing trips"; ADDED, its
     deprecated predecessor, is read the same way) or a REPLACEMENT run,
@@ -676,7 +679,8 @@ class RealtimeTrip:
     ``direction_id`` and ``headsign`` are what the update says
     (``TripProperties.trip_headsign`` for the headsign); a replacement,
     once matched, takes the replaced run's ``trip_id`` (a frequency
-    repetition's own), route and direction, and its headsign where the
+    repetition's own; a headway-based run's, its own start's), route and
+    direction, and its headsign where the
     update gives none.
     """
 
@@ -688,6 +692,9 @@ class RealtimeTrip:
     vehicle_id: str | None
     calls: tuple[RealtimeCall, ...]
     replaces: TripUpdateKey | None = None
+    # The key realtime names the run by, where it differs from ``replaces``
+    # (an exact_times=0 run's own start): its vehicle names it so.
+    run: TripUpdateKey | None = None
     # A DUPLICATED copy's trip descriptors, its original's (a short name
     # also from TripProperties, for any extra trip); unknown (None)
     # otherwise. No realtime-only trip has a block: a block is a vehicle's
@@ -695,6 +702,9 @@ class RealtimeTrip:
     wheelchair_accessible: WheelchairAccess | None = None
     bikes_allowed: BikesAllowed | None = None
     trip_short_name: str | None = None
+    # An exact_times=0 run's trip's service: it runs on that service's day.
+    # None for any other realtime-only trip, which no calendar runs.
+    service_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -773,7 +783,8 @@ class TripUpdates:
     ``canceled_trips`` the runs that were scheduled but do not operate
     (shown as cancelled); ``deleted_trips`` runs removed outright, which
     "must not be shown to users"; ``realtime_trips`` the realtime-only
-    trips (NEW, ADDED, REPLACEMENT), a replacement also naming the
+    trips (NEW, ADDED, REPLACEMENT; once matched, runs of exact_times=0
+    frequency trips too), a replacement also naming the
     scheduled run it replaces (see :attr:`replaced_trips`); ``duplicates``
     the DUPLICATED records, whose copies ``transit`` builds from the
     schedule and adds to ``realtime_trips``.

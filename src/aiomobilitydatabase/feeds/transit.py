@@ -68,6 +68,7 @@ from .rt import (
     RealtimeTrip,
     TripModifications,
     TripPredictions,
+    TripUpdateEntry,
     TripUpdateKey,
     TripUpdateRecord,
     TripUpdates,
@@ -88,9 +89,11 @@ from .static_index import (
     _LATEST_INSTANT,
     ScheduledDeparture,
     ScheduledTrip,
+    SlotRun,
     StaticIndex,
     TripCall,
     TripInstanceCalls,
+    repetition_trip_id,
 )
 
 if TYPE_CHECKING:
@@ -596,11 +599,18 @@ def _replacing(
 
     A TripDescriptor's route and direction only select the trip; they
     cannot move it to another route. The headsign and short name may
-    differ ("when it differs from the original"), else are the trip's.
+    differ ("when it differs from the original"), else are the trip's. A
+    run of headway-based service (:attr:`RealtimeTrip.run`) is its own
+    start's run, under that start's id: its slot's other runs are other
+    vehicles.
     """
     route_id, headsign, direction_id, short_name = summaries.get(
         concrete_trip_id, (trip.route_id or "", None, trip.direction_id, None)
     )
+    if trip.run is not None:
+        source_trip_id, _day, start_secs = trip.run
+        assert start_secs is not None  # a slot is found only by a start
+        concrete_trip_id = repetition_trip_id(source_trip_id, start_secs)
     return replace(
         trip,
         trip_id=concrete_trip_id,
@@ -635,7 +645,7 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
     calls = (
         stated
         if any(call.scheduled_arrival or call.scheduled_departure for call in stated)
-        else _moved_calls(record, run)
+        else _moved_calls(record.entry, run)
     )
     if record.trip_headsign:
         # The original's stop headsigns would override the headsign the
@@ -657,10 +667,10 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
 
 
 def _moved_calls(
-    record: TripUpdateRecord, run: TripInstanceCalls
+    entry: TripUpdateEntry, run: TripInstanceCalls
 ) -> tuple[RealtimeCall, ...]:
-    """Return a copy's calls: its original's moved, its updates resolved."""
-    resolved = resolve_trip_predictions(record.entry, run.calls)
+    """Return a moved run's calls, its updates resolved against them."""
+    resolved = resolve_trip_predictions(entry, run.calls)
     calls: list[RealtimeCall] = []
     for call in run.calls:
         if call.stop_sequence in resolved.skipped:
@@ -689,18 +699,107 @@ def _moved_calls(
     return tuple(calls)
 
 
+def _times_only(entry: TripUpdateEntry) -> TripUpdateEntry:
+    """Return an exact_times=0 run's updates without their delays.
+
+    "Delay can only be used in case the trip update refers to a scheduled
+    GTFS trip, as opposed to a frequency-based trip": such a trip "does not
+    follow a fixed schedule", so a delay states nothing about it. Its times
+    stand: an event with no time is not predicted from its update, while a
+    time's offset from the run's moved schedule still carries on to later
+    stops, as any update's does.
+    """
+    return replace(
+        entry,
+        delay_seconds=None,
+        stop_updates=tuple(
+            replace(update, arrival_delay=None, departure_delay=None)
+            for update in entry.stop_updates
+        ),
+    )
+
+
+def _detoured(
+    run: TripInstanceCalls,
+    modifications: Sequence[TripModifications],
+    rt_stops: Mapping[str, Stop],
+    static_stops: Mapping[str, Stop],
+) -> TripInstanceCalls:
+    """Return a run with the detours that select it applied.
+
+    As a scheduled run is rebuilt (see :meth:`_apply_trip_modifications`):
+    an entity naming its trip on its service day, listing no start_times or
+    the run's own ("the start times in the real-time trip descriptor").
+    """
+    applicable = [
+        modification
+        for entity in modifications
+        if run.source_trip_id in entity.trip_ids
+        and run.service_date in entity.service_dates
+        and (not entity.start_secs or run.start_secs in entity.start_secs)
+        for modification in entity.modifications
+    ]
+    if not applicable:
+        return run
+    return replace(run, calls=_modified_calls(run, applicable, rt_stops, static_stops))
+
+
+def _slot_run(
+    key: TripUpdateKey,
+    entry: TripUpdateEntry,
+    slot: SlotRun,
+    detoured: TripInstanceCalls,
+) -> RealtimeTrip:
+    """Build an exact_times=0 run from the repetition whose slot it takes.
+
+    It is its trip at its own start (see :meth:`StaticIndex.slot_runs`),
+    the trip's descriptors its own, its updates' times alone predicting it
+    (:func:`_times_only`). Such service "does not follow a fixed
+    schedule", so no delay is reported against the moved one. A run a
+    detour rebuilds (``detoured``, differing from the slot's) shows that
+    schedule with no prediction, as a detoured scheduled run does (its
+    vehicle, matched by its own start, is still shown). It
+    stands in for that repetition, and its vehicle names it by its own
+    start.
+    """
+    run = detoured
+    if run.calls != slot.run.calls:
+        entry = TripUpdateEntry(
+            stop_updates=(), delay_seconds=None, vehicle_id=entry.vehicle_id
+        )
+    return RealtimeTrip(
+        trip_id=run.trip_id,
+        route_id=run.route_id,
+        direction_id=run.direction_id,
+        headsign=run.headsign,
+        start_date=run.service_date,
+        vehicle_id=entry.vehicle_id,
+        calls=tuple(
+            replace(call, delay_seconds=None)
+            for call in _moved_calls(_times_only(entry), run)
+        ),
+        replaces=(run.source_trip_id, run.service_date, slot.slot_start),
+        run=key,
+        wheelchair_accessible=run.wheelchair_accessible,
+        bikes_allowed=run.bikes_allowed,
+        trip_short_name=run.trip_short_name,
+        service_id=run.service_id,
+    )
+
+
 def _realtime_vehicle(
     trip: RealtimeTrip, vehicles: _Vehicles
 ) -> VehiclePosition | None:
     """Return the vehicle running a realtime-only trip.
 
     A replacement is the run it replaces, matched exactly as that run is:
-    by its trip, repetition and service day. An extra trip by its own
-    vehicle id, else the one vehicle naming the trip id its producer
-    minted for it.
+    by its trip, repetition and service day -- an exact_times=0 run by its
+    own start (:attr:`RealtimeTrip.run`). An extra trip by its own vehicle
+    id, else the one vehicle naming the trip id its producer minted for it.
     """
-    if trip.replaces is not None:
-        source_trip_id, service_date, start_secs = trip.replaces
+    named = trip.run or trip.replaces
+    if named is not None:
+        source_trip_id, service_date, start_secs = named
         return _match_vehicle(
             trip.vehicle_id,
             source_trip_id,
@@ -735,10 +834,10 @@ def _realtime_rows(
     """Board rows for realtime-only trips, at the queried stops.
 
     There is no stop_times row of their own: the times are the update's
-    (its ``scheduled_time`` and predictions; a copy's moved schedule), and
-    the stop_time descriptors are a copy's original's, else unknown --
-    timepoint included, whose absent-means-exact default only applies to
-    rows in stop_times.
+    (its ``scheduled_time`` and predictions; a copy's or a headway-based
+    run's moved schedule), and the stop_time descriptors are those moved
+    calls' own, else unknown -- timepoint included, whose
+    absent-means-exact default only applies to rows in stop_times.
     """
     rows: list[StopArrival] = []
     for trip in trips:
@@ -753,7 +852,7 @@ def _realtime_rows(
                     route_id=trip.route_id,
                     route=routes_by_id.get(trip.route_id) if trip.route_id else None,
                     trip_id=trip.trip_id,
-                    service_id=None,
+                    service_id=trip.service_id,
                     headsign=trip.headsign,
                     scheduled_arrival=call.scheduled_arrival,
                     scheduled_departure=call.scheduled_departure,
@@ -822,7 +921,7 @@ def _realtime_journeys(
                 UpcomingTrip(
                     trip_id=trip.trip_id,
                     route_id=trip.route_id,
-                    service_id=None,
+                    service_id=trip.service_id,
                     route=routes_by_id.get(trip.route_id) if trip.route_id else None,
                     headsign=trip.headsign,
                     origin_stop_id=origin_stop_id,
@@ -1820,6 +1919,9 @@ class TransitFeedHandle:
         start: datetime,
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
+        *,
+        modifications: Sequence[TripModifications] = (),
+        rt_stops: Mapping[str, Stop] | None = None,
     ) -> tuple[TripUpdates, _Vehicles]:
         """Match every realtime trip reference to the dated run it names.
 
@@ -1835,7 +1937,11 @@ class TransitFeedHandle:
         trip or a date is dropped (a dated one for a day its trip does not
         run simply matches no row), and so is a replacement naming no run
         that operates (see below) -- it is a scheduled run on a new
-        schedule, and replaces nothing.
+        schedule, and replaces nothing. A run of an exact_times=0 trip, at
+        whatever start, stands in for the repetition whose headway slot
+        holds it (see :meth:`StaticIndex.slot_runs`), with the detours of
+        ``modifications`` that select it applied (``rt_stops`` defining
+        any stop only realtime does).
         TripUpdates from every TU-capable sibling feed then merge: a
         cancellation or deletion anywhere wins, and of several updates for
         one run the most explicit reference wins, then the later feed in
@@ -1934,6 +2040,47 @@ class TransitFeedHandle:
                 )
             )
         updates = indexed_trip_updates(record for _, record in ranked)
+        # An exact_times=0 run is named by a start that "may be arbitrary":
+        # it takes the place of the repetition whose headway slot holds that
+        # start. A removal or replacement of the run is one of that
+        # repetition; the run's predictions are the run itself, shown in its
+        # place (see _slot_run). Done after the merge, so a removal of a run
+        # still wins over its predictions.
+        slots = await self._index_read(
+            self._index.slot_runs,
+            [
+                *updates.trips,
+                *updates.canceled_trips,
+                *updates.deleted_trips,
+                *(trip.replaces for trip in updates.realtime_trips if trip.replaces),
+            ],
+        )
+
+        def slotted(key: TripUpdateKey) -> TripUpdateKey:
+            slot = slots.get(key)
+            return key if slot is None else (key[0], key[1], slot.slot_start)
+
+        updates.deleted_trips = {slotted(key) for key in updates.deleted_trips}
+        updates.canceled_trips = {
+            slotted(key) for key in updates.canceled_trips
+        } - updates.deleted_trips
+        updates.realtime_trips = [
+            replace(trip, replaces=slotted(trip.replaces), run=trip.replaces)
+            if trip.replaces is not None and trip.replaces in slots
+            else trip
+            for trip in updates.realtime_trips
+        ]
+        # Detours apply where the caller applies them to scheduled runs.
+        slot_runs = [
+            _slot_run(
+                key,
+                updates.trips.pop(key),
+                slots[key],
+                _detoured(slots[key].run, modifications, rt_stops or {}, stops_by_id),
+            )
+            for key in list(updates.trips)
+            if key in slots
+        ]
         # A replacement is the run it replaces, on a new schedule: one
         # naming no run that operates replaces nothing and is dropped, as
         # predictions for no run are. It shows as that run: its trip id (a
@@ -1957,6 +2104,7 @@ class TransitFeedHandle:
             for trip in updates.realtime_trips
             if not trip.replaces or trip.replaces in runs
         ]
+        updates.realtime_trips.extend(slot_runs)
         # A DUPLICATED copy is its original's calls, moved to the copy's
         # start and day, with its StopTimeUpdates resolved against them.
         for record in updates.duplicates:
@@ -2167,9 +2315,16 @@ class TransitFeedHandle:
         start_time never applies to repetitions (which repetition was meant
         is unknowable, and guessing — or applying it to all of them — would
         be wrong more often than not), and a start_time matching no
-        materialized repetition applies to nothing. A plain (non-frequency)
-        trip's start_time, when given, is its first departure, as GTFS-RT
-        requires; any other value names no run.
+        exact_times=1 repetition applies to none of them. Headway-based
+        (exact_times=0) service has no fixed schedule, and its start_time
+        "may be arbitrary": a run at any start is the trip moved there,
+        shown in place of the repetition whose headway slot holds it and
+        predicted by its updates' times alone, with no delay reported (a
+        detour of it is shown as a detoured scheduled run is: rebuilt, with
+        no prediction); a removal or replacement of it is one of that
+        repetition (see :meth:`StaticIndex.slot_runs`). A plain
+        (non-frequency) trip's start_time, when given, is its first
+        departure, as GTFS-RT requires; any other value names no run.
 
         ``TripDescriptor.start_date`` picks the SERVICE DAY instance the
         start_time rules then apply within (see :func:`_dated`):
@@ -2234,7 +2389,13 @@ class TransitFeedHandle:
             )
             routes_by_id = await self._index_read(self._index.routes_by_id)
             updates, vehicles = await self._matched_realtime(
-                tu_messages, vehicle_messages, start, stops_by_id, routes_by_id
+                tu_messages,
+                vehicle_messages,
+                start,
+                stops_by_id,
+                routes_by_id,
+                modifications=modifications,
+                rt_stops=rt_stops,
             )
             # Realtime moves exactly the runs it names: those a TripUpdate
             # addresses and those a detour rebuilds. Both are read whole,
@@ -2309,6 +2470,7 @@ class TransitFeedHandle:
                     modified_rows=modified_rows,
                     modified_instances=modified_instances,
                     stops_by_id=stops_by_id,
+                    rt_stops=rt_stops,
                     routes_by_id=routes_by_id,
                     vehicles=vehicles,
                     memo=memo,
@@ -2356,6 +2518,7 @@ class TransitFeedHandle:
         modified_rows: Sequence[StopArrival],
         modified_instances: Collection[tuple[str, date]],
         stops_by_id: Mapping[str, Stop],
+        rt_stops: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
         vehicles: _Vehicles,
         memo: _PredictionMemo,
@@ -2456,7 +2619,8 @@ class TransitFeedHandle:
                 updates.realtime_trips,
                 set(all_stop_ids),
                 end=end,
-                stops_by_id=stops_by_id,
+                # A stop realtime defines (a detour's) is defined only there.
+                stops_by_id={**stops_by_id, **rt_stops},
                 routes_by_id=routes_by_id,
                 vehicles=vehicles,
             )
@@ -2551,8 +2715,10 @@ class TransitFeedHandle:
         Frequency-based repetitions (synthetic ``{trip_id}#{start_secs}``
         ids) match RT via ``TripDescriptor.start_time`` exactly as in
         :meth:`get_arrivals`: aligned start_time applies to that one
-        repetition; missing or unmatched start_time applies to no
-        repetition, and a plain trip's start_time, when given, is its first
+        exact_times=1 repetition, a start in an exact_times=0 repetition's
+        headway slot names a run shown in its place (not detoured here, as
+        no journey is), and a missing or unmatched start_time applies to no
+        repetition; a plain trip's start_time, when given, is its first
         departure (any other value names no run).
         ``TripDescriptor.start_date`` service-day matching also follows
         :meth:`get_arrivals` exactly: a dated update or cancellation

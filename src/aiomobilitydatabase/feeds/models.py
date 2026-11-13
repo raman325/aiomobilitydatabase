@@ -387,7 +387,8 @@ class StopArrival:
     and ``block_id`` are None; ``route_id``, ``direction_id``,
     ``headsign`` and ``trip_short_name`` are what the update gives
     (TripProperties for the last two) -- a replacement shows under the
-    trip it replaces (its ``trip_id``, a frequency repetition's own, route
+    trip it replaces (its ``trip_id``, a frequency repetition's own -- a
+    headway-based run's, its own start's -- route
     and direction; its headsign where the update gives none). A
     DUPLICATED copy is its original moved to the copy's start: its own
     ``trip_id`` (``TripProperties.trip_id``), the original's schedule
@@ -395,7 +396,13 @@ class StopArrival:
     updates' stops and times -- and the original's descriptors (headsign
     and short name unless TripProperties gives them), but no
     ``service_id`` and no ``block_id``: a block is the vehicle's sequence
-    of scheduled trips, which a copy at another time is not part of.
+    of scheduled trips, which a copy at another time is not part of. A
+    realtime run of headway-based (``exact_times`` 0) frequency service is
+    built the same way: its trip moved to the run's own start, under the
+    ``{trip_id}#{start_secs}`` id of that start, in place of the repetition
+    whose headway slot holds it; it keeps its trip's ``service_id``, only
+    its updates' times predict it, and its ``delay_seconds`` is None (such
+    service "does not follow a fixed schedule").
 
     ``predicted_arrival``/``predicted_departure`` are each event's own
     prediction; ``delay_seconds`` is the delay realtime gives this stop --
@@ -467,9 +474,10 @@ class UpcomingTrip:
     destination stop. A scheduled trip always has both scheduled times; a
     realtime-only trip (NEW, or a REPLACEMENT run, whose static
     schedule "isn't used") has only the ones its update gives
-    (``scheduled_time``), a DUPLICATED copy its original's moved to its
-    start (or its updates' own, where they state ``scheduled_time``), and
-    its other fields as on :class:`StopArrival`.
+    (``scheduled_time``), a DUPLICATED copy or a run of headway-based
+    frequency service its trip's moved to its start (a copy's updates'
+    own, where they state ``scheduled_time``), and its other fields as on
+    :class:`StopArrival`.
     Realtime predicts the events its updates give:
     ``predicted_departure``/``origin_predicted_arrival`` at the origin and
     ``predicted_arrival`` at the destination, each None when realtime says

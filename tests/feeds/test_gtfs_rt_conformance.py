@@ -1820,20 +1820,25 @@ def test_a_cancelled_copy_is_not_shown_and_leaves_the_original() -> None:
 
 def test_a_duplicate_of_a_repetition_copies_that_repetition() -> None:
     """A frequency trip's run is named by its start_time: the copy is that
-    repetition's calls at the copy's start."""
-    files = _feed(
-        frequencies=(
-            "trip_id,start_time,end_time,headway_secs\nT,08:00:00,09:00:00,1800\n"
-        ),
-    )
+    repetition's calls at the copy's start. But "Trips defined in GTFS
+    frequencies.txt with exact_times that is empty or equal to 0 cannot be
+    duplicated"."""
     message = _descriptor_message(
         {**_duplicate(("T-2", "20260730", "10:15:00")), "start_time": "08:30:00"}
     )
-    board, _ = _run_feeds(files, _boards_and_journeys(), [message])
-    assert [row[:3] for row in board if row[0] == "T-2"] == [
-        ("T-2", "S0", _at(135)),
-        ("T-2", "S1", _at(145)),
-    ]
+    for exact_times, copied in (
+        ("1", [("T-2", "S0", _at(135)), ("T-2", "S1", _at(145))]),
+        ("0", []),
+        ("", []),
+    ):
+        files = _feed(
+            frequencies=(
+                "trip_id,start_time,end_time,headway_secs,exact_times\n"
+                f"T,08:00:00,09:00:00,1800,{exact_times}\n"
+            ),
+        )
+        board, _ = _run_feeds(files, _boards_and_journeys(), [message])
+        assert [row[:3] for row in board if row[0] == "T-2"] == copied
 
 
 def test_a_duplicate_missing_its_copys_identity_is_ignored() -> None:
@@ -1900,23 +1905,29 @@ def test_a_duplicate_keeps_its_originals_drop_off_rules() -> None:
 
 def test_copied_run_names_one_run_and_moves_it() -> None:
     """copied_run: a plain trip (by no start, or its own first departure)
-    or a repetition (by its start), moved to the copy's start on any day;
-    a start naming no run names nothing."""
+    or an exact_times=1 repetition (by its start), moved to the copy's
+    start on any day; a start naming no run names nothing."""
     files = _feed(
         trips=(
             "route_id,service_id,trip_id,trip_headsign,direction_id\n"
-            "R,S,T,Out,0\nR,S,F,Out,0\n"
+            "R,S,T,Out,0\nR,S,F,Out,0\nR,S,G,Out,0\n"
         ),
         stop_times=(
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
             "T,08:00:00,08:00:00,S0,1\nT,08:10:00,08:10:00,S1,2\n"
             "F,09:00:00,09:00:00,S0,1\nF,09:10:00,09:10:00,S1,2\n"
+            "G,09:00:00,09:00:00,S0,1\nG,09:10:00,09:10:00,S1,2\n"
         ),
-        frequencies="trip_id,start_time,end_time,headway_secs\nF,09:00:00,10:00:00,1800\n",
+        frequencies=(
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "F,09:00:00,10:00:00,1800,1\nG,09:00:00,10:00:00,1800,0\n"
+        ),
     )
     index = _build_index_from_files(files)
     day = date(2026, 7, 30)
     try:
+        # A frequency-based (exact_times=0) trip has no run to copy.
+        assert index.copied_run("G", 34200, day, 37800) is None
         for source, secs, copy, first in (
             ("T", None, 37800, ("T", _at(150))),
             ("T", 28800, 37800, ("T", _at(150))),
@@ -2269,3 +2280,431 @@ def test_a_copys_trip_delay_moves_its_moved_schedule() -> None:
         ("S1", _at(105), _at(110), 300),
         ("S2", _at(120), _at(120), 300),
     ]
+
+
+# T leaves S0 at 08:00, 08:10 and 08:20, arriving at S1 ten minutes later:
+# exact_times blank, so each repetition stands for a 600 s headway slot.
+_SLOTS = _feed(
+    frequencies="trip_id,start_time,end_time,headway_secs\nT,08:00:00,08:30:00,600\n",
+)
+_UNSCHEDULED = gtfs_realtime_pb2.TripDescriptor.UNSCHEDULED
+
+
+def _slot_update(start_time: str, **fields: object) -> dict[str, object]:
+    return {
+        "trip_id": "T",
+        "start_date": "20260730",
+        "start_time": start_time,
+        "relationship": _UNSCHEDULED,
+        **fields,
+    }
+
+
+def test_a_frequency_based_run_takes_its_slot_and_bunched_runs_both_show() -> None:
+    """An exact_times=0 trip's start_time "may be arbitrary, and is
+    initially expected to be the first departure of the trip": a run at
+    08:03 is the trip moved to 08:03, shown under its own id in place of
+    the 08:00 repetition whose slot holds it; its time against that
+    schedule propagates. Two runs in one slot are two vehicles: both
+    show. Journeys agree."""
+    message = _descriptor_message(
+        _slot_update("08:03:00", stops=[{"stop": "S0", "departure": _at(4)}]),
+        _slot_update("08:07:00", stops=[{"stop": "S1", "arrival": _at(18)}]),
+    )
+    board, (journeys,) = _run_feeds(
+        _SLOTS, _boards_and_journeys(("S0", "S1")), [message]
+    )
+    assert set(board) == {
+        ("T#28980", "S0", _at(3), None, _at(4), False),
+        ("T#28980", "S1", _at(13), _at(14), _at(14), False),
+        ("T#29220", "S0", _at(7), None, None, False),
+        ("T#29220", "S1", _at(17), _at(18), None, False),
+        ("T#29400", "S0", _at(10), None, None, False),
+        ("T#29400", "S1", _at(20), None, None, False),
+        ("T#30000", "S0", _at(20), None, None, False),
+        ("T#30000", "S1", _at(30), None, None, False),
+    }
+    assert journeys == [
+        ("T#28980", _at(3), _at(4), _at(14), "Downtown", "R"),
+        ("T#29220", _at(7), None, _at(18), "Downtown", "R"),
+        ("T#29400", _at(10), None, None, "Downtown", "R"),
+        ("T#30000", _at(20), None, None, "Downtown", "R"),
+    ]
+
+
+def test_a_frequency_based_runs_delays_state_nothing() -> None:
+    """ "Delay can only be used in case the trip update refers to a
+    scheduled GTFS trip, as opposed to a frequency-based trip": a delay,
+    stop-level or trip-wide, predicts nothing on such a run -- even one
+    starting on a repetition's own start. The run still takes its slot."""
+    message = _descriptor_message(
+        _slot_update("08:10:00", delay=120),
+    )
+    message.entity[0].trip_update.delay = 300
+    board, _ = _run_feeds(_SLOTS, _boards_and_journeys(), [message])
+    assert [row for row in board if row[0] == "T#29400"] == [
+        ("T#29400", "S0", _at(10), None, None, False),
+        ("T#29400", "S1", _at(20), None, None, False),
+    ]
+
+
+def test_a_removal_of_a_frequency_based_run_is_of_its_slot() -> None:
+    """A cancellation or deletion naming a run at any start in a slot
+    names that slot's repetition: cancelled, it is shown flagged; deleted,
+    not shown. A removal still wins over predictions for its own run."""
+    canceled = _descriptor_message(
+        _slot_update(
+            "08:13:00", relationship=gtfs_realtime_pb2.TripDescriptor.CANCELED
+        ),
+        _slot_update("08:13:00", stops=[{"stop": "S0", "departure": _at(14)}]),
+        _slot_update("08:25:00", relationship=gtfs_realtime_pb2.TripDescriptor.DELETED),
+    )
+    board, (journeys,) = _run_feeds(
+        _SLOTS, _boards_and_journeys(("S0", "S1")), [canceled]
+    )
+    assert set(board) == {
+        ("T#28800", "S0", _EIGHT, None, None, False),
+        ("T#28800", "S1", _at(10), None, None, False),
+        ("T#29400", "S0", _at(10), None, None, True),
+        ("T#29400", "S1", _at(20), None, None, True),
+    }
+    assert [row[0] for row in journeys] == ["T#28800", "T#29400"]
+
+
+def test_a_start_in_no_slot_names_no_run() -> None:
+    """A run names nothing where no slot holds its start (before the
+    first repetition, or past the last one's headway) or its trip does not
+    run that day (the feed's calendar ends in 2027): the schedule stands
+    as it is."""
+    message = _descriptor_message(
+        *(
+            _slot_update(start, stops=[{"stop": "S0", "departure": _at(minutes)}])
+            for start, minutes in (("07:59:59", 1), ("08:30:00", 31))
+        ),
+        _slot_update("08:05:00", start_date="20280105"),
+        _slot_update(
+            "07:55:00", relationship=gtfs_realtime_pb2.TripDescriptor.CANCELED
+        ),
+    )
+    board, _ = _run_feeds(_SLOTS, _boards_and_journeys(), [message])
+    assert {row[0] for row in board} == {"T#28800", "T#29400", "T#30000"}
+    assert all(row[3:] == (None, None, False) for row in board)
+
+
+def test_a_frequency_based_run_rides_the_vehicle_naming_its_start() -> None:
+    """A vehicle names a frequency-based run as its TripUpdate does, by
+    trip, start_time and start_date: the 08:03 run rides the vehicle
+    naming 08:03, not one naming the 08:00 repetition it stands in for."""
+    stamp = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    trip_updates = _descriptor_message(_slot_update("08:03:00"), timestamp=stamp)
+    vehicles = gtfs_realtime_pb2.FeedMessage()
+    vehicles.header.gtfs_realtime_version = "2.0"
+    vehicles.header.timestamp = int(stamp.timestamp())
+    for vehicle_id, start_time in (("BUS-0800", "08:00:00"), ("BUS-0803", "08:03:00")):
+        entity = vehicles.entity.add()
+        entity.id = vehicle_id
+        entity.vehicle.vehicle.id = vehicle_id
+        entity.vehicle.trip.trip_id = "T"
+        entity.vehicle.trip.start_time = start_time
+        entity.vehicle.trip.start_date = "20260730"
+        entity.vehicle.position.latitude = 0
+        entity.vehicle.position.longitude = 0
+    board = _run_feeds(
+        _SLOTS, _board(stamp, with_vehicles=True), [trip_updates], [vehicles]
+    )
+    assert [
+        (r.trip_id, r.scheduled_departure, r.vehicle.vehicle_id if r.vehicle else None)
+        for r in board
+    ] == [
+        ("T#28980", _at(3), "BUS-0803"),
+        ("T#29400", _at(10), None),
+        ("T#30000", _at(20), None),
+    ]
+
+
+def test_a_replacement_of_a_frequency_based_run_replaces_its_slot() -> None:
+    """A REPLACEMENT names "the trip from static GTFS to be replaced": a
+    frequency-based run at any start in a slot replaces that slot's
+    repetition, shown under the run's own id."""
+    message = _descriptor_message(
+        _slot_update(
+            "08:12:00",
+            relationship=gtfs_realtime_pb2.TripDescriptor.REPLACEMENT,
+            calls=[("S0", None, _at(12), False)],
+        ),
+    )
+    board, _ = _run_feeds(_SLOTS, _boards_and_journeys(), [message])
+    assert [row for row in board if row[0] in {"T#29400", "T#29520"}] == [
+        ("T#29520", "S0", None, None, _at(12), False)
+    ]
+
+
+def test_slot_runs_find_the_slot_holding_a_start() -> None:
+    """slot_runs: a start in [repetition, repetition + headway) takes that
+    repetition (the latest, where a feed's slots overlap; the last one's
+    slot runs past end_time), moved to the start under its own id. Only
+    exact_times=0 repetitions have slots."""
+    files = _feed(
+        trips="route_id,service_id,trip_id,trip_headsign\nR,S,T,D\nR,S,E,D\n",
+        stop_times=(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T,08:00:00,08:00:00,S0,1\nT,08:10:00,08:10:00,S1,2\n"
+            "E,08:00:00,08:00:00,S0,1\nE,08:10:00,08:10:00,S1,2\n"
+        ),
+        frequencies=(
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T,08:00:00,08:25:00,600,0\nT,08:15:00,08:16:00,400,0\n"
+            "E,08:00:00,09:00:00,600,1\n"
+        ),
+    )
+    index = _build_index_from_files(files)
+    day = date(2026, 7, 30)
+    try:
+        keys = [
+            ("T", day, start)
+            for start in (28799, 28800, 29399, 29400, 29700, 30000, 30599, 30600)
+        ]
+        found = index.slot_runs([*keys, ("E", day, 28800), ("T", None, 28800)])
+        assert {
+            key[2]: (
+                slot.slot_start,
+                slot.run.trip_id,
+                slot.run.start_secs,
+                slot.run.calls[0].departure,
+                slot.run.calls[1].arrival,
+            )
+            for key, slot in found.items()
+        } == {
+            28800: (28800, "T#28800", 28800, _EIGHT, _at(10)),
+            29399: (
+                28800,
+                "T#29399",
+                29399,
+                _EIGHT + timedelta(seconds=599),
+                _at(10) + timedelta(seconds=599),
+            ),
+            29400: (29400, "T#29400", 29400, _at(10), _at(20)),
+            29700: (29700, "T#29700", 29700, _at(15), _at(25)),
+            30000: (30000, "T#30000", 30000, _at(20), _at(30)),
+            30599: (
+                30000,
+                "T#30599",
+                30599,
+                _at(20) + timedelta(seconds=599),
+                _at(30) + timedelta(seconds=599),
+            ),
+        }
+    finally:
+        index.close()
+
+
+def test_a_frequency_based_run_keeps_its_service_and_states_no_delay() -> None:
+    """A run of headway-based service runs on its trip's service, so it
+    keeps the trip's ``service_id``; it "does not follow a fixed schedule",
+    so no delay is reported against the moved one -- though its time's
+    offset from it still predicts later stops."""
+    message = _descriptor_message(
+        _slot_update("08:03:00", stops=[{"stop": "S0", "departure": _at(4)}])
+    )
+
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S1"], limit=2)],
+            start=_EIGHT - timedelta(minutes=30),
+            end=_EIGHT + timedelta(hours=2),
+        )
+        return [
+            (r.trip_id, r.stop_id, r.service_id, r.delay_seconds, r.predicted_arrival)
+            for r in board
+        ]
+
+    assert _run_feeds(_SLOTS, body, [message]) == [
+        ("T#28980", "S0", "S", None, None),
+        ("T#29400", "S0", "S", None, None),
+    ]
+    trip_rows = _run_feeds(_SLOTS, _boards_and_journeys(), [message])[0]
+    assert ("T#28980", "S1", _at(13), _at(14), _at(14), False) in trip_rows
+
+
+def test_a_frequency_based_run_is_detoured_as_its_repetition_would_be() -> None:
+    """TripModifications apply to the runs they select: a detour of T on
+    the day, listing no start_times, reroutes a run at any start -- S1
+    replaced by S2 ten minutes after S0 -- shown as a detoured scheduled
+    run is: its rebuilt schedule, with no prediction. The stop_sequences
+    start at 0, where a detour's replacement calls are numbered 1, 2, ...
+    like the trip's own."""
+    files = {
+        **_THREE_STOPS,
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T,08:00:00,08:00:00,S0,0\nT,08:10:00,08:10:00,S1,1\n"
+            "T,08:20:00,08:20:00,S2,2\n"
+        ),
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs\nT,08:00:00,08:30:00,600\n"
+        ),
+    }
+    message = _descriptor_message(
+        _slot_update(
+            "08:12:00",
+            stops=[
+                {"stop": "S0", "departure": _at(14)},
+                {"stop": "S2", "departure": _at(36)},
+            ],
+        )
+    )
+    entity = message.entity.add()
+    entity.id = "detour"
+    modification = entity.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 1
+    modification.end_stop_selector.stop_sequence = 1
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = "S2"
+    replacement.travel_time_to_stop = 600
+    entity.trip_modifications.selected_trips.add().trip_ids.append("T")
+    entity.trip_modifications.service_dates.append("20260730")
+    board, _ = _run_feeds(files, _boards_and_journeys(), [message])
+    assert [row for row in board if row[0] in {"T#29400", "T#29520"}] == [
+        ("T#29520", "S0", _at(12), None, None, False),
+        ("T#29520", "S2", _at(22), None, None, False),
+        ("T#29520", "S2", _at(32), None, None, False),
+    ]
+
+
+def test_a_slot_ends_at_the_next_repetition_whatever_its_kind() -> None:
+    """ "New headways may start at the exact time the previous headway
+    ends": headway-based service to 08:25, then exact times from 08:25.
+    08:25 is a scheduled run of its own, so the 08:20 slot ends there --
+    a cancellation or delay at 08:25 is that run's, never 08:20's -- while
+    08:24:59 still runs in the 08:20 slot."""
+    files = _feed(
+        frequencies=(
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T,08:00:00,08:25:00,600,0\nT,08:25:00,08:40:00,600,1\n"
+        ),
+    )
+    message = _descriptor_message(
+        _slot_update(
+            "08:25:00", relationship=gtfs_realtime_pb2.TripDescriptor.CANCELED
+        ),
+        _slot_update("08:35:00", delay=120, relationship=0),
+        _slot_update("08:24:59", stops=[{"stop": "S0", "departure": _at(26)}]),
+    )
+    board, _ = _run_feeds(files, _boards_and_journeys(), [message])
+    assert [row for row in board if row[1] == "S0"] == [
+        ("T#28800", "S0", _EIGHT, None, None, False),
+        ("T#29400", "S0", _at(10), None, None, False),
+        ("T#30300", "S0", _at(25), None, None, True),
+        ("T#30299", "S0", _at(25) - timedelta(seconds=1), None, _at(26), False),
+        ("T#30900", "S0", _at(35), None, _at(37), False),
+    ]
+
+
+def test_runs_sharing_a_slot_show_one_row_for_it() -> None:
+    """A slot's repetition is one row for the runs it stands for: a run
+    taking it hides it, whatever another feed removes in the same slot,
+    and of a deletion and a cancellation in one slot the deletion wins, as
+    for one run."""
+    removals = _descriptor_message(
+        _slot_update(
+            "08:11:00", relationship=gtfs_realtime_pb2.TripDescriptor.CANCELED
+        ),
+        _slot_update("08:01:00", relationship=gtfs_realtime_pb2.TripDescriptor.DELETED),
+        _slot_update(
+            "08:05:00", relationship=gtfs_realtime_pb2.TripDescriptor.CANCELED
+        ),
+    )
+    running = _descriptor_message(
+        _slot_update("08:14:00", stops=[{"stop": "S0", "departure": _at(14)}])
+    )
+    board, _ = _run_feeds(_SLOTS, _boards_and_journeys(), [removals, running])
+    assert [row for row in board if row[1] == "S0"] == [
+        ("T#29640", "S0", _at(14), None, _at(14), False),
+        ("T#30000", "S0", _at(20), None, None, False),
+    ]
+
+
+def test_each_run_in_a_slot_has_its_own_id() -> None:
+    """Runs sharing a slot are different vehicles: a REPLACEMENT of a run
+    at 08:11 is that run, under its own id, beside a replacement at 08:16
+    and a run named exactly by the slot's 08:10 start."""
+    replacement = gtfs_realtime_pb2.TripDescriptor.REPLACEMENT
+    message = _descriptor_message(
+        _slot_update(
+            "08:11:00", relationship=replacement, calls=[("S0", None, _at(11), False)]
+        ),
+        _slot_update(
+            "08:16:00", relationship=replacement, calls=[("S0", None, _at(16), False)]
+        ),
+        _slot_update("08:10:00", stops=[{"stop": "S0", "departure": _at(12)}]),
+    )
+    board, _ = _run_feeds(_SLOTS, _boards_and_journeys(), [message])
+    assert [row[:5] for row in board if row[1] == "S0"] == [
+        ("T#28800", "S0", _EIGHT, None, None),
+        ("T#29460", "S0", None, None, _at(11)),
+        ("T#29400", "S0", _at(10), None, _at(12)),
+        ("T#29760", "S0", None, None, _at(16)),
+        ("T#30000", "S0", _at(20), None, None),
+    ]
+
+
+def test_a_run_at_a_stop_only_realtime_defines_carries_that_stop() -> None:
+    """ "An RT-added stop is the ONLY definition of itself": a run of
+    headway-based service detoured through a stop only a realtime Stop
+    entity defines shows that stop, as a detoured scheduled run does."""
+    message = _descriptor_message(_slot_update("08:12:00"))
+    entity = message.entity.add()
+    entity.id = "detour"
+    modification = entity.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 2
+    modification.end_stop_selector.stop_sequence = 2
+    replacement_stop = modification.replacement_stops.add()
+    replacement_stop.stop_id = "POP"
+    replacement_stop.travel_time_to_stop = 300
+    entity.trip_modifications.selected_trips.add().trip_ids.append("T")
+    entity.trip_modifications.service_dates.append("20260730")
+    stop = message.entity.add()
+    stop.id = "pop"
+    stop.stop.stop_id = "POP"
+    stop.stop.stop_name.translation.add().text = "Pop-up"
+
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["POP"])],
+            start=_EIGHT - timedelta(minutes=30),
+            end=_EIGHT + timedelta(hours=2),
+        )
+        return [(r.trip_id, r.stop.name if r.stop else None) for r in board]
+
+    assert _run_feeds(_SLOTS, body, [message]) == [
+        ("T#28800", "Pop-up"),
+        ("T#29520", "Pop-up"),
+        ("T#30000", "Pop-up"),
+    ]
+
+
+def test_a_detour_naming_start_times_selects_runs_by_their_own_start() -> None:
+    """A detour listing start_times selects "the start times in the
+    real-time trip descriptor": one naming 08:12 rebuilds the 08:12 run
+    (no prediction); one naming only the slot's 08:10 start leaves the
+    08:12 run in that slot as its update predicts it."""
+    files = {
+        **_THREE_STOPS,
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs\nT,08:00:00,08:30:00,600\n"
+        ),
+    }
+    for start_time, s0 in (
+        ("08:12:00", ("T#29520", "S0", _at(12), None, None, False)),
+        ("08:10:00", ("T#29520", "S0", _at(12), None, _at(13), False)),
+    ):
+        message = _descriptor_message(
+            _slot_update("08:12:00", stops=[{"stop": "S0", "departure": _at(13)}])
+        )
+        _detoured(message)
+        message.entity[-1].trip_modifications.start_times.append(start_time)
+        board, _ = _run_feeds(files, _boards_and_journeys(), [message])
+        rows = [row for row in board if row[0] in {"T#29400", "T#29520"}]
+        assert rows[0] == s0
+        # Rebuilt, the run calls at S2 in S1's place; otherwise it keeps S1.
+        assert ("S1" in {row[1] for row in rows}) is (start_time == "08:10:00")

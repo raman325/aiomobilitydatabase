@@ -47,7 +47,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -87,7 +87,11 @@ CREATE TABLE trips (
     short_name TEXT, block_id TEXT,
     -- The trip's first departure (see StaticIndex._store_first_departures),
     -- filled once every stop_time is loaded; NULL with no timed call.
-    first_secs INTEGER
+    first_secs INTEGER,
+    -- An exact_times=0 repetition's headway: the slot of starts
+    -- [start_secs, start_secs + slot_secs) a realtime run of the trip may
+    -- take in its place. NULL for every trip that keeps exact times.
+    slot_secs INTEGER
 );
 -- GTFS-RT's alternative trip matching names a trip by route, direction and
 -- first departure.
@@ -461,6 +465,26 @@ def _valid_zone(name: str) -> bool:
     return True
 
 
+def repetition_trip_id(trip_id: str, start_secs: int) -> str:
+    """Return the synthetic trip id of one run of a frequency trip.
+
+    A frequencies.txt repetition is ``{trip_id}#{start_secs}`` (e.g.
+    ``CITY1#21600``), as is a realtime run of an exact_times=0 trip at its
+    own start.
+    """
+    return f"{trip_id}#{start_secs}"
+
+
+def _later(when: datetime | None, shift: timedelta) -> datetime | None:
+    """Return ``when`` moved by ``shift``; None without it, or past datetime."""
+    if when is None:
+        return None
+    try:
+        return when + shift
+    except OverflowError:
+        return None
+
+
 def _shifted(secs: int | None, shift: int) -> int | None:
     """Move a template time onto a repetition; None before its day starts."""
     if secs is None or secs + shift < 0:
@@ -525,6 +549,18 @@ class TripInstanceCalls:
     trip_short_name: str | None
     block_id: str | None
     calls: list[TripCall]
+
+
+class SlotRun(NamedTuple):
+    """A realtime run of an exact_times=0 trip, and the repetition it takes.
+
+    ``run`` is the trip at the run's own start: its slot repetition's calls
+    moved there, under the run's own synthetic id. ``slot_start`` is that
+    repetition's start, the scheduled run it stands in for.
+    """
+
+    slot_start: int
+    run: TripInstanceCalls
 
 
 @dataclass(frozen=True)
@@ -1048,7 +1084,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)"
+        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)"
         for row in reader:
             rows.append(
                 (
@@ -1141,7 +1177,10 @@ class StaticIndex:
         exact_times=0 (or empty) is service that "does not follow a fixed
         schedule", so its repetitions' times are stored as approximate
         (timepoint 0) whatever the template says, and an unparseable
-        exact_times leaves timepoint unknown.
+        exact_times leaves timepoint unknown. An exact_times=0 repetition
+        also keeps its headway as ``slot_secs``: GTFS-RT names such a run by
+        a start_time that "may be arbitrary", and :meth:`slot_runs` finds
+        the repetition whose slot it starts in.
 
         A trips row is duplicated per repetition under the synthetic id
         (INSERT..SELECT from the original row, a no-op for orphan trips)
@@ -1171,10 +1210,10 @@ class StaticIndex:
             "INSERT OR REPLACE INTO trips "
             "(id, route_id, service_id, headsign, source_trip_id, start_secs, "
             "wheelchair_accessible, bikes_allowed, direction_id, "
-            "short_name, block_id) "
+            "short_name, block_id, slot_secs) "
             "SELECT ?, route_id, service_id, headsign, ?, ?, "
             "wheelchair_accessible, bikes_allowed, direction_id, "
-            "short_name, block_id "
+            "short_name, block_id, ? "
             "FROM trips WHERE id = ?"
         )
         stop_times_sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
@@ -1198,16 +1237,24 @@ class StaticIndex:
                     "to anchor repetition offsets"
                 )
             conn.execute("DELETE FROM stop_times WHERE trip_id = ?", (trip_id,))
-            starts: dict[int, int | None] = {}
+            starts: dict[int, tuple[int | None, int]] = {}
             for start_secs, end_secs, headway_secs, exact_times in trip_spans:
                 rep_start = start_secs
                 while rep_start < end_secs:
-                    starts.setdefault(rep_start, exact_times)
+                    starts.setdefault(rep_start, (exact_times, headway_secs))
                     rep_start += headway_secs
-            for rep_start, exact_times in sorted(starts.items()):
-                synthetic_id = f"{trip_id}#{rep_start}"
+            for rep_start, (exact_times, headway_secs) in sorted(starts.items()):
+                synthetic_id = repetition_trip_id(trip_id, rep_start)
                 shift = rep_start - anchor
-                trip_rows.append((synthetic_id, trip_id, rep_start, trip_id))
+                trip_rows.append(
+                    (
+                        synthetic_id,
+                        trip_id,
+                        rep_start,
+                        headway_secs if exact_times == 0 else None,
+                        trip_id,
+                    )
+                )
                 for (
                     stop_id,
                     arrival_secs,
@@ -1537,14 +1584,16 @@ class StaticIndex:
         duplicated trip are calculated based on the offset between the
         original trip departure_time and this field". The original is the
         run a TripDescriptor names -- a plain trip (``start_secs`` None or
-        its own first departure) or one frequency repetition -- and every
-        call keeps its offset from that trip's first departure. The copy
-        runs whether or not the original's service runs that day. None for
-        a trip naming no run, or one with no timed call.
+        its own first departure) or one exact_times=1 repetition -- and
+        every call keeps its offset from that trip's first departure. The
+        copy runs whether or not the original's service runs that day. None
+        for a trip naming no run, one with no timed call, or an
+        exact_times=0 repetition: such trips "cannot be duplicated".
         """
         rows = self._conn.execute(
             "SELECT id, service_id, start_secs, first_secs FROM trips "
-            "WHERE source_trip_id = ? AND first_secs IS NOT NULL",
+            "WHERE source_trip_id = ? AND first_secs IS NOT NULL "
+            "AND slot_secs IS NULL",
             (source_trip_id,),
         ).fetchall()
         named = [
@@ -1576,6 +1625,85 @@ class StaticIndex:
             if found
             else None
         )
+
+    def slot_runs[K: tuple[str, date | None, int | None]](
+        self, keys: Iterable[K]
+    ) -> dict[K, SlotRun]:
+        """Resolve realtime references to exact_times=0 trips to their runs.
+
+        Each key is ``(trip id, start_date, start_secs)``. GTFS-RT: such a
+        trip's start_time "may be arbitrary, and is initially expected to be
+        the first departure of the trip", so a run is the trip at that
+        start. frequencies.txt gives it no schedule of its own, only
+        headways: the run takes the place of the repetition whose slot holds
+        its start -- from that repetition's start for one headway, but never
+        past the trip's next repetition ("New headways may start at the
+        exact time the previous headway ends", and an exact_times=1 one is
+        a run of its own) -- and is that repetition's calls moved to its
+        start (a call materialization left untimed stays so). A key naming
+        no such slot, or a day the trip's service does not run, names
+        nothing here.
+        """
+        keys = [key for key in keys if key[1] is not None and key[2] is not None]
+        sources = sorted({source for source, _day, _secs in keys})
+        # Every repetition, in order: a slot ends at the next one.
+        repetitions: dict[str, list[tuple[int, int | None, str]]] = {}
+        # In slices: realtime can name more trips than SQLite allows bound
+        # variables in one statement.
+        for offset in range(0, len(sources), _ID_SLICE):
+            chunk = sources[offset : offset + _ID_SLICE]
+            for trip_id, source, start, width in self._conn.execute(
+                "SELECT id, source_trip_id, start_secs, slot_secs FROM trips "
+                f"WHERE source_trip_id IN ({','.join('?' * len(chunk))}) "
+                "AND start_secs IS NOT NULL ORDER BY source_trip_id, start_secs",
+                chunk,
+            ):
+                repetitions.setdefault(source, []).append((start, width, trip_id))
+        taken: dict[K, tuple[int, str, date]] = {}
+        for key in keys:
+            source, day, secs = key
+            assert day is not None and secs is not None
+            runs_of = repetitions.get(source, [])
+            for n, (start, width, trip_id) in enumerate(runs_of):
+                if width is None:
+                    continue  # exact times: a run of its own, no slot
+                end = start + width
+                if n + 1 < len(runs_of):
+                    end = min(end, runs_of[n + 1][0])
+                if start <= secs < end:
+                    taken[key] = (start, trip_id, day)
+                    break
+        runs = {
+            (run.trip_id, run.service_date): run
+            for run in self.instance_trip_calls(
+                {(trip_id, day) for _start, trip_id, day in taken.values()}
+            )
+        }
+        found: dict[K, SlotRun] = {}
+        for key, (start, trip_id, day) in taken.items():
+            source, _day, secs = key
+            assert secs is not None
+            run = runs.get((trip_id, day))
+            if run is None:
+                continue  # the trip's service does not run that day
+            shift = timedelta(seconds=secs - start)
+            found[key] = SlotRun(
+                start,
+                replace(
+                    run,
+                    trip_id=repetition_trip_id(source, secs),
+                    start_secs=secs,
+                    calls=[
+                        replace(
+                            call,
+                            arrival=_later(call.arrival, shift),
+                            departure=_later(call.departure, shift),
+                        )
+                        for call in run.calls
+                    ],
+                ),
+            )
+        return found
 
     def instance_trip_calls(
         self, instances: Iterable[tuple[str, date]]
