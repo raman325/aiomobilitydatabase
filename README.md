@@ -230,7 +230,10 @@ Notes on direct mode:
   cancellations, deletions and realtime-only trips when present.
   NEW (or ADDED) trips and REPLACEMENT runs show at their stops and as
   origin→destination journeys, at the times their updates give; a
-  replacement hides the scheduled run it replaces. A cancelled run
+  replacement hides the scheduled run it replaces. A DUPLICATED trip shows
+  as a copy of its original, under the copy's own trip id, moved to the
+  copy's start date and time, with its updates predicting against that
+  schedule; the original is untouched. A cancelled run
   stays listed at its scheduled time with `canceled=True` and no prediction
   (boards and journeys alike, counting toward `limit`), so riders see the
   cancellation; a deleted one "must not be shown to users" and is gone.

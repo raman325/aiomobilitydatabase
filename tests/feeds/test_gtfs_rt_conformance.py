@@ -469,6 +469,16 @@ def _descriptor_message(
             stu.departure.delay = fields["delay"]
         if "headsign" in fields:
             entity.trip_update.trip_properties.trip_headsign = fields["headsign"]
+        if "copy" in fields:
+            properties = entity.trip_update.trip_properties
+            copy_id, copy_date, copy_time = fields["copy"]
+            for name, value in (
+                ("trip_id", copy_id),
+                ("start_date", copy_date),
+                ("start_time", copy_time),
+            ):
+                if value:
+                    setattr(properties, name, value)
         stops = [
             *fields.get("stops", ()),
             *(
@@ -1703,3 +1713,155 @@ def test_filters_see_realtime_only_trips_by_what_their_updates_give() -> None:
         return [[row.trip_id for row in board] for board in boards]
 
     assert _run_feeds(_DIRECTED, body, [message]) == [["N"], ["T"], ["T", "N"], []]
+
+
+# --- DUPLICATED: a copy of a scheduled trip at another start ---------------
+
+
+def _duplicate(
+    copy: tuple[str, str, str], *, stops: list[dict[str, Any]] | None = None
+) -> dict[str, object]:
+    return {
+        "trip_id": "T",
+        "relationship": gtfs_realtime_pb2.TripDescriptor.DUPLICATED,
+        "copy": copy,
+        "stops": stops or [],
+    }
+
+
+def test_a_duplicate_runs_the_original_at_its_own_start() -> None:
+    """DUPLICATED: "A new trip that is the same as an existing scheduled trip
+    except for service start date and time"; "Scheduled arrival and
+    departure times for the duplicated trip are calculated based on the
+    offset between the original trip departure_time and this field", and
+    "delay values are applied to this calculated schedule time". The
+    original is untouched: "This enumeration does not modify the existing
+    trip"."""
+    message = _descriptor_message(
+        _duplicate(
+            ("T-2", "20260730", "09:30:00"),
+            stops=[{"stop": "S1", "departure_delay": 120}],
+        )
+    )
+    board, (s0_s1,) = _run_feeds(
+        _DIRECTED, _boards_and_journeys(("S0", "S1")), [message]
+    )
+    assert [row for row in board if row[0] in {"T", "T-2"}] == [
+        ("T", "S0", _EIGHT, None, None, False),
+        ("T", "S1", _at(10), None, None, False),
+        ("T-2", "S0", _at(90), None, None, False),
+        ("T-2", "S1", _at(100), None, _at(102), False),
+    ]
+    assert ("T-2", _at(90), None, None, "Out", "R") in s0_s1
+    assert ("T", _EIGHT, None, None, "Out", "R") in s0_s1
+
+
+def test_a_duplicate_runs_on_a_day_its_original_does_not() -> None:
+    """The copy runs at its own start_date even where the original's
+    service does not (the feed's calendar ends in 2027)."""
+    message = _descriptor_message(_duplicate(("T-2", "20280105", "09:30:00")))
+    start = datetime(2028, 1, 5, 9, tzinfo=UTC)
+    board = _run_feeds(_DIRECTED, _board(start), [message])
+    assert [(r.trip_id, r.scheduled_departure) for r in board] == [
+        ("T-2", datetime(2028, 1, 5, 9, 30, tzinfo=UTC))
+    ]
+
+
+def test_a_duplicates_vehicle_names_the_copy() -> None:
+    """ "The VehiclePosition.TripDescriptor.trip_id for the new trip must
+    contain the matching value from TripUpdate.TripProperties.trip_id": the
+    copy rides that vehicle, the original keeps its own."""
+    stamp = datetime(2026, 7, 30, 7, 45, tzinfo=UTC)
+    trip_updates = _descriptor_message(
+        _duplicate(("T-2", "20260730", "09:30:00")), timestamp=stamp
+    )
+    vehicles = gtfs_realtime_pb2.FeedMessage()
+    vehicles.header.gtfs_realtime_version = "2.0"
+    vehicles.header.timestamp = int(stamp.timestamp())
+    for vehicle_id, trip_id in (("BUS-T", "T"), ("BUS-COPY", "T-2")):
+        entity = vehicles.entity.add()
+        entity.id = vehicle_id
+        entity.vehicle.vehicle.id = vehicle_id
+        entity.vehicle.trip.trip_id = trip_id
+        entity.vehicle.trip.start_date = "20260730"
+        if trip_id == "T-2":
+            entity.vehicle.trip.schedule_relationship = (
+                gtfs_realtime_pb2.TripDescriptor.DUPLICATED
+            )
+        entity.vehicle.position.latitude = 0
+        entity.vehicle.position.longitude = 0
+    board = _run_feeds(
+        _DIRECTED, _board(stamp, with_vehicles=True), [trip_updates], [vehicles]
+    )
+    assert {
+        r.trip_id: r.vehicle.vehicle_id if r.vehicle else None
+        for r in board
+        if r.trip_id in {"T", "T-2"}
+    } == {"T": "BUS-T", "T-2": "BUS-COPY"}
+
+
+def test_a_cancelled_copy_is_not_shown_and_leaves_the_original() -> None:
+    """A copy is identified by its own trip_id: a cancellation naming it
+    removes the copy, never the original (cancelling the original "must"
+    be its own TripUpdate)."""
+    descriptor = gtfs_realtime_pb2.TripDescriptor
+    message = _descriptor_message(
+        _duplicate(("T-2", "20260730", "09:30:00")),
+        {
+            "trip_id": "T-2",
+            "start_date": "20260730",
+            "relationship": descriptor.CANCELED,
+        },
+    )
+    board, _ = _run_feeds(_DIRECTED, _boards_and_journeys(), [message])
+    assert {row[0] for row in board} == {"T", "U", "X"}
+    assert not any(row[5] for row in board)
+
+
+def test_a_duplicate_of_a_repetition_copies_that_repetition() -> None:
+    """A frequency trip's run is named by its start_time: the copy is that
+    repetition's calls at the copy's start."""
+    files = _feed(
+        frequencies=(
+            "trip_id,start_time,end_time,headway_secs\nT,08:00:00,09:00:00,1800\n"
+        ),
+    )
+    message = _descriptor_message(
+        {**_duplicate(("T-2", "20260730", "10:15:00")), "start_time": "08:30:00"}
+    )
+    board, _ = _run_feeds(files, _boards_and_journeys(), [message])
+    assert [row[:3] for row in board if row[0] == "T-2"] == [
+        ("T-2", "S0", _at(135)),
+        ("T-2", "S1", _at(145)),
+    ]
+
+
+def test_a_duplicate_missing_its_copys_identity_is_ignored() -> None:
+    """TripProperties' trip_id, start_date and start_time are all "required
+    if schedule_relationship is DUPLICATED": without one there is no copy,
+    and the original is untouched either way."""
+    for copy in (
+        ("", "20260730", "09:30:00"),
+        ("T-2", "", "09:30:00"),
+        ("T-2", "20260730", ""),
+    ):
+        board, _ = _run_feeds(
+            _DIRECTED, _boards_and_journeys(), [_descriptor_message(_duplicate(copy))]
+        )
+        assert {row[0] for row in board} == {"T", "U", "X"}, copy
+        assert all(row[3] is row[4] is None for row in board)
+
+
+def test_a_duplicate_keeps_its_originals_pickup_rules() -> None:
+    """A copy is the original's stop list with its descriptors: no journey
+    boards it where the original allows no pickup."""
+    files = _feed(
+        stop_times=(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence,pickup_type\n"
+            "T,08:00:00,08:00:00,S0,1,1\nT,08:10:00,08:10:00,S1,2,0\n"
+        ),
+    )
+    message = _descriptor_message(_duplicate(("T-2", "20260730", "09:30:00")))
+    board, (s0_s1,) = _run_feeds(files, _boards_and_journeys(("S0", "S1")), [message])
+    assert {row[0] for row in board} == {"T", "T-2"}  # still shown at S0
+    assert s0_s1 == []

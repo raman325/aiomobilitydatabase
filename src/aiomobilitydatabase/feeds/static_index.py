@@ -1522,6 +1522,53 @@ class StaticIndex:
                 found[trip_id] = (route_id, headsign, direction_id)
         return found
 
+    def copied_run(
+        self,
+        source_trip_id: str,
+        start_secs: int | None,
+        service_date: date,
+        copy_start_secs: int,
+    ) -> TripInstanceCalls | None:
+        """Return a trip's calls copied onto a day, starting at ``copy_start_secs``.
+
+        GTFS-RT DUPLICATED: "Scheduled arrival and departure times for the
+        duplicated trip are calculated based on the offset between the
+        original trip departure_time and this field". The original is the
+        run a TripDescriptor names -- a plain trip (``start_secs`` None or
+        its own first departure) or one frequency repetition -- and every
+        call keeps its offset from that trip's first departure. The copy
+        runs whether or not the original's service runs that day. None for
+        a trip naming no run, or one with no timed call.
+        """
+        rows = self._conn.execute(
+            "SELECT id, service_id, start_secs, first_secs FROM trips "
+            "WHERE source_trip_id = ? AND first_secs IS NOT NULL",
+            (source_trip_id,),
+        ).fetchall()
+        named = [
+            (trip_id, service_id, first)
+            for trip_id, service_id, repetition, first in rows
+            if (repetition is not None and repetition == start_secs)
+            or (
+                repetition is None
+                and trip_id == source_trip_id
+                and start_secs in (None, first)
+            )
+        ]
+        if len(named) != 1:
+            return None
+        [(trip_id, service_id, first)] = named
+        try:
+            day_start = self._service_day_start(service_date) + timedelta(
+                seconds=copy_start_secs - first
+            )
+        except OverflowError:
+            return None
+        found = self._instance_calls_on(
+            service_date, day_start, [trip_id], {service_id}
+        )
+        return found[0] if found else None
+
     def instance_trip_calls(
         self, instances: Iterable[tuple[str, date]]
     ) -> list[TripInstanceCalls]:
