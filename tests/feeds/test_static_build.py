@@ -768,6 +768,9 @@ def test_a_build_replaced_by_a_concurrent_one_is_labelled_by_its_file(
     really holds, never claim its own over another build's data."""
     other = tmp_path / "other.db"
     StaticIndex.build(_write_zip(tmp_path), str(other), "ds-OTHER", TZ).close()
+    with sqlite3.connect(other) as conn:  # the other dataset's own zone
+        conn.execute("UPDATE meta SET value = 'Europe/Paris' WHERE key = 'timezone'")
+    conn.close()
     db_path = tmp_path / "static.db"
     real_replace = Path.replace
 
@@ -781,9 +784,31 @@ def test_a_build_replaced_by_a_concurrent_one_is_labelled_by_its_file(
     monkeypatch.setattr(Path, "replace", replace_then_lose_the_race)
     index = StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ)
     try:
-        assert index.dataset_id == "ds-OTHER"
+        assert (index.dataset_id, index.timezone_name) == ("ds-OTHER", "Europe/Paris")
     finally:
         index.close()
+
+
+def test_a_reopened_file_that_is_no_index_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file renamed in that carries no dataset id is not labelled with the
+    caller's: it is no index of ours."""
+    db_path = tmp_path / "static.db"
+    real_replace = Path.replace
+
+    def replace_with_a_stranger(self: Path, target: Path | str) -> Path:
+        result = real_replace(self, target)
+        if Path(target) == db_path:
+            db_path.unlink()
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+            conn.close()
+        return result
+
+    monkeypatch.setattr(Path, "replace", replace_with_a_stranger)
+    with pytest.raises(FeedParseError, match="not a built static index"):
+        StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ)
 
 
 def test_a_scratch_file_is_removed_when_its_connection_fails(

@@ -760,19 +760,17 @@ class StaticIndex:
             raise
         conn = sqlite3.connect(db_target, check_same_thread=False)
         try:
+            # Reopened by name: a concurrent build of the same target may
+            # have replaced ours since the rename. Label the index with the
+            # dataset the file actually holds, so it is never served as
+            # another; a caller wanting a different one rebuilds.
             meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            if "dataset_id" not in meta or "timezone" not in meta:
+                raise FeedParseError(f"{db_target} is not a built static index")
+            return cls(conn, meta["dataset_id"], meta["timezone"])
         except BaseException:
             conn.close()
             raise
-        # Reopened by name: a concurrent build of the same target may have
-        # replaced ours since the rename. Label the index with the dataset
-        # the file actually holds, so it is never served as another; a
-        # caller wanting a different one rebuilds.
-        return cls(
-            conn,
-            meta.get("dataset_id", dataset_id),
-            meta.get("timezone", timezone_name),
-        )
 
     @classmethod
     def open_cached(cls, db_path: Path, dataset_id: str) -> StaticIndex | None:

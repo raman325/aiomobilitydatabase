@@ -1279,7 +1279,17 @@ class TransitFeedHandle:
             timezone_name=dataset.agency_timezone,
             headers=None,
         )
-        return await cls._ensure_index_from_source(client, source, on_progress)
+        index = await cls._ensure_index_from_source(client, source, on_progress)
+        if index.dataset_id != dataset.id:
+            # A concurrent build of another dataset replaced ours on disk:
+            # the index is truthfully labelled, but not the dataset this
+            # catalog record describes, and the two travel together.
+            await asyncio.to_thread(index.close)
+            raise StaticDataUnavailableError(
+                f"Feed {static_feed.id}'s index was replaced by a concurrent "
+                f"build of dataset {index.dataset_id!r}; try again"
+            )
+        return index
 
     @classmethod
     async def _ensure_index_from_source(
