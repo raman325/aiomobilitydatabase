@@ -1482,13 +1482,16 @@ class _Doc:
 
 
 def _model_lifetime(
-    cache_control: str | None, date: int | None, age: int | None, received: float
+    cache_control: str | None, date: int | None, age: int | None, received: datetime
 ) -> tuple[bool, float | None]:
     """(storable, lifetime) for the header shapes the fake producer sends.
 
     Requests are instantaneous here, so the lifetime is max-age less the
     initial age: the larger of Date's apparent age and Age. Date is whole
-    seconds; a missing one is the (whole-second) receipt time.
+    seconds; a missing one is the (whole-second) receipt time. The apparent
+    age is a datetime difference, as the cache takes it: the same instants
+    as float epoch seconds (about 1.8e9) carry rounding error of about
+    1e-7 s, which reads a response as fresh at the instant it goes stale.
     """
     if cache_control is None:
         return True, None
@@ -1497,13 +1500,17 @@ def _model_lifetime(
     if cache_control == "no-cache":
         return True, 0.0
     max_age = float(cache_control.removeprefix("max-age="))
-    dated = date if date is not None else int(received)
-    initial = max(0.0, received - dated, float(age or 0))
+    dated = (
+        datetime.fromtimestamp(date, UTC)
+        if date is not None
+        else received.replace(microsecond=0)
+    )
+    initial = max(0.0, (received - dated).total_seconds(), float(age or 0))
     return True, max(0.0, max_age - initial)
 
 
 def _model_hop(
-    hop: tuple[int, str | None], received: float
+    hop: tuple[int, str | None], received: datetime
 ) -> tuple[bool, float | None]:
     """(storable, lifetime) of a redirect the fake producer answers through.
 
@@ -1520,7 +1527,7 @@ def _model_hop(
 def _model_chain(
     final: tuple[bool, float | None],
     hop: tuple[int, str | None] | None,
-    received: float,
+    received: datetime,
 ) -> tuple[bool, float | None, float | None]:
     """(storable, lifetime, cap) of a response and the redirect to it.
 
@@ -1670,8 +1677,9 @@ class FreshnessMachine(RuleBasedStateMachine):
     def _wall(self) -> int:
         return int(T0.timestamp() + self.clock.now)
 
-    def _received(self) -> float:
-        return T0.timestamp() + self.clock.now
+    def _received(self) -> datetime:
+        # The instant the fake fetcher stamps on its response.
+        return T0 + timedelta(seconds=self.clock.now)
 
     def _etag(self, doc: _Doc) -> str | None:
         if not self.validators_offered:
@@ -2069,7 +2077,7 @@ class FreshnessMachine(RuleBasedStateMachine):
         date = (
             int(parsedate_to_datetime(_canonical(headers["Date"]) or "").timestamp())
             if "Date" in headers
-            else int(received)  # dated at receipt
+            else int(received.replace(microsecond=0).timestamp())  # at receipt
         )
         age = int(headers["Age"]) if "Age" in headers else None
         if served is None:
@@ -2274,6 +2282,32 @@ async def test_a_redirect_chain_is_reused_only_as_long_as_every_hop(
     response = Response("a", fields, T0, T0, hops)
     await cache.get("u", _Producer([response]))
     assert cache._entries["u"].lifetime == lifetime
+
+
+async def test_a_redirect_dated_at_receipt_goes_stale_exactly_at_its_lifetime() -> None:
+    """A 301 carrying max-age=5 and no Date, received 0.1 s past a whole
+    second, is dated at that second: its initial age is 0.1 s, so the chain
+    is fresh 4.8 s later and stale at 4.9 s (fresh only while lifetime >
+    age). Found by the state machine once its model took the apparent age
+    in float epoch seconds, whose rounding read 4.9 s as still fresh."""
+    clock = _Clock()
+    cache: FreshnessCache[str] = FreshnessCache(clock)
+    received = T0 + timedelta(seconds=1.1)
+    fields = header_fields({"Cache-Control": "max-age=30"})
+    hops = [_hop(Cache_Control="max-age=5")]
+    producer = _Producer(
+        [
+            Response("a", fields, received, received, hops),
+            Response("b", fields, received, received, hops),
+        ]
+    )
+    clock.now = 1.1
+    assert await cache.get("u", producer) == "a"
+    assert cache._entries["u"].lifetime == pytest.approx(4.9)
+    clock.now = 1.1 + 4.8
+    assert await cache.get("u", producer) == "a"
+    clock.now = 6.0
+    assert await cache.get("u", producer) == "b"
 
 
 async def test_min_interval_never_reuses_past_a_lifetime_the_chain_declared() -> None:
