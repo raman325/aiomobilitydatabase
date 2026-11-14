@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
+import pytest
 from google.transit import gtfs_realtime_pb2
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -112,7 +113,7 @@ def _attached(
     return body
 
 
-_SCOPES = _alerts(
+_SCOPE_LIST: list[tuple[str, list[dict[str, Any]]]] = [
     ("route", [{"route_id": "R"}]),
     ("route_type", [{"route_type": 3}]),
     ("agency", [{"agency_id": "A"}]),  # R names none: the feed's only agency
@@ -141,7 +142,8 @@ _SCOPES = _alerts(
             }
         ],
     ),
-)
+]
+_SCOPES = _alerts(*_SCOPE_LIST)
 _EVERYWHERE = {
     "route",
     "route_type",
@@ -166,6 +168,97 @@ def test_each_row_carries_the_alerts_whose_selectors_match_its_run() -> None:
     # A journey: at its origin or its destination.
     assert journeys == {
         ("T", _EIGHT): _EVERYWHERE | {"route_at_s0", "station", "stop_s1"},
+    }
+
+
+@pytest.mark.parametrize(
+    "scope", _SCOPE_LIST, ids=[alert_id for alert_id, _ in _SCOPE_LIST]
+)
+def test_each_alert_alone_lands_on_the_same_rows(
+    scope: tuple[str, list[dict[str, Any]]],
+) -> None:
+    """Sent alone, each alert lands exactly where it does among the others:
+    no selector leans on another's lookups."""
+    together, _ = _run_with(_FEED, _attached(), alerts=[_SCOPES])
+    alone, _ = _run_with(_FEED, _attached(), alerts=[_alerts(scope)])
+    alert_id = scope[0]
+    assert {key for key, ids in alone.items() if ids} == {
+        key for key, ids in together.items() if alert_id in ids
+    }
+
+
+def test_a_trip_run_names_only_a_unique_plain_trip() -> None:
+    """A trip without trip_id resolves as a TripUpdate's does: to the one
+    trip that is not frequency based leaving at that start on that day,
+    else to none."""
+    run = {
+        "trip": {
+            "route_id": "R",
+            "direction_id": 0,
+            "start_time": "08:00:00",
+            "start_date": "20260730",
+        }
+    }
+    frequent = {
+        **_FEED,
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T,08:00:00,08:30:00,600,1\n"
+        ),
+    }
+    twin = {
+        **_FEED,
+        "trips.txt": (
+            "route_id,service_id,trip_id,trip_headsign,direction_id\n"
+            "R,S,T,Downtown,0\nR,S,U,Downtown,0\n"
+        ),
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T,08:00:00,08:00:00,S0,1\nT,08:10:00,08:10:00,S1,2\n"
+            "U,08:00:00,08:00:00,S0,1\nU,08:10:00,08:10:00,S1,2\n"
+        ),
+    }
+    message = _alerts(("run", [run]))
+    for files in (frequent, twin):
+        board, journeys = _run_with(files, _attached(), alerts=[message])
+        assert board
+        assert all(not ids for ids in board.values())
+        assert all(not ids for ids in journeys.values())
+
+
+def test_a_stop_realtime_defines_takes_its_parent_stations_alerts() -> None:
+    """A detour's replacement stop may exist only in realtime; its own
+    parent_station is the station whose alerts reach it."""
+    updates = _descriptor_message({"trip_id": "T", "start_date": "20260730"})
+    stop = updates.entity.add()
+    stop.id = "pop"
+    stop.stop.stop_id = "POP"
+    stop.stop.parent_station = "ST"
+    detour = updates.entity.add()
+    detour.id = "detour"
+    modification = detour.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 2
+    modification.end_stop_selector.stop_sequence = 2
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = "POP"
+    replacement.travel_time_to_stop = 600
+    detour.trip_modifications.selected_trips.add().trip_ids.append("T")
+    detour.trip_modifications.service_dates.append("20260730")
+
+    async def body(handle: TransitFeedHandle) -> dict[str, set[str]]:
+        start = _EIGHT - timedelta(minutes=30)
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "POP"], limit=None)],
+            start=start,
+            end=start + timedelta(hours=2),
+            with_alerts=True,
+        )
+        return {row.stop_id: {alert.id for alert in row.alerts} for row in board}
+
+    message = _alerts(("station", [{"stop_id": "ST"}]))
+    assert _run_with(_FEED, body, alerts=[message], trip_updates=[updates]) == {
+        "S0": {"station"},
+        "POP": {"station"},
     }
 
 
@@ -285,6 +378,13 @@ def _selector(draw: st.DrawFn) -> dict[str, Any]:
         if draw(st.booleans())
     }
     if draw(st.booleans()):
+        selector["trip"] = {
+            "route_id": "R",
+            "direction_id": 0,
+            "start_time": draw(st.sampled_from(["08:00:00", "08:10:00"])),
+            "start_date": "20260730",
+        }
+    elif draw(st.booleans()):
         selector["trip"] = {"trip_id": draw(st.sampled_from(["T", "N"]))}
         if draw(st.booleans()):
             selector["trip"]["start_time"] = draw(
@@ -303,14 +403,18 @@ def test_with_alerts_only_adds_alerts(
     selectors: list[list[dict[str, Any]]], frequent: bool, canceled: bool
 ) -> None:
     """Asking for alerts changes no row and no other field: the same rows
-    come back, each with the alerts that apply to it, in feed order."""
+    come back, each with the alerts that apply to it, in feed order -- and
+    every row of route R carries the alert on route R."""
     files = dict(_FEED)
     if frequent:
         files["frequencies.txt"] = (
             "trip_id,start_time,end_time,headway_secs,exact_times\n"
             "T,08:00:00,08:30:00,600,1\n"
         )
-    message = _alerts(*((f"a{n}", chosen) for n, chosen in enumerate(selectors)))
+    message = _alerts(
+        *((f"a{n}", chosen) for n, chosen in enumerate(selectors)),
+        ("on_r", [{"route_id": "R"}]),
+    )
     updates = _descriptor_message(
         {
             "trip_id": "T",
@@ -345,7 +449,9 @@ def test_with_alerts_only_adds_alerts(
 
     plain, alerted = _run_with(files, body, alerts=[message], trip_updates=[updates])
     assert [replace(row, alerts=()) for row in alerted] == plain
-    order = [f"a{n}" for n in range(len(selectors))]
+    order = [*(f"a{n}" for n in range(len(selectors))), "on_r"]
+    assert alerted
     for row in alerted:
+        assert "on_r" in [alert.id for alert in row.alerts]
         ids = [alert.id for alert in row.alerts]
         assert ids == [alert_id for alert_id in order if alert_id in ids]

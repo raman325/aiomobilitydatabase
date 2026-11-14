@@ -49,6 +49,7 @@ from .geo import Circle, in_circle
 from .models import (
     Agency,
     ArrivalsQuery,
+    EntitySelector,
     FeedInfo,
     PickupDropOffType,
     Route,
@@ -59,6 +60,7 @@ from .models import (
     StopArrival,
     StopLocationType,
     TripQuery,
+    TripSelector,
     UpcomingTrip,
     VehiclePosition,
     WheelchairAccess,
@@ -244,14 +246,17 @@ class _Vehicles:
 class _Alerts:
     """The service alerts a query attaches to its rows, and what matching needs.
 
-    ``sole_agency_id`` is the feed's agency when it has exactly one: a
-    route naming none is that agency's. ``plain_starts`` maps each plain
-    trip an alert names with a start time to its first departure, which
-    is that run's start time ("should either be omitted or be equal to the
-    value in the GTFS feed").
+    ``alerts`` pairs each alert as parsed (what rows carry) with the alert
+    it is matched as: its trip-run selectors resolved to the one trip each
+    names, as a TripUpdate's are (:meth:`StaticIndex.alternative_trip_ids`),
+    or left out where they name none. ``sole_agency_id`` is the feed's
+    agency when it has exactly one: a route naming none is that agency's.
+    ``plain_starts`` maps each plain trip an alert names with a start time
+    to its first departure, which is that run's start time ("should either
+    be omitted or be equal to the value in the GTFS feed").
     """
 
-    alerts: Sequence[ServiceAlert] = ()
+    alerts: Sequence[tuple[ServiceAlert, ServiceAlert]] = ()
     routes_by_id: Mapping[str, Route] = field(default_factory=dict)
     stops_by_id: Mapping[str, Stop] = field(default_factory=dict)
     sole_agency_id: str | None = None
@@ -289,9 +294,9 @@ class _Alerts:
                 places.append(stop.parent_station)
         return tuple(
             alert
-            for alert in self.alerts
+            for alert, matched in self.alerts
             if any(
-                alert.applies_to(
+                matched.applies_to(
                     agency_id=agency_id,
                     route_id=route_id,
                     route_type=route.type if route else None,
@@ -304,6 +309,48 @@ class _Alerts:
                 for place in places
             )
         )
+
+
+def _run_ref(trip: TripSelector) -> tuple[str, int, date, int] | None:
+    """Return a trip-run selector's (route, direction, start date, time).
+
+    None for a trip naming its trip_id. A trip without one is kept only
+    with all four (see :func:`~.rt.alerts_from_message`).
+    """
+    if trip.trip_id is not None:
+        return None
+    assert trip.route_id is not None and trip.direction_id is not None
+    assert trip.start_date is not None and trip.start_secs is not None
+    return (trip.route_id, trip.direction_id, trip.start_date, trip.start_secs)
+
+
+def _run_refs(alert: ServiceAlert) -> list[tuple[str, int, date, int]]:
+    """Return the trip-run references an alert's selectors make."""
+    return [
+        ref
+        for selector in alert.informed_entities
+        if selector.trip is not None and (ref := _run_ref(selector.trip)) is not None
+    ]
+
+
+def _resolved(
+    alert: ServiceAlert, runs: Mapping[tuple[str, int, date, int], str]
+) -> ServiceAlert:
+    """Return ``alert`` with each trip-run selector naming its trip by id.
+
+    The run it resolves to (a trip that is not frequency based, the only
+    one leaving at that start on that day) is that trip at that start; a
+    run resolving to none, or to several, names nothing, as for TripUpdates.
+    """
+    selectors: list[EntitySelector] = []
+    for selector in alert.informed_entities:
+        trip = selector.trip
+        ref = _run_ref(trip) if trip is not None else None
+        if trip is None or ref is None:
+            selectors.append(selector)
+        elif ref in runs:
+            selectors.append(replace(selector, trip=replace(trip, trip_id=runs[ref])))
+    return replace(alert, informed_entities=tuple(selectors))
 
 
 def _realtime_run(trip: RealtimeTrip) -> TripUpdateKey:
@@ -2588,8 +2635,9 @@ class TransitFeedHandle:
                 wanted_stops=all_stop_ids,
                 window=(start - grace, end),
             )
+            # A detour's stop realtime defines is defined only there.
             alerts = await self._alert_matcher(
-                alert_messages, stops_by_id, routes_by_id
+                alert_messages, {**stops_by_id, **rt_stops}, routes_by_id
             )
             # Realtime moves exactly the runs TripUpdates address (a detoured
             # run is realtime's own trip, already built). They are read
@@ -2970,8 +3018,9 @@ class TransitFeedHandle:
                 },
                 window=(start - grace, end),
             )
+            # A detour's stop realtime defines is defined only there.
             alerts = await self._alert_matcher(
-                alert_messages, stops_by_id, routes_by_id
+                alert_messages, {**stops_by_id, **rt_stops}, routes_by_id
             )
             # As in get_arrivals: the runs realtime addresses are read whole
             # up front, so the scan only adds rows at their scheduled time.
@@ -3241,10 +3290,15 @@ class TransitFeedHandle:
         ]
         if not alerts:
             return _Alerts()
+        runs = await self._index_read(
+            self._index.alternative_trip_ids,
+            [ref for alert in alerts for ref in _run_refs(alert)],
+        )
+        matched = [_resolved(alert, runs) for alert in alerts]
         named = sorted(
             {
                 selector.trip.trip_id
-                for alert in alerts
+                for alert in matched
                 for selector in alert.informed_entities
                 if selector.trip is not None
                 and selector.trip.trip_id is not None
@@ -3252,7 +3306,7 @@ class TransitFeedHandle:
             }
         )
         return _Alerts(
-            alerts=alerts,
+            alerts=list(zip(alerts, matched, strict=True)),
             routes_by_id=routes_by_id,
             stops_by_id=stops_by_id,
             sole_agency_id=self._agencies[0].id if len(self._agencies) == 1 else None,
