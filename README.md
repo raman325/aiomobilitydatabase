@@ -527,6 +527,16 @@ Notes on direct mode:
   touching the exterior and each other so as to cut the zone in two. A
   `locations.geojson` that is not a GeoJSON FeatureCollection fails the
   build.
+- **On-demand service in a zone**: `locations_in(zone)` picks the Flex zones
+  a `Circle` overlaps (its centre inside one, or the zone's edge within the
+  radius; GeoJSON edges are straight lines in longitude and latitude, scaled
+  to metres around the circle), and `await get_on_demand_services(zone,
+  route_ids=...)` lists every `OnDemandService` serving it: a call at a zone
+  it overlaps, at a stop group with a stop in it, or at a stop in it served
+  within a window. Each carries its trip, route, `service_id`, window as
+  `timedelta` offsets into the service day (None where unknown, never "no
+  limit"), pickup/drop-off types, and the place and booking-rule records it
+  names. Schedule only, no network.
 - **Alert scope is the spec's, selector by selector**: `ServiceAlert`
   keeps each `informed_entity` whole as an `EntitySelector` (spec field
   names; a trip as a `TripSelector`, one run of it where it gives a start
@@ -615,9 +625,10 @@ files (`locations.geojson`, `location_groups.txt`, `location_group_stops.txt`,
   raw cell, but nothing interprets it.)
 - `translations.txt` — text is returned as the feed wrote it.
 
-**GTFS-Flex service is not queryable yet.** The Flex records load (see
-above), but nothing answers "what on-demand service covers here, and when".
-A zone-only feed loads (stops.txt is optional when `locations.geojson` is
+**GTFS-Flex: no dated windows or booking deadlines yet.**
+`get_on_demand_services(zone)` says which on-demand calls serve a place and
+their windows as offsets into the service day, but not yet the dated windows
+of a time range or when a ride can still be booked. A zone-only feed loads (stops.txt is optional when `locations.geojson` is
 present), and a `stop_times.txt` row naming a zone, a stop group, or a
 pickup/drop-off window is kept apart from the fixed calls: boards and
 journeys show only the fixed calls around it, while a GTFS-RT update or a
