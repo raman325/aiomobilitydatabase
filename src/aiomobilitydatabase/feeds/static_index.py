@@ -1980,10 +1980,19 @@ class StaticIndex:
                 ]
             except OverflowError:
                 continue  # a call past the end of datetime: no run to date
-            # Stable: a fixed call stays ahead of a Flex one sharing its
-            # stop_sequence (a feed error either way).
+            # A Flex call repeating a fixed call's stop_sequence (a feed
+            # error: the pair is the primary key) yields to it, so whatever
+            # names that sequence names the fixed call.
+            taken = {call.stop_sequence for call in fixed}
             calls = sorted(
-                [*fixed, *on_demand.get(trip_id, ())],
+                [
+                    *fixed,
+                    *(
+                        call
+                        for call in on_demand.get(trip_id, ())
+                        if call.stop_sequence not in taken
+                    ),
+                ],
                 key=lambda call: call.stop_sequence,
             )
             instances.append(

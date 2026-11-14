@@ -335,6 +335,55 @@ def test_a_detour_may_start_at_a_flex_call() -> None:
     ]
 
 
+def test_a_fixed_call_wins_a_stop_sequence_a_flex_call_repeats() -> None:
+    """A zone row repeating S1's stop_sequence (Forbidden: the pair is the
+    primary key) does not take S1's update: S1 shows its ten minutes."""
+    feed = _deviation()
+    feed["stop_times.txt"] += "T,,,,Z,,08:05:00,08:25:00,3,2,2\n"
+    message = _deviation_update((3, 600, _STU.SCHEDULED))
+
+    async def body(handle: TransitFeedHandle) -> dict[str, object]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S1"], limit=None)],
+            start=_EIGHT - timedelta(minutes=30),
+            end=_EIGHT + timedelta(hours=2),
+        )
+        return {
+            row.stop_id: (row.predicted_arrival, row.delay_seconds) for row in board
+        }
+
+    assert _run_feeds(feed, body, [message]) == {
+        "S1": (_EIGHT + timedelta(minutes=40), 600)
+    }
+
+
+def test_a_replacement_is_not_timed_from_a_flex_call() -> None:
+    """ "The reference stop is the stop prior to start_stop_selector": when
+    that is a zone call, it has no time to measure travel_time_to_stop
+    from, so the replacement stop (S2 for S0) is left untimed -- not shown
+    -- rather than timed from an instant nobody stated."""
+    feed = _feed(
+        stops="stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\nS2,C,0,0\n",
+        stop_times=_FLEX_HEADER
+        + "T,,,,Z,,07:30:00,07:55:00,1,2,1\n"
+        + "T,08:00:00,08:00:00,S0,,,,,2,,\n"
+        + "T,08:30:00,08:30:00,S1,,,,,3,,\n",
+    )
+    feed["locations.geojson"] = _ZONES
+    message = _deviation_update()
+    _detour(message, start=2, end=2, replacements=[("S2", 300)])
+
+    async def body(handle: TransitFeedHandle) -> list[object]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S1", "S2"], limit=None)],
+            start=_EIGHT - timedelta(minutes=30),
+            end=_EIGHT + timedelta(hours=2),
+        )
+        return [row.stop_id for row in board]
+
+    assert _run_feeds(feed, body, [message]) == ["S1"]
+
+
 def _call(sequence: int, stop_id: str, *, on_demand: bool = False) -> TripCall:
     when = None if on_demand else _EIGHT + timedelta(minutes=sequence)
     return TripCall(
