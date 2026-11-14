@@ -9,17 +9,22 @@ falls in it, with the records they name.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
+import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds import static_index
 from aiomobilitydatabase.feeds.geo import Circle, polygon_overlaps_circle
 from aiomobilitydatabase.feeds.models import (
     BookingType,
     OnDemandService,
     PickupDropOffType,
+    WheelchairAccess,
 )
 from aiomobilitydatabase.feeds.static_index import StaticIndex
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle
@@ -122,20 +127,92 @@ _WINDOWS = (
 
 def test_a_stop_served_within_a_window(tmp_path: Path) -> None:
     """A stop's window call serves a zone the stop lies in, naming the stop;
-    a booking rule id booking_rules.txt lacks resolves to no rule."""
+    a booking rule id booking_rules.txt lacks keeps its id beside no record
+    (a reference the feed could not resolve, not an absence); blank types
+    read REGULAR, "0 or empty", as stated."""
     index = _build(
         tmp_path,
         _feed(
             stop_times=_WINDOWS
             + "T,08:00:00,08:00:00,S0,,,,1,,,\n"
             + "T,,,S1,,08:05:00,08:30:00,2,2,2,MISSING\n"
+            + "T,,,S1,,09:00:00,09:30:00,3,,,\n"
         ),
     )
+    window, blank = _services(index, Circle(0.0, 0.0, 10.0))
+    assert (window.trip_id, window.stop_sequence) == ("T", 2)
+    assert window.stop_id == "S1"
+    assert window.stop is not None and window.stop.id == "S1"
+    assert (window.pickup_booking_rule_id, window.pickup_booking_rule) == (
+        "MISSING",
+        None,
+    )
+    assert window.start_pickup_drop_off_window == timedelta(hours=8, minutes=5)
+    assert (blank.pickup_type, blank.drop_off_type) == (
+        PickupDropOffType.REGULAR,
+        PickupDropOffType.REGULAR,
+    )
+    assert (blank.pickup_booking_rule_id, blank.pickup_booking_rule) == (None, None)
+
+
+def test_a_bare_string_of_route_ids_is_refused(tmp_path: Path) -> None:
+    """As in ArrivalsQuery: "ZONE" would otherwise be the routes Z, O, N, E."""
+    with pytest.raises(TypeError, match="route_ids"):
+        _services(_flex_index(tmp_path), _AT_H2, "ZONE")  # type: ignore[arg-type]
+
+
+def test_a_row_naming_two_places_is_listed_once_with_both(tmp_path: Path) -> None:
+    """A row naming a stop and a zone (forbidden, kept as stated) is one
+    call, however many of its places the zone holds, showing both; its
+    trip's wheelchair access and its own headsign come along."""
+    feed = _with_zone(
+        _feed(
+            trips="route_id,service_id,trip_id,trip_headsign,wheelchair_accessible\n"
+            "R,S,T,Downtown,1\n",
+            stop_times=_WINDOWS.replace(
+                "pickup_booking_rule_id\n", "pickup_booking_rule_id,stop_headsign\n"
+            )
+            + "T,08:00:00,08:00:00,S0,,,,1,,,,\n"
+            + "T,,,S1,Z,08:05:00,08:30:00,2,2,2,,Uptown\n",
+        )
+    )
+    index = _build(tmp_path, feed)
     [service] = _services(index, Circle(0.0, 0.0, 10.0))
-    assert (service.trip_id, service.stop_sequence) == ("T", 2)
-    assert service.stop is not None and service.stop.id == "S1"
-    assert service.pickup_booking_rule is None
-    assert service.start_pickup_drop_off_window == timedelta(hours=8, minutes=5)
+    assert (service.stop_id, service.location_id) == ("S1", "Z")
+    assert service.stop is not None and service.location is not None
+    assert service.wheelchair_accessible is WheelchairAccess.POSSIBLE
+    assert (service.headsign, service.stop_headsign) == ("Downtown", "Uptown")
+
+
+def test_many_places_are_read_in_slices(tmp_path: Path) -> None:
+    """Ids are bound a slice at a time, under SQLite's variable limit: with
+    slices of one, the same calls come back."""
+    expected = _calls(_services(_flex_index(tmp_path), Circle(41.01, -87.02, 3000)))
+    with patch.object(static_index, "_ID_SLICE", 1):
+        sliced = _calls(_services(_flex_index(tmp_path), Circle(41.01, -87.02, 3000)))
+    assert sliced == expected
+    assert len(expected) == 3
+
+
+def _with_zone(feed: dict[str, str]) -> dict[str, str]:
+    """Add zone Z, a 2-degree square around (0, 0)."""
+    feed["locations.geojson"] = json.dumps(
+        {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "id": "Z",
+                    "properties": {},
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[-1, -1], [1, -1], [1, 1], [-1, 1], [-1, -1]]],
+                    },
+                }
+            ],
+        }
+    )
+    return feed
 
 
 def test_repetitions_carry_their_shifted_windows_and_an_unknown_one_is_none(
@@ -202,7 +279,7 @@ def test_every_call_serving_a_zone_is_listed_and_nothing_else(
 
     async def body(
         handle: TransitFeedHandle,
-    ) -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
+    ) -> tuple[Counter[tuple[str, int]], Counter[tuple[str, int]]]:
         near = {stop.id for stop in handle.stops_in(zone)}
         zones = {
             location.id
@@ -218,13 +295,13 @@ def test_every_call_serving_a_zone_is_listed_and_nothing_else(
             "SELECT trip_id, stop_sequence, location_id, location_group_id, "
             "stop_id FROM flex_stop_times"
         )
-        expected = {
+        expected = Counter(
             (trip_id, sequence)
             for trip_id, sequence, location_id, group_id, stop_id in rows
             if location_id in zones or group_id in groups or stop_id in near
-        }
+        )
         listed = await handle.get_on_demand_services(zone)
-        return {(s.trip_id, s.stop_sequence) for s in listed}, expected
+        return Counter((s.trip_id, s.stop_sequence) for s in listed), expected
 
     listed, expected = _run(index, body)
     assert listed == expected

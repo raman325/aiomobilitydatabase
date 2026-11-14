@@ -724,6 +724,36 @@ _HOLED = FlexPolygon(
             False,
             id="across the antimeridian, out of reach",
         ),
+        pytest.param(
+            FlexPolygon(
+                exterior=((0, -179), (0, 179), (1, 179), (1, -179), (0, -179)),
+                holes=(),
+            ),
+            Circle(0.5, 179.5, 60_000.0),
+            True,
+            id="an unsplit band the long way round, its 179 edge in reach",
+        ),
+        pytest.param(
+            FlexPolygon(
+                exterior=((0, 179), (1, 179), (1, -179), (0, -179), (0, 179)),
+                holes=(),
+            ),
+            Circle(0.5, 179.5, 60_000.0),
+            True,
+            id="the same band from another start vertex",
+        ),
+        pytest.param(
+            _square(80.0, 10.0, 100),
+            _at(80.0, 10.0, 150, 0, 51),
+            True,
+            id="at 80 N, edge within 51 m",
+        ),
+        pytest.param(
+            _square(80.0, 10.0, 100),
+            _at(80.0, 10.0, 150, 0, 49),
+            False,
+            id="at 80 N, 49 m short",
+        ),
     ],
 )
 def test_polygon_overlaps_circle(
@@ -890,3 +920,39 @@ def test_reach_matches_great_circle_distance_within_one_percent(
     short = Circle(centre.latitude, centre.longitude, max(0.0, true * 0.99 - 1))
     assert polygon_overlaps_circle(zone, reach)
     assert not polygon_overlaps_circle(zone, short)
+
+
+@given(
+    origin=st.tuples(st.floats(-80, 80), st.floats(-180, 180)),
+    count=st.integers(3, 9),
+    size=st.floats(50, 2000),
+    shift=st.integers(0, 8),
+    circle=st.tuples(_METRES, _METRES, st.floats(0, 3000)),
+)
+def test_the_answer_ignores_the_start_vertex_and_winding(
+    origin: tuple[float, float],
+    count: int,
+    size: float,
+    shift: int,
+    circle: tuple[float, float, float],
+) -> None:
+    """A ring names the same zone from any start vertex, either way round --
+    near the antimeridian too."""
+    lat0, lon0 = origin
+    corners = [
+        (
+            size * math.cos(2 * math.pi * k / count),
+            size * math.sin(2 * math.pi * k / count),
+        )
+        for k in range(count)
+    ]
+    body = list(_metres_to_degrees(lat0, lon0, corners)[:-1])
+    shift %= len(body)
+    zone = _at(lat0, lon0, *circle)
+    answers = set()
+    for ring in (body[shift:] + body[:shift], (body[shift:] + body[:shift])[::-1]):
+        polygon = FlexPolygon(exterior=(*ring, ring[0]), holes=())
+        answers.add(polygon_overlaps_circle(polygon, zone))
+    reference = FlexPolygon(exterior=(*body, body[0]), holes=())
+    answers.add(polygon_overlaps_circle(reference, zone))
+    assert len(answers) == 1
