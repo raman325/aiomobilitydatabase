@@ -402,14 +402,15 @@ def test_a_repetition_at_the_service_day_start_keeps_its_windows(
     tmp_path: Path,
 ) -> None:
     """A repetition starting at 00:00:00 has start 0 -- a start, not a
-    missing one: its windows stand."""
+    missing one: even with its exactness unknown (an unparseable cell), it
+    is a repetition, and its windows stand."""
     feed = _with_zone(
         _feed(
             stop_times=_WINDOWS
             + "T,08:00:00,08:00:00,S0,,,,1,,,\n"
             + "T,,,,Z,08:05:00,09:00:00,2,2,2,\n",
             frequencies="trip_id,start_time,end_time,headway_secs,exact_times\n"
-            "T,00:00:00,00:01:00,600,1\n",
+            "T,00:00:00,00:01:00,600,x\n",
         )
     )
     [service] = _services(_build(tmp_path, feed), Circle(0.0, 0.0, 10.0))
@@ -418,4 +419,4 @@ def test_a_repetition_at_the_service_day_start_keeps_its_windows(
         service.exact_times,
         service.start_pickup_drop_off_window,
         service.end_pickup_drop_off_window,
-    ) == ("T#0", True, timedelta(minutes=5), timedelta(hours=1))
+    ) == ("T#0", None, timedelta(minutes=5), timedelta(hours=1))
