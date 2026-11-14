@@ -110,6 +110,38 @@ def test_a_trip_id_less_selector_names_its_run_and_is_never_feed_wide() -> None:
     assert not alert.applies_to()
 
 
+@pytest.mark.parametrize(
+    ("selector", "entity"),
+    [
+        # TripDescriptor.route_id "cannot be used within an Alert
+        # EntitySelector to specify a route-wide alert".
+        ({"trip": {"route_id": "R1"}}, {"route_id": "R1"}),
+        (
+            {"trip": {"route_id": "R1", "direction_id": 0}},
+            {"route_id": "R1", "direction_id": 0},
+        ),
+        # No start_date: the 08:00 run of which day?
+        (
+            {"trip": {"route_id": "R1", "direction_id": 0, "start_time": "08:00:00"}},
+            {"route_id": "R1", "direction_id": 0, "start_secs": 8 * 3600},
+        ),
+        # An empty trip names no run, so the stop does not stand alone.
+        ({"stop_id": "S1", "trip": {}}, {"stop_id": "S1"}),
+        # "If direction_id is provided, route_id must also be provided."
+        ({"direction_id": 0}, {"route_id": "R1", "direction_id": 0}),
+    ],
+)
+def test_a_selector_that_names_no_single_thing_is_not_widened(
+    selector: dict[str, Any], entity: dict[str, Any]
+) -> None:
+    """A trip without trip_id must give route_id, direction_id, start_date
+    and start_time to name one run; with fewer, the selector is left out
+    rather than read as the route, direction or stop it does give."""
+    alert = _alert(selectors=[selector])
+    assert not alert.applies_to(**entity)
+    assert alert.informed_entities == ()
+
+
 def test_a_selector_with_a_malformed_start_names_nothing() -> None:
     """A start date that does not parse names a run nobody can tell: that
     selector is left out (it must not widen to every day), the others
@@ -177,9 +209,14 @@ def _oracle(selector: dict[str, Any], entity: dict[str, Any]) -> bool:
     """The spec, restated: every field the selector provides must match the
     entity's; a trip with an id is that trip, one without it is the run of
     its route and direction; its start date and time pick the run."""
+    if "direction_id" in selector and "route_id" not in selector:
+        return False  # "route_id must also be provided"
     required = {name: selector[name] for name in _POOL if name in selector}
     trip = selector.get("trip")
     if trip is not None:
+        run = ("route_id", "direction_id", "start_date", "start_time")
+        if "trip_id" not in trip and not all(name in trip for name in run):
+            return False  # not one run: names nothing
         if "trip_id" in trip:
             required["trip_id"] = trip["trip_id"]
         else:
@@ -258,6 +295,8 @@ def test_a_present_bound_is_an_instant_and_only_an_absent_one_is_infinite(
         ([("Hallo", "de"), ("", "en"), ("Hi", "")], "Hi"),
         ([("Hallo", "de"), ("Bonjour", "fr")], "Hallo"),
         ([("", "en")], None),
+        ([("Hallo", "de"), ("Hi", "en_US")], "Hi"),  # common, if not BCP 47
+        ([("Hallo", "de"), ("Hi", "eng")], "Hallo"),  # not English's subtag
     ],
 )
 def test_text_is_picked_in_the_spec_order(

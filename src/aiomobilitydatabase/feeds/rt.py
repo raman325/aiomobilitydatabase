@@ -15,6 +15,7 @@ from google.transit import gtfs_realtime_pb2
 
 from ._freshness import Response, Validators, header_fields, request_fields
 from ._freshness import hops as _hops
+from ._language import is_preferred_language
 from ._redirects import get_withholding
 from ._urls import _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
@@ -1382,18 +1383,14 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
     return indexed_trip_updates(trip_update_records(message))
 
 
-# GTFS-RT's "default UI language (e.g., English)"; the library has no UI
-# language of its own, so English is both (as GBFS_LANGUAGE_PREFERENCE).
-_PREFERRED_LANGUAGE = "en"
-
-
 def _first_translation(translated: object) -> str | None:
     """Return a TranslatedString's text in the language the spec picks.
 
     The spec: the UI language's translation, else the default UI
     language's (English), else "If some translation has an unspecified
-    language code, that translation is picked". English stands for both
-    languages here, matched by its BCP 47 primary subtag ("en-US" is
+    language code, that translation is picked". The library has no UI
+    language of its own, so its preference, English, stands for both, as
+    for GBFS (:func:`~._language.is_preferred_language`: "en-US" is
     English). A translation without text is no translation. Where none
     of those exist, the first translation with text: some text over none,
     as for GBFS. None when there is none.
@@ -1404,7 +1401,7 @@ def _first_translation(translated: object) -> str | None:
         if candidate.text
     ]
     for candidate in usable:
-        if candidate.language.split("-")[0].casefold() == _PREFERRED_LANGUAGE:
+        if is_preferred_language(candidate.language):
             return str(candidate.text)
     for candidate in usable:
         if not candidate.language:
@@ -1412,18 +1409,22 @@ def _first_translation(translated: object) -> str | None:
     return str(usable[0].text) if usable else None
 
 
+_NOT_YET = datetime.max.replace(tzinfo=UTC) - timedelta(days=2)
+
+
 def _period_start(period: gtfs_realtime_pb2.TimeRange) -> datetime | None:
     """Return a TimeRange's start: None (minus infinity) only when absent.
 
     A present value is an instant, 0 the epoch; one past what a datetime
-    holds has not started yet, so it reads as the latest instant.
+    holds has not started yet, so it reads as an instant later than any
+    other (with a margin, so that it still converts to any timezone).
     """
     if not period.HasField("start"):
         return None
     try:
         return datetime.fromtimestamp(period.start, tz=UTC)
     except (OverflowError, OSError, ValueError):
-        return datetime.max.replace(tzinfo=UTC)
+        return _NOT_YET
 
 
 def _period_end(period: gtfs_realtime_pb2.TimeRange) -> datetime | None:
@@ -1444,12 +1445,23 @@ def _trip_selector(trip: gtfs_realtime_pb2.TripDescriptor) -> TripSelector | Non
     """Return the trip an EntitySelector names, or None where it cannot say.
 
     A start date or time that is present but does not parse names a run
-    nobody can tell, so the selector names nothing readable.
+    nobody can tell. A trip without trip_id names one only with all of
+    route_id, direction_id, start_date and start_time ("must all be
+    provided"): with fewer it is not one run, and its route_id "cannot be
+    used ... to specify a route-wide alert". Either way the selector names
+    nothing readable.
     """
     start_date = _trip_start_date(trip)
     start_secs = _trip_start_secs(trip)
     if (trip.start_date and start_date is None) or (
         trip.start_time and start_secs is None
+    ):
+        return None
+    if not trip.trip_id and (
+        not trip.route_id
+        or not trip.HasField("direction_id")
+        or start_date is None
+        or start_secs is None
     ):
         return None
     return TripSelector(
@@ -1465,10 +1477,14 @@ def _entity_selectors(alert: gtfs_realtime_pb2.Alert) -> tuple[EntitySelector, .
     """Every informed_entity the alert names readably, in feed order.
 
     route_type and direction_id have 0 as a meaningful value (tram, and
-    the feed's first direction), so presence is HasField.
+    the feed's first direction), so presence is HasField. "If direction_id
+    is provided, route_id must also be provided": a direction alone is
+    every route's, so such a selector is left out.
     """
     selectors: list[EntitySelector] = []
     for entity in alert.informed_entity:
+        if entity.HasField("direction_id") and not entity.route_id:
+            continue
         trip = None
         if entity.HasField("trip"):
             trip = _trip_selector(entity.trip)

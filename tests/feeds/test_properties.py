@@ -828,6 +828,14 @@ _JSONISH = st.recursive(
 )
 
 
+@pytest.mark.parametrize("tag", ["en", "EN", "en-US", "en_GB"])
+def test_localized_prefers_any_english_tag(tag: str) -> None:
+    """GBFS and GTFS-RT share one preference: a tag names English by its
+    primary subtag, so "en-US" is English for GBFS text as for GTFS-RT."""
+    value = [{"text": "Hallo", "language": "de"}, {"text": "Hi", "language": tag}]
+    assert _localized(value) == "Hi"
+
+
 @given(value=_JSONISH)
 def test_localized_is_total(value: object) -> None:
     """Any JSON value yields a string or None, never a raise. The event
@@ -7130,7 +7138,8 @@ def test_alert_scope_lists_index_exactly_the_named_ids(
         target = entity.alert.informed_entity.add()
         target.route_id = route_id
         target.stop_id = stop_id
-        target.trip.trip_id = trip_id
+        if trip_id:  # a trip without one would not name a run
+            target.trip.trip_id = trip_id
     [alert] = alerts_from_message(msg)
     expected_routes = sorted({r for r, _, _ in informed if r})
     expected_stops = sorted({s for _, s, _ in informed if s})

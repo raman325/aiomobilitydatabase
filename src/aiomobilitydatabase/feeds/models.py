@@ -685,9 +685,7 @@ class TripSelector:
     With a ``trip_id`` it names that trip -- one run of it where
     ``start_date``/``start_secs`` say which. Without one it names the run
     of ``route_id`` and ``direction_id`` that starts at ``start_secs`` on
-    ``start_date``: "If trip_id is omitted, route_id, direction_id,
-    start_time, and schedule_relationship=SCHEDULED must all be set to
-    identify a trip instance".
+    ``start_date``, all four set (a trip without them is not kept).
     """
 
     trip_id: str | None
@@ -761,9 +759,12 @@ class ServiceAlert:
     ``informed_entities`` are the alert's EntitySelectors, one per
     ``informed_entity``, each the AND of the fields it names; the alert
     applies to an entity any of them matches (:meth:`applies_to`). A
-    selector the parser could not read in full (a malformed start date or
-    time) is left out: it names a run it cannot say. An alert with no
-    selector applies to nothing.
+    selector that cannot say what it names is left out rather than read
+    wider: a malformed start date or time; a trip without trip_id that
+    lacks any of route_id, direction_id, start_date and start_time (it is
+    not one run, and its route_id "cannot be used ... to specify a
+    route-wide alert"); a direction_id without a route_id ("route_id must
+    also be provided"). An alert with no selector applies to nothing.
 
     ``agency_ids``/``route_ids``/``route_types``/``direction_ids``/
     ``stop_ids``/``trip_ids`` list the distinct values the selectors name,

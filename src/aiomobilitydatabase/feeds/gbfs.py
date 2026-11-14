@@ -21,9 +21,9 @@ from ._freshness import (
 )
 from ._freshness import hops as _hops
 from ._frozen import FrozenDict
+from ._language import is_preferred_language
 from ._redirects import get_withholding
 from ._urls import _require_http_url  # deliberate friend access: shared URL guard
-from .const import GBFS_LANGUAGE_PREFERENCE
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
 from .models import (
@@ -84,11 +84,6 @@ def _record_id(value: Any) -> str | None:
     return str(value) or None
 
 
-def _is_preferred_language(tag: Any) -> bool:
-    """Whether a BCP 47 tag is the preferred language (tags ignore case)."""
-    return isinstance(tag, str) and tag.casefold() == GBFS_LANGUAGE_PREFERENCE
-
-
 def _localized(value: Any) -> str | None:
     """Normalize GBFS text: 3.x localized lists vs 2.x plain strings.
 
@@ -106,7 +101,7 @@ def _localized(value: Any) -> str | None:
         if isinstance(entry, dict) and (text := _plain_text(entry.get("text")))
     ]
     for language, text in texts:
-        if _is_preferred_language(language):
+        if is_preferred_language(language):
             return text
     return texts[0][1] if texts else None
 
@@ -389,7 +384,7 @@ def _endpoints_from_discovery(document: Any) -> dict[str, str]:
                 (
                     block
                     for tag, block in data.items()
-                    if _is_preferred_language(tag)
+                    if is_preferred_language(tag)
                     and isinstance(block, Mapping)
                     and isinstance(block.get("feeds"), list)
                 ),
