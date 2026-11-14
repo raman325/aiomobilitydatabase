@@ -332,6 +332,9 @@ def test_windows_are_exact_as_frequencies_txt_says(tmp_path: Path) -> None:
         ("H#28800", False),
         ("P", True),
     ]
+    # Unknown exactness on a repetition is not an unknown window: G's run
+    # still has its (shifted) window.
+    assert all(s.start_pickup_drop_off_window is not None for s in services)
 
 
 def test_a_zone_reaching_only_a_later_part_of_a_multipolygon(tmp_path: Path) -> None:
@@ -372,8 +375,9 @@ def test_a_zone_reaching_only_a_later_part_of_a_multipolygon(tmp_path: Path) -> 
 def test_a_frequency_trip_of_flex_calls_alone_has_unknown_exactness(
     tmp_path: Path,
 ) -> None:
-    """With no timed call to repeat from, it stays one trip whose windows
-    are only the template's: neither exact nor approximate instants."""
+    """With no timed call to repeat from, it stays one trip: its windows
+    are the template's, no run's, so they read unknown -- as does its
+    exactness."""
     feed = _with_zone(
         _feed(
             stop_times=_WINDOWS + "T,,,,Z,08:05:00,09:00:00,2,2,2,\n",
@@ -382,4 +386,9 @@ def test_a_frequency_trip_of_flex_calls_alone_has_unknown_exactness(
         )
     )
     [service] = _services(_build(tmp_path, feed), Circle(0.0, 0.0, 10.0))
-    assert (service.trip_id, service.exact_times) == ("T", None)
+    assert (
+        service.trip_id,
+        service.exact_times,
+        service.start_pickup_drop_off_window,
+        service.end_pickup_drop_off_window,
+    ) == ("T", None, None, None)

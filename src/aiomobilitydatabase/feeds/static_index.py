@@ -1542,8 +1542,9 @@ class StaticIndex:
         handling. A row referencing a trip with no stop_times template is
         skipped, matching the loaders' no-referential-checks policy. A
         real trip id that happens to equal a synthetic one (it would need
-        a literal ``#<secs>`` suffix) would be overwritten -- accepted as
-        negligible. Malformed rows (unparseable or missing times,
+        a literal ``#<secs>`` suffix) has its trips row replaced by the
+        repetition's, its calls then read as the repetition's -- accepted
+        as negligible. Malformed rows (unparseable or missing times,
         non-positive headway) raise, mirroring stop_times.
         """
         spans = cls._parse_frequency_spans(reader)
@@ -2514,6 +2515,7 @@ class StaticIndex:
                     drop_off_rule,
                     wheelchair,
                     exact_times,
+                    start_secs,
                 ) in self._conn.execute(
                     "SELECT f.rowid, f.trip_id, t.route_id, t.service_id, "
                     "t.headsign, f.stop_headsign, f.stop_sequence, "
@@ -2521,11 +2523,15 @@ class StaticIndex:
                     "f.location_group_id, f.stop_id, f.pickup_type, "
                     "f.drop_off_type, f.pickup_booking_rule_id, "
                     "f.drop_off_booking_rule_id, t.wheelchair_accessible, "
-                    "t.exact_times "
+                    "t.exact_times, t.start_secs "
                     "FROM flex_stop_times f JOIN trips t ON t.id = f.trip_id "
                     f"WHERE f.{column} IN ({','.join('?' * len(chunk))})",
                     chunk,
                 ):
+                    # A frequencies.txt trip the loader could not repeat
+                    # (exactness unknown on a trip that is no repetition):
+                    # its windows are the template's, no run's.
+                    unrepeated = exact_times is None and start_secs is None
                     found[rowid] = OnDemandRow(
                         trip_id=trip_id,
                         route_id=route_id,
@@ -2533,8 +2539,8 @@ class StaticIndex:
                         headsign=headsign,
                         stop_headsign=stop_headsign,
                         stop_sequence=stop_sequence,
-                        start_window_secs=start_window,
-                        end_window_secs=end_window,
+                        start_window_secs=None if unrepeated else start_window,
+                        end_window_secs=None if unrepeated else end_window,
                         location_id=location_id,
                         location_group_id=location_group_id,
                         stop_id=stop_id,

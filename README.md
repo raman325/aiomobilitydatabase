@@ -536,8 +536,11 @@ Notes on direct mode:
   within a window. Each carries its trip, route, `service_id`, its
   `start_pickup_drop_off_window`/`end_pickup_drop_off_window` as
   `timedelta` offsets into the service day (None where unknown, never "no
-  limit"), `exact_times` (False on a headway-based frequencies.txt
-  repetition, whose windows are approximate), pickup/drop-off types, and
+  limit"), `exact_times` (True on a plain trip or an `exact_times=1`
+  repetition; False on a headway-based one, whose windows are approximate;
+  None when frequencies.txt's value is unparseable, or for a frequencies.txt
+  trip of Flex calls alone, kept as one trip with no windows),
+  pickup/drop-off types, and
   each id it names beside its record
   (an id whose record the feed lacks keeps the id, with None for the
   record). Schedule only, no network. Meant for circles of up to a few
