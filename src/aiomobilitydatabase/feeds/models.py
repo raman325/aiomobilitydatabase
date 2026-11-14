@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import IntEnum, StrEnum
+from typing import Any
 
 from ._frozen import FrozenDict
 
@@ -677,20 +678,104 @@ class VehiclePosition:
 
 
 @dataclass(frozen=True)
+class TripSelector:
+    """The trip an alert's EntitySelector names (a GTFS-RT TripDescriptor).
+
+    Field names are the spec's; ``start_date``/``start_secs`` are the
+    parsed ``start_date``/``start_time``, as on :class:`VehiclePosition`.
+    With a ``trip_id`` it names that trip -- one run of it where
+    ``start_date``/``start_secs`` say which. Without one it names the run
+    of ``route_id`` and ``direction_id`` that starts at ``start_secs`` on
+    ``start_date``, all four set (a trip without them is not kept).
+    """
+
+    trip_id: str | None
+    route_id: str | None
+    direction_id: int | None
+    start_date: date | None
+    start_secs: int | None
+
+
+@dataclass(frozen=True)
+class EntitySelector:
+    """One ``informed_entity`` of an alert: the fields it names, joined by AND.
+
+    "If several are given, they should be interpreted as being joined by
+    the logical AND operator ... in order for an alert to apply to an
+    entity in GTFS it must match all of the provided EntitySelector
+    fields." ``route_type`` is a raw int (an open vocabulary, as on
+    :attr:`Route.type`); ``direction_id`` a raw 0/1.
+    """
+
+    agency_id: str | None
+    route_id: str | None
+    route_type: int | None
+    direction_id: int | None
+    trip: TripSelector | None
+    stop_id: str | None
+
+
+def _selects(
+    selector: EntitySelector,
+    *,
+    agency_id: str | None,
+    route_id: str | None,
+    route_type: int | None,
+    direction_id: int | None,
+    stop_id: str | None,
+    trip_id: str | None,
+    start_date: date | None,
+    start_secs: int | None,
+) -> bool:
+    """Whether an entity with these values matches every field ``selector`` names.
+
+    A value the entity does not give cannot match a field the selector
+    names. A selector naming nothing selects nothing (the spec requires at
+    least one field).
+    """
+    named: tuple[tuple[object, object], ...] = (
+        (selector.agency_id, agency_id),
+        (selector.route_id, route_id),
+        (selector.route_type, route_type),
+        (selector.direction_id, direction_id),
+        (selector.stop_id, stop_id),
+    )
+    trip = selector.trip
+    if trip is not None:
+        # A trip_id implies its route and direction; without one, they and
+        # the start pick the run out.
+        named += (
+            ((trip.trip_id, trip_id),)
+            if trip.trip_id is not None
+            else ((trip.route_id, route_id), (trip.direction_id, direction_id))
+        ) + ((trip.start_date, start_date), (trip.start_secs, start_secs))
+    wanted = [(field, value) for field, value in named if field is not None]
+    return bool(wanted) and all(field == value for field, value in wanted)
+
+
+@dataclass(frozen=True)
 class ServiceAlert:
     """A service alert from a GTFS-RT feed.
 
-    ``agency_ids``/``route_ids``/``route_types``/``direction_ids``/
-    ``stop_ids``/``trip_ids`` are the alert's scope: the distinct values
-    an ``informed_entity`` named, each sorted. GTFS-RT's EntitySelector
-    can scope by any of these, so an alert is UNSCOPED (applies
-    feed-wide) only when EVERY list is empty. An alert informing only one
-    agency is agency-scoped, not feed-wide -- which matters as soon as a
-    feed carries more than one agency.
+    ``informed_entities`` are the alert's EntitySelectors, one per
+    ``informed_entity``, each the AND of the fields it names; the alert
+    applies to an entity any of them matches (:meth:`applies_to`). A
+    selector that cannot say what it names is left out rather than read
+    wider: a malformed start date or time; a trip without trip_id that
+    lacks any of route_id, direction_id, start_date and start_time (it is
+    not one run, and its route_id "cannot be used ... to specify a
+    route-wide alert"); a direction_id without a route_id ("route_id must
+    also be provided"). An alert with no selector applies to nothing.
 
-    ``route_types`` holds raw ints for the same reason as
-    :attr:`Route.type`: Google's extended route types are an open
-    vocabulary. ``direction_ids`` are raw 0/1 with feed-defined meaning.
+    ``agency_ids``/``route_ids``/``route_types``/``direction_ids``/
+    ``stop_ids``/``trip_ids`` list the distinct values the selectors name,
+    sorted: an index, not a scope test (a selector naming route R and stop
+    S puts R and S in them, though the alert applies to R only at S).
+
+    ``cause``/``effect``/``severity`` take the proto's declared defaults
+    (UNKNOWN_CAUSE, UNKNOWN_EFFECT, UNKNOWN_SEVERITY) when unset; None only
+    for a value outside the vocabulary. ``active_periods`` are (start, end)
+    pairs, None where a bound is absent (minus or plus infinity).
     """
 
     id: str
@@ -705,27 +790,114 @@ class ServiceAlert:
     severity: AlertSeverity | None
     images: tuple[AlertImage, ...]
     image_alternative_text: str | None
-    agency_ids: tuple[str, ...]
-    route_ids: tuple[str, ...]
-    route_types: tuple[int, ...]
-    direction_ids: tuple[int, ...]
-    stop_ids: tuple[str, ...]
-    trip_ids: tuple[str, ...]
+    informed_entities: tuple[EntitySelector, ...]
     active_periods: tuple[tuple[datetime | None, datetime | None], ...]
     url: str | None
+
+    @property
+    def agency_ids(self) -> tuple[str, ...]:
+        """Every agency_id a selector names."""
+        return _named(s.agency_id for s in self.informed_entities)
+
+    @property
+    def route_ids(self) -> tuple[str, ...]:
+        """Every route_id a selector names, a trip-run selector's included."""
+        return _named(
+            route_id
+            for s in self.informed_entities
+            for route_id in (s.route_id, _run_part(s.trip, "route_id"))
+        )
+
+    @property
+    def route_types(self) -> tuple[int, ...]:
+        """Every route_type a selector names."""
+        return _named(s.route_type for s in self.informed_entities)
+
+    @property
+    def direction_ids(self) -> tuple[int, ...]:
+        """Every direction_id a selector names, a trip-run selector's included."""
+        return _named(
+            direction_id
+            for s in self.informed_entities
+            for direction_id in (s.direction_id, _run_part(s.trip, "direction_id"))
+        )
+
+    @property
+    def stop_ids(self) -> tuple[str, ...]:
+        """Every stop_id a selector names."""
+        return _named(s.stop_id for s in self.informed_entities)
+
+    @property
+    def trip_ids(self) -> tuple[str, ...]:
+        """Every trip_id a selector's trip names."""
+        return _named(s.trip.trip_id for s in self.informed_entities if s.trip)
+
+    def applies_to(
+        self,
+        *,
+        agency_id: str | None = None,
+        route_id: str | None = None,
+        route_type: int | None = None,
+        direction_id: int | None = None,
+        stop_id: str | None = None,
+        trip_id: str | None = None,
+        start_date: date | None = None,
+        start_secs: int | None = None,
+    ) -> bool:
+        """Return True if the alert applies to the entity these values describe.
+
+        It does when one of its selectors matches: every field the selector
+        names equals the value given for it ("it must match all of the
+        provided EntitySelector fields"). A value not given matches no
+        field that names one, so describe the entity in full: a stop and
+        route alert applies to ``stop_id=S, route_id=R``, not to
+        ``stop_id=S`` alone, and a selector naming one run of a trip
+        (``start_date``, ``start_secs``: its TripDescriptor start date and
+        start time) applies only where those are given. A ``trip_id`` is
+        the trip a selector names, its route and direction implied.
+        """
+        return any(
+            _selects(
+                selector,
+                agency_id=agency_id,
+                route_id=route_id,
+                route_type=route_type,
+                direction_id=direction_id,
+                stop_id=stop_id,
+                trip_id=trip_id,
+                start_date=start_date,
+                start_secs=start_secs,
+            )
+            for selector in self.informed_entities
+        )
 
     def is_active(self, at: datetime) -> bool:
         """Return True if the alert is active at the given instant.
 
-        An alert with no active periods is always active; open-ended bounds
-        (None start or end) are unbounded on that side.
+        An alert with no active periods is always active. A period "is
+        considered active at time t if t is greater than or equal to the
+        start time and less than the end time"; an absent bound is
+        unbounded on that side.
         """
         if not self.active_periods:
             return True
         return any(
-            (start is None or start <= at) and (end is None or at <= end)
+            (start is None or start <= at) and (end is None or at < end)
             for start, end in self.active_periods
         )
+
+
+def _run_part(trip: TripSelector | None, name: str) -> Any:
+    """Return a trip-run selector's route_id or direction_id, else None.
+
+    Only a trip without trip_id names them (one with an id implies its own).
+    """
+    return getattr(trip, name) if trip is not None and trip.trip_id is None else None
+
+
+def _named[T: (str, int)](values: Iterable[T | None]) -> tuple[T, ...]:
+    """Return the distinct values present, sorted."""
+    return tuple(sorted({value for value in values if value is not None}))
 
 
 @dataclass(frozen=True)

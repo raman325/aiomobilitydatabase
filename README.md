@@ -515,12 +515,17 @@ Notes on direct mode:
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
   `get_headsigns_serving()` alongside the stop/route helpers.
-- **Alert scoping covers every selector GTFS-RT offers**: `ServiceAlert`
-  carries `agency_ids`, `route_ids`, `route_types`, `direction_ids`,
-  `stop_ids`, and `trip_ids` — an alert is feed-wide only when *all* of them
-  are empty. Collecting a subset is not a missing nicety but a correctness
-  bug: an alert scoped to one agency, or to a whole mode, would otherwise
-  read as applying everywhere. `is_active(at)` evaluates its active periods.
+- **Alert scope is the spec's, selector by selector**: `ServiceAlert`
+  keeps each `informed_entity` whole as an `EntitySelector` (spec field
+  names; a trip as a `TripSelector`, one run of it where it gives a start
+  date or time). A selector's fields are joined by AND, so
+  `applies_to(stop_id="S", route_id="R")` is true for an alert on route R
+  at stop S, and `applies_to(stop_id="S")` is not. The `agency_ids`,
+  `route_ids`, ... lists only index the values named. `is_active(at)`
+  counts a period from its start up to, not including, its end. Text
+  fields pick English (`en-US` counts), else a translation without a
+  language, else the first; an unset cause, effect or severity is the
+  spec's UNKNOWN default.
 - **GBFS exposes what the documents carry**: the full station surface
   (`is_installed` alongside `is_renting`/`is_returning` — a station removed
   from the street is not "operational"; disabled counts, address, region,

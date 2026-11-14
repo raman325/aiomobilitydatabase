@@ -367,12 +367,7 @@ def test_service_alert_is_active() -> None:
             severity=None,
             images=(),
             image_alternative_text=None,
-            agency_ids=(),
-            route_ids=(),
-            route_types=(),
-            direction_ids=(),
-            stop_ids=(),
-            trip_ids=(),
+            informed_entities=(),
             active_periods=periods,
             url=None,
         )
@@ -389,9 +384,10 @@ def test_service_alert_is_active() -> None:
             (datetime(2026, 7, 30, tzinfo=UTC), None),
         ]
     ).is_active(now)  # second period matches
-    # Exact-boundary inclusivity: both endpoints use <=, not strict < / >.
+    # "active at time t if t is greater than or equal to the start time and
+    # less than the end time".
     assert alert_with([(now, None)]).is_active(now)  # start == at
-    assert alert_with([(None, now)]).is_active(now)  # at == end
+    assert not alert_with([(None, now)]).is_active(now)  # at == end
 
 
 async def test_in_flight_query_blocks_index_swap(
@@ -763,31 +759,26 @@ def _scoped_alert(**selectors: object) -> gtfs_realtime_pb2.FeedMessage:
         pytest.param({"route_type": 1}, "route_types", [1], id="route_type"),
         # route_type 0 is tram -- meaningful AND falsy.
         pytest.param({"route_type": 0}, "route_types", [0], id="route_type_tram"),
-        pytest.param({"direction_id": 0}, "direction_ids", [0], id="direction"),
+        # A direction needs its route ("route_id must also be provided").
+        pytest.param(
+            {"route_id": "R1", "direction_id": 0},
+            "direction_ids",
+            [0],
+            id="direction",
+        ),
     ],
 )
 def test_alert_scoped_by_any_selector_is_not_feed_wide(
     selector: dict[str, object], attribute: str, expected: list[object]
 ) -> None:
-    """An alert naming ONLY an agency, a mode or a direction is scoped.
-
-    Collecting just route/stop/trip ids would leave every one of these
-    reading as unscoped, i.e. applying to the whole feed -- wrong the
-    moment a feed carries more than one agency. route_type 1 and
-    direction_id 0 are also the falsy values, so presence must be
-    HasField rather than truthiness.
+    """An alert naming ONLY an agency, a mode or a route's direction
+    applies to that and nothing else. route_type 0 and direction_id 0 are
+    falsy, so presence must be HasField rather than truthiness.
     """
     [alert] = alerts_from_message(_scoped_alert(**selector))
     assert getattr(alert, attribute) == tuple(expected)
-    scope = (
-        alert.agency_ids
-        + alert.route_ids
-        + alert.route_types
-        + alert.direction_ids
-        + alert.stop_ids
-        + alert.trip_ids
-    )
-    assert scope, "alert read as feed-wide despite naming a selector"
+    assert alert.applies_to(**selector)  # type: ignore[arg-type]
+    assert not alert.applies_to()
 
 
 async def test_unsolicited_304_raises_a_typed_error(

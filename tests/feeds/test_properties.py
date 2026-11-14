@@ -828,6 +828,14 @@ _JSONISH = st.recursive(
 )
 
 
+@pytest.mark.parametrize("tag", ["en", "EN", "en-US", "en_GB"])
+def test_localized_prefers_any_english_tag(tag: str) -> None:
+    """GBFS and GTFS-RT share one preference: a tag names English by its
+    primary subtag, so "en-US" is English for GBFS text as for GTFS-RT."""
+    value = [{"text": "Hallo", "language": "de"}, {"text": "Hi", "language": tag}]
+    assert _localized(value) == "Hi"
+
+
 @given(value=_JSONISH)
 def test_localized_is_total(value: object) -> None:
     """Any JSON value yields a string or None, never a raise. The event
@@ -4010,35 +4018,32 @@ def test_great_circle_along_a_meridian_equals_arc_length(
 
 
 @given(
-    # Languages INCLUDING "en", with the oracle computed from the drawn list
-    # rather than from a separately injected entry. That lets one strategy
-    # cover every branch at once: the empty list (-> None, the branch the
-    # previous version could not reach because min_size was 1), the
-    # first-entry fallback, "en" anywhere, and -- undrawn before -- a list
-    # with MORE THAN ONE "en" entry, where the first one must win.
     entries=st.lists(
         st.tuples(
-            st.text(max_size=10), st.sampled_from(["de", "fr", "es", "en", "en"])
+            st.sampled_from(["", "Bonjour", "Hello", "Hallo"]),
+            st.sampled_from(["de", "fr", "en", "EN", "en-US", "eng", ""]),
         ),
         max_size=5,
     )
 )
-def test_first_translation_prefers_en_else_first_else_none(
+def test_first_translation_follows_the_spec_order(
     entries: list[tuple[str, str]],
 ) -> None:
-    """Mirrors test_localized_prefers_en_else_first for the protobuf-side
-    translation picker: the first 'en' wins wherever it sits; otherwise the
-    first entry wins; and an empty translation list yields None.
+    """TranslatedString: the (default UI language) English translation --
+    any tag whose primary subtag is "en" -- else "If some translation has
+    an unspecified language code, that translation is picked", else the
+    first; a translation without text is none, and none at all is None.
+    "eng" is not English's BCP 47 primary subtag.
     """
     translated = gtfs_realtime_pb2.TranslatedString()
     for text, language in entries:
         entry = translated.translation.add()
         entry.text = text
         entry.language = language
-    expected = next(
-        (text for text, language in entries if language == "en"),
-        entries[0][0] if entries else None,
-    )
+    usable = [(text, language) for text, language in entries if text]
+    english = [t for t, lang in usable if lang.split("-")[0].casefold() == "en"]
+    unspecified = [t for t, lang in usable if not lang]
+    expected = (english or unspecified or [t for t, _ in usable] or [None])[0]
     assert _first_translation(translated) == expected
 
 
@@ -7117,17 +7122,12 @@ _SCOPE_IDS = ["", "R1", "R2", "S1", "S2", "T1", "T2"]
         max_size=5,
     )
 )
-def test_alert_scope_lists_are_exact_and_unscoped_iff_all_empty(
+def test_alert_scope_lists_index_exactly_the_named_ids(
     informed: list[tuple[str, str, str]],
 ) -> None:
-    """Scoping law for alerts_from_message: each of route_ids, stop_ids and
-    trip_ids is exactly the sorted, distinct, empty-free set of ids the
-    informed entities named, and the alert is unscoped (feed-wide) if and
-    only if all three are empty.
-
-    The failure direction that matters is a scoped alert reading as
-    feed-wide -- a trip- or stop-scoped alert losing its ids shows up on
-    every entity in the feed.
+    """Each of route_ids, stop_ids and trip_ids is exactly the sorted,
+    distinct, empty-free set of ids the informed entities named, and the
+    alert applies to nothing when they name nothing.
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
@@ -7138,7 +7138,8 @@ def test_alert_scope_lists_are_exact_and_unscoped_iff_all_empty(
         target = entity.alert.informed_entity.add()
         target.route_id = route_id
         target.stop_id = stop_id
-        target.trip.trip_id = trip_id
+        if trip_id:  # a trip without one would not name a run
+            target.trip.trip_id = trip_id
     [alert] = alerts_from_message(msg)
     expected_routes = sorted({r for r, _, _ in informed if r})
     expected_stops = sorted({s for _, s, _ in informed if s})
@@ -7149,8 +7150,8 @@ def test_alert_scope_lists_are_exact_and_unscoped_iff_all_empty(
     for scope in (alert.route_ids, alert.stop_ids, alert.trip_ids):
         assert scope == tuple(sorted(set(scope)))
         assert "" not in scope
-    unscoped = not (alert.route_ids or alert.stop_ids or alert.trip_ids)
-    assert unscoped is not any(value for triple in informed for value in triple)
+    if not any(value for triple in informed for value in triple):
+        assert not alert.applies_to(route_id="R", stop_id="S", trip_id="T")
 
 
 @given(
@@ -7171,9 +7172,8 @@ def test_first_translation_without_text_entries_is_none(
         entry = translated.translation.add()
         entry.text = ""
         entry.language = language
-    # Entries with empty text still COUNT as text (the producer sent a
-    # translation); only an absent list is "no text".
-    assert _first_translation(translated) == ("" if languages else None)
+    # A translation without text is no text.
+    assert _first_translation(translated) is None
 
 
 # --- trip_updates_from_message laws ------------------------------------------
