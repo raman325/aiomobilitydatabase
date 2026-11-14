@@ -786,6 +786,27 @@ class TripCall:
     on_demand: bool = False
 
 
+class OnDemandRow(NamedTuple):
+    """One flex_stop_times row with its trip's columns (see on_demand_rows)."""
+
+    trip_id: str
+    route_id: str
+    service_id: str
+    headsign: str | None
+    stop_headsign: str | None
+    stop_sequence: int
+    start_window_secs: int | None
+    end_window_secs: int | None
+    location_id: str | None
+    location_group_id: str | None
+    stop_id: str | None
+    pickup_type: PickupDropOffType | None
+    drop_off_type: PickupDropOffType | None
+    pickup_booking_rule_id: str | None
+    drop_off_booking_rule_id: str | None
+    wheelchair_accessible: WheelchairAccess | None
+
+
 @dataclass(frozen=True)
 class TripInstanceCalls:
     """One trip instance's COMPLETE ordered call sequence.
@@ -2430,6 +2451,77 @@ class StaticIndex:
                 )
             )
         return found
+
+    def on_demand_rows(
+        self,
+        location_ids: Sequence[str],
+        location_group_ids: Sequence[str],
+        stop_ids: Sequence[str],
+    ) -> list[OnDemandRow]:
+        """Return the GTFS-Flex calls serving any of these places.
+
+        A zone by ``location_id``, a stop group by ``location_group_id``, a
+        stop's window by ``stop_id``; each row once, even one naming two of
+        them (which the spec forbids, and the row keeps as stated).
+        """
+        found: dict[int, OnDemandRow] = {}
+        for column, ids in (
+            ("location_id", sorted(set(location_ids))),
+            ("location_group_id", sorted(set(location_group_ids))),
+            ("stop_id", sorted(set(stop_ids))),
+        ):
+            for offset in range(0, len(ids), _ID_SLICE):
+                chunk = ids[offset : offset + _ID_SLICE]
+                for (
+                    rowid,
+                    trip_id,
+                    route_id,
+                    service_id,
+                    headsign,
+                    stop_headsign,
+                    stop_sequence,
+                    start_window,
+                    end_window,
+                    location_id,
+                    location_group_id,
+                    stop_id,
+                    pickup_type,
+                    drop_off_type,
+                    pickup_rule,
+                    drop_off_rule,
+                    wheelchair,
+                ) in self._conn.execute(
+                    "SELECT f.rowid, f.trip_id, t.route_id, t.service_id, "
+                    "t.headsign, f.stop_headsign, f.stop_sequence, "
+                    "f.start_window_secs, f.end_window_secs, f.location_id, "
+                    "f.location_group_id, f.stop_id, f.pickup_type, "
+                    "f.drop_off_type, f.pickup_booking_rule_id, "
+                    "f.drop_off_booking_rule_id, t.wheelchair_accessible "
+                    "FROM flex_stop_times f JOIN trips t ON t.id = f.trip_id "
+                    f"WHERE f.{column} IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                ):
+                    found[rowid] = OnDemandRow(
+                        trip_id=trip_id,
+                        route_id=route_id,
+                        service_id=service_id,
+                        headsign=headsign,
+                        stop_headsign=stop_headsign,
+                        stop_sequence=stop_sequence,
+                        start_window_secs=start_window,
+                        end_window_secs=end_window,
+                        location_id=location_id,
+                        location_group_id=location_group_id,
+                        stop_id=stop_id,
+                        pickup_type=_enum_or_none(PickupDropOffType, pickup_type),
+                        drop_off_type=_enum_or_none(PickupDropOffType, drop_off_type),
+                        pickup_booking_rule_id=pickup_rule,
+                        drop_off_booking_rule_id=drop_off_rule,
+                        wheelchair_accessible=_enum_or_none(
+                            WheelchairAccess, wheelchair
+                        ),
+                    )
+        return list(found.values())
 
     def concrete_trip_ids(self, source_trip_ids: list[str]) -> dict[str, list[str]]:
         """Map each PRODUCER-facing trip id to its concrete instances.
