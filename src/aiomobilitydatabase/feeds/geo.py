@@ -171,8 +171,10 @@ def _candidate_pairs(edges: list[_Edge]) -> set[tuple[int, int]]:
     xs = [x for _r, _i, a, b in edges for x in (a[0], b[0])]
     ys = [y for _r, _i, a, b in edges for y in (a[1], b[1])]
     extents = sorted(max(abs(b[0] - a[0]), abs(b[1] - a[1])) for *_, a, b in edges)
-    size = extents[len(extents) // 2] or max(max(xs) - min(xs), max(ys) - min(ys))
-    size = size or 1.0
+    span = max(max(xs) - min(xs), max(ys) - min(ys))
+    # Never finer than about 4n cells across the zone: a few tiny edges must
+    # not make every other edge cover an astronomical number of cells.
+    size = max(extents[len(extents) // 2], span / (4 * len(edges))) or 1.0
     x0, y0 = min(xs), min(ys)
 
     def cell(value: float, origin: float) -> int:
@@ -183,7 +185,9 @@ def _candidate_pairs(edges: list[_Edge]) -> set[tuple[int, int]]:
     for index, (_r, _i, a, b) in enumerate(edges):
         columns = range(cell(min(a[0], b[0]), x0), cell(max(a[0], b[0]), x0) + 1)
         rows = range(cell(min(a[1], b[1]), y0), cell(max(a[1], b[1]), y0) + 1)
-        if len(columns) * len(rows) > _MAX_CELLS_PER_EDGE:
+        if (columns.stop - columns.start) * (rows.stop - rows.start) > (
+            _MAX_CELLS_PER_EDGE
+        ):
             long_edges.append(index)
             continue
         for column in columns:

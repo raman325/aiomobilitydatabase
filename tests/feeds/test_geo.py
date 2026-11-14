@@ -363,3 +363,16 @@ def test_a_star_with_a_shrunk_copy_inside_is_valid_and_around_it_is_not(
     assert polygon_is_valid([exterior])
     assert polygon_is_valid([exterior, inner])
     assert not polygon_is_valid([exterior, outer])
+
+
+@given(a=_SMALL, b=_SMALL, c=_SMALL, d=_SMALL)
+@settings(max_examples=500)
+def test_touch_equals_the_integer_oracle(
+    a: tuple[int, int], b: tuple[int, int], c: tuple[int, int], d: tuple[int, int]
+) -> None:
+    """Closed segments meet -- crossing, an end on the other, or overlapping
+    -- exactly as exact integer arithmetic says, whichever order they come in."""
+    expected = _int_meet(a, b, c, d)
+    fa, fb, fc, fd = ((float(x), float(y)) for x, y in (a, b, c, d))
+    assert _touch(fa, fb, fc, fd) is expected
+    assert _touch(fc, fd, fa, fb) is expected
