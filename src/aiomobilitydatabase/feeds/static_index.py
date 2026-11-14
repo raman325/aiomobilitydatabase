@@ -26,6 +26,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .exceptions import FeedParseError
+from .geo import polygon_is_valid
 from .models import (
     Agency,
     BikesAllowed,
@@ -556,8 +557,11 @@ def _ring(value: object) -> _Ring | None:
 def _polygons(geometry: object) -> list[list[_Ring]] | None:
     """Return a Polygon's or MultiPolygon's rings, or None if any is malformed.
 
-    One bad ring discards the whole geometry: keeping the rest would offer
-    a zone smaller (or, losing a hole, larger) than the producer's.
+    Malformed: a ring that is not a GeoJSON linear ring, or a polygon that
+    is not valid as GTFS-Flex requires (see :func:`.geo.polygon_is_valid`;
+    a MultiPolygon's parts are each checked, not against one another). One
+    bad ring or part discards the whole geometry: keeping the rest would
+    offer a zone smaller (or, losing a hole, larger) than the producer's.
     """
     if not isinstance(geometry, dict):
         return None
@@ -575,9 +579,12 @@ def _polygons(geometry: object) -> list[list[_Ring]] | None:
         if not isinstance(part, list) or not part:
             return None
         rings = [_ring(ring) for ring in part]
-        if any(ring is None for ring in rings):
+        valid = [ring for ring in rings if ring is not None]
+        if len(valid) < len(rings) or not polygon_is_valid(
+            [[(lat, lon) for lat, lon in ring] for ring in valid]
+        ):
             return None
-        polygons.append([ring for ring in rings if ring is not None])
+        polygons.append(valid)
     return polygons
 
 

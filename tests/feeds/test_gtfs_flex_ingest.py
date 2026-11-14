@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import tempfile
 import zipfile
 from pathlib import Path
@@ -517,21 +518,44 @@ def test_booking_rule_cells_parse_leniently_and_are_kept_as_stated(
 # -- Property strategies ------------------------------------------------------
 
 _IDS = st.sampled_from(["A", "B", "C", "D"])
-_LONGITUDES = st.one_of(st.floats(-180, 180, allow_nan=False), st.integers(-180, 180))
-_LATITUDES = st.one_of(st.floats(-90, 90, allow_nan=False), st.integers(-90, 90))
 
 
 @st.composite
-def _rings(draw: st.DrawFn) -> list[list[float]]:
-    """A closed GeoJSON ring of [lon, lat] (maybe with an altitude)."""
-    positions = draw(
-        st.lists(st.tuples(_LONGITUDES, _LATITUDES), min_size=3, max_size=6)
-    )
+def _polygon_parts(draw: st.DrawFn) -> list[list[list[Any]]]:
+    """One valid polygon as GeoJSON rings of [lon, lat] (maybe an altitude).
+
+    A star around a centre: 4-8 vertices at increasing angles (each within
+    an eighth of its share of the turn) and radii in [r, 2r], so the ring
+    is simple and holds the disc of radius 0.55r; maybe a square hole well
+    inside that disc. Either winding.
+    """
+    lon0 = draw(st.floats(-170, 170, allow_nan=False))
+    lat0 = draw(st.floats(-80, 80, allow_nan=False))
+    radius = draw(st.floats(0.001, 5))
+    count = draw(st.integers(4, 8))
     altitude = draw(st.booleans())
-    ring: list[list[Any]] = [
-        [lon, lat, 0] if altitude else [lon, lat] for lon, lat in positions
-    ]
-    return [*ring, ring[0]]
+
+    def position(lon: float, lat: float) -> list[Any]:
+        return [lon, lat, 0] if altitude else [lon, lat]
+
+    exterior = []
+    for k in range(count):
+        angle = 2 * math.pi * k / count + draw(
+            st.floats(-math.pi / (4 * count), math.pi / (4 * count))
+        )
+        reach = radius * draw(st.floats(1, 2))
+        exterior.append(
+            position(lon0 + reach * math.cos(angle), lat0 + reach * math.sin(angle))
+        )
+    if draw(st.booleans()):
+        exterior.reverse()
+    rings = [[*exterior, exterior[0]]]
+    if draw(st.booleans()):
+        half = 0.3 * radius
+        corners = [(-half, -half), (half, -half), (half, half), (-half, half)]
+        hole = [position(lon0 + dx, lat0 + dy) for dx, dy in corners]
+        rings.append([*hole, hole[0]])
+    return rings
 
 
 def _swapped(ring: list[list[Any]]) -> tuple[tuple[float, float], ...]:
@@ -541,9 +565,7 @@ def _swapped(ring: list[list[Any]]) -> tuple[tuple[float, float], ...]:
 @st.composite
 def _valid_features(draw: st.DrawFn) -> tuple[dict[str, Any], FlexLocation]:
     """A Feature naming a zone, and the FlexLocation it must load as."""
-    parts = draw(
-        st.lists(st.lists(_rings(), min_size=1, max_size=3), min_size=1, max_size=3)
-    )
+    parts = draw(st.lists(_polygon_parts(), min_size=1, max_size=3))
     multi = len(parts) > 1 or draw(st.booleans())
     geometry = (
         {"type": "MultiPolygon", "coordinates": parts}
@@ -590,23 +612,39 @@ def _invalid_features(draw: st.DrawFn) -> dict[str, Any]:
     feature, _location = draw(_valid_features())
     how = draw(
         st.sampled_from(
-            ["no id", "number id", "point", "unclosed", "short", "range", "bool"]
+            [
+                "no id",
+                "number id",
+                "point",
+                "unclosed",
+                "short",
+                "range",
+                "bool",
+                "bowtie",
+                "hole over exterior",
+            ]
         )
     )
-    if how == "no id":
+    geometry = feature["geometry"]
+    parts = (
+        geometry["coordinates"]
+        if geometry["type"] == "MultiPolygon"
+        else [geometry["coordinates"]]
+    )
+    part = draw(st.sampled_from(parts))
+    if how == "bowtie":
+        lon, lat = part[0][0][0], part[0][0][1]
+        part[0] = [[lon, lat], [lon + 1, lat + 1], [lon + 1, lat], [lon, lat + 1]]
+        part[0].append(part[0][0])
+    elif how == "hole over exterior":
+        part.append(list(part[0]))
+    elif how == "no id":
         del feature["id"]
     elif how == "number id":
         feature["id"] = 1
     elif how == "point":
         feature["geometry"] = {"type": "Point", "coordinates": [0, 0]}
     else:
-        geometry = feature["geometry"]
-        parts = (
-            geometry["coordinates"]
-            if geometry["type"] == "MultiPolygon"
-            else [geometry["coordinates"]]
-        )
-        part = draw(st.sampled_from(parts))
         index = draw(st.integers(0, len(part) - 1))
         part[index] = _break_ring(part[index], how)
     return feature
