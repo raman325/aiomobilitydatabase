@@ -605,8 +605,10 @@ in the zip is ignored:
   `location_group_stops.txt`, `booking_rules.txt`) — on-demand service is not
   modelled. A zone-only feed still loads (stops.txt is optional when
   `locations.geojson` is present), and a `stop_times.txt` row naming a zone, a
-  stop group, or a pickup/drop-off window is skipped, so boards and journeys
-  show only the fixed calls around it.
+  stop group, or a pickup/drop-off window is kept apart from the fixed calls:
+  boards and journeys show only the fixed calls around it, while a GTFS-RT
+  update or a detour naming its `stop_sequence` still applies at its place in
+  the trip (a delay stated there propagates to the fixed stops after it).
 
 Service calendars **are** answerable — `get_services_on(date)` resolves
 `calendar.txt` against `calendar_dates` exceptions, and rows carry their

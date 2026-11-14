@@ -644,13 +644,14 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
     # would serve every query, but slowly, until the next dataset.
     assert indexes == [
         "ix_calendar_dates_date",
+        "ix_flex_stop_times_trip",
         "ix_stop_times_stop_departure",
         "ix_stop_times_trip_sequence",
         "ix_trips_route_start",
         "ix_trips_source",
     ], "indexes changed: bump SCHEMA_VERSION and update this list"
     assert (SCHEMA_VERSION, fingerprint) == (
-        9,
+        10,
         {
             "agencies": [
                 "email",
@@ -684,6 +685,20 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
                 "publisher_url",
                 "start_date",
                 "version",
+            ],
+            "flex_stop_times": [
+                "drop_off_booking_rule_id",
+                "drop_off_type",
+                "end_window_secs",
+                "location_group_id",
+                "location_id",
+                "pickup_booking_rule_id",
+                "pickup_type",
+                "start_window_secs",
+                "stop_headsign",
+                "stop_id",
+                "stop_sequence",
+                "trip_id",
             ],
             "meta": ["key", "value"],
             "routes": [
