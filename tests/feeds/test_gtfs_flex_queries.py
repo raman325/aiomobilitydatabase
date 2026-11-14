@@ -64,7 +64,7 @@ def test_a_zone_inside_a_flex_zone_and_at_a_group_stop(tmp_path: Path) -> None:
     assert pickup.location is None and pickup.stop is None
     assert pickup.location_group is not None
     assert pickup.location_group.stop_ids == ("H1", "H2")
-    assert (pickup.window_start_offset, pickup.window_end_offset) == (
+    assert (pickup.start_pickup_drop_off_window, pickup.end_pickup_drop_off_window) == (
         timedelta(hours=9),
         timedelta(hours=17),
     )
@@ -135,7 +135,7 @@ def test_a_stop_served_within_a_window(tmp_path: Path) -> None:
     assert (service.trip_id, service.stop_sequence) == ("T", 2)
     assert service.stop is not None and service.stop.id == "S1"
     assert service.pickup_booking_rule is None
-    assert service.window_start_offset == timedelta(hours=8, minutes=5)
+    assert service.start_pickup_drop_off_window == timedelta(hours=8, minutes=5)
 
 
 def test_repetitions_carry_their_shifted_windows_and_an_unknown_one_is_none(
@@ -175,7 +175,8 @@ def test_repetitions_carry_their_shifted_windows_and_an_unknown_one_is_none(
     )
     services = _services(index, Circle(0.0, 0.0, 10.0))
     assert [
-        (s.trip_id, s.window_start_offset, s.window_end_offset) for s in services
+        (s.trip_id, s.start_pickup_drop_off_window, s.end_pickup_drop_off_window)
+        for s in services
     ] == [
         # 07:00-09:00 anchored on the 08:00 departure, repeated from 00:30:
         # its start would fall half an hour before the service day.

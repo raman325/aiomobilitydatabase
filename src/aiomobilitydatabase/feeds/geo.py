@@ -116,9 +116,15 @@ def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
     centre and drifts with distance from it: well under 1% within a few
     kilometres outside polar latitudes.
 
-    The polygon is moved whole by a multiple of 360 degrees of longitude
-    to the circle's side of the antimeridian, so a zone just across it is
-    found without bending any edge.
+    The polygon is moved whole by multiples of 360 degrees of longitude,
+    so a zone just across the antimeridian is found without bending any
+    edge: each copy within a turn of the circle is tested (one is not
+    enough for a zone over 180 degrees wide, such as one crossing the
+    antimeridian unsplit, which RFC 7946 reads as spanning the long way).
+
+    Meant for circles of up to a few hundred kilometres that do not reach a
+    pole, like :func:`in_circle`; beyond that the plane bends too far from
+    the sphere.
     """
     radius = zone.radius_m
     dlat = radius * _BBOX_SAFETY / _M_PER_DEG_LAT
@@ -126,28 +132,40 @@ def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
     if max(latitudes) < zone.latitude - dlat or min(latitudes) > zone.latitude + dlat:
         return False  # wholly north or south of the circle
     scale = _M_PER_DEG_LAT * math.cos(math.radians(zone.latitude))
-    first_lon = polygon.exterior[0][1]
-    shift = _FULL_TURN_DEG * round((zone.longitude - first_lon) / _FULL_TURN_DEG)
-
-    def plane(ring: Sequence[tuple[float, float]]) -> list[_Plane]:
-        return [
-            (
-                (lon + shift - zone.longitude) * scale,
-                (lat - zone.latitude) * _M_PER_DEG_LAT,
-            )
-            for lat, lon in ring
-        ]
-
-    rings = [plane(polygon.exterior), *(plane(hole) for hole in polygon.holes)]
-    if any(
-        _segment_distance(a, b) <= radius
-        for ring in rings
-        for a, b in itertools.pairwise(ring)
-    ):
-        return True
-    return _encloses_origin(rings[0]) and not any(
-        _encloses_origin(hole) for hole in rings[1:]
+    nearest = _FULL_TURN_DEG * round(
+        (zone.longitude - polygon.exterior[0][1]) / _FULL_TURN_DEG
     )
+
+    def overlaps(shift: float) -> bool:
+        def plane(ring: Sequence[tuple[float, float]]) -> list[_Plane]:
+            return [
+                (
+                    (lon + shift - zone.longitude) * scale,
+                    (lat - zone.latitude) * _M_PER_DEG_LAT,
+                )
+                for lat, lon in ring
+            ]
+
+        rings = [plane(polygon.exterior), *(plane(hole) for hole in polygon.holes)]
+        if any(
+            _segment_distance(a, b) <= radius
+            for ring in rings
+            for a, b in itertools.pairwise(ring)
+        ):
+            return True
+        return _encloses_origin(rings[0]) and not any(
+            _encloses_origin(hole) for hole in rings[1:]
+        )
+
+    longitudes = [lon for _lat, lon in polygon.exterior]
+    # Within half a turn wide, the copy nearest the circle is the only one in
+    # reach of it; a wider zone may reach it from either neighbour too.
+    turns = (
+        (0.0,)
+        if max(longitudes) - min(longitudes) <= _HALF_TURN_DEG
+        else (0.0, -_FULL_TURN_DEG, _FULL_TURN_DEG)
+    )
+    return any(overlaps(nearest + turn) for turn in turns)
 
 
 # -- Polygon validity ----------------------------------------------------------

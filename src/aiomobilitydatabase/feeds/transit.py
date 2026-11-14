@@ -1552,6 +1552,11 @@ class _FlexRecords:
         )
 
 
+def _seconds(secs: int | None) -> timedelta | None:
+    """Return a stored GTFS time (seconds into its day) as a timedelta."""
+    return None if secs is None else timedelta(seconds=secs)
+
+
 def _serialized[T](lock: threading.Lock, call: Callable[[], T]) -> T:
     """Run ``call`` holding ``lock`` (on the calling worker thread).
 
@@ -3792,9 +3797,12 @@ class TransitFeedHandle:
         or a stop in it served within a pickup/drop-off window. One entry
         per call, whatever days its trip runs (``service_id`` says which;
         :meth:`get_services_on` resolves a date), narrowed to ``route_ids``
-        when given (None or empty: every route). Sorted by route, trip and
-        stop_sequence.
+        when given (None or empty: every route; a bare string is a
+        ``TypeError``, as in :class:`ArrivalsQuery`). Sorted by route, trip
+        and stop_sequence.
         """
+        if isinstance(route_ids, str):
+            raise TypeError("route_ids must be a sequence of ids, not a str")
         async with self._guard.reader():
             flex = self._flex
             locations = self.locations_in(zone)
@@ -3818,9 +3826,6 @@ class TransitFeedHandle:
         by_group = {group.id: group for group in flex.location_groups}
         rules = {rule.id: rule for rule in flex.booking_rules}
 
-        def offset(secs: int | None) -> timedelta | None:
-            return None if secs is None else timedelta(seconds=secs)
-
         services = [
             OnDemandService(
                 trip_id=row.trip_id,
@@ -3830,14 +3835,19 @@ class TransitFeedHandle:
                 headsign=row.headsign,
                 stop_headsign=row.stop_headsign,
                 stop_sequence=row.stop_sequence,
-                window_start_offset=offset(row.start_window_secs),
-                window_end_offset=offset(row.end_window_secs),
+                start_pickup_drop_off_window=_seconds(row.start_window_secs),
+                end_pickup_drop_off_window=_seconds(row.end_window_secs),
+                location_id=row.location_id,
                 location=by_location.get(row.location_id or ""),
+                location_group_id=row.location_group_id,
                 location_group=by_group.get(row.location_group_id or ""),
+                stop_id=row.stop_id,
                 stop=stops.get(row.stop_id or ""),
                 pickup_type=row.pickup_type,
                 drop_off_type=row.drop_off_type,
+                pickup_booking_rule_id=row.pickup_booking_rule_id,
                 pickup_booking_rule=rules.get(row.pickup_booking_rule_id or ""),
+                drop_off_booking_rule_id=row.drop_off_booking_rule_id,
                 drop_off_booking_rule=rules.get(row.drop_off_booking_rule_id or ""),
                 wheelchair_accessible=row.wheelchair_accessible,
             )

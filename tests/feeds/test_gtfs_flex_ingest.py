@@ -15,6 +15,7 @@ import json
 import math
 import tempfile
 import zipfile
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -111,9 +112,9 @@ _DAY_BEFORE = BookingRule(
     prior_notice_duration_min=None,
     prior_notice_duration_max=None,
     prior_notice_last_day=1,
-    prior_notice_last_secs=17 * 3600,
+    prior_notice_last_time=timedelta(hours=17),
     prior_notice_start_day=7,
-    prior_notice_start_secs=0,
+    prior_notice_start_time=timedelta(0),
     prior_notice_service_id="WEEKDAYS",
     message="Book by 5PM the business day before",
     pickup_message=None,
@@ -128,9 +129,9 @@ _NOW = BookingRule(
     prior_notice_duration_min=None,
     prior_notice_duration_max=None,
     prior_notice_last_day=None,
-    prior_notice_last_secs=None,
+    prior_notice_last_time=None,
     prior_notice_start_day=None,
-    prior_notice_start_secs=None,
+    prior_notice_start_time=None,
     prior_notice_service_id=None,
     message="Call when ready",
     pickup_message=None,
@@ -505,9 +506,9 @@ def test_booking_rule_cells_parse_leniently_and_are_kept_as_stated(
     assert (
         bad.booking_type,
         bad.prior_notice_duration_min,
-        bad.prior_notice_last_secs,
-        bad.prior_notice_start_secs,
-    ) == (None, None, None, 25 * 3600)
+        bad.prior_notice_last_time,
+        bad.prior_notice_start_time,
+    ) == (None, None, None, timedelta(hours=25))
     assert (real_time.booking_type, real_time.prior_notice_duration_min) == (
         BookingType.REAL_TIME,
         30,
@@ -691,7 +692,7 @@ _TIME_CELLS = st.one_of(
     st.tuples(st.integers(0, 47), st.integers(0, 59), st.integers(0, 59)).map(
         lambda hms: (
             f"{hms[0]:02d}:{hms[1]:02d}:{hms[2]:02d}",
-            hms[0] * 3600 + hms[1] * 60 + hms[2],
+            timedelta(hours=hms[0], minutes=hms[1], seconds=hms[2]),
         )
     ),
     st.sampled_from([("", None), ("17:60:00", None), ("5PM", None), ("8:00", None)]),
@@ -724,10 +725,7 @@ _RULE_COLUMNS: dict[str, st.SearchStrategy[Any]] = {
     "booking_url": _TEXT_CELLS,
 }
 # The model field each column loads into, where it is not the column name.
-_RULE_FIELDS = {
-    "prior_notice_last_time": "prior_notice_last_secs",
-    "prior_notice_start_time": "prior_notice_start_secs",
-}
+_RULE_FIELDS: dict[str, str] = {}
 
 
 def _csv(columns: list[str], rows: list[dict[str, str]]) -> str:

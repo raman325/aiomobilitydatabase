@@ -1067,10 +1067,10 @@ class LocationGroup:
 class BookingRule:
     """How a GTFS-Flex ride is booked (booking_rules.txt).
 
-    Field names are the spec's, with ``id`` for ``booking_rule_id`` and
-    ``prior_notice_last_secs``/``prior_notice_start_secs`` for the parsed
-    ``prior_notice_last_time``/``prior_notice_start_time`` (seconds, like
-    every GTFS time here). Durations are minutes, as the file gives them.
+    Field names are the spec's, with ``id`` for ``booking_rule_id``.
+    ``prior_notice_last_time``/``prior_notice_start_time`` are GTFS times:
+    time since the start of their day (noon minus 12 hours), as
+    ``timedelta``. Durations are minutes, as the file gives them.
     Every cell is kept as the file states it, even one the spec forbids
     for this ``booking_type``; unparseable cells are None, and an unknown
     ``booking_type`` is None.
@@ -1081,9 +1081,9 @@ class BookingRule:
     prior_notice_duration_min: int | None
     prior_notice_duration_max: int | None
     prior_notice_last_day: int | None
-    prior_notice_last_secs: int | None
+    prior_notice_last_time: timedelta | None
     prior_notice_start_day: int | None
-    prior_notice_start_secs: int | None
+    prior_notice_start_time: timedelta | None
     prior_notice_service_id: str | None
     message: str | None
     pickup_message: str | None
@@ -1097,21 +1097,27 @@ class BookingRule:
 class OnDemandService:
     """One GTFS-Flex call: on-demand pickup or drop-off at a place, in a window.
 
-    A stop_times row serving a zone (``location``), a group of stops
-    (``location_group``) or a stop within a pickup/drop-off window
-    (``stop``), as its trip runs on any of its ``service_id``'s days.
-    ``window_start_offset``/``window_end_offset`` are its
-    ``start_pickup_drop_off_window``/``end_pickup_drop_off_window``: time
-    since the start of the service day (noon minus 12 hours). Either is
-    None where the feed gives none, or where a frequencies.txt repetition
-    would move it before its service day starts -- unknown, never "no
-    limit".
+    A stop_times row serving a zone (``location_id``), a group of stops
+    (``location_group_id``) or a stop within a pickup/drop-off window
+    (``stop_id``), as its trip runs on any of its ``service_id``'s days.
+    Field names are the spec's. ``start_pickup_drop_off_window``/
+    ``end_pickup_drop_off_window`` are GTFS times: time since the start of
+    the service day (noon minus 12 hours). Either is None where the feed
+    gives none, or where a frequencies.txt repetition would move it before
+    its service day starts -- unknown, never "no limit".
 
     ``pickup_type``/``drop_off_type`` say whether, and how, a rider may be
     picked up or dropped off there ("travel is possible from one stop or
     location to any stop or location later in the trip" where they and the
-    windows allow). Booking rules are the records the row names, None for
-    none or an id booking_rules.txt lacks; ``route`` likewise.
+    windows allow). As everywhere, a blank cell is ``REGULAR`` ("0 or
+    empty"), though the spec forbids 0 on a call with a window: the value
+    is kept as the feed states it.
+
+    Each id the row names comes with its record (``route``, ``location``,
+    ``location_group``, ``stop``, the booking rules), None where the
+    dataset lacks it: an id without its record is a reference the feed
+    could not resolve, not an absence. A row naming two places (which the
+    spec forbids) keeps both.
     """
 
     trip_id: str
@@ -1121,14 +1127,19 @@ class OnDemandService:
     headsign: str | None
     stop_headsign: str | None
     stop_sequence: int
-    window_start_offset: timedelta | None
-    window_end_offset: timedelta | None
+    start_pickup_drop_off_window: timedelta | None
+    end_pickup_drop_off_window: timedelta | None
+    location_id: str | None
     location: FlexLocation | None
+    location_group_id: str | None
     location_group: LocationGroup | None
+    stop_id: str | None
     stop: Stop | None
     pickup_type: PickupDropOffType | None
     drop_off_type: PickupDropOffType | None
+    pickup_booking_rule_id: str | None
     pickup_booking_rule: BookingRule | None
+    drop_off_booking_rule_id: str | None
     drop_off_booking_rule: BookingRule | None
     wheelchair_accessible: WheelchairAccess | None
 

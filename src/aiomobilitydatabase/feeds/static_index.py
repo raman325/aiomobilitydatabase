@@ -54,7 +54,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -136,6 +136,10 @@ CREATE TABLE flex_stop_times (
     stop_headsign TEXT
 );
 CREATE INDEX ix_flex_stop_times_trip ON flex_stop_times (trip_id, stop_sequence);
+-- On-demand queries find calls by the place they serve.
+CREATE INDEX ix_flex_stop_times_location ON flex_stop_times (location_id);
+CREATE INDEX ix_flex_stop_times_group ON flex_stop_times (location_group_id);
+CREATE INDEX ix_flex_stop_times_stop ON flex_stop_times (stop_id);
 -- GTFS-Flex zones (locations.geojson). polygons is JSON: a list of
 -- polygons, each a list of rings (the exterior, then its holes), each ring
 -- a list of [latitude, longitude] -- swapped at load from GeoJSON's
@@ -639,6 +643,11 @@ def _lenient_time(value: str | None) -> int | None:
         return parse_gtfs_time(value)
     except FeedParseError:
         return None
+
+
+def _offset(secs: int | None) -> timedelta | None:
+    """Return a stored GTFS time (seconds into its day) as a timedelta."""
+    return None if secs is None else timedelta(seconds=secs)
 
 
 def _flex_ring(ring: list[list[float]]) -> tuple[tuple[float, float], ...]:
@@ -2045,9 +2054,9 @@ class StaticIndex:
                 prior_notice_duration_min=row[2],
                 prior_notice_duration_max=row[3],
                 prior_notice_last_day=row[4],
-                prior_notice_last_secs=row[5],
+                prior_notice_last_time=_offset(row[5]),
                 prior_notice_start_day=row[6],
-                prior_notice_start_secs=row[7],
+                prior_notice_start_time=_offset(row[7]),
                 prior_notice_service_id=row[8],
                 message=row[9],
                 pickup_message=row[10],
