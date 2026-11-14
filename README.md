@@ -523,7 +523,8 @@ Notes on direct mode:
   without an id, or with a geometry that is not a well-formed Polygon or
   MultiPolygon, is skipped whole -- including a polygon that is not valid as
   GTFS-Flex requires (OGC Simple Features 6.1.11): a ring crossing itself or
-  another, or a hole outside its exterior or inside another hole. A
+  another, a hole outside its exterior or overlapping another hole, or holes
+  touching the exterior and each other so as to cut the zone in two. A
   `locations.geojson` that is not a GeoJSON FeatureCollection fails the
   build.
 - **Alert scope is the spec's, selector by selector**: `ServiceAlert`
