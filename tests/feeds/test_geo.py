@@ -686,6 +686,26 @@ _HOLED = FlexPolygon(
 )
 
 
+# 359 degrees wide, unsplit: a strip along the equator from 179.5 W, up a
+# meridian, and a strip at 39-40 N to 179.5 E. Just east of 180 at the
+# equator only the copy a turn east reaches (its west end); just west of 180
+# at 39.5 N only the copy a turn west (its east end).
+_Z_BAND = FlexPolygon(
+    exterior=(
+        (0, -179.5),
+        (0, 1),
+        (39, 1),
+        (39, 179.5),
+        (40, 179.5),
+        (40, 0),
+        (1, 0),
+        (1, -179.5),
+        (0, -179.5),
+    ),
+    holes=(),
+)
+
+
 @pytest.mark.parametrize(
     ("polygon", "zone", "overlaps"),
     [
@@ -774,6 +794,18 @@ _HOLED = FlexPolygon(
             Circle(0.5, -179.95, 20_000.0),
             True,
             id="a zone nearly half a turn wide, its far edge across the antimeridian",
+        ),
+        pytest.param(
+            _Z_BAND,
+            Circle(0.5, 179.9, 70_000.0),
+            True,
+            id="a Z band reached only by its copy a turn east",
+        ),
+        pytest.param(
+            _Z_BAND,
+            Circle(39.5, -179.9, 70_000.0),
+            True,
+            id="a Z band reached only by its copy a turn west",
         ),
         pytest.param(
             _square(80.0, 10.0, 100),
