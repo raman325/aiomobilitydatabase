@@ -376,3 +376,14 @@ def test_touch_equals_the_integer_oracle(
     fa, fb, fc, fd = ((float(x), float(y)) for x, y in (a, b, c, d))
     assert _touch(fa, fb, fc, fd) is expected
     assert _touch(fc, fd, fa, fb) is expected
+
+
+def test_a_vanishingly_short_edge_does_not_shrink_the_grid() -> None:
+    """Edges a subnormal long -- most of them, so the median is one -- must
+    not make every other edge span an astronomical number of cells (an
+    overflow, or hours of bucketing)."""
+    tiny = [(k * 5e-324, 0.0) for k in range(6)]
+    ring = _ring(*tiny, (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+    assert polygon_is_valid([ring])
+    edges = [(0, i, ring[i], ring[i + 1]) for i in range(len(ring) - 1)]
+    assert len(_candidate_pairs(edges)) <= len(edges) * (len(edges) - 1) // 2

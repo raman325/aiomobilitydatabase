@@ -521,8 +521,11 @@ Notes on direct mode:
   groups with their `stop_ids`), and `transit.booking_rules` (every
   `booking_rules.txt` column; `BookingType` for `booking_type`). A Feature
   without an id, or with a geometry that is not a well-formed Polygon or
-  MultiPolygon, is skipped whole; a `locations.geojson` that is not a
-  GeoJSON FeatureCollection fails the build.
+  MultiPolygon, is skipped whole -- including a polygon that is not valid as
+  GTFS-Flex requires (OGC Simple Features 6.1.11): a ring crossing itself or
+  another, or a hole outside its exterior or inside another hole. A
+  `locations.geojson` that is not a GeoJSON FeatureCollection fails the
+  build.
 - **Alert scope is the spec's, selector by selector**: `ServiceAlert`
   keeps each `informed_entity` whole as an `EntitySelector` (spec field
   names; a trip as a `TripSelector`, one run of it where it gives a start
