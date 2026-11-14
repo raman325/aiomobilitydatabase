@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -81,39 +81,39 @@ def in_circle(zone: Circle, latitude: float, longitude: float) -> bool:
 # -- Polygon validity ----------------------------------------------------------
 
 type Point = tuple[float, float]
-type _Edge = tuple[int, int, Point, Point]
+# Points scaled to exact integers (see _exact_rings): every decision below is
+# integer arithmetic, so no rounding can move a point across a line.
+type _IntPoint = tuple[int, int]
+type _Edge = tuple[int, int, _IntPoint, _IntPoint]
 
-# Shewchuk's ccwerrboundA, (3 + 16e)e for double precision e = 2**-53: past
-# this share of the terms' magnitude the float determinant's sign is right.
-_ORIENTATION_ERROR = (3 + 16 * 2.0**-53) * 2.0**-53
 
+def _exact_rings(rings: Sequence[Sequence[Point]]) -> list[list[_IntPoint]]:
+    """Return the rings with every coordinate scaled to an even integer.
 
-def _orientation(a: Point, b: Point, c: Point) -> int:
-    """Return the sign of ``(b - a) x (c - a)``, exactly: 1, 0 or -1.
-
-    Floats first; when the result is within their rounding error of zero,
-    again in exact rationals, so a nearly collinear triple never reads as
-    crossing (or not) by accident of rounding.
+    Each float is a fraction with a power-of-two denominator, so scaling by
+    twice their common denominator is exact and keeps every orientation,
+    and makes every edge midpoint an integer too.
     """
-    left = (b[0] - a[0]) * (c[1] - a[1])
-    right = (b[1] - a[1]) * (c[0] - a[0])
-    det = left - right
-    if abs(det) > _ORIENTATION_ERROR * (abs(left) + abs(right)):
-        return 1 if det > 0 else -1
-    ax, ay = Fraction(a[0]), Fraction(a[1])
-    exact = (Fraction(b[0]) - ax) * (Fraction(c[1]) - ay) - (Fraction(b[1]) - ay) * (
-        Fraction(c[0]) - ax
+    exact = [[(Fraction(x), Fraction(y)) for x, y in ring] for ring in rings]
+    scale = 2 * math.lcm(
+        *(value.denominator for ring in exact for point in ring for value in point)
     )
-    return (exact > 0) - (exact < 0)
+    return [[(int(x * scale), int(y * scale)) for x, y in ring] for ring in exact]
 
 
-def _within_box(p: Point, a: Point, b: Point) -> bool:
+def _orientation(a: _IntPoint, b: _IntPoint, c: _IntPoint) -> int:
+    """Return the sign of ``(b - a) x (c - a)``: 1, 0 or -1."""
+    det = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    return (det > 0) - (det < 0)
+
+
+def _within_box(p: _IntPoint, a: _IntPoint, b: _IntPoint) -> bool:
     return min(a[0], b[0]) <= p[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= p[
         1
     ] <= max(a[1], b[1])
 
 
-def _touch(a: Point, b: Point, c: Point, d: Point) -> bool:
+def _touch(a: _IntPoint, b: _IntPoint, c: _IntPoint, d: _IntPoint) -> bool:
     """Return whether the closed segments ab and cd share any point."""
     o1, o2 = _orientation(a, b, c), _orientation(a, b, d)
     o3, o4 = _orientation(c, d, a), _orientation(c, d, b)
@@ -127,11 +127,13 @@ def _touch(a: Point, b: Point, c: Point, d: Point) -> bool:
     )
 
 
-def _sign(value: float) -> int:
+def _sign(value: int) -> int:
     return (value > 0) - (value < 0)
 
 
-def _meet_only_at_a_shared_end(a: Point, b: Point, c: Point, d: Point) -> bool:
+def _meet_only_at_a_shared_end(
+    a: _IntPoint, b: _IntPoint, c: _IntPoint, d: _IntPoint
+) -> bool:
     """Return whether ab and cd meet in exactly one point, an end of both."""
     if a == c:
         p, u, v = a, b, d
@@ -153,65 +155,75 @@ def _meet_only_at_a_shared_end(a: Point, b: Point, c: Point, d: Point) -> bool:
     ) == (-_sign(v[0] - p[0]), -_sign(v[1] - p[1]))
 
 
-# An edge whose bounding box covers more grid cells than this is compared
-# with every edge instead of being bucketed (a long straight side among
-# short ones would otherwise fill a whole row of cells).
-_MAX_CELLS_PER_EDGE = 16
+def _cells(
+    a: _IntPoint, b: _IntPoint, origin: _IntPoint, size: int
+) -> Iterator[tuple[int, int]]:
+    """Yield every grid cell the closed segment ab passes through.
+
+    Column by column: the segment's y-range over each column's closed slab,
+    computed exactly, gives the rows. A point of the segment lies in the
+    cell of its own floor coordinates, which this always yields.
+    """
+    (x1, y1), (x2, y2) = sorted((a, b))
+    x0, y0 = origin
+    if x1 == x2:
+        for row in range((min(y1, y2) - y0) // size, (max(y1, y2) - y0) // size + 1):
+            yield (x1 - x0) // size, row
+        return
+    dx, dy = x2 - x1, y2 - y1
+    for column in range((x1 - x0) // size, (x2 - x0) // size + 1):
+        lo = max(x1, x0 + column * size)
+        hi = min(x2, x0 + (column + 1) * size)
+        # floor((y(x) - y0) / size) with y(x) = y1 + dy (x - x1) / dx, exactly
+        rows = [((y1 - y0) * dx + dy * (x - x1)) // (dx * size) for x in (lo, hi)]
+        for row in range(min(rows), max(rows) + 1):
+            yield column, row
 
 
-def _candidate_pairs(edges: list[_Edge]) -> set[tuple[int, int]]:
-    """Return index pairs ``(i, j)``, ``i < j``, of edges that may meet.
+def _candidate_pairs(edges: list[_Edge]) -> Iterator[tuple[int, int]]:
+    """Yield index pairs ``(i, j)``, ``i < j``, of edges that may meet.
 
-    Edges are bucketed on a grid with cells the size of the median edge, so
-    a zone with evenly spread vertices costs about its edge count rather
-    than its square; the few edges spanning many cells are paired with
-    every edge. Float subtraction and division round monotonically, so a
-    point both edges hold falls in a cell both cover.
+    Edges are bucketed on a grid, each in just the cells its line crosses,
+    and only edges sharing a cell are paired; edges that meet share the
+    cell of their meeting point. A pair sharing several cells is yielded
+    once per cell (checking it twice is harmless; remembering every pair
+    would cost memory quadratic in the worst case).
+
+    Cells are the size of the median edge, coarsened so the edges cover
+    about 8n cells in all and so no more than about 4n fit across the zone:
+    memory stays linear in the edge count. Time follows how crowded the
+    busiest cells are -- about the edge count for evenly spread vertices
+    with or without a few long edges, more where many edges run close
+    together or converge (a fine comb, a sunburst of spikes).
     """
     xs = [x for _r, _i, a, b in edges for x in (a[0], b[0])]
     ys = [y for _r, _i, a, b in edges for y in (a[1], b[1])]
     extents = sorted(max(abs(b[0] - a[0]), abs(b[1] - a[1])) for *_, a, b in edges)
     span = max(max(xs) - min(xs), max(ys) - min(ys))
-    # Never finer than about 4n cells across the zone: a few tiny edges must
-    # not make every other edge cover an astronomical number of cells.
-    size = max(extents[len(extents) // 2], span / (4 * len(edges))) or 1.0
-    x0, y0 = min(xs), min(ys)
-
-    def cell(value: float, origin: float) -> int:
-        return int((value - origin) / size)
-
-    buckets: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
-    long_edges: list[int] = []
-    for index, (_r, _i, a, b) in enumerate(edges):
-        columns = range(cell(min(a[0], b[0]), x0), cell(max(a[0], b[0]), x0) + 1)
-        rows = range(cell(min(a[1], b[1]), y0), cell(max(a[1], b[1]), y0) + 1)
-        if (columns.stop - columns.start) * (rows.stop - rows.start) > (
-            _MAX_CELLS_PER_EDGE
-        ):
-            long_edges.append(index)
-            continue
-        for column in columns:
-            for row in rows:
-                buckets[column, row].append(index)
-    pairs = {
-        (first, second)
-        for members in buckets.values()
-        for n, first in enumerate(members)
-        for second in members[n + 1 :]
-    }
-    pairs.update(
-        (min(index, other), max(index, other))
-        for index in long_edges
-        for other in range(len(edges))
-        if other != index
+    travel = sum(abs(b[0] - a[0]) + abs(b[1] - a[1]) for *_, a, b in edges)
+    size = max(
+        extents[len(extents) // 2],
+        span // (4 * len(edges)),
+        travel // (6 * len(edges)),
+        1,
     )
-    return pairs
+    origin = (min(xs), min(ys))
+    buckets: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
+    for index, (_r, _i, a, b) in enumerate(edges):
+        for cell in _cells(a, b, origin, size):
+            buckets[cell].append(index)
+    for members in buckets.values():
+        for n, first in enumerate(members):
+            for second in members[n + 1 :]:
+                yield first, second
 
 
-def _position(p: Point, ring: Sequence[Point]) -> int:
+def _position(p: _IntPoint, ring: Sequence[_IntPoint]) -> int:
     """Return 1 if ``p`` is inside ``ring`` (closed), 0 on it, -1 outside."""
     inside = False
     for a, b in itertools.pairwise(ring):
+        if (a[1] > p[1]) == (b[1] > p[1]) and p[1] not in (a[1], b[1]):
+            continue  # the edge neither reaches p's row nor can hold p
         orientation = _orientation(a, b, p)
         if orientation == 0 and _within_box(p, a, b):
             return 0
@@ -220,21 +232,28 @@ def _position(p: Point, ring: Sequence[Point]) -> int:
     return 1 if inside else -1
 
 
-def _arc_points(ring: Sequence[Point], shared: set[Point]) -> list[Point]:
+def _arc_points(ring: Sequence[_IntPoint], shared: set[_IntPoint]) -> list[_IntPoint]:
     """Return one point on each arc ``ring`` splits into at ``shared`` points.
 
-    The midpoint of the edge leaving each shared vertex (or of the first
-    edge, if none is shared). With no edge crossing another ring, each arc
-    lies wholly on one side of it, so these points place the whole ring.
+    With no edge touching the other ring except at shared vertices, each
+    arc lies wholly on one side of it, so these points place the whole
+    ring. Each is the vertex after a shared one where that is not shared
+    itself, else (the arc is that one edge) the edge's midpoint -- an exact
+    integer, every coordinate being even.
     """
-    starts = [i for i, point in enumerate(ring[:-1]) if point in shared] or [0]
-    return [
-        ((ring[i][0] + ring[i + 1][0]) / 2, (ring[i][1] + ring[i + 1][1]) / 2)
-        for i in starts
-    ]
+    starts = [i for i, point in enumerate(ring[:-1]) if point in shared]
+    if not starts:
+        return [ring[0]]
+    points = []
+    for i in starts:
+        a, b = ring[i], ring[i + 1]
+        points.append(
+            b if b not in shared else ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
+        )
+    return points
 
 
-def _box(ring: Sequence[Point]) -> tuple[float, float, float, float]:
+def _box(ring: Sequence[_IntPoint]) -> tuple[int, int, int, int]:
     return (
         min(p[0] for p in ring),
         min(p[1] for p in ring),
@@ -248,21 +267,22 @@ def polygon_is_valid(rings: Sequence[Sequence[Point]]) -> bool:
 
     GTFS-Flex: "Each polygon must be valid by the definition of the OpenGIS
     Simple Features Specification, section 6.1.11". Checked, on closed
-    rings of planar points (consecutive repeats ignored):
+    rings of planar points (consecutive repeats ignored), in exact integer
+    arithmetic:
 
     - each ring is simple: three or more distinct vertices, no edge
       touching another except a neighbour at their shared vertex, and no
       neighbour folding back along it;
     - rings do not cross: two rings meet only at vertices both have;
-    - every hole lies inside the exterior and outside every other hole.
+    - every hole lies inside the exterior, and no two holes overlap.
 
     Not checked: that the interior stays connected (a hole meeting the
     exterior at two vertices cuts it in two). Stricter than 6.1.11 in one
     case: a ring touching another along an edge's middle (a tangent there
     is valid) is refused.
     """
-    cleaned: list[list[Point]] = []
-    for ring in rings:
+    cleaned: list[list[_IntPoint]] = []
+    for ring in _exact_rings(rings):
         points = [p for i, p in enumerate(ring) if i == 0 or p != ring[i - 1]]
         if len(points) < 4 or points[0] != points[-1]:  # noqa: PLR2004
             return False
@@ -285,19 +305,24 @@ def polygon_is_valid(rings: Sequence[Sequence[Point]]) -> bool:
         if not ok:
             return False
     exterior, holes = cleaned[0], cleaned[1:]
+    corners = set(exterior)
+    if any(
+        _position(p, exterior) != 1
+        for hole in holes
+        for p in _arc_points(hole, corners)
+    ):
+        return False
     boxes = [_box(hole) for hole in holes]
     for h, hole in enumerate(holes):
-        if any(_position(p, exterior) != 1 for p in _arc_points(hole, set(exterior))):
-            return False
         for g, other in enumerate(holes):
-            inner, outer = boxes[h], boxes[g]
-            if g == h or not (
-                outer[0] <= inner[0]
-                and outer[1] <= inner[1]
-                and inner[2] <= outer[2]
-                and inner[3] <= outer[3]
+            mine, theirs = boxes[h], boxes[g]
+            if g == h or (
+                mine[2] < theirs[0]
+                or theirs[2] < mine[0]
+                or mine[3] < theirs[1]
+                or theirs[3] < mine[1]
             ):
-                continue  # a hole can only lie inside one whose box holds its box
+                continue  # disjoint boxes: no overlap
             if any(_position(p, other) == 1 for p in _arc_points(hole, set(other))):
                 return False
     return True

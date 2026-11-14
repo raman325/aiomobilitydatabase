@@ -2,6 +2,7 @@
 
 import math
 from fractions import Fraction
+from typing import Any
 
 import pytest
 from hypothesis import given, settings
@@ -11,6 +12,7 @@ from aiomobilitydatabase.feeds.geo import (
     _EARTH_RADIUS_M,
     Circle,
     _candidate_pairs,
+    _exact_rings,
     _orientation,
     _touch,
     great_circle_m,
@@ -188,6 +190,37 @@ _SQUARE = _ring((0, 0), (4, 0), (4, 4), (0, 4))
         ),
         pytest.param([_SQUARE, _SQUARE], False, id="hole over the exterior"),
         pytest.param(
+            [
+                _ring((-10, -10), (10, -10), (10, 10), (-10, 10)),
+                _ring((0, 0), (2, 0), (2, 2), (1, 5), (0, 2)),
+                _ring((0, 0), (2, 2), (3, -1)),
+            ],
+            False,
+            id="holes crossing at two shared vertices, boxes not nested",
+        ),
+        pytest.param(
+            [
+                _ring((1.1, 1.3), (4.1, 4.3), (4.1, -1.6999999999999995)),
+                _ring(
+                    (1.1, 1.3), (2.0999999999999996, 2.3), (0.10000000000000009, 3.3)
+                ),
+            ],
+            False,
+            id="hole just outside, its float midpoint just inside",
+        ),
+        pytest.param(
+            [
+                _ring(
+                    (-5.752656294961473e-155, 1.3720070901607009e-155),
+                    (1.9413805967715086e-155, -3.709526842205869e-155),
+                    (-2.8819125348167282e-155, -5.239783377203719e-156),
+                    (-5.422679501000013e-155, -4.370996783586863e-155),
+                )
+            ],
+            False,
+            id="bowtie at 1e-155 (float products underflow)",
+        ),
+        pytest.param(
             [_ring((1, 1), (1, 2), (2, 2), (2, 1)), _SQUARE],
             False,
             id="hole around the exterior",
@@ -198,25 +231,64 @@ def test_polygon_validity(rings: list[list[tuple[float, float]]], valid: bool) -
     assert polygon_is_valid(rings) is valid
 
 
-def test_a_large_zone_validates_in_linear_time() -> None:
-    """A 20,000-vertex ring checks in a fraction of a second, not minutes:
-    the grid keeps candidate pairs near the edge count."""
-    count = 20_000
-    ring = _ring(
+def _circle(count: int, radius: float = 1.0) -> list[tuple[float, float]]:
+    return _ring(
         *(
-            (math.cos(2 * math.pi * k / count), math.sin(2 * math.pi * k / count))
+            (
+                radius * math.cos(2 * math.pi * k / count),
+                radius * math.sin(2 * math.pi * k / count),
+            )
             for k in range(count)
         )
     )
-    edges = [(0, i, ring[i], ring[i + 1]) for i in range(count)]
-    assert len(_candidate_pairs(edges)) < 10 * count
+
+
+def _edges(rings: list[list[tuple[float, float]]]) -> list[tuple[Any, ...]]:
+    exact = _exact_rings(rings)
+    return [
+        (r, i, ring[i], ring[i + 1])
+        for r, ring in enumerate(exact)
+        for i in range(len(ring) - 1)
+    ]
+
+
+def test_a_large_zone_validates_in_linear_time() -> None:
+    """A 20,000-vertex ring checks in a fraction of a second, not minutes:
+    the grid keeps candidate pairs near the edge count."""
+    ring = _circle(20_000)
+    assert sum(1 for _ in _candidate_pairs(_edges([ring]))) < 10 * 20_000
     assert polygon_is_valid([ring])
+
+
+def test_coarse_holes_in_a_detailed_exterior_stay_near_linear() -> None:
+    """Long hole edges among short exterior ones each sit only in the
+    cells they cross, not paired with every edge."""
+    holes = [
+        _ring(
+            (x / 10, -0.05),
+            (x / 10 + 0.05, -0.05),
+            (x / 10 + 0.05, 0.05),
+            (x / 10, 0.05),
+        )
+        for x in range(-5, 5)
+    ]
+    rings = [_circle(20_000), *holes]
+    assert sum(1 for _ in _candidate_pairs(_edges(rings))) < 10 * 20_000
+    assert polygon_is_valid(rings)
 
 
 _COORDINATES = st.one_of(
     st.floats(-1e3, 1e3, allow_nan=False), st.integers(-4, 4).map(float)
 )
 _POINTS = st.tuples(_COORDINATES, _COORDINATES)
+
+
+_TINY_POINTS = st.tuples(_POINTS, st.integers(0, 320)).map(
+    lambda point_scale: (
+        point_scale[0][0] * 10.0 ** -point_scale[1],
+        point_scale[0][1] * 10.0 ** -point_scale[1],
+    )
+)
 
 
 def _exact_sign(
@@ -230,23 +302,29 @@ def _exact_sign(
 
 
 @given(
-    a=_POINTS,
-    b=_POINTS,
+    a=st.one_of(_POINTS, _TINY_POINTS),
+    b=st.one_of(_POINTS, _TINY_POINTS),
     t=st.floats(-2, 2),
-    jitter=st.sampled_from([0.0, 1e-15, -1e-12]),
+    jitter=st.sampled_from([0.0, 1e-15, -1e-12, 1e-300]),
 )
 @settings(max_examples=300)
 def test_orientation_is_exact(
     a: tuple[float, float], b: tuple[float, float], t: float, jitter: float
 ) -> None:
-    """Even for a point computed onto (or a rounding error off) the line
-    through a and b, the sign is the exact rational one."""
+    """Scaled to integers, a triple orients as its exact rationals do: for a
+    point computed onto (or a rounding error off) the line through a and b,
+    and at scales where float products underflow."""
     c = (a[0] + t * (b[0] - a[0]) + jitter, a[1] + t * (b[1] - a[1]))
-    assert _orientation(a, b, c) == _exact_sign(a, b, c)
+    [[ia, ib, ic]] = _exact_rings([[a, b, c]])
+    assert _orientation(ia, ib, ic) == _exact_sign(a, b, c)
 
 
 @given(
-    segments=st.lists(st.tuples(_POINTS, _POINTS), min_size=2, max_size=12),
+    segments=st.lists(
+        st.one_of(st.tuples(_POINTS, _POINTS), st.tuples(_TINY_POINTS, _POINTS)),
+        min_size=2,
+        max_size=12,
+    ),
     flat=st.booleans(),
 )
 @settings(max_examples=200)
@@ -257,11 +335,13 @@ def test_every_touching_pair_is_a_candidate(
     every segment lies on one vertical line (a zero-width grid)."""
     if flat:
         segments = [((0.0, a[1]), (0.0, b[1])) for a, b in segments]
-    edges = [(0, i, a, b) for i, (a, b) in enumerate(segments)]
-    candidates = _candidate_pairs(edges)
-    for i in range(len(segments)):
-        for j in range(i + 1, len(segments)):
-            if _touch(*segments[i], *segments[j]):
+    [points] = _exact_rings([[point for segment in segments for point in segment]])
+    exact = list(zip(points[::2], points[1::2], strict=True))
+    edges = [(0, i, a, b) for i, (a, b) in enumerate(exact)]
+    candidates = set(_candidate_pairs(edges))
+    for i in range(len(exact)):
+        for j in range(i + 1, len(exact)):
+            if _touch(*exact[i], *exact[j]):
                 assert (i, j) in candidates
 
 
@@ -373,9 +453,8 @@ def test_touch_equals_the_integer_oracle(
     """Closed segments meet -- crossing, an end on the other, or overlapping
     -- exactly as exact integer arithmetic says, whichever order they come in."""
     expected = _int_meet(a, b, c, d)
-    fa, fb, fc, fd = ((float(x), float(y)) for x, y in (a, b, c, d))
-    assert _touch(fa, fb, fc, fd) is expected
-    assert _touch(fc, fd, fa, fb) is expected
+    assert _touch(a, b, c, d) is expected
+    assert _touch(c, d, a, b) is expected
 
 
 def test_a_vanishingly_short_edge_does_not_shrink_the_grid() -> None:
@@ -385,5 +464,5 @@ def test_a_vanishingly_short_edge_does_not_shrink_the_grid() -> None:
     tiny = [(k * 5e-324, 0.0) for k in range(6)]
     ring = _ring(*tiny, (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
     assert polygon_is_valid([ring])
-    edges = [(0, i, ring[i], ring[i + 1]) for i in range(len(ring) - 1)]
-    assert len(_candidate_pairs(edges)) <= len(edges) * (len(edges) - 1) // 2
+    edges = _edges([ring])
+    assert len(set(_candidate_pairs(edges))) <= len(edges) * (len(edges) - 1) // 2
