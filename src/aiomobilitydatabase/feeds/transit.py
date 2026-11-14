@@ -11,6 +11,7 @@ from collections.abc import (
     AsyncIterator,
     Callable,
     Collection,
+    Iterable,
     Iterator,
     Mapping,
     Sequence,
@@ -237,6 +238,82 @@ class _Vehicles:
     by_vehicle_id: Mapping[str, VehiclePosition]
     by_instance: Mapping[tuple[str, int | None, date | None], VehiclePosition | None]
     by_trip_id: Mapping[str, VehiclePosition | None]
+
+
+@dataclass(frozen=True)
+class _Alerts:
+    """The service alerts a query attaches to its rows, and what matching needs.
+
+    ``sole_agency_id`` is the feed's agency when it has exactly one: a
+    route naming none is that agency's. ``plain_starts`` maps each plain
+    trip an alert names with a start time to its first departure, which
+    is that run's start time ("should either be omitted or be equal to the
+    value in the GTFS feed").
+    """
+
+    alerts: Sequence[ServiceAlert] = ()
+    routes_by_id: Mapping[str, Route] = field(default_factory=dict)
+    stops_by_id: Mapping[str, Stop] = field(default_factory=dict)
+    sole_agency_id: str | None = None
+    plain_starts: Mapping[str, int] = field(default_factory=dict)
+
+    def for_run(
+        self,
+        run: TripUpdateKey,
+        *,
+        route_id: str | None,
+        direction_id: int | None,
+        stop_ids: Iterable[str],
+    ) -> tuple[ServiceAlert, ...]:
+        """Return the alerts that apply to one run at ``stop_ids``.
+
+        ``run`` is (trip id, service day, start seconds), the start None
+        for a plain trip (its first departure stands in). An alert applies
+        where one of its selectors matches the run, its route (route type,
+        agency) and direction at one of the stops or its parent station: a
+        station alert reaches its platforms, where a rider "will not be
+        able to board or alight" under one with no service.
+        """
+        if not self.alerts:
+            return ()
+        trip_id, start_date, start_secs = run
+        if start_secs is None:
+            start_secs = self.plain_starts.get(trip_id)
+        route = self.routes_by_id.get(route_id) if route_id else None
+        agency_id = (route.agency_id if route else None) or self.sole_agency_id
+        places: list[str] = []
+        for stop_id in stop_ids:
+            places.append(stop_id)
+            stop = self.stops_by_id.get(stop_id)
+            if stop is not None and stop.parent_station:
+                places.append(stop.parent_station)
+        return tuple(
+            alert
+            for alert in self.alerts
+            if any(
+                alert.applies_to(
+                    agency_id=agency_id,
+                    route_id=route_id,
+                    route_type=route.type if route else None,
+                    direction_id=direction_id,
+                    stop_id=place,
+                    trip_id=trip_id,
+                    start_date=start_date,
+                    start_secs=start_secs,
+                )
+                for place in places
+            )
+        )
+
+
+def _realtime_run(trip: RealtimeTrip) -> TripUpdateKey:
+    """Return the run a realtime-only trip is, as alerts name runs.
+
+    A replacement, a detoured run or an exact_times=0 run is the scheduled
+    run it stands for (an exact_times=0 run its own start); any other is
+    its own trip on its own day.
+    """
+    return trip.run or trip.replaces or (trip.trip_id, trip.start_date, None)
 
 
 # A trip reference as a TripDescriptor sends it: (trip_id, start_date,
@@ -894,6 +971,7 @@ def _realtime_rows(
     stops_by_id: Mapping[str, Stop],
     routes_by_id: Mapping[str, Route],
     vehicles: _Vehicles,
+    alerts: _Alerts,
 ) -> list[StopArrival]:
     """Board rows for realtime-only trips, at the queried stops.
 
@@ -936,6 +1014,12 @@ def _realtime_rows(
                     stop_headsign=call.stop_headsign,
                     trip_short_name=trip.trip_short_name,
                     block_id=trip.block_id,
+                    alerts=alerts.for_run(
+                        _realtime_run(trip),
+                        route_id=trip.route_id,
+                        direction_id=trip.direction_id,
+                        stop_ids=(call.stop_id,),
+                    ),
                 )
             )
     return rows
@@ -950,6 +1034,7 @@ def _realtime_journeys(
     stops_by_id: Mapping[str, Stop],
     routes_by_id: Mapping[str, Route],
     vehicles: _Vehicles,
+    alerts: _Alerts,
 ) -> list[UpcomingTrip]:
     """Journeys on realtime-only trips, origin then destination.
 
@@ -1017,6 +1102,12 @@ def _realtime_journeys(
                     is_last=False,
                     trip_short_name=trip.trip_short_name,
                     block_id=trip.block_id,
+                    alerts=alerts.for_run(
+                        _realtime_run(trip),
+                        route_id=trip.route_id,
+                        direction_id=trip.direction_id,
+                        stop_ids=(origin_stop_id, destination_stop_id),
+                    ),
                 )
             )
     return journeys
@@ -2291,6 +2382,7 @@ class TransitFeedHandle:
         end: datetime | None = None,
         grace: timedelta = timedelta(hours=1),
         with_vehicles: bool = False,
+        with_alerts: bool = False,
     ) -> list[list[StopArrival]]:
         """Upcoming arrivals for each query: schedule merged with RT.
 
@@ -2440,6 +2532,12 @@ class TransitFeedHandle:
         and a board that shows no vehicles should not pay for one. A
         producer serving both entity types off one url is fetched once
         either way, so there the flag costs no extra request.
+
+        ``with_alerts`` attaches the service alerts that apply to each row
+        (:attr:`StopArrival.alerts`), matched against the row's run, which
+        callers cannot see: its trip, start and service day, as well as its
+        route, direction and stop. Off by default for the same reason: the
+        alerts are another fetch, shared with any url that serves them too.
         """
         _require_bound(end, [query.limit for query in queries])
         start, end = _utc_window(start, end, grace)
@@ -2463,6 +2561,11 @@ class TransitFeedHandle:
             if with_vehicles
             else []
         )
+        alert_messages = (
+            await self._fetch_entity_messages(EntityType.SERVICE_ALERTS, rt_memo)
+            if with_alerts
+            else []
+        )
         rt_stops: dict[str, Stop] = {}
         modifications: list[TripModifications] = []
         for message in tu_messages:
@@ -2484,6 +2587,9 @@ class TransitFeedHandle:
                 rt_stops=rt_stops,
                 wanted_stops=all_stop_ids,
                 window=(start - grace, end),
+            )
+            alerts = await self._alert_matcher(
+                alert_messages, stops_by_id, routes_by_id
             )
             # Realtime moves exactly the runs TripUpdates address (a detoured
             # run is realtime's own trip, already built). They are read
@@ -2546,6 +2652,7 @@ class TransitFeedHandle:
                     rt_stops=rt_stops,
                     routes_by_id=routes_by_id,
                     vehicles=vehicles,
+                    alerts=alerts,
                     memo=memo,
                 )
                 for i in pending:
@@ -2592,6 +2699,7 @@ class TransitFeedHandle:
         rt_stops: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
         vehicles: _Vehicles,
+        alerts: _Alerts,
         memo: _PredictionMemo,
     ) -> list[StopArrival]:
         """Merge one horizon's board over ``all_stop_ids``, sorted.
@@ -2685,6 +2793,14 @@ class TransitFeedHandle:
                     stop_headsign=dep.stop_headsign,
                     trip_short_name=dep.trip_short_name,
                     block_id=dep.block_id,
+                    alerts=alerts.for_run(
+                        _run_key(
+                            (dep.source_trip_id, dep.start_secs), dep.service_date
+                        ),
+                        route_id=dep.route_id,
+                        direction_id=dep.direction_id,
+                        stop_ids=(dep.stop_id,),
+                    ),
                 )
             )
         arrivals.extend(
@@ -2696,6 +2812,7 @@ class TransitFeedHandle:
                 stops_by_id={**stops_by_id, **rt_stops},
                 routes_by_id=routes_by_id,
                 vehicles=vehicles,
+                alerts=alerts,
             )
         )
         # The grace window admitted scheduled rows before `now` so their
@@ -2735,6 +2852,7 @@ class TransitFeedHandle:
         end: datetime | None = None,
         grace: timedelta = timedelta(hours=1),
         with_vehicles: bool = False,
+        with_alerts: bool = False,
     ) -> list[list[UpcomingTrip]]:
         """Upcoming departures from the origin on trips serving the destination.
 
@@ -2802,7 +2920,9 @@ class TransitFeedHandle:
 
         ``with_vehicles`` attaches the live :class:`VehiclePosition` running
         each journey, exactly as :meth:`get_arrivals` does; ``vehicle_id``
-        is filled from the realtime prediction either way.
+        is filled from the realtime prediction either way. ``with_alerts``
+        attaches the alerts that apply to each journey's run at its origin
+        or destination, as :meth:`get_arrivals` does at a stop.
         """
         _require_bound(end, [query.limit for query in queries])
         start, end = _utc_window(start, end, grace)
@@ -2815,6 +2935,11 @@ class TransitFeedHandle:
         vehicle_messages = (
             await self._fetch_entity_messages(EntityType.VEHICLE_POSITIONS, rt_memo)
             if with_vehicles
+            else []
+        )
+        alert_messages = (
+            await self._fetch_entity_messages(EntityType.SERVICE_ALERTS, rt_memo)
+            if with_alerts
             else []
         )
         # Detours apply to journeys as to boards: "the consumer should behave
@@ -2844,6 +2969,9 @@ class TransitFeedHandle:
                     for stop_id in (query.origin_stop_id, query.destination_stop_id)
                 },
                 window=(start - grace, end),
+            )
+            alerts = await self._alert_matcher(
+                alert_messages, stops_by_id, routes_by_id
             )
             # As in get_arrivals: the runs realtime addresses are read whole
             # up front, so the scan only adds rows at their scheduled time.
@@ -2898,6 +3026,7 @@ class TransitFeedHandle:
                             rt_stops=rt_stops,
                             routes_by_id=routes_by_id,
                             vehicles=vehicles,
+                            alerts=alerts,
                             memo=memo,
                         )
                     )[: query.limit]
@@ -2923,6 +3052,7 @@ class TransitFeedHandle:
         rt_stops: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
         vehicles: _Vehicles,
+        alerts: _Alerts,
         memo: _PredictionMemo,
     ) -> list[UpcomingTrip]:
         """Merge one horizon's journeys for one stop pair, sorted, unlimited.
@@ -2959,6 +3089,7 @@ class TransitFeedHandle:
             stops_by_id={**stops_by_id, **rt_stops},
             routes_by_id=routes_by_id,
             vehicles=vehicles,
+            alerts=alerts,
         )
         for trip in scheduled:
             key = _run_key((trip.source_trip_id, trip.start_secs), trip.service_date)
@@ -3037,6 +3168,12 @@ class TransitFeedHandle:
                     is_last=trip.is_last,
                     trip_short_name=trip.trip_short_name,
                     block_id=trip.block_id,
+                    alerts=alerts.for_run(
+                        key,
+                        route_id=trip.route_id,
+                        direction_id=trip.direction_id,
+                        stop_ids=(trip.origin_stop_id, trip.destination_stop_id),
+                    ),
                 )
             )
         trips = [row for row in trips if _effective_trip_departure(row, start) >= start]
@@ -3086,6 +3223,43 @@ class TransitFeedHandle:
             and vehicle.longitude is not None
             and in_circle(zone, vehicle.latitude, vehicle.longitude)
         ]
+
+    async def _alert_matcher(
+        self,
+        messages: Sequence[gtfs_realtime_pb2.FeedMessage],
+        stops_by_id: Mapping[str, Stop],
+        routes_by_id: Mapping[str, Route],
+    ) -> _Alerts:
+        """Parse each message's alerts into a matcher for a query's rows.
+
+        No messages, no alerts: the query did not ask. Only the plain trips
+        an alert names with a start time are looked up. Caller holds the
+        reader guard.
+        """
+        alerts = [
+            alert for message in messages for alert in alerts_from_message(message)
+        ]
+        if not alerts:
+            return _Alerts()
+        named = sorted(
+            {
+                selector.trip.trip_id
+                for alert in alerts
+                for selector in alert.informed_entities
+                if selector.trip is not None
+                and selector.trip.trip_id is not None
+                and selector.trip.start_secs is not None
+            }
+        )
+        return _Alerts(
+            alerts=alerts,
+            routes_by_id=routes_by_id,
+            stops_by_id=stops_by_id,
+            sole_agency_id=self._agencies[0].id if len(self._agencies) == 1 else None,
+            plain_starts=await self._index_read(self._index.plain_trip_starts, named)
+            if named
+            else {},
+        )
 
     async def _vehicles_from(
         self,

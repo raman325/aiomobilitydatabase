@@ -433,6 +433,13 @@ class StopArrival:
     so riders see the cancellation, with no prediction and no vehicle;
     ``realtime`` is True, a cancellation being realtime information. A run
     realtime DELETES "must not be shown to users" and has no row at all.
+
+    ``alerts`` are the service alerts that apply to this row, only with
+    ``with_alerts``: those with a selector matching its run (its trip, the
+    repetition's start or a plain trip's first departure, and service
+    day), route, route type, agency, direction, and this stop or its
+    parent station (see :meth:`ServiceAlert.applies_to`). Every period is
+    kept: :meth:`ServiceAlert.is_active` says which apply now.
     """
 
     stop_id: str
@@ -460,6 +467,7 @@ class StopArrival:
     stop_headsign: str | None
     trip_short_name: str | None
     block_id: str | None
+    alerts: tuple[ServiceAlert, ...] = ()
 
     @property
     def effective_departure(self) -> datetime | None:
@@ -518,6 +526,10 @@ class UpcomingTrip:
     The ``*_stop_id`` fields stay as the ids the query named, which is
     what callers passed in and what RT rows key on.
 
+    ``alerts`` are those that apply to the journey, only with
+    ``with_alerts``: as on :class:`StopArrival`, at the origin or the
+    destination.
+
     ``is_first``/``is_last`` mark whether this departure is the first/last
     scheduled departure OF ITS SERVICE DAY for this origin->destination
     pair -- legacy ``gtfs`` sensor parity; they describe the static
@@ -571,6 +583,7 @@ class UpcomingTrip:
     is_last: bool
     trip_short_name: str | None
     block_id: str | None
+    alerts: tuple[ServiceAlert, ...] = ()
 
     @property
     def effective_departure(self) -> datetime | None:
