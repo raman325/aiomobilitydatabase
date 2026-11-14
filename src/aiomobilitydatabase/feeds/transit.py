@@ -251,9 +251,10 @@ class _Alerts:
     names, as a TripUpdate's are (:meth:`StaticIndex.alternative_trip_ids`),
     or left out where they name none. ``sole_agency_id`` is the feed's
     agency when it has exactly one: a route naming none is that agency's.
-    ``plain_starts`` maps each plain trip an alert names with a start time
-    to its first departure, which is that run's start time ("should either
-    be omitted or be equal to the value in the GTFS feed").
+    ``plain_starts`` maps each plain trip an alert names with a start time,
+    or without a date, to its first departure: that run's start time
+    ("should either be omitted or be equal to the value in the GTFS
+    feed"), and the mark of a plain trip that :func:`_bound` dates.
     """
 
     alerts: Sequence[tuple[ServiceAlert, ServiceAlert]] = ()

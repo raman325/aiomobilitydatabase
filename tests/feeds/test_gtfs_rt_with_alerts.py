@@ -464,7 +464,7 @@ def test_a_trip_named_without_a_date_is_the_run_it_means_now() -> None:
     A selector giving the day names that day's."""
     message = _alerts(
         ("today", [{"trip": {"trip_id": "T"}}]),
-        ("thursday", [{"trip": {"trip_id": "T", "start_date": "20260731"}}]),
+        ("friday", [{"trip": {"trip_id": "T", "start_date": "20260731"}}]),
     )
     message.header.timestamp = int((_EIGHT - timedelta(hours=1)).timestamp())
 
@@ -485,6 +485,41 @@ def test_a_trip_named_without_a_date_is_the_run_it_means_now() -> None:
     days = _run_with(_FEED, body, alerts=[message])
     assert days == {
         _EIGHT.date(): {"today"},
-        _EIGHT.date() + timedelta(days=1): {"thursday"},
+        _EIGHT.date() + timedelta(days=1): {"friday"},
         _EIGHT.date() + timedelta(days=2): set(),
+    }
+
+
+def test_each_alert_feed_dates_its_trips_at_its_own_time() -> None:
+    """A date-less trip is judged at its own feed's header time, as a
+    TripUpdate's is: two alert feeds a day apart name two different runs,
+    and one from two days before the board names a run already gone."""
+
+    def feed(alert_id: str, hours: int) -> gtfs_realtime_pb2.FeedMessage:
+        message = _alerts((alert_id, [{"trip": {"trip_id": "T"}}]))
+        message.header.timestamp = int((_EIGHT + timedelta(hours=hours)).timestamp())
+        return message
+
+    async def body(handle: TransitFeedHandle) -> dict[object, set[str]]:
+        start = _EIGHT - timedelta(minutes=30)
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0"], limit=None)],
+            start=start,
+            end=start + timedelta(days=3),
+            with_alerts=True,
+        )
+        return {
+            row.scheduled_departure.date(): {alert.id for alert in row.alerts}
+            for row in board
+            if row.scheduled_departure is not None
+        }
+
+    days = _run_with(
+        _FEED, body, alerts=[feed("first", -1), feed("second", 23), feed("old", -49)]
+    )
+    day = _EIGHT.date()
+    assert days == {
+        day: {"first"},
+        day + timedelta(days=1): {"second"},
+        day + timedelta(days=2): set(),
     }
