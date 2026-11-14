@@ -235,22 +235,17 @@ def _position(p: _IntPoint, ring: Sequence[_IntPoint]) -> int:
 def _arc_points(ring: Sequence[_IntPoint], shared: set[_IntPoint]) -> list[_IntPoint]:
     """Return one point on each arc ``ring`` splits into at ``shared`` points.
 
-    With no edge touching the other ring except at shared vertices, each
-    arc lies wholly on one side of it, so these points place the whole
-    ring. Each is the vertex after a shared one where that is not shared
-    itself, else (the arc is that one edge) the edge's midpoint -- an exact
-    integer, every coordinate being even.
+    The midpoint of the edge leaving each shared vertex (of the first edge
+    if none is shared) -- exact, every coordinate being even. With no edge
+    touching the other ring except at shared vertices, an edge's interior,
+    and so each arc, lies wholly on one side of it: these points place the
+    whole ring.
     """
-    starts = [i for i, point in enumerate(ring[:-1]) if point in shared]
-    if not starts:
-        return [ring[0]]
-    points = []
-    for i in starts:
-        a, b = ring[i], ring[i + 1]
-        points.append(
-            b if b not in shared else ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
-        )
-    return points
+    starts = [i for i, point in enumerate(ring[:-1]) if point in shared] or [0]
+    return [
+        ((ring[i][0] + ring[i + 1][0]) // 2, (ring[i][1] + ring[i + 1][1]) // 2)
+        for i in starts
+    ]
 
 
 def _box(ring: Sequence[_IntPoint]) -> tuple[int, int, int, int]:

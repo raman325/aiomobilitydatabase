@@ -466,3 +466,32 @@ def test_a_vanishingly_short_edge_does_not_shrink_the_grid() -> None:
     assert polygon_is_valid([ring])
     edges = _edges([ring])
     assert len(set(_candidate_pairs(edges))) <= len(edges) * (len(edges) - 1) // 2
+
+
+@given(
+    rings=st.lists(
+        st.lists(st.one_of(_POINTS, _TINY_POINTS), min_size=1, max_size=5),
+        min_size=1,
+        max_size=3,
+    )
+)
+@settings(max_examples=200)
+def test_exact_rings_are_even_integers_in_proportion(
+    rings: list[list[tuple[float, float]]],
+) -> None:
+    """Every coordinate scales to an even integer (so midpoints stay exact)
+    by one common factor, exactly."""
+    exact = _exact_rings(rings)
+    pairs = [
+        (value, scaled)
+        for ring, scaled_ring in zip(rings, exact, strict=True)
+        for point, scaled_point in zip(ring, scaled_ring, strict=True)
+        for value, scaled in zip(point, scaled_point, strict=True)
+    ]
+    assert all(isinstance(scaled, int) and scaled % 2 == 0 for _, scaled in pairs)
+    nonzero = [(value, scaled) for value, scaled in pairs if value]
+    if nonzero:
+        factor = Fraction(nonzero[0][1]) / Fraction(nonzero[0][0])
+        assert all(
+            Fraction(scaled) == Fraction(value) * factor for value, scaled in pairs
+        )
