@@ -770,20 +770,21 @@ _METRES = st.floats(-2000, 2000)
 @given(
     lat0=_LATS,
     lon0=_LONS,
-    corners=st.tuples(_METRES, _METRES, _METRES, _METRES),
+    corner=st.tuples(_METRES, _METRES),
+    size=st.tuples(st.floats(2, 2000), st.floats(2, 2000)),
     point=st.tuples(_METRES, _METRES),
 )
 def test_radius_zero_on_a_rectangle_is_its_bounds_check(
     lat0: float,
     lon0: float,
-    corners: tuple[float, float, float, float],
+    corner: tuple[float, float],
+    size: tuple[float, float],
     point: tuple[float, float],
 ) -> None:
     """A zero-radius circle overlaps an axis-aligned rectangle exactly when
     its centre lies within the rectangle's bounds."""
-    west, east = sorted(corners[:2])
-    south, north = sorted(corners[2:])
-    assume(east - west > 1 and north - south > 1)
+    west, south = corner
+    east, north = west + size[0], south + size[1]
     x, y = point
     # Clear of the boundary, where either answer is within float error.
     assume(min(abs(x - west), abs(x - east), abs(y - south), abs(y - north)) > 1e-3)
