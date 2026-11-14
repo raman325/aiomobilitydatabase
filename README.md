@@ -601,6 +601,12 @@ in the zip is ignored:
   fares, zone pricing, or rider categories. (`Stop.zone_id` is exposed as a
   raw cell, but nothing interprets it.)
 - `translations.txt` — text is returned as the feed wrote it.
+- GTFS-Flex (`locations.geojson`, `location_groups.txt`,
+  `location_group_stops.txt`, `booking_rules.txt`) — on-demand service is not
+  modelled. A zone-only feed still loads (stops.txt is optional when
+  `locations.geojson` is present), and a `stop_times.txt` row naming a zone, a
+  stop group, or a pickup/drop-off window is skipped, so boards and journeys
+  show only the fixed calls around it.
 
 Service calendars **are** answerable — `get_services_on(date)` resolves
 `calendar.txt` against `calendar_dates` exceptions, and rows carry their

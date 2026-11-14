@@ -160,7 +160,28 @@ _USABLE_PAIR_SQL = (
 # default trips.trip_headsign when the headsign changes between stops".
 _HEADSIGN_SQL = "COALESCE(st.stop_headsign, t.headsign)"
 
-_REQUIRED_FILES = frozenset({"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"})
+_REQUIRED_FILES = frozenset({"routes.txt", "trips.txt", "stop_times.txt"})
+
+# stops.txt is "Conditionally Required: Optional if demand-responsive zones
+# are defined in locations.geojson. Required otherwise."
+_ZONES_FILE = "locations.geojson"
+
+# A stop_times row naming one of these is a GTFS-Flex call: a zone or a
+# group of stops (stop_id is then "Forbidden"), or an on-demand window at a
+# stop (arrival and departure times are then "Forbidden"). Such a call is a
+# span of on-demand availability, not a timed stop of a fixed run.
+_FLEX_COLUMNS = (
+    "location_id",
+    "location_group_id",
+    "start_pickup_drop_off_window",
+    "end_pickup_drop_off_window",
+)
+
+
+def _required_files(names: set[str]) -> frozenset[str]:
+    """Return the files a zip of ``names`` must hold: stops.txt unless zoned."""
+    return _REQUIRED_FILES if _ZONES_FILE in names else _REQUIRED_FILES | {"stops.txt"}
+
 
 _WEEKDAY_COLUMNS = (
     "monday",
@@ -772,7 +793,7 @@ class StaticIndex:
             names = set(archive.namelist())
             # Before the timezone: a zip whose files sit in a subfolder has
             # no agency.txt either, and should say what is actually wrong.
-            if missing := sorted(_REQUIRED_FILES - names):
+            if missing := sorted(_required_files(names) - names):
                 raise FeedParseError(f"GTFS zip missing required file: {missing[0]}")
             timezone_name = next(
                 (
@@ -1129,15 +1150,27 @@ class StaticIndex:
         reader: csv.DictReader[str],
         report: Callable[[], None] | None = None,
     ) -> None:
+        """Load the timed calls of fixed runs.
+
+        A GTFS-Flex row (see ``_FLEX_COLUMNS``) is skipped, and so is a row
+        that names no place at all: neither is a stop the vehicle calls at
+        on a schedule, and storing one as an untimed call would misplace it
+        in boards, journeys, and a frequency template's anchor.
+        """
         rows: list[tuple[object, ...]] = []
         sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
         for row in reader:
+            stop_id = row.get("stop_id") or ""
+            if not stop_id.strip() or any(
+                (row.get(column) or "").strip() for column in _FLEX_COLUMNS
+            ):
+                continue
             arrival = parse_gtfs_time(row.get("arrival_time", ""))
             departure = parse_gtfs_time(row.get("departure_time", ""))
             rows.append(
                 (
                     row["trip_id"],
-                    row["stop_id"],
+                    stop_id,
                     # "If there are not separate times for arrival and
                     # departure at a stop, arrival_time and departure_time
                     # should be the same": a call timed by one of them alone
