@@ -651,7 +651,7 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
         "ix_trips_source",
     ], "indexes changed: bump SCHEMA_VERSION and update this list"
     assert (SCHEMA_VERSION, fingerprint) == (
-        10,
+        11,
         {
             "agencies": [
                 "email",
@@ -674,6 +674,23 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
                 "thursday",
                 "tuesday",
                 "wednesday",
+            ],
+            "booking_rules": [
+                "booking_type",
+                "booking_url",
+                "drop_off_message",
+                "id",
+                "info_url",
+                "message",
+                "phone_number",
+                "pickup_message",
+                "prior_notice_duration_max",
+                "prior_notice_duration_min",
+                "prior_notice_last_day",
+                "prior_notice_last_secs",
+                "prior_notice_service_id",
+                "prior_notice_start_day",
+                "prior_notice_start_secs",
             ],
             "calendar_dates": ["date", "exception_type", "service_id"],
             "feed_info": [
@@ -700,6 +717,9 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
                 "stop_sequence",
                 "trip_id",
             ],
+            "location_group_stops": ["location_group_id", "stop_id"],
+            "location_groups": ["id", "name"],
+            "locations": ["description", "id", "name", "polygons"],
             "meta": ["key", "value"],
             "routes": [
                 "agency_id",

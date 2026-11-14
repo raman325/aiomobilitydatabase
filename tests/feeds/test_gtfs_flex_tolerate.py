@@ -553,10 +553,15 @@ def _csv(fieldnames: list[str], rows: list[dict[str, str]]) -> str:
 def _without_flex(
     outcome: dict[str, list[tuple[object, ...]]] | str,
 ) -> tuple[object, list[tuple[object, ...]]]:
-    """Split an outcome into everything but flex_stop_times, and that."""
+    """Split an outcome into everything but flex_stop_times, and that.
+
+    The zones the Flex rows name (locations.geojson, which only the Flex
+    feed ships) are dropped too: no fixed-route query reads them.
+    """
     if isinstance(outcome, str):
         return outcome, []
     rest = dict(outcome)
+    del rest["locations"]
     return rest, rest.pop("flex_stop_times")
 
 
