@@ -47,7 +47,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -116,6 +116,19 @@ CREATE INDEX ix_stop_times_stop_departure ON stop_times (stop_id, departure_secs
 -- against a trip's full static stop order at query time, and the frequency
 -- loader reads whole templates by trip during build.
 CREATE INDEX ix_stop_times_trip_sequence ON stop_times (trip_id, stop_sequence);
+-- GTFS-Flex calls: a zone (location_id), a stop group (location_group_id),
+-- or a stop served within a pickup/drop-off window. Never a timed call, so
+-- never on a board or in a journey; kept so a GTFS-RT stop_sequence naming
+-- one still marks its place in the trip.
+CREATE TABLE flex_stop_times (
+    trip_id TEXT NOT NULL, stop_sequence INTEGER NOT NULL,
+    stop_id TEXT, location_id TEXT, location_group_id TEXT,
+    start_window_secs INTEGER, end_window_secs INTEGER,
+    pickup_type INTEGER, drop_off_type INTEGER,
+    pickup_booking_rule_id TEXT, drop_off_booking_rule_id TEXT,
+    stop_headsign TEXT
+);
+CREATE INDEX ix_flex_stop_times_trip ON flex_stop_times (trip_id, stop_sequence);
 CREATE TABLE calendar (
     service_id TEXT PRIMARY KEY,
     monday INTEGER, tuesday INTEGER, wednesday INTEGER, thursday INTEGER,
@@ -160,7 +173,29 @@ _USABLE_PAIR_SQL = (
 # default trips.trip_headsign when the headsign changes between stops".
 _HEADSIGN_SQL = "COALESCE(st.stop_headsign, t.headsign)"
 
-_REQUIRED_FILES = frozenset({"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"})
+_REQUIRED_FILES = frozenset({"routes.txt", "trips.txt", "stop_times.txt"})
+
+# stops.txt is "Conditionally Required: Optional if demand-responsive zones
+# are defined in locations.geojson. Required otherwise."
+_ZONES_FILE = "locations.geojson"
+
+# A stop_times row naming one of these is a GTFS-Flex call: a zone or a
+# group of stops (stop_id is then "Forbidden"), or an on-demand window at a
+# stop (arrival and departure times are then "Forbidden"). Such a call is a
+# span of on-demand availability, not a timed stop of a fixed run, and is
+# stored in flex_stop_times.
+_FLEX_PLACE_COLUMNS = ("location_id", "location_group_id")
+_FLEX_COLUMNS = (
+    *_FLEX_PLACE_COLUMNS,
+    "start_pickup_drop_off_window",
+    "end_pickup_drop_off_window",
+)
+
+
+def _required_files(names: set[str]) -> frozenset[str]:
+    """Return the files a zip of ``names`` must hold: stops.txt unless zoned."""
+    return _REQUIRED_FILES if _ZONES_FILE in names else _REQUIRED_FILES | {"stops.txt"}
+
 
 _WEEKDAY_COLUMNS = (
     "monday",
@@ -485,6 +520,33 @@ def _later(when: datetime | None, shift: timedelta) -> datetime | None:
         return None
 
 
+def _cell(row: dict[str, str], column: str) -> str | None:
+    """Return a row's cell, or None when absent or blank."""
+    value = row.get(column) or ""
+    return value if value.strip() else None
+
+
+_FLEX_INSERT_SQL = "INSERT INTO flex_stop_times VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+
+
+def _flex_stop_time(row: dict[str, str], stop_id: str | None) -> tuple[object, ...]:
+    """Return a GTFS-Flex stop_times row as a flex_stop_times record."""
+    return (
+        row["trip_id"],
+        _strict_int(row["stop_sequence"], "stop_sequence"),
+        stop_id,
+        _cell(row, "location_id"),
+        _cell(row, "location_group_id"),
+        parse_gtfs_time(row.get("start_pickup_drop_off_window", "")),
+        parse_gtfs_time(row.get("end_pickup_drop_off_window", "")),
+        _defaulted_int(row.get("pickup_type"), 0),
+        _defaulted_int(row.get("drop_off_type"), 0),
+        _cell(row, "pickup_booking_rule_id"),
+        _cell(row, "drop_off_booking_rule_id"),
+        row.get("stop_headsign") or None,
+    )
+
+
 def _shifted(secs: int | None, shift: int) -> int | None:
     """Move a template time onto a repetition; None before its day starts."""
     if secs is None or secs + shift < 0:
@@ -525,6 +587,11 @@ class TripCall:
     # A TripModifications replacement stop, not one of the trip's own: its
     # stop_sequence is synthetic, and no StopTimeUpdate addresses it.
     replacement: bool = False
+    # A GTFS-Flex call (a zone, a stop group, or a window at a stop): never
+    # timed, so it shows on no board, but a StopTimeUpdate or a
+    # TripModifications selector may name its stop_sequence. ``stop_id``
+    # is then the place it names: the stop, zone, or group id.
+    on_demand: bool = False
 
 
 @dataclass(frozen=True)
@@ -772,7 +839,7 @@ class StaticIndex:
             names = set(archive.namelist())
             # Before the timezone: a zip whose files sit in a subfolder has
             # no agency.txt either, and should say what is actually wrong.
-            if missing := sorted(_REQUIRED_FILES - names):
+            if missing := sorted(_required_files(names) - names):
                 raise FeedParseError(f"GTFS zip missing required file: {missing[0]}")
             timezone_name = next(
                 (
@@ -1129,15 +1196,35 @@ class StaticIndex:
         reader: csv.DictReader[str],
         report: Callable[[], None] | None = None,
     ) -> None:
+        """Load the calls of each trip: fixed calls, then Flex calls apart.
+
+        A GTFS-Flex row (see ``_FLEX_COLUMNS``) goes to flex_stop_times, so
+        stop_times holds only calls of fixed runs; a row that names no
+        place at all is skipped. A Flex call is not a stop the vehicle calls
+        at on a schedule, and storing it as an untimed fixed call would
+        misplace it in boards, journeys, and a frequency template's anchor.
+        """
         rows: list[tuple[object, ...]] = []
+        flex_rows: list[tuple[object, ...]] = []
         sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
         for row in reader:
+            stop_id = _cell(row, "stop_id")
+            if any(_cell(row, column) for column in _FLEX_COLUMNS):
+                if stop_id is not None or any(
+                    _cell(row, column) for column in _FLEX_PLACE_COLUMNS
+                ):
+                    flex_rows.append(_flex_stop_time(row, stop_id))
+                if len(flex_rows) >= _BATCH_SIZE:
+                    cls._batched_insert(conn, _FLEX_INSERT_SQL, flex_rows)
+                continue
+            if stop_id is None:
+                continue  # names no place
             arrival = parse_gtfs_time(row.get("arrival_time", ""))
             departure = parse_gtfs_time(row.get("departure_time", ""))
             rows.append(
                 (
                     row["trip_id"],
-                    row["stop_id"],
+                    stop_id,
                     # "If there are not separate times for arrival and
                     # departure at a stop, arrival_time and departure_time
                     # should be the same": a call timed by one of them alone
@@ -1157,6 +1244,7 @@ class StaticIndex:
                 if report is not None:
                     report()
         cls._batched_insert(conn, sql, rows)
+        cls._batched_insert(conn, _FLEX_INSERT_SQL, flex_rows)
         if report is not None:
             report()
 
@@ -1190,7 +1278,12 @@ class StaticIndex:
         exact_times=0 (or empty) is service that "does not follow a fixed
         schedule", so its repetitions' times are stored as approximate
         (timepoint 0) whatever the template says, and an unparseable
-        exact_times leaves timepoint unknown. An exact_times=0 repetition
+        exact_times leaves timepoint unknown. A template's GTFS-Flex calls
+        are copied into each repetition with their windows shifted alike;
+        the anchor is then the first fixed call that is timed when Flex
+        calls come before it (the trip's first stop is a window, with no
+        departure to measure from), and a template of Flex calls alone has
+        no anchor and is kept as one unrepeated trip. An exact_times=0 repetition
         also keeps its headway as ``slot_secs``: GTFS-RT names such a run by
         a start_time that "may be arbitrary", and :meth:`slot_runs` finds
         the repetition whose slot it starts in.
@@ -1232,6 +1325,7 @@ class StaticIndex:
         stop_times_sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
         trip_rows: list[tuple[object, ...]] = []
         stop_time_rows: list[tuple[object, ...]] = []
+        flex_rows: list[tuple[object, ...]] = []
         for trip_id, trip_spans in spans.items():
             template = conn.execute(
                 "SELECT stop_id, arrival_secs, departure_secs, stop_sequence, "
@@ -1240,16 +1334,24 @@ class StaticIndex:
                 (trip_id,),
             ).fetchall()
             if not template:
-                continue  # dangling reference: nothing to repeat
+                continue  # dangling, or Flex calls alone: nothing to anchor
+            flex_template = conn.execute(
+                "SELECT * FROM flex_stop_times WHERE trip_id = ? "
+                "ORDER BY stop_sequence",
+                (trip_id,),
+            ).fetchall()
             # The loader already lets a lone arrival stand in for a blank
             # departure, so this is None only for an untimed first stop.
             anchor = template[0][2]
+            if flex_template and flex_template[0][1] < template[0][3]:
+                anchor = next((row[2] for row in template if row[2] is not None), None)
             if anchor is None:
                 raise ValueError(
                     f"frequency trip {trip_id!r} has no first-stop time "
                     "to anchor repetition offsets"
                 )
             conn.execute("DELETE FROM stop_times WHERE trip_id = ?", (trip_id,))
+            conn.execute("DELETE FROM flex_stop_times WHERE trip_id = ?", (trip_id,))
             starts: dict[int, tuple[int | None, int]] = {}
             for start_secs, end_secs, headway_secs, exact_times in trip_spans:
                 rep_start = start_secs
@@ -1293,13 +1395,25 @@ class StaticIndex:
                             stop_headsign,
                         )
                     )
+                flex_rows.extend(
+                    (
+                        synthetic_id,
+                        *flex[1:5],
+                        _shifted(flex[5], shift),
+                        _shifted(flex[6], shift),
+                        *flex[7:],
+                    )
+                    for flex in flex_template
+                )
                 if len(stop_time_rows) >= _BATCH_SIZE:
                     cls._batched_insert(conn, trips_sql, trip_rows)
                     cls._batched_insert(conn, stop_times_sql, stop_time_rows)
+                    cls._batched_insert(conn, _FLEX_INSERT_SQL, flex_rows)
                     if report is not None:
                         report()
         cls._batched_insert(conn, trips_sql, trip_rows)
         cls._batched_insert(conn, stop_times_sql, stop_time_rows)
+        cls._batched_insert(conn, _FLEX_INSERT_SQL, flex_rows)
         if report is not None:
             report()
 
@@ -1839,10 +1953,11 @@ class StaticIndex:
         by_trip: dict[str, list[Any]] = {}
         for row in rows:
             by_trip.setdefault(row[0], []).append(row)
+        on_demand = self._on_demand_calls(list(by_trip))
         for trip_id, trip_rows in by_trip.items():
             head = trip_rows[0]
             try:
-                calls = [
+                fixed = [
                     TripCall(
                         stop_sequence=row[11],
                         stop_id=row[12],
@@ -1865,6 +1980,21 @@ class StaticIndex:
                 ]
             except OverflowError:
                 continue  # a call past the end of datetime: no run to date
+            # A Flex call repeating a fixed call's stop_sequence (a feed
+            # error: the pair is the primary key) yields to it, so whatever
+            # names that sequence names the fixed call.
+            taken = {call.stop_sequence for call in fixed}
+            calls = sorted(
+                [
+                    *fixed,
+                    *(
+                        call
+                        for call in on_demand.get(trip_id, ())
+                        if call.stop_sequence not in taken
+                    ),
+                ],
+                key=lambda call: call.stop_sequence,
+            )
             instances.append(
                 TripInstanceCalls(
                     trip_id=trip_id,
@@ -1884,6 +2014,34 @@ class StaticIndex:
                 )
             )
         return instances
+
+    def _on_demand_calls(self, trip_ids: list[str]) -> dict[str, list[TripCall]]:
+        """Return each trip's GTFS-Flex calls, untimed, by stop_sequence."""
+        found: dict[str, list[TripCall]] = {}
+        if not trip_ids:
+            return found
+        marks = ",".join("?" * len(trip_ids))
+        for row in self._conn.execute(
+            "SELECT trip_id, stop_sequence, "
+            "COALESCE(stop_id, location_id, location_group_id), "
+            "pickup_type, drop_off_type, stop_headsign FROM flex_stop_times "
+            f"WHERE trip_id IN ({marks}) ORDER BY trip_id, stop_sequence",
+            trip_ids,
+        ):
+            found.setdefault(row[0], []).append(
+                TripCall(
+                    stop_sequence=row[1],
+                    stop_id=row[2],
+                    arrival=None,
+                    departure=None,
+                    pickup_type=_enum_or_none(PickupDropOffType, row[3]),
+                    drop_off_type=_enum_or_none(PickupDropOffType, row[4]),
+                    timepoint_exact=None,
+                    stop_headsign=row[5],
+                    on_demand=True,
+                )
+            )
+        return found
 
     def concrete_trip_ids(self, source_trip_ids: list[str]) -> dict[str, list[str]]:
         """Map each PRODUCER-facing trip id to its concrete instances.

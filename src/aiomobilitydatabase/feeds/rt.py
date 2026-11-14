@@ -945,8 +945,9 @@ def resolve_trip_predictions(
 
     ``calls`` is the instance's complete ordered call list with its
     scheduled instants (one materialized repetition's for frequency
-    trips). Only what the spec states is predicted, walking the calls in
-    order:
+    trips), its untimed GTFS-Flex calls included: an update may name one,
+    and it carries or cuts propagation where it stands. Only what the
+    spec states is predicted, walking the calls in order:
 
     - An event (arrival or departure) an update gives is predicted from its
       time, else its delay ("If both time and delay are specified, time
@@ -1209,11 +1210,14 @@ def stated_copy_calls(
     original's calls as a scheduled trip's are (by stop_sequence, or a stop
     visited once), and each stated call is that stop -- its id and
     descriptors -- at the times the update gives, as a NEW trip's call is.
-    Only the stops its updates name are shown, in the trip's order.
+    Only the stops its updates name are shown, in the trip's order, and
+    never a GTFS-Flex call, which is no timed stop.
     """
     stated: list[RealtimeCall] = []
     for pos, update in sorted(_placed(entry, calls).items()):
         call = calls[pos]
+        if call.on_demand:
+            continue
         realtime = _realtime_call(replace(update, stop_id=call.stop_id))
         if realtime is not None:
             stated.append(
