@@ -526,6 +526,17 @@ Notes on direct mode:
   fields pick English (`en-US` counts), else a translation without a
   language, else the first; an unset cause, effect or severity is the
   spec's UNKNOWN default.
+- **Boards and journeys can carry their alerts**: `with_alerts=True` on
+  `get_arrivals()` and `get_upcoming_trips()` (shaped like `with_vehicles`)
+  fills each row's `alerts` with the alerts that apply to it. The library
+  matches them against the row's run, which a caller cannot see: the
+  trip, the repetition's start (or a plain trip's first departure), and
+  the service day, as well as the route, agency, direction and stop. An
+  alert's trip names its run as a TripUpdate's does: without a trip_id,
+  the one trip its route, direction and start resolve to; without a date,
+  the run a plain trip's trip_id names at the alert feed's time. A
+  station's alerts reach its platforms. Every alert is kept whatever its
+  period; `is_active(at)` says which apply now.
 - **GBFS exposes what the documents carry**: the full station surface
   (`is_installed` alongside `is_renting`/`is_returning` — a station removed
   from the street is not "operational"; disabled counts, address, region,
