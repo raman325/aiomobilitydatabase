@@ -300,6 +300,24 @@ def test_realtime_accessibility_overwrites_the_static_value(
         assert board == {("T", expected)}
         assert journeys == {("T", expected)}
 
+    async def attached(handle: TransitFeedHandle) -> set[object]:
+        start = _EIGHT - timedelta(minutes=30)
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S1"], limit=None)],
+            start=start,
+            end=start + timedelta(hours=2),
+            with_vehicles=True,
+        )
+        return {
+            row.vehicle.wheelchair_accessible if row.vehicle else "no vehicle"
+            for row in board
+        }
+
+    # The vehicle is attached and keeps its own descriptor's value.
+    assert _run_feeds(_ACCESSIBLE_TRIP, attached, [update], vehicles) == {
+        _STATED[from_vehicle]
+    }
+
 
 def test_a_new_trip_shows_the_accessibility_its_update_states() -> None:
     """A NEW trip has no static value to overwrite: its rows show what its
@@ -439,3 +457,15 @@ def test_a_detoured_run_shows_the_accessibility_its_update_states() -> None:
     board, journeys = _run_feeds(files, _accessibility(), [update])
     assert board == {("T", WheelchairAccess.NOT_POSSIBLE)}
     assert journeys == {("T", WheelchairAccess.NOT_POSSIBLE)}
+
+    async def replacement_stop(handle: TransitFeedHandle) -> set[object]:
+        start = _EIGHT - timedelta(minutes=30)
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S3"])], start=start, end=start + timedelta(hours=2)
+        )
+        return {(row.trip_id, row.wheelchair_accessible) for row in board}
+
+    # The rows are the rebuilt run's: it calls at the replacement stop.
+    assert _run_feeds(files, replacement_stop, [update]) == {
+        ("T", WheelchairAccess.NOT_POSSIBLE)
+    }

@@ -438,9 +438,10 @@ Notes on direct mode:
   on the same headway-based trip be told apart — without it, concurrent
   repetitions of one template trip are indistinguishable. A vehicle that
   reports no position is still returned, with `latitude`/`longitude` of
-  `None` (as a docked GBFS vehicle's are), and no zone includes it. Its
-  `current_status` is `None` without a `current_stop_sequence` (the spec
-  ignores it then), and its `timestamp` falls back to the message's.
+  `None` (as a docked GBFS vehicle's are), and no zone includes it. Any
+  vehicle's `current_status` is `None` without a `current_stop_sequence`
+  (the spec ignores it then), and its `timestamp` falls back to the
+  message's when it sends none.
 - **Realtime accessibility wins**: a row's `wheelchair_accessible` is what
   its `TripUpdate`'s `VehicleDescriptor` states, and the static value where
   it states none. It reads the same with or without `with_vehicles`; an
