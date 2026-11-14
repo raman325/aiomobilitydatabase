@@ -533,10 +533,13 @@ Notes on direct mode:
   to metres around the circle), and `await get_on_demand_services(zone,
   route_ids=...)` lists every `OnDemandService` serving it: a call at a zone
   it overlaps, at a stop group with a stop in it, or at a stop in it served
-  within a window. Each carries its trip, route, `service_id`, window as
+  within a window. Each carries its trip, route, `service_id`, its
+  `start_pickup_drop_off_window`/`end_pickup_drop_off_window` as
   `timedelta` offsets into the service day (None where unknown, never "no
-  limit"), pickup/drop-off types, and the place and booking-rule records it
-  names. Schedule only, no network.
+  limit"), pickup/drop-off types, and each id it names beside its record
+  (an id whose record the feed lacks keeps the id, with None for the
+  record). Schedule only, no network. Meant for circles of up to a few
+  hundred kilometres that do not reach a pole, like `stops_in`.
 - **Alert scope is the spec's, selector by selector**: `ServiceAlert`
   keeps each `informed_entity` whole as an `EntitySelector` (spec field
   names; a trip as a `TripSelector`, one run of it where it gives a start
@@ -628,9 +631,10 @@ files (`locations.geojson`, `location_groups.txt`, `location_group_stops.txt`,
 **GTFS-Flex: no dated windows or booking deadlines yet.**
 `get_on_demand_services(zone)` says which on-demand calls serve a place and
 their windows as offsets into the service day, but not yet the dated windows
-of a time range or when a ride can still be booked. A zone-only feed loads (stops.txt is optional when `locations.geojson` is
-present), and a `stop_times.txt` row naming a zone, a stop group, or a
-pickup/drop-off window is kept apart from the fixed calls: boards and
+of a time range or when a ride can still be booked. A zone-only feed loads
+(stops.txt is optional when `locations.geojson` is present), and a
+`stop_times.txt` row naming a zone, a stop group, or a pickup/drop-off
+window is kept apart from the fixed calls: boards and
 journeys show only the fixed calls around it, while a GTFS-RT update or a
 detour naming its `stop_sequence` still applies at its place in the trip (a
 delay stated there propagates to the fixed stops after it).
