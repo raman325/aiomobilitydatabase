@@ -96,6 +96,14 @@ class StopLocationType(IntEnum):
     BOARDING_AREA = 4
 
 
+class BookingType(IntEnum):
+    """How far ahead a GTFS-Flex ride can be booked (booking_rules.txt)."""
+
+    REAL_TIME = 0
+    SAME_DAY = 1
+    PRIOR_DAYS = 2
+
+
 class AlertCause(StrEnum):
     """GTFS-RT ``Alert.Cause`` vocabulary.
 
@@ -1010,6 +1018,79 @@ class FeedInfo:
     end_date: date | None
     contact_email: str | None
     contact_url: str | None
+
+
+@dataclass(frozen=True)
+class FlexPolygon:
+    """One polygon of a GTFS-Flex zone, as ``(latitude, longitude)`` rings.
+
+    ``exterior`` is the outer ring and ``holes`` the rings cut out of it,
+    each exactly as locations.geojson gives it (closed: the last position
+    repeats the first), with GeoJSON's ``[longitude, latitude]`` swapped.
+    """
+
+    exterior: tuple[tuple[float, float], ...]
+    holes: tuple[tuple[tuple[float, float], ...], ...]
+
+
+@dataclass(frozen=True)
+class FlexLocation:
+    """A GTFS-Flex zone where riders may request pickup or drop off.
+
+    A locations.geojson Feature: ``id`` is the one ``stop_times.location_id``
+    names, ``name``/``description`` its ``stop_name``/``stop_desc``
+    properties, and ``polygons`` its Polygon (one) or MultiPolygon (each
+    part). A Feature without an id or with any malformed ring is not kept:
+    a zone with only some of its parts would be smaller than the producer's.
+    """
+
+    id: str
+    name: str | None
+    description: str | None
+    polygons: tuple[FlexPolygon, ...]
+
+
+@dataclass(frozen=True)
+class LocationGroup:
+    """A GTFS-Flex group of stops where riders may request pickup or drop off.
+
+    ``id`` is the one ``stop_times.location_group_id`` names; ``stop_ids``
+    are its stops from location_group_stops.txt, in file order, each once.
+    """
+
+    id: str
+    name: str | None
+    stop_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BookingRule:
+    """How a GTFS-Flex ride is booked (booking_rules.txt).
+
+    Field names are the spec's, with ``id`` for ``booking_rule_id`` and
+    ``prior_notice_last_secs``/``prior_notice_start_secs`` for the parsed
+    ``prior_notice_last_time``/``prior_notice_start_time`` (seconds, like
+    every GTFS time here). Durations are minutes, as the file gives them.
+    Every cell is kept as the file states it, even one the spec forbids
+    for this ``booking_type``; unparseable cells are None, and an unknown
+    ``booking_type`` is None.
+    """
+
+    id: str
+    booking_type: BookingType | None
+    prior_notice_duration_min: int | None
+    prior_notice_duration_max: int | None
+    prior_notice_last_day: int | None
+    prior_notice_last_secs: int | None
+    prior_notice_start_day: int | None
+    prior_notice_start_secs: int | None
+    prior_notice_service_id: str | None
+    message: str | None
+    pickup_message: str | None
+    drop_off_message: str | None
+    phone_number: str | None
+    info_url: str | None
+    booking_url: str | None
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,5 @@
+stop_id,stop_name,stop_lat,stop_lon
+S1,Main St,41.000,-87.000
+S2,Depot,41.020,-87.020
+H1,Hospital East,41.010,-87.030
+H2,Hospital West,41.010,-87.040

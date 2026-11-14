@@ -1,0 +1,17 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "TOWN",
+      "properties": {"stop_name": "Town", "stop_desc": "Anywhere in town but the park"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [[-87.05, 40.99], [-86.99, 40.99], [-86.99, 41.03], [-87.05, 41.03], [-87.05, 40.99]],
+          [[-87.02, 41.00], [-87.02, 41.01], [-87.01, 41.01], [-87.01, 41.00], [-87.02, 41.00]]
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+trip_id,arrival_time,departure_time,stop_id,location_id,location_group_id,start_pickup_drop_off_window,end_pickup_drop_off_window,stop_sequence,pickup_type,drop_off_type,pickup_booking_rule_id,drop_off_booking_rule_id
+DEV1,08:00:00,08:00:00,S1,,,,,1,0,0,,
+DEV1,,,,TOWN,,08:05:00,08:25:00,2,2,2,NOW,NOW
+DEV1,08:30:00,08:30:00,S2,,,,,3,0,0,,
+ZONE1,,,,,HOSPITAL,09:00:00,17:00:00,1,2,1,DAY_BEFORE,
+ZONE1,,,,TOWN,,09:00:00,17:00:00,2,1,2,,DAY_BEFORE

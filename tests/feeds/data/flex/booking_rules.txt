@@ -1,0 +1,3 @@
+booking_rule_id,booking_type,prior_notice_duration_min,prior_notice_duration_max,prior_notice_last_day,prior_notice_last_time,prior_notice_start_day,prior_notice_start_time,prior_notice_service_id,message,pickup_message,drop_off_message,phone_number,info_url,booking_url
+NOW,0,,,,,,,,Call when ready,,,555-0100,https://flex.example/info,
+DAY_BEFORE,2,,,1,17:00:00,7,00:00:00,WEEKDAYS,Book by 5PM the business day before,,,555-0101,,https://flex.example/book
