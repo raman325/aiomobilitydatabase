@@ -58,6 +58,7 @@ from aiomobilitydatabase.feeds.models import (
     StopArrival,
     StopLocationType,
     UpcomingTrip,
+    VehiclePosition,
     VehicleStopStatus,
     WheelchairAccess,
 )
@@ -1067,22 +1068,25 @@ def test_station_merge_invariants(
 
 def _maybe_fill_vehicle_entity(
     entity: gtfs_realtime_pb2.FeedEntity, data: st.DataObject
-) -> dict[str, object] | None:
-    """Fill a vehicle entity; return the expected descriptive status
-    surface when a position was set (the entity surfaces), else None.
+) -> dict[str, object]:
+    """Fill a vehicle entity; return its expected descriptive surface.
 
-    Draws exercise the whole VehiclePosition descriptive surface:
+    Every vehicle entity surfaces, positioned or not. Draws exercise the
+    whole VehiclePosition descriptive surface: position presence,
     current_status across EVERY protobuf value and absent, congestion
     across every value and absent, stop_id / current_stop_sequence
-    presence (the referent gate for the IN_TRANSIT_TO default), and
-    license_plate. The expected values restate the documented rules from
-    the drawn values: explicit status verbatim, the default only with a
-    stop referent, None otherwise; congestion only when set.
+    presence, and license_plate. The expected values restate the spec
+    from the drawn values: current_status is "Ignored if
+    current_stop_sequence is missing" (None), and with one an unset status
+    is IN_TRANSIT_TO; congestion only when set.
     """
+    entity.vehicle.SetInParent()  # a vehicle entity, even with no field set
     has_position = data.draw(st.booleans())
+    position: tuple[float, float] | None = None
     if has_position:
-        entity.vehicle.position.latitude = data.draw(st.floats(-90, 90))
-        entity.vehicle.position.longitude = data.draw(st.floats(-180, 180))
+        position = (data.draw(st.floats(-90, 90)), data.draw(st.floats(-180, 180)))
+        entity.vehicle.position.latitude = position[0]
+        entity.vehicle.position.longitude = position[1]
     if data.draw(st.booleans()):
         entity.vehicle.trip.trip_id = data.draw(st.text(max_size=6))
     if data.draw(st.booleans()):
@@ -1112,17 +1116,16 @@ def _maybe_fill_vehicle_entity(
     )
     if congestion_value is not None:
         entity.vehicle.congestion_level = congestion_value
-    if not has_position:
-        return None
-    if status_value is not None:
-        expected_status: VehicleStopStatus | None = VehicleStopStatus(
+    if stop_sequence is None:
+        expected_status: VehicleStopStatus | None = None
+    elif status_value is not None:
+        expected_status = VehicleStopStatus(
             gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.Name(status_value)
         )
-    elif stop_id is not None or stop_sequence is not None:
-        expected_status = VehicleStopStatus.IN_TRANSIT_TO
     else:
-        expected_status = None
+        expected_status = VehicleStopStatus.IN_TRANSIT_TO
     return {
+        "position": position,
         "current_status": expected_status,
         "congestion_level": (
             CongestionLevel(
@@ -1284,6 +1287,17 @@ def _assert_trip_update_keys(
     assert replaced - eligible - canceled - deleted <= updates.replaced_trips
 
 
+def _assert_position(
+    vehicle: VehiclePosition, position: tuple[float, float] | None
+) -> None:
+    """A vehicle has the drawn position (float32 on the wire), else none."""
+    if position is None:
+        assert (vehicle.latitude, vehicle.longitude) == (None, None)
+    else:
+        assert vehicle.latitude == pytest.approx(position[0], abs=1e-4)
+        assert vehicle.longitude == pytest.approx(position[1], abs=1e-4)
+
+
 @given(data=st.data())
 @settings(max_examples=100, deadline=None)
 def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
@@ -1315,10 +1329,9 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
             continue
         result = filler(entity, data)
         if kind == "vehicle":
-            if result is not None:
-                expected_vehicles.append(result)  # type: ignore[arg-type]
+            expected_vehicles.append(result)  # type: ignore[arg-type]
         elif kind == "trip_update":
-            entity_keys = result  # type: ignore[misc]
+            entity_keys = result
             eligible_keys |= entity_keys[0]
             canceled_keys |= entity_keys[1]
             deleted_keys |= entity_keys[2]
@@ -1330,7 +1343,7 @@ def test_rt_parsers_are_total_over_field_presence(data: st.DataObject) -> None:
     )
     assert len(vehicles) == len(expected_vehicles)
     for vehicle, expected in zip(vehicles, expected_vehicles, strict=True):
-        assert vehicle.latitude is not None and vehicle.longitude is not None
+        _assert_position(vehicle, expected["position"])  # type: ignore[arg-type]
         assert vehicle.occupancy_status is None or isinstance(
             vehicle.occupancy_status, OccupancyStatus
         )
@@ -6936,17 +6949,12 @@ def _status_vehicle_message(
 def test_vehicle_current_status_tri_rule_oracle(
     has_sequence: bool, has_stop_id: bool, status_value: int | None
 ) -> None:
-    """The documented three branches of the current_status rule, over the
-    WHOLE presence lattice (status set or not x sequence set or not x
-    stop_id set or not): an explicitly set status surfaces verbatim even
-    when it equals the proto2 default; an unset status surfaces as the
-    IN_TRANSIT_TO default only behind a stop referent; with neither
-    referent an unset status is None.
-
-    The None branch is the misreport the rule exists to prevent: proto2
-    gives current_status the implicit default IN_TRANSIT_TO, so a vehicle
-    that named no stop at all would otherwise read as "in transit to"
-    some stop it never identified.
+    """The spec's current_status rule over the WHOLE presence lattice
+    (status set or not x sequence set or not x stop_id set or not): it is
+    "Ignored if current_stop_sequence is missing" -- a stop_id alone does
+    not count -- and with a current_stop_sequence a set status surfaces
+    verbatim while an unset one is IN_TRANSIT_TO ("If current_status is
+    missing IN_TRANSIT_TO is assumed").
     """
     msg = _status_vehicle_message(
         status_value=status_value,
@@ -6956,14 +6964,14 @@ def test_vehicle_current_status_tri_rule_oracle(
     [vehicle] = vehicles_from_message(
         msg, routes_by_id={}, stops_by_id={}, trip_routes={}
     )
-    if status_value is not None:
-        expected: VehicleStopStatus | None = VehicleStopStatus(
+    if not has_sequence:
+        expected: VehicleStopStatus | None = None
+    elif status_value is not None:
+        expected = VehicleStopStatus(
             gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.Name(status_value)
         )
-    elif has_sequence or has_stop_id:
-        expected = VehicleStopStatus.IN_TRANSIT_TO
     else:
-        expected = None
+        expected = VehicleStopStatus.IN_TRANSIT_TO
     assert vehicle.current_status is expected
 
 

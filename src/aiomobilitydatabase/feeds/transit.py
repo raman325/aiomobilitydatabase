@@ -93,6 +93,7 @@ from .static_index import (
     StaticIndex,
     TripCall,
     TripInstanceCalls,
+    TripSummary,
     repetition_trip_id,
 )
 
@@ -609,19 +610,22 @@ def _shifted_calls(calls: Sequence[TripCall], shift: timedelta) -> list[TripCall
 def _replacing(
     trip: RealtimeTrip,
     concrete_trip_id: str,
-    summaries: Mapping[str, tuple[str, str | None, int | None, str | None]],
+    summaries: Mapping[str, TripSummary],
 ) -> RealtimeTrip:
     """Return a replacement as its run: that trip's id, route and direction.
 
     A TripDescriptor's route and direction only select the trip; they
     cannot move it to another route. The headsign and short name may
-    differ ("when it differs from the original"), else are the trip's. A
+    differ ("when it differs from the original"), else are the trip's, and
+    so is its accessibility where the update's VehicleDescriptor states
+    none (NO_VALUE: "it won't be overwritten"). A
     run of headway-based service (:attr:`RealtimeTrip.run`) is its own
     start's run, under that start's id: its slot's other runs are other
     vehicles.
     """
-    route_id, headsign, direction_id, short_name = summaries.get(
-        concrete_trip_id, (trip.route_id or "", None, trip.direction_id, None)
+    route_id, headsign, direction_id, short_name, wheelchair = summaries.get(
+        concrete_trip_id,
+        TripSummary(trip.route_id or "", None, trip.direction_id, None, None),
     )
     if trip.run is not None:
         source_trip_id, _day, start_secs = trip.run
@@ -634,6 +638,7 @@ def _replacing(
         headsign=trip.headsign or headsign,
         direction_id=direction_id,
         trip_short_name=trip.trip_short_name or short_name,
+        wheelchair_accessible=_wheelchair(wheelchair, trip.wheelchair_accessible),
     )
 
 
@@ -676,7 +681,9 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
         start_date=record.copy_start_date,
         vehicle_id=record.entry.vehicle_id,
         calls=calls,
-        wheelchair_accessible=run.wheelchair_accessible,
+        wheelchair_accessible=_wheelchair(
+            run.wheelchair_accessible, record.entry.wheelchair_accessible
+        ),
         bikes_allowed=run.bikes_allowed,
         trip_short_name=record.trip_short_name or run.trip_short_name,
     )
@@ -790,7 +797,9 @@ def _slot_run(
         ),
         replaces=(run.source_trip_id, run.service_date, slot.slot_start),
         run=key,
-        wheelchair_accessible=run.wheelchair_accessible,
+        wheelchair_accessible=_wheelchair(
+            run.wheelchair_accessible, entry.wheelchair_accessible
+        ),
         bikes_allowed=run.bikes_allowed,
         trip_short_name=run.trip_short_name,
         service_id=run.service_id,
@@ -817,12 +826,29 @@ def _detoured_run(
         vehicle_id=entry.vehicle_id,
         calls=_run_calls(entry, run.calls, detoured),
         replaces=key,
-        wheelchair_accessible=run.wheelchair_accessible,
+        wheelchair_accessible=_wheelchair(
+            run.wheelchair_accessible, entry.wheelchair_accessible
+        ),
         bikes_allowed=run.bikes_allowed,
         trip_short_name=run.trip_short_name,
         service_id=run.service_id,
         block_id=run.block_id,
     )
+
+
+def _wheelchair(
+    static: WheelchairAccess | None, stated: WheelchairAccess | None
+) -> WheelchairAccess | None:
+    """Return a trip's accessibility: what its TripUpdate states, else static.
+
+    A VehicleDescriptor's wheelchair_accessible, "When available, ...
+    should overwrite the wheelchair_accessible value from the static GTFS",
+    an explicit UNKNOWN too ("This value will overwrite the value from the
+    GTFS"). None is NO_VALUE, which leaves the static value. Only the
+    TripUpdate's descriptor counts, so a row reads the same whether or not
+    a query fetched VehiclePositions (an attached vehicle keeps its own).
+    """
+    return static if stated is None else stated
 
 
 def _realtime_vehicle(
@@ -2647,7 +2673,10 @@ class TransitFeedHandle:
                         service_date=dep.service_date,
                         vehicles=vehicles,
                     ),
-                    wheelchair_accessible=dep.wheelchair_accessible,
+                    wheelchair_accessible=_wheelchair(
+                        dep.wheelchair_accessible,
+                        trip_rt.wheelchair_accessible if trip_rt else None,
+                    ),
                     bikes_allowed=dep.bikes_allowed,
                     direction_id=dep.direction_id,
                     pickup_type=dep.pickup_type,
@@ -2990,7 +3019,10 @@ class TransitFeedHandle:
                         service_date=trip.service_date,
                         vehicles=vehicles,
                     ),
-                    wheelchair_accessible=trip.wheelchair_accessible,
+                    wheelchair_accessible=_wheelchair(
+                        trip.wheelchair_accessible,
+                        trip_rt.wheelchair_accessible if trip_rt else None,
+                    ),
                     bikes_allowed=trip.bikes_allowed,
                     direction_id=trip.direction_id,
                     origin_pickup_type=trip.origin_pickup_type,
@@ -3050,7 +3082,9 @@ class TransitFeedHandle:
         return [
             vehicle
             for vehicle in vehicles
-            if in_circle(zone, vehicle.latitude, vehicle.longitude)
+            if vehicle.latitude is not None
+            and vehicle.longitude is not None
+            and in_circle(zone, vehicle.latitude, vehicle.longitude)
         ]
 
     async def _vehicles_from(
