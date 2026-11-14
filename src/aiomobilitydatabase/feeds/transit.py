@@ -676,7 +676,9 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
         start_date=record.copy_start_date,
         vehicle_id=record.entry.vehicle_id,
         calls=calls,
-        wheelchair_accessible=run.wheelchair_accessible,
+        wheelchair_accessible=_wheelchair(
+            run.wheelchair_accessible, record.entry.wheelchair_accessible
+        ),
         bikes_allowed=run.bikes_allowed,
         trip_short_name=record.trip_short_name or run.trip_short_name,
     )
@@ -790,7 +792,9 @@ def _slot_run(
         ),
         replaces=(run.source_trip_id, run.service_date, slot.slot_start),
         run=key,
-        wheelchair_accessible=run.wheelchair_accessible,
+        wheelchair_accessible=_wheelchair(
+            run.wheelchair_accessible, entry.wheelchair_accessible
+        ),
         bikes_allowed=run.bikes_allowed,
         trip_short_name=run.trip_short_name,
         service_id=run.service_id,
@@ -817,12 +821,32 @@ def _detoured_run(
         vehicle_id=entry.vehicle_id,
         calls=_run_calls(entry, run.calls, detoured),
         replaces=key,
-        wheelchair_accessible=run.wheelchair_accessible,
+        wheelchair_accessible=_wheelchair(
+            run.wheelchair_accessible, entry.wheelchair_accessible
+        ),
         bikes_allowed=run.bikes_allowed,
         trip_short_name=run.trip_short_name,
         service_id=run.service_id,
         block_id=run.block_id,
     )
+
+
+def _wheelchair(
+    static: WheelchairAccess | None, *stated: WheelchairAccess | None
+) -> WheelchairAccess | None:
+    """Return a trip's accessibility: the first value realtime states, else static.
+
+    A VehicleDescriptor's wheelchair_accessible, "When available, ...
+    should overwrite the wheelchair_accessible value from the static GTFS",
+    an explicit UNKNOWN too ("This value will overwrite the value from the
+    GTFS"). None is NO_VALUE, which leaves the static value.
+    """
+    return next((value for value in stated if value is not None), static)
+
+
+def _vehicle_wheelchair(vehicle: VehiclePosition | None) -> WheelchairAccess | None:
+    """Return the accessibility a row's matched vehicle states, if any."""
+    return vehicle.wheelchair_accessible if vehicle is not None else None
 
 
 def _realtime_vehicle(
@@ -901,7 +925,9 @@ def _realtime_rows(
                     canceled=False,
                     vehicle_id=trip.vehicle_id,
                     vehicle=vehicle,
-                    wheelchair_accessible=trip.wheelchair_accessible,
+                    wheelchair_accessible=_wheelchair(
+                        trip.wheelchair_accessible, _vehicle_wheelchair(vehicle)
+                    ),
                     bikes_allowed=trip.bikes_allowed,
                     direction_id=trip.direction_id,
                     pickup_type=call.pickup_type,
@@ -976,7 +1002,9 @@ def _realtime_journeys(
                     canceled=False,
                     vehicle_id=trip.vehicle_id,
                     vehicle=vehicle,
-                    wheelchair_accessible=trip.wheelchair_accessible,
+                    wheelchair_accessible=_wheelchair(
+                        trip.wheelchair_accessible, _vehicle_wheelchair(vehicle)
+                    ),
                     bikes_allowed=trip.bikes_allowed,
                     direction_id=trip.direction_id,
                     origin_pickup_type=board.pickup_type,
@@ -2621,6 +2649,17 @@ class TransitFeedHandle:
                 if dep.stop_sequence in trip_rt.skipped:
                     continue  # SKIPPED: the vehicle will not serve this stop
                 prediction = trip_rt.predictions.get(dep.stop_sequence)
+            vehicle = (
+                None
+                if canceled
+                else _match_vehicle(
+                    prediction.vehicle_id if prediction else None,
+                    dep.source_trip_id,
+                    dep.start_secs,
+                    service_date=dep.service_date,
+                    vehicles=vehicles,
+                )
+            )
             arrivals.append(
                 StopArrival(
                     stop_id=dep.stop_id,
@@ -2638,16 +2677,12 @@ class TransitFeedHandle:
                     realtime=canceled or prediction is not None,
                     canceled=canceled,
                     vehicle_id=prediction.vehicle_id if prediction else None,
-                    vehicle=None
-                    if canceled
-                    else _match_vehicle(
-                        prediction.vehicle_id if prediction else None,
-                        dep.source_trip_id,
-                        dep.start_secs,
-                        service_date=dep.service_date,
-                        vehicles=vehicles,
+                    vehicle=vehicle,
+                    wheelchair_accessible=_wheelchair(
+                        dep.wheelchair_accessible,
+                        _vehicle_wheelchair(vehicle),
+                        trip_rt.wheelchair_accessible if trip_rt else None,
                     ),
-                    wheelchair_accessible=dep.wheelchair_accessible,
                     bikes_allowed=dep.bikes_allowed,
                     direction_id=dep.direction_id,
                     pickup_type=dep.pickup_type,
@@ -2957,6 +2992,17 @@ class TransitFeedHandle:
                 ),
                 None,
             )
+            vehicle = (
+                None
+                if canceled
+                else _match_vehicle(
+                    vehicle_id,
+                    trip.source_trip_id,
+                    trip.start_secs,
+                    service_date=trip.service_date,
+                    vehicles=vehicles,
+                )
+            )
             trips.append(
                 UpcomingTrip(
                     trip_id=trip.trip_id,
@@ -2981,16 +3027,12 @@ class TransitFeedHandle:
                     or dest_pred is not None,
                     canceled=canceled,
                     vehicle_id=vehicle_id,
-                    vehicle=None
-                    if canceled
-                    else _match_vehicle(
-                        vehicle_id,
-                        trip.source_trip_id,
-                        trip.start_secs,
-                        service_date=trip.service_date,
-                        vehicles=vehicles,
+                    vehicle=vehicle,
+                    wheelchair_accessible=_wheelchair(
+                        trip.wheelchair_accessible,
+                        _vehicle_wheelchair(vehicle),
+                        trip_rt.wheelchair_accessible if trip_rt else None,
                     ),
-                    wheelchair_accessible=trip.wheelchair_accessible,
                     bikes_allowed=trip.bikes_allowed,
                     direction_id=trip.direction_id,
                     origin_pickup_type=trip.origin_pickup_type,
@@ -3050,7 +3092,9 @@ class TransitFeedHandle:
         return [
             vehicle
             for vehicle in vehicles
-            if in_circle(zone, vehicle.latitude, vehicle.longitude)
+            if vehicle.latitude is not None
+            and vehicle.longitude is not None
+            and in_circle(zone, vehicle.latitude, vehicle.longitude)
         ]
 
     async def _vehicles_from(

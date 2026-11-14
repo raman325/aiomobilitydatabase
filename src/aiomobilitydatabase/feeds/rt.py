@@ -322,17 +322,18 @@ def _stop_from_rt(stop: Any) -> Stop:
     the RT entity is the only definition of it that exists. GTFS-RT's Stop
     has no location_type, so it is a stop -- GTFS's reading of an empty
     one. Its own cells only: parent-station inheritance needs the static
-    stops, and the handle applies it.
+    stops, and the handle applies it. Its TranslatedString fields read as
+    every alert text does (:func:`_first_translation`).
     """
     return Stop(
         id=stop.stop_id,
-        name=stop.stop_name.translation[0].text if stop.stop_name.translation else None,
+        name=_first_translation(stop.stop_name),
         latitude=stop.stop_lat if stop.HasField("stop_lat") else None,
         longitude=stop.stop_lon if stop.HasField("stop_lon") else None,
         parent_station=stop.parent_station or None,
         location_type=StopLocationType.STOP,
-        stop_code=stop.stop_code or None,
-        platform_code=stop.platform_code or None,
+        stop_code=_first_translation(stop.stop_code),
+        platform_code=_first_translation(stop.platform_code),
         # Unset reads as the proto default, UNKNOWN: GTFS's "0 or empty".
         wheelchair_boarding=_RT_BOARDING.get(
             _pb_enum_name(
@@ -340,10 +341,8 @@ def _stop_from_rt(stop: Any) -> Stop:
             )
             or ""
         ),
-        description=stop.stop_desc.translation[0].text
-        if stop.stop_desc.translation
-        else None,
-        url=stop.stop_url.translation[0].text if stop.stop_url.translation else None,
+        description=_first_translation(stop.stop_desc),
+        url=_first_translation(stop.stop_url),
         zone_id=stop.zone_id or None,
         timezone=stop.stop_timezone or None,
     )
@@ -478,7 +477,22 @@ def _occupancy_percentage(holder: Any) -> int | None:
 def _carriages(
     vehicle: gtfs_realtime_pb2.VehiclePosition,
 ) -> tuple[CarriageDetail, ...]:
-    """Per-carriage occupancy for a multi-carriage vehicle."""
+    """Per-carriage occupancy for a multi-carriage vehicle, front first.
+
+    The carriages must be numbered 1, 2, ... in the direction of travel:
+    "If the second carriage in the direction of travel has a value of 3,
+    consumers will discard data for all carriages". So unless their
+    carriage_sequence values are exactly 1 to n, there are none. An unset
+    occupancy_status is the proto's declared default, NO_DATA_AVAILABLE.
+    """
+    carriages = sorted(
+        vehicle.multi_carriage_details, key=lambda carriage: carriage.carriage_sequence
+    )
+    if [
+        carriage.carriage_sequence if carriage.HasField("carriage_sequence") else None
+        for carriage in carriages
+    ] != list(range(1, len(carriages) + 1)):
+        return ()
     return tuple(
         CarriageDetail(
             id=carriage.id or None,
@@ -489,15 +503,11 @@ def _carriages(
                     gtfs_realtime_pb2.VehiclePosition.OccupancyStatus,
                     carriage.occupancy_status,
                 ),
-            )
-            if carriage.HasField("occupancy_status")
-            else None,
+            ),
             occupancy_percentage=_occupancy_percentage(carriage),
-            carriage_sequence=carriage.carriage_sequence
-            if carriage.HasField("carriage_sequence")
-            else None,
+            carriage_sequence=carriage.carriage_sequence,
         )
-        for carriage in vehicle.multi_carriage_details
+        for carriage in carriages
     )
 
 
@@ -523,14 +533,19 @@ def vehicles_from_message(
     stops_by_id: Mapping[str, Stop],
     trip_routes: Mapping[str, str],
 ) -> list[VehiclePosition]:
-    """Extract vehicle positions, resolving route via trip when unset."""
+    """Extract vehicle positions, resolving route via trip when unset.
+
+    A vehicle without a timestamp takes the message's: "consumers must use
+    the message timestamp".
+    """
     vehicles: list[VehiclePosition] = []
+    sent = feed_timestamp(message)
     for entity in message.entity:
         if not entity.HasField("vehicle"):
             continue
         vehicle = entity.vehicle
-        if not vehicle.HasField("position"):
-            continue
+        # Position is optional: a vehicle may say only which trip and stop.
+        positioned = vehicle.HasField("position")
         route_id = (
             vehicle.trip.route_id or trip_routes.get(vehicle.trip.trip_id) or None
         )
@@ -545,16 +560,9 @@ def vehicles_from_message(
             if vehicle.HasField("occupancy_status")
             else None
         )
-        # current_status is only meaningful with respect to a current stop
-        # (the proto documents it as ignored without one), but its proto2
-        # default (IN_TRANSIT_TO) is real information once a stop referent
-        # exists. So: an explicitly SET status always surfaces verbatim;
-        # the implicit default surfaces only when current_stop_sequence or
-        # stop_id identifies the stop it refers to; with neither, an unset
-        # status is None -- there is no stop to be "in transit to".
-        has_stop_referent = vehicle.HasField(
-            "current_stop_sequence"
-        ) or vehicle.HasField("stop_id")
+        # current_status is "Ignored if current_stop_sequence is missing";
+        # with one, "If current_status is missing IN_TRANSIT_TO is assumed"
+        # (the proto2 default an unset field reads as).
         current_status = (
             _vocab_or_none(
                 VehicleStopStatus,
@@ -563,7 +571,7 @@ def vehicles_from_message(
                     vehicle.current_status,
                 ),
             )
-            if vehicle.HasField("current_status") or has_stop_referent
+            if vehicle.HasField("current_stop_sequence")
             else None
         )
         congestion = (
@@ -581,8 +589,8 @@ def vehicles_from_message(
             VehiclePosition(
                 vehicle_id=vehicle.vehicle.id or None,
                 label=vehicle.vehicle.label or None,
-                latitude=vehicle.position.latitude,
-                longitude=vehicle.position.longitude,
+                latitude=vehicle.position.latitude if positioned else None,
+                longitude=vehicle.position.longitude if positioned else None,
                 bearing=vehicle.position.bearing
                 if vehicle.position.HasField("bearing")
                 else None,
@@ -601,7 +609,9 @@ def vehicles_from_message(
                 odometer=vehicle.position.odometer
                 if vehicle.position.HasField("odometer")
                 else None,
-                timestamp=_epoch_to_utc(vehicle.timestamp),
+                timestamp=_epoch_to_utc(vehicle.timestamp)
+                if vehicle.HasField("timestamp")
+                else sent,
                 current_status=current_status,
                 congestion_level=congestion,
                 stop_id=vehicle.stop_id or None,
@@ -709,7 +719,8 @@ class RealtimeTrip:
     # (an exact_times=0 run's own start): its vehicle names it so.
     run: TripUpdateKey | None = None
     # A copy's or a schedule run's trip descriptors (a short name also from
-    # TripProperties, for any extra trip); unknown (None) otherwise.
+    # TripProperties, for any extra trip); unknown (None) otherwise. The
+    # accessibility the update's VehicleDescriptor states overrides them.
     wheelchair_accessible: WheelchairAccess | None = None
     bikes_allowed: BikesAllowed | None = None
     trip_short_name: str | None = None
@@ -764,6 +775,9 @@ class TripUpdateEntry:
     stop_updates: tuple[TripStopUpdate, ...]
     delay_seconds: int | None
     vehicle_id: str | None
+    # TripUpdate.vehicle.wheelchair_accessible, None for NO_VALUE: it
+    # "will overwrite the value from the GTFS".
+    wheelchair_accessible: WheelchairAccess | None = None
 
 
 @dataclass(frozen=True)
@@ -777,6 +791,9 @@ class TripPredictions:
 
     predictions: Mapping[int, StopPrediction]
     skipped: frozenset[int]
+    # The trip's accessibility as its update states it (see
+    # :attr:`TripUpdateEntry.wheelchair_accessible`).
+    wheelchair_accessible: WheelchairAccess | None = None
 
 
 @dataclass
@@ -989,7 +1006,11 @@ def resolve_trip_predictions(
             delay_seconds=delay,
             vehicle_id=entry.vehicle_id,
         )
-    return TripPredictions(predictions=predictions, skipped=frozenset(skipped))
+    return TripPredictions(
+        predictions=predictions,
+        skipped=frozenset(skipped),
+        wheelchair_accessible=entry.wheelchair_accessible,
+    )
 
 
 # A TripDescriptor, or TripProperties naming a duplicate's start alike.
@@ -1113,6 +1134,7 @@ def trip_update_records(
                         trip_update.delay if trip_update.HasField("delay") else None
                     ),
                     vehicle_id=trip_update.vehicle.id or None,
+                    wheelchair_accessible=_rt_wheelchair(trip_update.vehicle),
                 ),
             )
         )
@@ -1215,6 +1237,7 @@ def _realtime_trip(record: TripUpdateRecord, *, replaces: bool) -> RealtimeTrip:
         vehicle_id=record.entry.vehicle_id,
         calls=realtime_calls(record.entry),
         replaces=record.key if replaces else None,
+        wheelchair_accessible=record.entry.wheelchair_accessible,
         trip_short_name=record.trip_short_name,
     )
 

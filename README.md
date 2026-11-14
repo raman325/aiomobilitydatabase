@@ -436,7 +436,15 @@ Notes on direct mode:
   the parsed `trip_start_date`/`trip_start_secs`, the pair a GTFS-RT
   `TripDescriptor` uses to address one run. That is what lets two buses out
   on the same headway-based trip be told apart — without it, concurrent
-  repetitions of one template trip are indistinguishable.
+  repetitions of one template trip are indistinguishable. A vehicle that
+  reports no position is still returned, with `latitude`/`longitude` of
+  `None` (as a docked GBFS vehicle's are), and no zone includes it. Its
+  `current_status` is `None` without a `current_stop_sequence` (the spec
+  ignores it then), and its `timestamp` falls back to the message's.
+- **Realtime accessibility wins**: a row's `wheelchair_accessible` is what
+  its vehicle's GTFS-RT `VehicleDescriptor` states (the matched
+  `VehiclePosition`'s, else the `TripUpdate`'s), and the static value only
+  where neither states one.
 - **Everything the library hands out is immutable**: every model (catalog
   and feeds) is a frozen dataclass whose collections are tuples or
   read-only dicts, and a handle's `stops`/`routes`/`agencies`/`rt_feeds`

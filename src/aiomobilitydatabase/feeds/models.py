@@ -352,7 +352,10 @@ class StopArrival:
     """An upcoming (or realtime-added) arrival/departure at a stop.
 
     The trailing descriptive fields come from the static schedule:
-    ``wheelchair_accessible``/``bikes_allowed`` describe the trip,
+    ``wheelchair_accessible``/``bikes_allowed`` describe the trip
+    (``wheelchair_accessible`` as realtime states it where it does: the
+    row's vehicle's VehicleDescriptor, else its TripUpdate's, "will
+    overwrite the value from the GTFS"),
     ``pickup_type``/``drop_off_type``/``timepoint_exact``/``stop_headsign``
     describe this stop's stop_time row (``stop_headsign`` is the per-stop
     override of the trip-level ``headsign``). ``timepoint_exact`` is True
@@ -383,8 +386,9 @@ class StopArrival:
     run, whose static schedule "isn't used") have no stop_times row: their
     scheduled times are the update's own ``scheduled_time`` (None where it
     gives none) and their predictions its times. ``service_id``, the
-    stop_time descriptors, ``wheelchair_accessible``, ``bikes_allowed``
-    and ``block_id`` are None; ``route_id``, ``direction_id``,
+    stop_time descriptors, ``bikes_allowed`` and ``block_id`` are None,
+    and ``wheelchair_accessible`` too unless realtime states it;
+    ``route_id``, ``direction_id``,
     ``headsign`` and ``trip_short_name`` are what the update gives
     (TripProperties for the last two) -- a replacement shows under the
     trip it replaces (its ``trip_id``, a frequency repetition's own -- a
@@ -496,8 +500,9 @@ class UpcomingTrip:
     (``drop_off_type`` 1).
 
     ``wheelchair_accessible``/``bikes_allowed``/``direction_id`` describe
-    the trip (``direction_id`` stays a raw int: 0/1 with feed-defined
-    meaning), as do ``trip_short_name``/``block_id`` (verbatim cells;
+    the trip (``wheelchair_accessible`` overridden by realtime as on
+    :class:`StopArrival`; ``direction_id`` stays a raw int: 0/1 with
+    feed-defined meaning), as do ``trip_short_name``/``block_id`` (verbatim cells;
     ``block_id`` is raw string exposure only -- no block-continuation
     computation). The ``origin_*``/``destination_*`` descriptors come from the
     stop_time rows at each end, with the same semantics as the matching
@@ -587,15 +592,18 @@ class CarriageDetail:
 
     ``occupancy_percentage`` is -1 in the protobuf when unset; that
     sentinel becomes None here rather than surfacing as a negative
-    percentage. ``carriage_sequence`` orders the carriages from the
-    vehicle's front.
+    percentage. An unset ``occupancy_status`` is the proto's declared
+    default, NO_DATA_AVAILABLE (None only for a value outside the
+    vocabulary). ``carriage_sequence`` numbers the carriages 1 to n from
+    the vehicle's front: a vehicle whose carriages are not numbered so
+    reports none (the spec says to discard them all).
     """
 
     id: str | None
     label: str | None
     occupancy_status: OccupancyStatus | None
     occupancy_percentage: int | None
-    carriage_sequence: int | None
+    carriage_sequence: int
 
 
 @dataclass(frozen=True)
@@ -611,15 +619,20 @@ class AlertImage:
 class VehiclePosition:
     """A live vehicle position from a GTFS-RT feed.
 
+    ``latitude``/``longitude`` (and ``bearing``, ``speed``,
+    ``odometer``) are None for a vehicle that reports no position: it may
+    say only which trip it runs and where along it, as a docked
+    :class:`GbfsVehicle` may. A zone filter never includes it.
+
     ``stop_id``/``current_stop_sequence`` identify the vehicle's current
     stop as the producer sent them (raw, unresolved). ``current_status``
-    describes the vehicle's relationship to that stop. The protobuf field
-    carries an implicit default (IN_TRANSIT_TO), which per the spec is
-    only meaningful with respect to a current stop -- so the default is
-    surfaced ONLY when ``current_stop_sequence`` or ``stop_id`` is
-    present; with neither, an unset ``current_status`` is None (there is
-    no stop to be in transit to). An EXPLICITLY set ``current_status`` is
-    always surfaced verbatim, referent or not -- consumers decide.
+    describes the vehicle's relationship to the stop
+    ``current_stop_sequence`` names: it is "Ignored if
+    current_stop_sequence is missing" (None), and with one an unset status
+    is IN_TRANSIT_TO, which "is assumed".
+    ``timestamp`` is when the position was measured, or, for a vehicle
+    that does not say, when the message was built (the spec has consumers
+    "use the message timestamp"); None only when neither says.
     ``congestion_level`` is None when unset (its protobuf default,
     UNKNOWN_CONGESTION_LEVEL, carries no information to synthesize);
     ``license_plate`` is the vehicle descriptor's verbatim plate.
@@ -639,8 +652,8 @@ class VehiclePosition:
 
     vehicle_id: str | None
     label: str | None
-    latitude: float
-    longitude: float
+    latitude: float | None
+    longitude: float | None
     bearing: float | None
     speed: float | None
     route_id: str | None

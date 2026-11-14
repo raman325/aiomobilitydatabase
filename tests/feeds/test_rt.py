@@ -512,10 +512,9 @@ def test_vehicles_from_message() -> None:
 
 
 def test_vehicles_from_message_status_surface() -> None:
-    """The descriptive status surface: explicit current_status verbatim,
-    the spec default IN_TRANSIT_TO synthesized ONLY when a stop referent
-    (current_stop_sequence or stop_id) is present, None with neither, and
-    congestion/stop referent/license plate passed through raw.
+    """The descriptive status surface: with a current_stop_sequence, an
+    explicit current_status verbatim and an unset one IN_TRANSIT_TO; None
+    without one; congestion/stop referent/license plate passed through raw.
     """
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(VEHICLE_POSITIONS_STATUS)
@@ -538,15 +537,15 @@ def test_vehicles_from_message_status_surface() -> None:
     assert v8.stop_id is None
     assert v8.congestion_level is None
     assert v8.license_plate is None
-    # V9: no status, no referent -> None (nothing to be in transit to).
+    # V9: no status, no current_stop_sequence -> None.
     assert v9.current_status is None
     assert v9.stop_id is None
     assert v9.current_stop_sequence is None
 
 
-def test_vehicles_stop_id_referent_alone_surfaces_default() -> None:
-    """A bare stop_id (no current_stop_sequence) is also a stop referent:
-    an unset current_status surfaces the IN_TRANSIT_TO default."""
+def test_vehicles_status_needs_current_stop_sequence() -> None:
+    """current_status is "Ignored if current_stop_sequence is missing", so a
+    stop_id alone gives none, even a STOPPED_AT the producer sets."""
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.header.gtfs_realtime_version = "2.0"
     entity = msg.entity.add()
@@ -554,11 +553,14 @@ def test_vehicles_stop_id_referent_alone_surfaces_default() -> None:
     entity.vehicle.position.latitude = 1.0
     entity.vehicle.position.longitude = 2.0
     entity.vehicle.stop_id = "S9"
+    entity.vehicle.current_status = (
+        gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus.STOPPED_AT
+    )
     (vehicle,) = vehicles_from_message(
         msg, routes_by_id={}, stops_by_id={}, trip_routes={}
     )
     assert vehicle.stop_id == "S9"
-    assert vehicle.current_status is VehicleStopStatus.IN_TRANSIT_TO
+    assert vehicle.current_status is None
 
 
 def test_trip_updates_from_message() -> None:
