@@ -455,3 +455,36 @@ def test_with_alerts_only_adds_alerts(
         assert "on_r" in [alert.id for alert in row.alerts]
         ids = [alert.id for alert in row.alerts]
         assert ids == [alert_id for alert_id in order if alert_id in ids]
+
+
+def test_a_trip_named_without_a_date_is_the_run_it_means_now() -> None:
+    """A plain trip's trip_id alone names one run -- the selector "must
+    resolve to a single trip instance" -- as it does in a TripUpdate: the
+    run under way or nearest at the alert feed's time, not every day's.
+    A selector giving the day names that day's."""
+    message = _alerts(
+        ("today", [{"trip": {"trip_id": "T"}}]),
+        ("thursday", [{"trip": {"trip_id": "T", "start_date": "20260731"}}]),
+    )
+    message.header.timestamp = int((_EIGHT - timedelta(hours=1)).timestamp())
+
+    async def body(handle: TransitFeedHandle) -> dict[object, set[str]]:
+        start = _EIGHT - timedelta(minutes=30)
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0"], limit=None)],
+            start=start,
+            end=start + timedelta(days=3),
+            with_alerts=True,
+        )
+        return {
+            row.scheduled_departure.date(): {alert.id for alert in row.alerts}
+            for row in board
+            if row.scheduled_departure is not None
+        }
+
+    days = _run_with(_FEED, body, alerts=[message])
+    assert days == {
+        _EIGHT.date(): {"today"},
+        _EIGHT.date() + timedelta(days=1): {"thursday"},
+        _EIGHT.date() + timedelta(days=2): set(),
+    }

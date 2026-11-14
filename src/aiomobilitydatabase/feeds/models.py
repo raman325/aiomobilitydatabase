@@ -438,8 +438,11 @@ class StopArrival:
     ``with_alerts``: those with a selector matching its run (its trip, the
     repetition's start or a plain trip's first departure, and service
     day), route, route type, agency, direction, and this stop or its
-    parent station (see :meth:`ServiceAlert.applies_to`). Every period is
-    kept: :meth:`ServiceAlert.is_active` says which apply now.
+    parent station (see :meth:`ServiceAlert.applies_to`). An alert's trip
+    names its run as a TripUpdate's does: without a trip_id, the one trip
+    its route, direction and start resolve to; a plain trip without a
+    date, the run its trip_id names at the alert feed's time. Every period
+    is kept: :meth:`ServiceAlert.is_active` says which apply now.
     """
 
     stop_id: str

@@ -353,6 +353,30 @@ def _resolved(
     return replace(alert, informed_entities=tuple(selectors))
 
 
+def _bound(
+    alert: ServiceAlert, plain_starts: Mapping[str, int], current: Mapping[str, date]
+) -> ServiceAlert:
+    """Return ``alert`` with each plain trip named without a date dated.
+
+    A trip_id alone names one run of a plain trip: the one ``current``
+    gives (see :meth:`StaticIndex.current_service_dates`); where it gives
+    none, the selector names nothing. A trip that is not a plain one in the
+    schedule (a frequency template, a realtime trip's own id) is left as
+    named.
+    """
+    selectors: list[EntitySelector] = []
+    for selector in alert.informed_entities:
+        trip = selector.trip
+        trip_id = trip.trip_id if trip is not None else None
+        if trip is None or trip.start_date is not None or trip_id not in plain_starts:
+            selectors.append(selector)
+        elif trip_id is not None and trip_id in current:
+            selectors.append(
+                replace(selector, trip=replace(trip, start_date=current[trip_id]))
+            )
+    return replace(alert, informed_entities=tuple(selectors))
+
+
 def _realtime_run(trip: RealtimeTrip) -> TripUpdateKey:
     """Return the run a realtime-only trip is, as alerts name runs.
 
@@ -2637,7 +2661,7 @@ class TransitFeedHandle:
             )
             # A detour's stop realtime defines is defined only there.
             alerts = await self._alert_matcher(
-                alert_messages, {**stops_by_id, **rt_stops}, routes_by_id
+                alert_messages, {**stops_by_id, **rt_stops}, routes_by_id, start
             )
             # Realtime moves exactly the runs TripUpdates address (a detoured
             # run is realtime's own trip, already built). They are read
@@ -3020,7 +3044,7 @@ class TransitFeedHandle:
             )
             # A detour's stop realtime defines is defined only there.
             alerts = await self._alert_matcher(
-                alert_messages, {**stops_by_id, **rt_stops}, routes_by_id
+                alert_messages, {**stops_by_id, **rt_stops}, routes_by_id, start
             )
             # As in get_arrivals: the runs realtime addresses are read whole
             # up front, so the scan only adds rows at their scheduled time.
@@ -3278,41 +3302,67 @@ class TransitFeedHandle:
         messages: Sequence[gtfs_realtime_pb2.FeedMessage],
         stops_by_id: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
+        start: datetime,
     ) -> _Alerts:
         """Parse each message's alerts into a matcher for a query's rows.
 
-        No messages, no alerts: the query did not ask. Only the plain trips
-        an alert names with a start time are looked up. Caller holds the
-        reader guard.
+        An alert's trip names its run as a TripUpdate's does: one without
+        trip_id resolves to its trip (:func:`_resolved`), and a plain trip
+        named without a start date means the run its trip_id alone names
+        at its own feed's time (:meth:`StaticIndex.current_service_dates`),
+        or none. No messages, no alerts: the query did not ask. Caller
+        holds the reader guard.
         """
-        alerts = [
-            alert for message in messages for alert in alerts_from_message(message)
+        parsed = [
+            (alert, _realtime_now(feed_timestamp(message), start))
+            for message in messages
+            for alert in alerts_from_message(message)
         ]
-        if not alerts:
+        if not parsed:
             return _Alerts()
         runs = await self._index_read(
             self._index.alternative_trip_ids,
-            [ref for alert in alerts for ref in _run_refs(alert)],
+            [ref for alert, _ in parsed for ref in _run_refs(alert)],
         )
-        matched = [_resolved(alert, runs) for alert in alerts]
+        resolved = [(_resolved(alert, runs), now) for alert, now in parsed]
+        trips = [
+            (selector.trip, now)
+            for alert, now in resolved
+            for selector in alert.informed_entities
+            if selector.trip is not None and selector.trip.trip_id is not None
+        ]
         named = sorted(
             {
-                selector.trip.trip_id
-                for alert in matched
-                for selector in alert.informed_entities
-                if selector.trip is not None
-                and selector.trip.trip_id is not None
-                and selector.trip.start_secs is not None
+                trip.trip_id
+                for trip, _ in trips
+                if trip.trip_id is not None
+                and (trip.start_secs is not None or trip.start_date is None)
             }
         )
+        plain_starts = (
+            await self._index_read(self._index.plain_trip_starts, named)
+            if named
+            else {}
+        )
+        dateless: dict[datetime, set[str]] = {}
+        for trip, now in trips:
+            if trip.start_date is None and trip.trip_id in plain_starts:
+                dateless.setdefault(now, set()).add(trip.trip_id)
+        current = {
+            now: await self._index_read(
+                self._index.current_service_dates, sorted(ids), now
+            )
+            for now, ids in dateless.items()
+        }
+        matched = [
+            _bound(alert, plain_starts, current.get(now, {})) for alert, now in resolved
+        ]
         return _Alerts(
-            alerts=list(zip(alerts, matched, strict=True)),
+            alerts=list(zip((alert for alert, _ in parsed), matched, strict=True)),
             routes_by_id=routes_by_id,
             stops_by_id=stops_by_id,
             sole_agency_id=self._agencies[0].id if len(self._agencies) == 1 else None,
-            plain_starts=await self._index_read(self._index.plain_trip_starts, named)
-            if named
-            else {},
+            plain_starts=plain_starts,
         )
 
     async def _vehicles_from(
