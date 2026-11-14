@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import IntEnum, StrEnum
+from typing import Any
 
 from ._frozen import FrozenDict
 
@@ -800,8 +801,12 @@ class ServiceAlert:
 
     @property
     def route_ids(self) -> tuple[str, ...]:
-        """Every route_id a selector names."""
-        return _named(s.route_id for s in self.informed_entities)
+        """Every route_id a selector names, a trip-run selector's included."""
+        return _named(
+            route_id
+            for s in self.informed_entities
+            for route_id in (s.route_id, _run_part(s.trip, "route_id"))
+        )
 
     @property
     def route_types(self) -> tuple[int, ...]:
@@ -810,8 +815,12 @@ class ServiceAlert:
 
     @property
     def direction_ids(self) -> tuple[int, ...]:
-        """Every direction_id a selector names."""
-        return _named(s.direction_id for s in self.informed_entities)
+        """Every direction_id a selector names, a trip-run selector's included."""
+        return _named(
+            direction_id
+            for s in self.informed_entities
+            for direction_id in (s.direction_id, _run_part(s.trip, "direction_id"))
+        )
 
     @property
     def stop_ids(self) -> tuple[str, ...]:
@@ -876,6 +885,14 @@ class ServiceAlert:
             (start is None or start <= at) and (end is None or at < end)
             for start, end in self.active_periods
         )
+
+
+def _run_part(trip: TripSelector | None, name: str) -> Any:
+    """Return a trip-run selector's route_id or direction_id, else None.
+
+    Only a trip without trip_id names them (one with an id implies its own).
+    """
+    return getattr(trip, name) if trip is not None and trip.trip_id is None else None
 
 
 def _named[T: (str, int)](values: Iterable[T | None]) -> tuple[T, ...]:

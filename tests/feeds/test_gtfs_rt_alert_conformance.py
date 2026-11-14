@@ -157,6 +157,36 @@ def test_a_selector_with_a_malformed_start_names_nothing() -> None:
     assert alert.trip_ids == ()
 
 
+@pytest.mark.parametrize("start_time", ["8:00", "  ", "08:00:60"])
+def test_a_selector_with_a_malformed_start_time_names_nothing(
+    start_time: str,
+) -> None:
+    """Likewise a start time that does not parse: the selector must not
+    widen to every run of the trip."""
+    alert = _alert(selectors=[{"trip": {"trip_id": "T1", "start_time": start_time}}])
+    assert alert.informed_entities == ()
+    assert not alert.applies_to(trip_id="T1")
+
+
+def test_the_index_lists_a_trip_runs_route_and_direction() -> None:
+    """A trip without trip_id names its route and direction, so the index
+    lists them; one with an id implies its own and lists only the id."""
+    run = {
+        "route_id": "R1",
+        "direction_id": 0,
+        "start_time": "08:00:00",
+        "start_date": "20260730",
+    }
+    alert = _alert(
+        selectors=[{"trip": run}, {"trip": {"trip_id": "T1", "route_id": "R2"}}]
+    )
+    assert (alert.route_ids, alert.direction_ids, alert.trip_ids) == (
+        ("R1",),
+        (0,),
+        ("T1",),
+    )
+
+
 def test_an_alert_naming_nothing_applies_to_nothing() -> None:
     alert = _alert(selectors=[{}])
     assert not alert.applies_to()
@@ -272,6 +302,7 @@ def test_a_period_is_active_from_its_start_up_to_its_end() -> None:
         ((None, 0), False),  # ended in 1970
         ((2**63, None), False),  # starts past any datetime: not yet
         ((None, 2**63), True),  # ends past any datetime: not yet
+        ((None, 253402300000), True),  # ends within days of the last datetime
         ((None, None), True),
     ],
 )

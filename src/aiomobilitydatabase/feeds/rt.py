@@ -1422,7 +1422,7 @@ def _period_start(period: gtfs_realtime_pb2.TimeRange) -> datetime | None:
     if not period.HasField("start"):
         return None
     try:
-        return datetime.fromtimestamp(period.start, tz=UTC)
+        return min(datetime.fromtimestamp(period.start, tz=UTC), _NOT_YET)
     except (OverflowError, OSError, ValueError):
         return _NOT_YET
 
@@ -1430,15 +1430,16 @@ def _period_start(period: gtfs_realtime_pb2.TimeRange) -> datetime | None:
 def _period_end(period: gtfs_realtime_pb2.TimeRange) -> datetime | None:
     """Return a TimeRange's end: None (plus infinity) when absent or past datetime.
 
-    A present value is an instant, 0 the epoch; one past what a datetime
-    holds never comes, as plus infinity.
+    A present value is an instant, 0 the epoch; one within days of what a
+    datetime holds, or past it, never comes, as plus infinity.
     """
     if not period.HasField("end"):
         return None
     try:
-        return datetime.fromtimestamp(period.end, tz=UTC)
+        end = datetime.fromtimestamp(period.end, tz=UTC)
     except (OverflowError, OSError, ValueError):
         return None
+    return None if end >= _NOT_YET else end
 
 
 def _trip_selector(trip: gtfs_realtime_pb2.TripDescriptor) -> TripSelector | None:
