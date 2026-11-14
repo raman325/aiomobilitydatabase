@@ -1675,7 +1675,8 @@ class FreshnessMachine(RuleBasedStateMachine):
         self.last_kind = "none"
 
     def _wall(self) -> int:
-        return int(T0.timestamp() + self.clock.now)
+        # The receipt instant's whole second: one "now" for the whole test.
+        return int(self._received().replace(microsecond=0).timestamp())
 
     def _received(self) -> datetime:
         # The instant the fake fetcher stamps on its response.
@@ -1748,7 +1749,7 @@ class FreshnessMachine(RuleBasedStateMachine):
             # An older edge copy.
             doc = _Doc(doc.version, doc.timestamp - 50, doc.region)
         etag, lm = self._etag(doc), self._lm(doc)
-        now = T0 + timedelta(seconds=self.clock.now)
+        now = self._received()
         unchanged = validators is not None and (
             (etag is not None and validators.etag == etag)
             or (etag is None and lm is not None and validators.last_modified == lm)
@@ -2285,14 +2286,16 @@ async def test_a_redirect_chain_is_reused_only_as_long_as_every_hop(
 
 
 async def test_a_redirect_dated_at_receipt_goes_stale_exactly_at_its_lifetime() -> None:
-    """A 301 carrying max-age=5 and no Date, received 0.1 s past a whole
-    second, is dated at that second: its initial age is 0.1 s, so the chain
-    is fresh 4.8 s later and stale at 4.9 s (fresh only while lifetime >
-    age). Found by the state machine once its model took the apparent age
-    in float epoch seconds, whose rounding read 4.9 s as still fresh."""
+    """A 301 carrying max-age=5 and no Date, received 0.75 s past a whole
+    second, is dated at that second (cut, not rounded): its initial age is
+    0.75 s, so the chain is fresh 4.25 s on less a moment and stale at
+    exactly 4.25 s (fresh only while lifetime > age). Every value is exact
+    in binary floating point. Found by the state machine once its model
+    took the apparent age in float epoch seconds, whose rounding read a
+    response stale at its lifetime as still fresh."""
     clock = _Clock()
     cache: FreshnessCache[str] = FreshnessCache(clock)
-    received = T0 + timedelta(seconds=1.1)
+    received = T0 + timedelta(seconds=1.75)
     fields = header_fields({"Cache-Control": "max-age=30"})
     hops = [_hop(Cache_Control="max-age=5")]
     producer = _Producer(
@@ -2301,10 +2304,10 @@ async def test_a_redirect_dated_at_receipt_goes_stale_exactly_at_its_lifetime() 
             Response("b", fields, received, received, hops),
         ]
     )
-    clock.now = 1.1
+    clock.now = 1.75
     assert await cache.get("u", producer) == "a"
-    assert cache._entries["u"].lifetime == pytest.approx(4.9)
-    clock.now = 1.1 + 4.8
+    assert cache._entries["u"].lifetime == 4.25
+    clock.now = 5.75
     assert await cache.get("u", producer) == "a"
     clock.now = 6.0
     assert await cache.get("u", producer) == "b"
