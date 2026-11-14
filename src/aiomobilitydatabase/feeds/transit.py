@@ -49,8 +49,11 @@ from .geo import Circle, in_circle
 from .models import (
     Agency,
     ArrivalsQuery,
+    BookingRule,
     EntitySelector,
     FeedInfo,
+    FlexLocation,
+    LocationGroup,
     PickupDropOffType,
     Route,
     ServiceAlert,
@@ -1531,6 +1534,23 @@ def _inherited_rt_stops(
     return {stop_id: resolve(stop_id, frozenset({stop_id})) for stop_id in rt_stops}
 
 
+@dataclass(frozen=True)
+class _FlexRecords:
+    """One dataset's GTFS-Flex records, published together on refresh."""
+
+    locations: tuple[FlexLocation, ...]
+    location_groups: tuple[LocationGroup, ...]
+    booking_rules: tuple[BookingRule, ...]
+
+    @classmethod
+    def of(cls, index: StaticIndex) -> _FlexRecords:
+        return cls(
+            tuple(index.flex_locations()),
+            tuple(index.location_groups()),
+            tuple(index.booking_rules()),
+        )
+
+
 def _serialized[T](lock: threading.Lock, call: Callable[[], T]) -> T:
     """Run ``call`` holding ``lock`` (on the calling worker thread).
 
@@ -1666,6 +1686,7 @@ class TransitFeedHandle:
         self._agencies: tuple[Agency, ...] = tuple(index.agencies())
         # None when the dataset ships no feed_info.txt (an optional file).
         self._feed_info: FeedInfo | None = index.feed_info()
+        self._flex = _FlexRecords.of(index)
 
     async def _index_read[T](
         self, fn: Callable[..., T], *args: object, **kwargs: object
@@ -1733,6 +1754,21 @@ class TransitFeedHandle:
     def feed_info(self) -> FeedInfo | None:
         """The dataset's feed_info.txt record, or None when it ships none."""
         return self._feed_info
+
+    @property
+    def flex_locations(self) -> tuple[FlexLocation, ...]:
+        """Every GTFS-Flex zone (locations.geojson); replaced on refresh."""
+        return self._flex.locations
+
+    @property
+    def location_groups(self) -> tuple[LocationGroup, ...]:
+        """Every GTFS-Flex stop group (location_groups.txt); replaced on refresh."""
+        return self._flex.location_groups
+
+    @property
+    def booking_rules(self) -> tuple[BookingRule, ...]:
+        """Every GTFS-Flex booking rule (booking_rules.txt); replaced on refresh."""
+        return self._flex.booking_rules
 
     @classmethod
     async def create(
@@ -3707,17 +3743,19 @@ class TransitFeedHandle:
         routes = tuple(await asyncio.to_thread(new_index.routes))
         agencies = tuple(await asyncio.to_thread(new_index.agencies))
         feed_info = await asyncio.to_thread(new_index.feed_info)
+        flex = await asyncio.to_thread(_FlexRecords.of, new_index)
         async with self._guard.writer():
             old_index = self._index
             if static_feed is not None:
                 self._static_feed = static_feed
-            self._index, self._stops, self._routes, self._agencies, self._feed_info = (
-                new_index,
-                stops,
-                routes,
-                agencies,
-                feed_info,
-            )
+            (
+                self._index,
+                self._stops,
+                self._routes,
+                self._agencies,
+                self._feed_info,
+                self._flex,
+            ) = (new_index, stops, routes, agencies, feed_info, flex)
             await asyncio.to_thread(old_index.close)
 
     def stops_in(self, zone: Circle) -> list[Stop]:

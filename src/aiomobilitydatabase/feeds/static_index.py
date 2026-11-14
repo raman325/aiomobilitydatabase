@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import sqlite3
 import tempfile
@@ -28,7 +29,12 @@ from .exceptions import FeedParseError
 from .models import (
     Agency,
     BikesAllowed,
+    BookingRule,
+    BookingType,
     FeedInfo,
+    FlexLocation,
+    FlexPolygon,
+    LocationGroup,
     PickupDropOffType,
     Route,
     Stop,
@@ -47,7 +53,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -129,6 +135,27 @@ CREATE TABLE flex_stop_times (
     stop_headsign TEXT
 );
 CREATE INDEX ix_flex_stop_times_trip ON flex_stop_times (trip_id, stop_sequence);
+-- GTFS-Flex zones (locations.geojson). polygons is JSON: a list of
+-- polygons, each a list of rings (the exterior, then its holes), each ring
+-- a list of [latitude, longitude] -- swapped at load from GeoJSON's
+-- [longitude, latitude].
+CREATE TABLE locations (
+    id TEXT PRIMARY KEY, name TEXT, description TEXT, polygons TEXT NOT NULL
+);
+CREATE TABLE location_groups (id TEXT PRIMARY KEY, name TEXT);
+CREATE TABLE location_group_stops (
+    location_group_id TEXT NOT NULL, stop_id TEXT NOT NULL
+);
+-- Durations in minutes, as booking_rules.txt gives them; the two Time
+-- columns as seconds, like every other GTFS time here.
+CREATE TABLE booking_rules (
+    id TEXT PRIMARY KEY, booking_type INTEGER,
+    prior_notice_duration_min INTEGER, prior_notice_duration_max INTEGER,
+    prior_notice_last_day INTEGER, prior_notice_last_secs INTEGER,
+    prior_notice_start_day INTEGER, prior_notice_start_secs INTEGER,
+    prior_notice_service_id TEXT, message TEXT, pickup_message TEXT,
+    drop_off_message TEXT, phone_number TEXT, info_url TEXT, booking_url TEXT
+);
 CREATE TABLE calendar (
     service_id TEXT PRIMARY KEY,
     monday INTEGER, tuesday INTEGER, wednesday INTEGER, thursday INTEGER,
@@ -451,6 +478,139 @@ def _open_csv(
             yield fp, csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
         except _READ_ERRORS as err:
             raise FeedParseError(f"Malformed {filename}: {err}") from err
+
+
+def _reject_constant(name: str) -> None:
+    """Refuse ``NaN``/``Infinity``: Python's json accepts them, JSON does not."""
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def _json_member(archive: zipfile.ZipFile, filename: str) -> object:
+    """Parse one dataset file as JSON; anything wrong with it is FeedParseError.
+
+    RecursionError too: json raises it for arrays nested deeper than the
+    interpreter's stack, which a hostile file can do in a few kilobytes.
+    """
+    try:
+        fp = archive.open(filename)
+    except _OPEN_ERRORS as err:
+        raise FeedParseError(f"Unreadable {filename}: {err}") from err
+    with fp:
+        try:
+            return json.loads(fp.read(), parse_constant=_reject_constant)
+        except (*_READ_ERRORS, RecursionError) as err:
+            raise FeedParseError(f"Malformed {filename}: {err}") from err
+
+
+# A GeoJSON linear ring "is a closed LineString with four or more positions".
+_RING_MIN_POSITIONS = 4
+_MAX_LATITUDE = 90
+_MAX_LONGITUDE = 180
+
+type _Ring = list[list[float]]
+
+
+def _ring(value: object) -> _Ring | None:
+    """One GeoJSON linear ring as ``[latitude, longitude]`` pairs, or None.
+
+    Each position is ``[longitude, latitude]`` with an optional altitude
+    after (ignored), both in range; the ring has four or more positions and
+    is closed, as RFC 7946 requires. Winding order is not checked: "parsers
+    SHOULD NOT reject Polygons that do not follow the right-hand rule".
+    """
+    if not isinstance(value, list) or len(value) < _RING_MIN_POSITIONS:
+        return None
+    ring: _Ring = []
+    for position in value:
+        if not isinstance(position, list) or len(position) < 2:  # noqa: PLR2004
+            return None
+        lon, lat = position[0], position[1]
+        if not all(
+            isinstance(coordinate, int | float) and not isinstance(coordinate, bool)
+            for coordinate in (lon, lat)
+        ):
+            return None
+        # Compared before float(): an int past float's range would overflow.
+        if not (-_MAX_LONGITUDE <= lon <= _MAX_LONGITUDE) or not (
+            -_MAX_LATITUDE <= lat <= _MAX_LATITUDE
+        ):
+            return None
+        ring.append([float(lat), float(lon)])
+    return ring if ring[0] == ring[-1] else None
+
+
+def _polygons(geometry: object) -> list[list[_Ring]] | None:
+    """Return a Polygon's or MultiPolygon's rings, or None if any is malformed.
+
+    One bad ring discards the whole geometry: keeping the rest would offer
+    a zone smaller (or, losing a hole, larger) than the producer's.
+    """
+    if not isinstance(geometry, dict):
+        return None
+    coordinates = geometry.get("coordinates")
+    if geometry.get("type") == "Polygon":
+        parts: object = [coordinates]
+    elif geometry.get("type") == "MultiPolygon":
+        parts = coordinates
+    else:
+        return None
+    if not isinstance(parts, list) or not parts:
+        return None
+    polygons: list[list[_Ring]] = []
+    for part in parts:
+        if not isinstance(part, list) or not part:
+            return None
+        rings = [_ring(ring) for ring in part]
+        if any(ring is None for ring in rings):
+            return None
+        polygons.append([ring for ring in rings if ring is not None])
+    return polygons
+
+
+def _geojson_text(value: object) -> str | None:
+    """Read a GeoJSON property as text, like a CSV cell: else None."""
+    return value if isinstance(value, str) and value else None
+
+
+def _location_row(feature: object) -> tuple[str, str | None, str | None, str] | None:
+    """One locations.geojson Feature as a ``locations`` row, or None to skip it.
+
+    "Every GeoJSON Feature must have an id", a String; its geometry "must
+    be of type" Polygon or MultiPolygon. A Feature breaking either names
+    no zone a stop_time can use, so it is skipped rather than failing the
+    whole dataset. ``properties`` hold only descriptive text.
+    """
+    if not isinstance(feature, dict):
+        return None
+    location_id = feature.get("id")
+    if not isinstance(location_id, str) or not location_id:
+        return None
+    polygons = _polygons(feature.get("geometry"))
+    if polygons is None:
+        return None
+    properties = feature.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    return (
+        location_id,
+        _geojson_text(properties.get("stop_name")),
+        _geojson_text(properties.get("stop_desc")),
+        json.dumps(polygons),
+    )
+
+
+def _lenient_time(value: str | None) -> int | None:
+    """Parse a DESCRIPTIVE GTFS time leniently: blank/garbage -> None."""
+    if value is None:
+        return None
+    try:
+        return parse_gtfs_time(value)
+    except FeedParseError:
+        return None
+
+
+def _flex_ring(ring: list[list[float]]) -> tuple[tuple[float, float], ...]:
+    return tuple((lat, lon) for lat, lon in ring)
 
 
 type _StopRow = tuple[Any, ...]
@@ -996,8 +1156,13 @@ class StaticIndex:
             ("calendar.txt", cls._load_calendar),
             ("calendar_dates.txt", cls._load_calendar_dates),
             ("feed_info.txt", cls._load_feed_info),
+            ("location_groups.txt", cls._load_location_groups),
+            ("location_group_stops.txt", cls._load_location_group_stops),
+            ("booking_rules.txt", cls._load_booking_rules),
         )
         parsed = [filename for filename, _ in files if filename in names]
+        if _ZONES_FILE in names:
+            parsed.append(_ZONES_FILE)
         total = sum(archive.getinfo(filename).file_size for filename in parsed) or None
         completed = 0
         for filename, loader in files:
@@ -1006,6 +1171,11 @@ class StaticIndex:
             with _open_csv(archive, filename) as (fp, reader):
                 loader(conn, reader, _reporter(progress, fp, completed, total))
             completed += archive.getinfo(filename).file_size
+            if progress is not None:
+                progress(completed, total)
+        if _ZONES_FILE in names:
+            cls._load_locations(conn, _json_member(archive, _ZONES_FILE))
+            completed += archive.getinfo(_ZONES_FILE).file_size
             if progress is not None:
                 progress(completed, total)
 
@@ -1545,6 +1715,110 @@ class StaticIndex:
         if report is not None:
             report()
 
+    @staticmethod
+    def _load_locations(conn: sqlite3.Connection, document: object) -> None:
+        """Load locations.geojson, which "must contain a FeatureCollection".
+
+        A file that is not one says nothing about any zone, so it fails the
+        build as malformed JSON does. Within it, a Feature that cannot name
+        a zone is skipped (see :func:`_location_row`); ids "must be unique",
+        and where they are not the last Feature wins, as in stops.txt.
+        """
+        features = document.get("features") if isinstance(document, dict) else None
+        if (
+            not isinstance(document, dict)
+            or document.get("type") != "FeatureCollection"
+            or not isinstance(features, list)
+        ):
+            raise FeedParseError("locations.geojson is not a GeoJSON FeatureCollection")
+        conn.executemany(
+            "INSERT OR REPLACE INTO locations VALUES (?,?,?,?)",
+            [row for feature in features if (row := _location_row(feature))],
+        )
+
+    @classmethod
+    def _load_location_groups(
+        cls,
+        conn: sqlite3.Connection,
+        reader: csv.DictReader[str],
+        report: Callable[[], None] | None = None,
+    ) -> None:
+        rows: list[tuple[object, ...]] = []
+        sql = "INSERT OR REPLACE INTO location_groups VALUES (?,?)"
+        for row in reader:
+            if not (group_id := row.get("location_group_id")):
+                continue  # Required: a row without one names no group
+            rows.append((group_id, row.get("location_group_name") or None))
+            if len(rows) >= _BATCH_SIZE:
+                cls._batched_insert(conn, sql, rows)
+                if report is not None:
+                    report()
+        cls._batched_insert(conn, sql, rows)
+        if report is not None:
+            report()
+
+    @classmethod
+    def _load_location_group_stops(
+        cls,
+        conn: sqlite3.Connection,
+        reader: csv.DictReader[str],
+        report: Callable[[], None] | None = None,
+    ) -> None:
+        rows: list[tuple[object, ...]] = []
+        sql = "INSERT INTO location_group_stops VALUES (?,?)"
+        for row in reader:
+            group_id, stop_id = row.get("location_group_id"), row.get("stop_id")
+            if not group_id or not stop_id:
+                continue  # both Required: half a pair assigns nothing
+            rows.append((group_id, stop_id))
+            if len(rows) >= _BATCH_SIZE:
+                cls._batched_insert(conn, sql, rows)
+                if report is not None:
+                    report()
+        cls._batched_insert(conn, sql, rows)
+        if report is not None:
+            report()
+
+    @classmethod
+    def _load_booking_rules(
+        cls,
+        conn: sqlite3.Connection,
+        reader: csv.DictReader[str],
+        report: Callable[[], None] | None = None,
+    ) -> None:
+        """Load booking_rules.txt: every cell as stated, descriptive (lenient)."""
+        rows: list[tuple[object, ...]] = []
+        sql = f"INSERT OR REPLACE INTO booking_rules VALUES ({','.join('?' * 15)})"
+        for row in reader:
+            if not (rule_id := row.get("booking_rule_id")):
+                continue  # Required: a row without one is no rule
+            rows.append(
+                (
+                    rule_id,
+                    _lenient_int(row.get("booking_type")),
+                    _lenient_int(row.get("prior_notice_duration_min")),
+                    _lenient_int(row.get("prior_notice_duration_max")),
+                    _lenient_int(row.get("prior_notice_last_day")),
+                    _lenient_time(row.get("prior_notice_last_time")),
+                    _lenient_int(row.get("prior_notice_start_day")),
+                    _lenient_time(row.get("prior_notice_start_time")),
+                    row.get("prior_notice_service_id") or None,
+                    row.get("message") or None,
+                    row.get("pickup_message") or None,
+                    row.get("drop_off_message") or None,
+                    row.get("phone_number") or None,
+                    row.get("info_url") or None,
+                    row.get("booking_url") or None,
+                )
+            )
+            if len(rows) >= _BATCH_SIZE:
+                cls._batched_insert(conn, sql, rows)
+                if report is not None:
+                    report()
+        cls._batched_insert(conn, sql, rows)
+        if report is not None:
+            report()
+
     # -- queries -----------------------------------------------------------
 
     def stops(self) -> list[Stop]:
@@ -1654,6 +1928,76 @@ class StaticIndex:
             for row in self._conn.execute(
                 "SELECT id, name, url, timezone, lang, phone, fare_url, email "
                 "FROM agencies"
+            )
+        ]
+
+    def flex_locations(self) -> list[FlexLocation]:
+        """Every GTFS-Flex zone (locations.geojson), by id."""
+        return [
+            FlexLocation(
+                id=row[0],
+                name=row[1],
+                description=row[2],
+                polygons=tuple(
+                    FlexPolygon(
+                        exterior=_flex_ring(rings[0]),
+                        holes=tuple(_flex_ring(ring) for ring in rings[1:]),
+                    )
+                    for rings in json.loads(row[3])
+                ),
+            )
+            for row in self._conn.execute(
+                "SELECT id, name, description, polygons FROM locations ORDER BY id"
+            )
+        ]
+
+    def location_groups(self) -> list[LocationGroup]:
+        """Every GTFS-Flex stop group, by id; its stops in file order, once each.
+
+        Built from location_groups.txt: a group only location_group_stops.txt
+        names is not one (its ``location_group_id`` must reference a group).
+        """
+        members: dict[str, dict[str, None]] = {}
+        for group_id, stop_id in self._conn.execute(
+            "SELECT location_group_id, stop_id FROM location_group_stops ORDER BY rowid"
+        ):
+            members.setdefault(group_id, {})[stop_id] = None
+        return [
+            LocationGroup(
+                id=group_id, name=name, stop_ids=tuple(members.get(group_id, ()))
+            )
+            for group_id, name in self._conn.execute(
+                "SELECT id, name FROM location_groups ORDER BY id"
+            )
+        ]
+
+    def booking_rules(self) -> list[BookingRule]:
+        """Every GTFS-Flex booking rule, by id."""
+        return [
+            BookingRule(
+                id=row[0],
+                booking_type=_enum_or_none(BookingType, row[1]),
+                prior_notice_duration_min=row[2],
+                prior_notice_duration_max=row[3],
+                prior_notice_last_day=row[4],
+                prior_notice_last_secs=row[5],
+                prior_notice_start_day=row[6],
+                prior_notice_start_secs=row[7],
+                prior_notice_service_id=row[8],
+                message=row[9],
+                pickup_message=row[10],
+                drop_off_message=row[11],
+                phone_number=row[12],
+                info_url=row[13],
+                booking_url=row[14],
+            )
+            for row in self._conn.execute(
+                "SELECT id, booking_type, prior_notice_duration_min, "
+                "prior_notice_duration_max, prior_notice_last_day, "
+                "prior_notice_last_secs, prior_notice_start_day, "
+                "prior_notice_start_secs, prior_notice_service_id, message, "
+                "pickup_message, drop_off_message, phone_number, info_url, "
+                "booking_url FROM booking_rules ORDER BY id"
             )
         ]
 

@@ -8,6 +8,7 @@ separate from fixture *code* and the folder layout says what everything is:
     data/catalog/   mocked aiomobilitydatabase catalog API responses
     data/gbfs/      GBFS 2.3/3.0 protocol documents
     data/gtfs/      the miniature GTFS static feed (real GTFS filenames)
+    data/flex/      a miniature GTFS-Flex feed (zone, stop group, booking rules)
     data/rt/        GTFS-RT protobuf messages (see scripts/generate_rt_fixtures.py)
 """
 
@@ -202,6 +203,24 @@ def build_sample_feed_zip_bytes() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(_SAMPLE_FEED_DIR.glob("*.txt")):
+            _writestr(zf, path.name, path.read_text(encoding="utf-8"))
+    return buf.getvalue()
+
+
+# -- A miniature GTFS-Flex feed ---------------------------------------------
+# data/flex/: one zone (TOWN, a polygon with a hole), one stop group
+# (HOSPITAL: H1, H2), two booking rules (NOW real-time, DAY_BEFORE prior
+# day), a route-deviation trip (DEV1: S1 08:00, a TOWN window 08:05-08:25,
+# S2 08:30) and a pure on-demand trip (ZONE1: HOSPITAL -> TOWN, 09:00-17:00).
+
+_FLEX_DIR = _DATA_DIR / "flex"
+
+
+def build_flex_gtfs_zip_bytes() -> bytes:
+    """Return the GTFS-Flex fixture feed as a byte-deterministic zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(_FLEX_DIR.iterdir()):
             _writestr(zf, path.name, path.read_text(encoding="utf-8"))
     return buf.getvalue()
 

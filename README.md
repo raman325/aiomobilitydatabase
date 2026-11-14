@@ -515,6 +515,14 @@ Notes on direct mode:
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
   `get_headsigns_serving()` alongside the stop/route helpers.
+- **GTFS-Flex records**: `transit.flex_locations` (zones from
+  `locations.geojson`, each a `FlexLocation` of `FlexPolygon`s in
+  `(latitude, longitude)`, holes kept), `transit.location_groups` (stop
+  groups with their `stop_ids`), and `transit.booking_rules` (every
+  `booking_rules.txt` column; `BookingType` for `booking_type`). A Feature
+  without an id, or with a geometry that is not a well-formed Polygon or
+  MultiPolygon, is skipped whole; a `locations.geojson` that is not a
+  GeoJSON FeatureCollection fails the build.
 - **Alert scope is the spec's, selector by selector**: `ServiceAlert`
   keeps each `informed_entity` whole as an `EntitySelector` (spec field
   names; a trip as a `TripSelector`, one run of it where it gives a start
@@ -589,8 +597,9 @@ Deliberate omissions, so you can tell "not supported" from "not found yet".
 
 **GTFS files not ingested.** The static index reads `agency.txt`, `stops.txt`,
 `routes.txt`, `trips.txt`, `stop_times.txt`, `calendar.txt`,
-`calendar_dates.txt`, `frequencies.txt`, and `feed_info.txt`. Everything else
-in the zip is ignored:
+`calendar_dates.txt`, `frequencies.txt`, `feed_info.txt`, and the GTFS-Flex
+files (`locations.geojson`, `location_groups.txt`, `location_group_stops.txt`,
+`booking_rules.txt`). Everything else in the zip is ignored:
 
 - `shapes.txt` — route geometry. Nothing here draws a line on a map, so trips
   carry no `shape_id`.
@@ -601,14 +610,15 @@ in the zip is ignored:
   fares, zone pricing, or rider categories. (`Stop.zone_id` is exposed as a
   raw cell, but nothing interprets it.)
 - `translations.txt` — text is returned as the feed wrote it.
-- GTFS-Flex (`locations.geojson`, `location_groups.txt`,
-  `location_group_stops.txt`, `booking_rules.txt`) — on-demand service is not
-  modelled. A zone-only feed still loads (stops.txt is optional when
-  `locations.geojson` is present), and a `stop_times.txt` row naming a zone, a
-  stop group, or a pickup/drop-off window is kept apart from the fixed calls:
-  boards and journeys show only the fixed calls around it, while a GTFS-RT
-  update or a detour naming its `stop_sequence` still applies at its place in
-  the trip (a delay stated there propagates to the fixed stops after it).
+
+**GTFS-Flex service is not queryable yet.** The Flex records load (see
+above), but nothing answers "what on-demand service covers here, and when".
+A zone-only feed loads (stops.txt is optional when `locations.geojson` is
+present), and a `stop_times.txt` row naming a zone, a stop group, or a
+pickup/drop-off window is kept apart from the fixed calls: boards and
+journeys show only the fixed calls around it, while a GTFS-RT update or a
+detour naming its `stop_sequence` still applies at its place in the trip (a
+delay stated there propagates to the fixed stops after it).
 
 Service calendars **are** answerable — `get_services_on(date)` resolves
 `calendar.txt` against `calendar_dates` exceptions, and rows carry their
