@@ -479,15 +479,15 @@ def _carriages(
 ) -> tuple[CarriageDetail, ...]:
     """Per-carriage occupancy for a multi-carriage vehicle, front first.
 
-    The carriages must be numbered 1, 2, ... in the direction of travel:
-    "If the second carriage in the direction of travel has a value of 3,
-    consumers will discard data for all carriages". So unless their
-    carriage_sequence values are exactly 1 to n, there are none. An unset
-    occupancy_status is the proto's declared default, NO_DATA_AVAILABLE.
+    "The first occurrence represents the first carriage of the vehicle,
+    given the current direction of travel", and the carriages must be
+    numbered 1, 2, ... in that order: "If the second carriage in the
+    direction of travel has a value of 3, consumers will discard data for
+    all carriages". So unless the i-th has carriage_sequence i, there are
+    none. An unset occupancy_status is the proto's declared default,
+    NO_DATA_AVAILABLE.
     """
-    carriages = sorted(
-        vehicle.multi_carriage_details, key=lambda carriage: carriage.carriage_sequence
-    )
+    carriages = vehicle.multi_carriage_details
     if [
         carriage.carriage_sequence if carriage.HasField("carriage_sequence") else None
         for carriage in carriages
@@ -609,9 +609,8 @@ def vehicles_from_message(
                 odometer=vehicle.position.odometer
                 if vehicle.position.HasField("odometer")
                 else None,
-                timestamp=_epoch_to_utc(vehicle.timestamp)
-                if vehicle.HasField("timestamp")
-                else sent,
+                # Unset, 0 and unrepresentable all read as no timestamp.
+                timestamp=_epoch_to_utc(vehicle.timestamp) or sent,
                 current_status=current_status,
                 congestion_level=congestion,
                 stop_id=vehicle.stop_id or None,

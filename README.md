@@ -442,9 +442,9 @@ Notes on direct mode:
   `current_status` is `None` without a `current_stop_sequence` (the spec
   ignores it then), and its `timestamp` falls back to the message's.
 - **Realtime accessibility wins**: a row's `wheelchair_accessible` is what
-  its vehicle's GTFS-RT `VehicleDescriptor` states (the matched
-  `VehiclePosition`'s, else the `TripUpdate`'s), and the static value only
-  where neither states one.
+  its `TripUpdate`'s `VehicleDescriptor` states, and the static value where
+  it states none. It reads the same with or without `with_vehicles`; an
+  attached `VehiclePosition` carries its own descriptor's value.
 - **Everything the library hands out is immutable**: every model (catalog
   and feeds) is a frozen dataclass whose collections are tuples or
   read-only dicts, and a handle's `stops`/`routes`/`agencies`/`rt_feeds`

@@ -89,6 +89,9 @@ def test_a_vehicle_without_a_position_is_kept_and_in_no_zone() -> None:
         (1_785_500_000, 1_785_500_100, 1_785_500_000),
         (None, 1_785_500_100, 1_785_500_100),
         (None, None, None),
+        # 0 and an unrepresentable value say no time either.
+        (0, 1_785_500_100, 1_785_500_100),
+        (2**63, 1_785_500_100, 1_785_500_100),
     ],
 )
 def test_a_vehicle_without_a_timestamp_takes_the_messages(
@@ -119,9 +122,10 @@ def test_carriages_are_kept_only_when_numbered_one_to_n(
 ) -> None:
     """ "The first carriage in the direction of travel must have a value of
     1 ... If the second carriage in the direction of travel has a value of
-    3, consumers will discard data for all carriages". Kept carriages come
-    front first, and an unset occupancy_status is its declared default,
-    NO_DATA_AVAILABLE."""
+    3, consumers will discard data for all carriages", and "The first
+    occurrence represents the first carriage": the i-th must be numbered
+    i. Kept carriages stay in feed order, and an unset occupancy_status is
+    its declared default, NO_DATA_AVAILABLE."""
     message, vehicle = _vehicle_message()
     for index, sequence in enumerate(sequences):
         carriage = vehicle.multi_carriage_details.add()
@@ -131,19 +135,16 @@ def test_carriages_are_kept_only_when_numbered_one_to_n(
     [parsed] = vehicles_from_message(
         message, routes_by_id={}, stops_by_id={}, trip_routes={}
     )
-    numbered = (
-        sorted(s for s in sequences if s is not None)
-        == list(range(1, len(sequences) + 1))
-        and None not in sequences
-    )
+    numbered = sequences == list(range(1, len(sequences) + 1))
     if not numbered:
         assert parsed.carriages == ()
         return
     assert [c.carriage_sequence for c in parsed.carriages] == list(
         range(1, len(sequences) + 1)
     )
-    by_label = {f"c{index}": s for index, s in enumerate(sequences)}
-    assert all(by_label[c.label] == c.carriage_sequence for c in parsed.carriages)  # type: ignore[index]
+    assert [c.label for c in parsed.carriages] == [
+        f"c{index}" for index in range(len(sequences))
+    ]
     assert all(
         c.occupancy_status is OccupancyStatus.NO_DATA_AVAILABLE
         for c in parsed.carriages
@@ -237,22 +238,22 @@ def _vehicle_running_t(wheelchair: int | None) -> gtfs_realtime_pb2.FeedMessage:
     return message
 
 
-def _accessibility() -> Callable[
-    [TransitFeedHandle], Awaitable[tuple[set[object], set[object]]]
-]:
+def _accessibility(
+    *, with_vehicles: bool = True
+) -> Callable[[TransitFeedHandle], Awaitable[tuple[set[object], set[object]]]]:
     async def body(handle: TransitFeedHandle) -> tuple[set[object], set[object]]:
         start = _EIGHT - timedelta(minutes=30)
         [board] = await handle.get_arrivals(
             [ArrivalsQuery(["S0", "S1"], limit=None)],
             start=start,
             end=start + timedelta(hours=2),
-            with_vehicles=True,
+            with_vehicles=with_vehicles,
         )
         [journeys] = await handle.get_upcoming_trips(
             [TripQuery("S0", "S1", limit=None)],
             start=start,
             end=start + timedelta(hours=2),
-            with_vehicles=True,
+            with_vehicles=with_vehicles,
         )
         return (
             {(row.trip_id, row.wheelchair_accessible) for row in board},
@@ -279,24 +280,25 @@ def test_realtime_accessibility_overwrites_the_static_value(
     """WheelchairAccessible: "When available, this value should overwrite
     the wheelchair_accessible value from the static GTFS" -- UNKNOWN,
     ACCESSIBLE and INACCESSIBLE each "will overwrite the value from the
-    GTFS", and NO_VALUE "won't". The row's vehicle's descriptor states it
-    first, then the TripUpdate's; T is accessible in trips.txt."""
+    GTFS", and NO_VALUE "won't". The TripUpdate's descriptor states it for
+    the row, which reads the same whether or not the query fetched
+    VehiclePositions; T is accessible in trips.txt."""
     update = _with_descriptor(
         _descriptor_message({"trip_id": "T", "start_date": "20260730", "delay": 60}),
         from_update,
     )
     vehicles = [_vehicle_running_t(from_vehicle)]
-    expected = next(
-        (
-            value
-            for value in (_STATED[from_vehicle], _STATED[from_update])
-            if value is not None
-        ),
-        WheelchairAccess.POSSIBLE,
-    )
-    board, journeys = _run_feeds(_ACCESSIBLE_TRIP, _accessibility(), [update], vehicles)
-    assert board == {("T", expected)}
-    assert journeys == {("T", expected)}
+    stated = _STATED[from_update]
+    expected = WheelchairAccess.POSSIBLE if stated is None else stated
+    for with_vehicles in (True, False):
+        board, journeys = _run_feeds(
+            _ACCESSIBLE_TRIP,
+            _accessibility(with_vehicles=with_vehicles),
+            [update],
+            vehicles,
+        )
+        assert board == {("T", expected)}
+        assert journeys == {("T", expected)}
 
 
 def test_a_new_trip_shows_the_accessibility_its_update_states() -> None:
@@ -340,3 +342,100 @@ def test_a_copy_shows_the_accessibility_its_update_states() -> None:
     assert ("T-copy", WheelchairAccess.NOT_POSSIBLE) in board
     assert ("T-copy", WheelchairAccess.NOT_POSSIBLE) in journeys
     assert ("T", WheelchairAccess.POSSIBLE) in board
+
+
+_ACCESSIBLE = (
+    "route_id,service_id,trip_id,trip_headsign,wheelchair_accessible\n"
+    "R,S,T,Downtown,1\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("stated", "expected"),
+    [
+        (None, WheelchairAccess.POSSIBLE),
+        (_DESCRIPTOR.WHEELCHAIR_INACCESSIBLE, WheelchairAccess.NOT_POSSIBLE),
+    ],
+)
+def test_a_replacement_keeps_its_trips_accessibility_unless_stated(
+    stated: int | None, expected: WheelchairAccess
+) -> None:
+    """A REPLACEMENT is its trip on a new schedule: NO_VALUE leaves the
+    trip's static value ("it won't be overwritten"); a stated value
+    overwrites it."""
+    update = _with_descriptor(
+        _descriptor_message(
+            {
+                "trip_id": "T",
+                "start_date": "20260730",
+                "relationship": gtfs_realtime_pb2.TripDescriptor.REPLACEMENT,
+                "calls": [
+                    ("S0", _EIGHT + timedelta(minutes=5), None, False),
+                    ("S1", _EIGHT + timedelta(minutes=15), None, False),
+                ],
+            }
+        ),
+        stated,
+    )
+    board, journeys = _run_feeds(_ACCESSIBLE_TRIP, _accessibility(), [update])
+    assert board == {("T", expected)}
+    assert journeys == {("T", expected)}
+
+
+def test_a_headway_based_run_shows_the_accessibility_its_update_states() -> None:
+    """An exact_times=0 run is its trip at its own start, so its update's
+    descriptor overwrites the trip's value there too."""
+    files = {
+        **_feed(trips=_ACCESSIBLE),
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T,08:00:00,08:30:00,600,0\n"
+        ),
+    }
+    update = _with_descriptor(
+        _descriptor_message(
+            {
+                "trip_id": "T",
+                "start_date": "20260730",
+                "start_time": "08:03:00",
+                "relationship": gtfs_realtime_pb2.TripDescriptor.UNSCHEDULED,
+            }
+        ),
+        _DESCRIPTOR.WHEELCHAIR_INACCESSIBLE,
+    )
+    board, journeys = _run_feeds(files, _accessibility(), [update])
+    assert ("T#28980", WheelchairAccess.NOT_POSSIBLE) in board
+    assert ("T#28980", WheelchairAccess.NOT_POSSIBLE) in journeys
+    # The other repetitions keep the static value.
+    assert ("T#29400", WheelchairAccess.POSSIBLE) in board
+
+
+def test_a_detoured_run_shows_the_accessibility_its_update_states() -> None:
+    """A detoured run is still its trip, with its trip's updates: their
+    descriptor overwrites the static value on the rebuilt run."""
+    files = _feed(
+        trips=_ACCESSIBLE,
+        stops="stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\nS3,D,0,0\n",
+        stop_times=(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T,08:00:00,08:00:00,S0,1\nT,08:10:00,08:10:00,S1,2\n"
+            "T,08:20:00,08:20:00,S0,3\n"
+        ),
+    )
+    update = _with_descriptor(
+        _descriptor_message({"trip_id": "T", "start_date": "20260730"}),
+        _DESCRIPTOR.WHEELCHAIR_INACCESSIBLE,
+    )
+    detour = update.entity.add()
+    detour.id = "detour"
+    modification = detour.trip_modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = 3
+    modification.end_stop_selector.stop_sequence = 3
+    replacement = modification.replacement_stops.add()
+    replacement.stop_id = "S3"
+    replacement.travel_time_to_stop = 600
+    detour.trip_modifications.selected_trips.add().trip_ids.append("T")
+    detour.trip_modifications.service_dates.append("20260730")
+    board, journeys = _run_feeds(files, _accessibility(), [update])
+    assert board == {("T", WheelchairAccess.NOT_POSSIBLE)}
+    assert journeys == {("T", WheelchairAccess.NOT_POSSIBLE)}

@@ -353,9 +353,9 @@ class StopArrival:
 
     The trailing descriptive fields come from the static schedule:
     ``wheelchair_accessible``/``bikes_allowed`` describe the trip
-    (``wheelchair_accessible`` as realtime states it where it does: the
-    row's vehicle's VehicleDescriptor, else its TripUpdate's, "will
-    overwrite the value from the GTFS"),
+    (``wheelchair_accessible`` as its TripUpdate's VehicleDescriptor
+    states it where it does, which "will overwrite the value from the
+    GTFS"; an attached ``vehicle`` carries its own),
     ``pickup_type``/``drop_off_type``/``timepoint_exact``/``stop_headsign``
     describe this stop's stop_time row (``stop_headsign`` is the per-stop
     override of the trip-level ``headsign``). ``timepoint_exact`` is True
@@ -387,7 +387,8 @@ class StopArrival:
     scheduled times are the update's own ``scheduled_time`` (None where it
     gives none) and their predictions its times. ``service_id``, the
     stop_time descriptors, ``bikes_allowed`` and ``block_id`` are None,
-    and ``wheelchair_accessible`` too unless realtime states it;
+    and ``wheelchair_accessible`` too unless the update states it (a
+    replacement's is its trip's unless the update states one);
     ``route_id``, ``direction_id``,
     ``headsign`` and ``trip_short_name`` are what the update gives
     (TripProperties for the last two) -- a replacement shows under the

@@ -554,6 +554,16 @@ class TripInstanceCalls:
     calls: list[TripCall]
 
 
+class TripSummary(NamedTuple):
+    """A trip's own descriptors, as a replacement run shows them."""
+
+    route_id: str
+    headsign: str | None
+    direction_id: int | None
+    short_name: str | None
+    wheelchair_accessible: WheelchairAccess | None
+
+
 class SlotRun(NamedTuple):
     """A realtime run of an exact_times=0 trip, and the repetition it takes.
 
@@ -1559,19 +1569,31 @@ class StaticIndex:
             )
         )
 
-    def trip_summaries(
-        self, trip_ids: Sequence[str]
-    ) -> dict[str, tuple[str, str | None, int | None, str | None]]:
-        """Map each trip to its (route_id, headsign, direction_id, short_name)."""
-        found: dict[str, tuple[str, str | None, int | None, str | None]] = {}
+    def trip_summaries(self, trip_ids: Sequence[str]) -> dict[str, TripSummary]:
+        """Map each trip to its :class:`TripSummary`."""
+        found: dict[str, TripSummary] = {}
         for offset in range(0, len(trip_ids), _ID_SLICE):
             chunk = list(trip_ids[offset : offset + _ID_SLICE])
-            for trip_id, route_id, headsign, direction_id, short in self._conn.execute(
-                "SELECT id, route_id, headsign, direction_id, short_name FROM trips "
+            for (
+                trip_id,
+                route_id,
+                headsign,
+                direction_id,
+                short,
+                wheelchair,
+            ) in self._conn.execute(
+                "SELECT id, route_id, headsign, direction_id, short_name, "
+                "wheelchair_accessible FROM trips "
                 f"WHERE id IN ({','.join('?' * len(chunk))})",
                 chunk,
             ):
-                found[trip_id] = (route_id, headsign, direction_id, short)
+                found[trip_id] = TripSummary(
+                    route_id,
+                    headsign,
+                    direction_id,
+                    short,
+                    _enum_or_none(WheelchairAccess, wheelchair),
+                )
         return found
 
     def copied_run(
