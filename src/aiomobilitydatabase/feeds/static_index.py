@@ -488,8 +488,14 @@ def _reject_constant(name: str) -> None:
 def _json_member(archive: zipfile.ZipFile, filename: str) -> object:
     """Parse one dataset file as JSON; anything wrong with it is FeedParseError.
 
-    RecursionError too: json raises it for arrays nested deeper than the
-    interpreter's stack, which a hostile file can do in a few kilobytes.
+    Decoded as strict UTF-8 first, as the CSV files are: ``json.loads`` on
+    bytes would also take UTF-16/32 and let an encoded surrogate through.
+    Integers parse as floats: every number here is a coordinate, and
+    ``int`` refuses a digit string past CPython's length limit, which would
+    fail the whole file over one Feature's value (it is out of range, and
+    the Feature is skipped). RecursionError too: json raises it for arrays
+    nested deeper than the interpreter's stack, which a hostile file can do
+    in a few kilobytes.
     """
     try:
         fp = archive.open(filename)
@@ -497,7 +503,11 @@ def _json_member(archive: zipfile.ZipFile, filename: str) -> object:
         raise FeedParseError(f"Unreadable {filename}: {err}") from err
     with fp:
         try:
-            return json.loads(fp.read(), parse_constant=_reject_constant)
+            return json.loads(
+                fp.read().decode("utf-8-sig"),
+                parse_int=float,
+                parse_constant=_reject_constant,
+            )
         except (*_READ_ERRORS, RecursionError) as err:
             raise FeedParseError(f"Malformed {filename}: {err}") from err
 
@@ -513,30 +523,34 @@ type _Ring = list[list[float]]
 def _ring(value: object) -> _Ring | None:
     """One GeoJSON linear ring as ``[latitude, longitude]`` pairs, or None.
 
-    Each position is ``[longitude, latitude]`` with an optional altitude
-    after (ignored), both in range; the ring has four or more positions and
-    is closed, as RFC 7946 requires. Winding order is not checked: "parsers
-    SHOULD NOT reject Polygons that do not follow the right-hand rule".
+    Each position is an array of numbers, ``[longitude, latitude]`` in
+    range with an optional altitude after (ignored); the ring has four or
+    more positions and is closed -- its first and last positions "MUST
+    contain identical values" -- as RFC 7946 requires. Winding order is not
+    checked: "parsers SHOULD NOT reject Polygons that do not follow the
+    right-hand rule".
     """
-    if not isinstance(value, list) or len(value) < _RING_MIN_POSITIONS:
+    if (
+        not isinstance(value, list)
+        or len(value) < _RING_MIN_POSITIONS
+        or value[0] != value[-1]
+    ):
         return None
     ring: _Ring = []
     for position in value:
-        if not isinstance(position, list) or len(position) < 2:  # noqa: PLR2004
-            return None
-        lon, lat = position[0], position[1]
-        if not all(
-            isinstance(coordinate, int | float) and not isinstance(coordinate, bool)
-            for coordinate in (lon, lat)
+        if (
+            not isinstance(position, list)
+            or len(position) < 2  # noqa: PLR2004
+            or not all(type(number) is float for number in position)
         ):
-            return None
-        # Compared before float(): an int past float's range would overflow.
+            return None  # parse_int=float: every JSON number is a float here
+        lon, lat = position[0], position[1]
         if not (-_MAX_LONGITUDE <= lon <= _MAX_LONGITUDE) or not (
             -_MAX_LATITUDE <= lat <= _MAX_LATITUDE
         ):
             return None
-        ring.append([float(lat), float(lon)])
-    return ring if ring[0] == ring[-1] else None
+        ring.append([lat, lon])
+    return ring
 
 
 def _polygons(geometry: object) -> list[list[_Ring]] | None:
@@ -568,22 +582,33 @@ def _polygons(geometry: object) -> list[list[_Ring]] | None:
 
 
 def _geojson_text(value: object) -> str | None:
-    """Read a GeoJSON property as text, like a CSV cell: else None."""
-    return value if isinstance(value, str) and value else None
+    """Read a GeoJSON property as text, like a CSV cell: else None.
+
+    A JSON string may escape a lone surrogate (U+D800 with no pair), which
+    is no character and cannot be stored: that is not text either.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value
 
 
 def _location_row(feature: object) -> tuple[str, str | None, str | None, str] | None:
     """One locations.geojson Feature as a ``locations`` row, or None to skip it.
 
-    "Every GeoJSON Feature must have an id", a String; its geometry "must
-    be of type" Polygon or MultiPolygon. A Feature breaking either names
-    no zone a stop_time can use, so it is skipped rather than failing the
-    whole dataset. ``properties`` hold only descriptive text.
+    A Feature's ``type`` is ``"Feature"``; "every GeoJSON Feature must have
+    an id", a String; its geometry "must be of type" Polygon or
+    MultiPolygon. A Feature breaking any of these names no zone a stop_time
+    can use, so it is skipped rather than failing the whole dataset.
+    ``properties`` hold only descriptive text.
     """
-    if not isinstance(feature, dict):
+    if not isinstance(feature, dict) or feature.get("type") != "Feature":
         return None
-    location_id = feature.get("id")
-    if not isinstance(location_id, str) or not location_id:
+    location_id = _geojson_text(feature.get("id"))
+    if location_id is None or not location_id.strip():
         return None
     polygons = _polygons(feature.get("geometry"))
     if polygons is None:
@@ -1721,8 +1746,10 @@ class StaticIndex:
 
         A file that is not one says nothing about any zone, so it fails the
         build as malformed JSON does. Within it, a Feature that cannot name
-        a zone is skipped (see :func:`_location_row`); ids "must be unique",
-        and where they are not the last Feature wins, as in stops.txt.
+        a zone is skipped (see :func:`_location_row`). Ids "must be unique";
+        where they are not, the last Feature with the id wins, as the last
+        row does in stops.txt -- even one that names no valid zone, which
+        then leaves none: the earlier Feature may be the one it replaced.
         """
         features = document.get("features") if isinstance(document, dict) else None
         if (
@@ -1731,9 +1758,18 @@ class StaticIndex:
             or not isinstance(features, list)
         ):
             raise FeedParseError("locations.geojson is not a GeoJSON FeatureCollection")
+        claims: dict[str, tuple[str, str | None, str | None, str] | None] = {}
+        for feature in features:
+            row = _location_row(feature)
+            if row is not None:
+                claims[row[0]] = row
+            elif isinstance(feature, dict) and (
+                location_id := _geojson_text(feature.get("id"))
+            ):
+                claims[location_id] = None
         conn.executemany(
-            "INSERT OR REPLACE INTO locations VALUES (?,?,?,?)",
-            [row for feature in features if (row := _location_row(feature))],
+            "INSERT INTO locations VALUES (?,?,?,?)",
+            [row for row in claims.values() if row is not None],
         )
 
     @classmethod
@@ -1746,7 +1782,7 @@ class StaticIndex:
         rows: list[tuple[object, ...]] = []
         sql = "INSERT OR REPLACE INTO location_groups VALUES (?,?)"
         for row in reader:
-            if not (group_id := row.get("location_group_id")):
+            if not (group_id := _cell(row, "location_group_id")):
                 continue  # Required: a row without one names no group
             rows.append((group_id, row.get("location_group_name") or None))
             if len(rows) >= _BATCH_SIZE:
@@ -1767,7 +1803,8 @@ class StaticIndex:
         rows: list[tuple[object, ...]] = []
         sql = "INSERT INTO location_group_stops VALUES (?,?)"
         for row in reader:
-            group_id, stop_id = row.get("location_group_id"), row.get("stop_id")
+            group_id = _cell(row, "location_group_id")
+            stop_id = _cell(row, "stop_id")
             if not group_id or not stop_id:
                 continue  # both Required: half a pair assigns nothing
             rows.append((group_id, stop_id))
@@ -1790,7 +1827,7 @@ class StaticIndex:
         rows: list[tuple[object, ...]] = []
         sql = f"INSERT OR REPLACE INTO booking_rules VALUES ({','.join('?' * 15)})"
         for row in reader:
-            if not (rule_id := row.get("booking_rule_id")):
+            if not (rule_id := _cell(row, "booking_rule_id")):
                 continue  # Required: a row without one is no rule
             rows.append(
                 (

@@ -218,6 +218,15 @@ def test_build_progress_counts_the_zones_file(tmp_path: Path) -> None:
         ),
         pytest.param("[" * 100_000 + "]" * 100_000, id="nested past the stack"),
         pytest.param(b"\xff\xfe\xff", id="not text"),
+        pytest.param(
+            json.dumps(_collection(_zone("Z")))
+            .encode()
+            .replace(b'"Z"', b'"\xed\xa0\x80"'),
+            id="an encoded surrogate is not UTF-8",
+        ),
+        pytest.param(
+            json.dumps(_collection(_zone())).encode("utf-16"), id="UTF-16, not UTF-8"
+        ),
         pytest.param(json.dumps(_zone()), id="a lone Feature"),
         pytest.param(json.dumps([_zone()]), id="a bare list"),
         pytest.param(json.dumps({"type": "FeatureCollection"}), id="no features"),
@@ -308,6 +317,17 @@ def _polygon(*rings: object) -> dict[str, object]:
             id="a MultiPolygon part of no rings",
         ),
         pytest.param("Z", id="not an object"),
+        pytest.param({**_zone(), "type": "Polygon"}, id="not a Feature"),
+        pytest.param(_zone("\ud800"), id="a lone surrogate id"),
+        pytest.param(_zone("  "), id="a blank id"),
+        pytest.param(
+            _zone(geometry=_polygon([[0, 0, 0], [1, 0], [1, 1], [0, 0, 5]])),
+            id="first and last differ in altitude",
+        ),
+        pytest.param(
+            _zone(geometry=_polygon([[0, 0, "x"], [1, 0], [1, 1], [0, 0, "x"]])),
+            id="text altitude",
+        ),
     ],
 )
 def test_a_feature_that_names_no_valid_zone_is_skipped(
@@ -316,6 +336,19 @@ def test_a_feature_that_names_no_valid_zone_is_skipped(
     """Skipped whole -- the dataset still builds, its other zones kept. One
     bad ring or part drops the Feature: the rest would be a different zone."""
     index = _build(tmp_path, _with_zones(_collection(feature, _zone("KEPT"))))
+    assert [location.id for location in index.flex_locations()] == ["KEPT"]
+    index.close()
+
+
+def test_a_number_past_the_int_digit_limit_skips_only_its_feature(
+    tmp_path: Path,
+) -> None:
+    """CPython's int() refuses a digit string over 4300 digits; that is one
+    Feature's out-of-range coordinate, not a malformed file."""
+    bad = json.dumps(_zone("BAD")).replace("[1, 0]", "[" + "1" * 5000 + ", 0]", 1)
+    kept = json.dumps(_zone("KEPT"))
+    document = f'{{"type": "FeatureCollection", "features": [{bad}, {kept}]}}'
+    index = _build(tmp_path, _with_zones(document))
     assert [location.id for location in index.flex_locations()] == ["KEPT"]
     index.close()
 
@@ -379,23 +412,37 @@ def test_feature_descriptions_are_text_or_none(tmp_path: Path) -> None:
 
 
 def test_a_repeated_zone_id_keeps_the_last_feature(tmp_path: Path) -> None:
-    """Ids "must be unique"; where they are not, the last wins, as in
-    stops.txt."""
+    """Ids "must be unique"; where they are not, the last Feature with the
+    id wins, as in stops.txt -- even one naming no valid zone, which leaves
+    none rather than the earlier zone it may have replaced."""
     index = _build(
         tmp_path,
         _with_zones(
             _collection(
                 _zone("Z", properties={"stop_name": "first"}),
                 _zone("Z", properties={"stop_name": "second"}),
+                _zone("Y"),
+                _zone("Y", geometry=_polygon(_SQUARE[:-1])),
             )
         ),
     )
-    assert [loc.name for loc in index.flex_locations()] == ["second"]
+    assert [(loc.id, loc.name) for loc in index.flex_locations()] == [("Z", "second")]
+    index.close()
+
+
+def test_a_name_that_is_no_text_reads_as_none(tmp_path: Path) -> None:
+    """A JSON string escaping a lone surrogate is no text (and could not be
+    stored): the name is None, the zone kept."""
+    index = _build(
+        tmp_path,
+        _with_zones(_collection(_zone(properties={"stop_name": "\ud800"}))),
+    )
+    assert [(loc.id, loc.name) for loc in index.flex_locations()] == [("Z", None)]
     index.close()
 
 
 def test_a_zones_file_with_a_byte_order_mark_loads(tmp_path: Path) -> None:
-    feed = _with_zones("﻿" + json.dumps(_collection(_zone())))
+    feed = _with_zones("\ufeff" + json.dumps(_collection(_zone())))
     index = _build(tmp_path, feed)
     assert [loc.id for loc in index.flex_locations()] == ["Z"]
     index.close()
@@ -412,9 +459,12 @@ def test_location_groups_list_their_stops_in_file_order_once(tmp_path: Path) -> 
     index = _build(
         tmp_path,
         _feed(
-            location_groups="location_group_id,location_group_name\nG2,\nG1,One\n,X\n",
+            location_groups=(
+                "location_group_id,location_group_name\nG2,\nG1,One\n,X\n  ,Y\n"
+            ),
             location_group_stops=(
-                "location_group_id,stop_id\nG1,S1\nG1,S0\nG1,S1\n,S0\nG1,\nGHOST,S0\n"
+                "location_group_id,stop_id\n"
+                "G1,S1\nG1,S0\nG1,S1\n,S0\nG1,\nGHOST,S0\nG1, \n  ,S1\n"
             ),
         ),
     )
@@ -444,6 +494,7 @@ def test_booking_rule_cells_parse_leniently_and_are_kept_as_stated(
                 "BAD,9,soon,5PM,25:00:00\n"
                 "RT,0,30,,\n"
                 ",1,30,,\n"
+                "  ,1,30,,\n"
             )
         ),
     )
@@ -565,7 +616,8 @@ def _invalid_features(draw: st.DrawFn) -> dict[str, Any]:
 def _zones_documents(
     draw: st.DrawFn,
 ) -> tuple[dict[str, Any], list[FlexLocation]]:
-    """A FeatureCollection, and the zones it must load as (by id, last wins)."""
+    """A FeatureCollection, and the zones it must load as: by id, the last
+    Feature with an id claiming it (an invalid one leaving no zone)."""
     entries = draw(
         st.lists(
             st.one_of(
@@ -575,12 +627,16 @@ def _zones_documents(
             max_size=6,
         )
     )
-    expected: dict[str, FlexLocation] = {}
-    for _feature, location in entries:
-        if location is not None:
-            expected[location.id] = location
+    claims: dict[str, FlexLocation | None] = {}
+    for feature, location in entries:
+        if isinstance(feature.get("id"), str):
+            claims[feature["id"]] = location
     document = _collection(*(feature for feature, _ in entries))
-    return document, [expected[zone_id] for zone_id in sorted(expected)]
+    return document, [
+        location
+        for _zone_id, location in sorted(claims.items())
+        if location is not None
+    ]
 
 
 def _cells[T](values: st.SearchStrategy[T], render: Any) -> st.SearchStrategy[Any]:
