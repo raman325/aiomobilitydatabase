@@ -854,13 +854,16 @@ def _run_calls(
     available to the common stops"), and its delay where the detour left
     its times alone (elsewhere the delay is against a schedule no longer
     shown); a replacement stop takes none ("no ETA would be available at
-    the replacement stops"). A skipped call, and one with no time at all,
-    is left out.
+    the replacement stops"). A skipped call, one with no time at all, and
+    a GTFS-Flex call (it marks its place for the updates, but is no timed
+    stop to show) are left out.
     """
     resolved = resolve_trip_predictions(entry, calls)
     own = {call.stop_sequence: call for call in calls}
     shown: list[RealtimeCall] = []
     for call in calls if detoured is None else detoured:
+        if call.on_demand:
+            continue
         kept = None if call.replacement else own.get(call.stop_sequence)
         if kept is not None and call.stop_sequence in resolved.skipped:
             continue
