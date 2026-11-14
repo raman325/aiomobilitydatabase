@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import bisect
 import itertools
 import math
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -156,45 +157,100 @@ def _meet_only_at_a_shared_end(
 
 
 def _cells(
-    a: _IntPoint, b: _IntPoint, origin: _IntPoint, size: int
+    a: _IntPoint,
+    b: _IntPoint,
+    origin: _IntPoint,
+    size: int,
+    limit: int | None = None,
 ) -> Iterator[tuple[int, int]]:
     """Yield every grid cell the closed segment ab passes through.
 
     Column by column: the segment's y-range over each column's closed slab,
     computed exactly, gives the rows. A point of the segment lies in the
-    cell of its own floor coordinates, which this always yields.
+    cell of its own floor coordinates, which this always yields. With
+    ``limit``, only cells with both indices in ``[0, limit)`` are walked.
     """
     (x1, y1), (x2, y2) = sorted((a, b))
     x0, y0 = origin
+    low, high = (0, limit - 1) if limit is not None else (None, None)
+
+    def clamp(first: int, last: int) -> range:
+        if low is not None and high is not None:
+            first, last = max(first, low), min(last, high)
+        return range(first, last + 1)
+
     if x1 == x2:
-        for row in range((min(y1, y2) - y0) // size, (max(y1, y2) - y0) // size + 1):
-            yield (x1 - x0) // size, row
+        column = (x1 - x0) // size
+        if low is not None and high is not None and not low <= column <= high:
+            return
+        for row in clamp((min(y1, y2) - y0) // size, (max(y1, y2) - y0) // size):
+            yield column, row
         return
     dx, dy = x2 - x1, y2 - y1
-    for column in range((x1 - x0) // size, (x2 - x0) // size + 1):
+    for column in clamp((x1 - x0) // size, (x2 - x0) // size):
         lo = max(x1, x0 + column * size)
         hi = min(x2, x0 + (column + 1) * size)
         # floor((y(x) - y0) / size) with y(x) = y1 + dy (x - x1) / dx, exactly
         rows = [((y1 - y0) * dx + dy * (x - x1)) // (dx * size) for x in (lo, hi)]
-        for row in range(min(rows), max(rows) + 1):
+        for row in clamp(min(rows), max(rows)):
             yield column, row
+
+
+# A cell holding more edges than this is split into a finer grid of its own
+# (each side cut in _SUBDIVISION), down to unit cells: detail clustered in
+# a few cells of an otherwise coarse zone stays near-linear.
+_CROWDED = 64
+_SUBDIVISION = 8
+
+
+def _bucket_pairs(
+    edges: list[_Edge],
+    members: Iterable[int],
+    origin: _IntPoint,
+    size: int,
+    limit: int | None,
+) -> Iterator[tuple[int, int]]:
+    """Yield pairs of ``members`` sharing a cell of this grid (or a sub-cell).
+
+    A crowded cell is re-bucketed on a finer grid clipped to the cell; two
+    edges meeting in the cell meet in the sub-cell holding that point.
+    """
+    buckets: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
+    for index in members:
+        _r, _i, a, b = edges[index]
+        for cell in _cells(a, b, origin, size, limit):
+            buckets[cell].append(index)
+    for (column, row), inside in buckets.items():
+        if len(inside) > _CROWDED and size > 1:
+            sub = -(-size // _SUBDIVISION)
+            yield from _bucket_pairs(
+                edges,
+                inside,
+                (origin[0] + column * size, origin[1] + row * size),
+                sub,
+                -(-size // sub),
+            )
+            continue
+        for n, first in enumerate(inside):
+            for second in inside[n + 1 :]:
+                yield (first, second) if first < second else (second, first)
 
 
 def _candidate_pairs(edges: list[_Edge]) -> Iterator[tuple[int, int]]:
     """Yield index pairs ``(i, j)``, ``i < j``, of edges that may meet.
 
     Edges are bucketed on a grid, each in just the cells its line crosses,
-    and only edges sharing a cell are paired; edges that meet share the
-    cell of their meeting point. A pair sharing several cells is yielded
-    once per cell (checking it twice is harmless; remembering every pair
-    would cost memory quadratic in the worst case).
+    crowded cells split finer, and only edges sharing a cell are paired;
+    edges that meet share the cell of their meeting point. A pair sharing
+    several cells is yielded once per cell (checking it twice is harmless;
+    remembering every pair would cost memory quadratic in the worst case).
 
     Cells are the size of the median edge, coarsened so the edges cover
     about 8n cells in all and so no more than about 4n fit across the zone:
-    memory stays linear in the edge count. Time follows how crowded the
-    busiest cells are -- about the edge count for evenly spread vertices
-    with or without a few long edges, more where many edges run close
-    together or converge (a fine comb, a sunburst of spikes).
+    memory stays linear in the edge count. Time is about the edge count for
+    evenly spread vertices, with or without a few long edges or a cluster
+    of fine detail; more where many edges converge on one point (a
+    sunburst of spikes), where no grid separates them.
     """
     xs = [x for _r, _i, a, b in edges for x in (a[0], b[0])]
     ys = [y for _r, _i, a, b in edges for y in (a[1], b[1])]
@@ -207,29 +263,35 @@ def _candidate_pairs(edges: list[_Edge]) -> Iterator[tuple[int, int]]:
         travel // (6 * len(edges)),
         1,
     )
-    origin = (min(xs), min(ys))
-    buckets: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
-    for index, (_r, _i, a, b) in enumerate(edges):
-        for cell in _cells(a, b, origin, size):
-            buckets[cell].append(index)
-    for members in buckets.values():
-        for n, first in enumerate(members):
-            for second in members[n + 1 :]:
-                yield first, second
+    return _bucket_pairs(edges, range(len(edges)), (min(xs), min(ys)), size, None)
 
 
 def _position(p: _IntPoint, ring: Sequence[_IntPoint]) -> int:
     """Return 1 if ``p`` is inside ``ring`` (closed), 0 on it, -1 outside."""
-    inside = False
+    return _positions([p], ring)[0]
+
+
+def _positions(points: Sequence[_IntPoint], ring: Sequence[_IntPoint]) -> list[int]:
+    """Place each point against ``ring`` (closed): 1 inside, 0 on it, -1 out.
+
+    One pass over the ring for all the points: each edge visits only the
+    points whose y lies in its own y-range (found by bisection), toggling
+    their parity where a ray to +x crosses it.
+    """
+    order = sorted(range(len(points)), key=lambda k: points[k][1])
+    ys = [points[k][1] for k in order]
+    inside = [False] * len(points)
+    on = [False] * len(points)
     for a, b in itertools.pairwise(ring):
-        if (a[1] > p[1]) == (b[1] > p[1]) and p[1] not in (a[1], b[1]):
-            continue  # the edge neither reaches p's row nor can hold p
-        orientation = _orientation(a, b, p)
-        if orientation == 0 and _within_box(p, a, b):
-            return 0
-        if (a[1] > p[1]) != (b[1] > p[1]) and (orientation > 0) == (b[1] > a[1]):
-            inside = not inside
-    return 1 if inside else -1
+        low, high = min(a[1], b[1]), max(a[1], b[1])
+        for k in order[bisect.bisect_left(ys, low) : bisect.bisect_right(ys, high)]:
+            p = points[k]
+            orientation = _orientation(a, b, p)
+            if orientation == 0 and _within_box(p, a, b):
+                on[k] = True
+            elif (a[1] > p[1]) != (b[1] > p[1]) and (orientation > 0) == (b[1] > a[1]):
+                inside[k] = not inside[k]
+    return [0 if on[k] else 1 if inside[k] else -1 for k in range(len(points))]
 
 
 def _arc_points(ring: Sequence[_IntPoint], shared: set[_IntPoint]) -> list[_IntPoint]:
@@ -257,6 +319,58 @@ def _box(ring: Sequence[_IntPoint]) -> tuple[int, int, int, int]:
     )
 
 
+def _holes_overlap(holes: list[list[_IntPoint]]) -> bool:
+    """Return whether any two holes overlap (rings meeting only at vertices).
+
+    Swept by box: only holes whose boxes overlap are compared, each way --
+    if no arc of either lies inside the other, their interiors are apart.
+    """
+    boxes = [_box(hole) for hole in holes]
+    active: list[int] = []
+    for h in sorted(range(len(holes)), key=lambda k: boxes[k][0]):
+        active = [g for g in active if boxes[g][2] >= boxes[h][0]]
+        for g in active:
+            if boxes[g][3] < boxes[h][1] or boxes[h][3] < boxes[g][1]:
+                continue
+            for inner, outer in ((holes[h], holes[g]), (holes[g], holes[h])):
+                if 1 in _positions(_arc_points(inner, set(outer)), outer):
+                    return True
+        active.append(h)
+    return False
+
+
+def _interior_disconnected(rings: list[list[_IntPoint]]) -> bool:
+    """Return whether rings meeting at shared vertices cut the interior apart.
+
+    With rings meeting only at vertices, the interior is disconnected
+    exactly when rings and the points they share form a cycle (a hole
+    touching the exterior twice, or holes chained from it and back): found
+    by union-find over ring-point incidences.
+    """
+    owners: defaultdict[_IntPoint, list[int]] = defaultdict(list)
+    for r, ring in enumerate(rings):
+        for point in set(ring):
+            owners[point].append(r)
+    parent: dict[tuple[str, object], tuple[str, object]] = {}
+
+    def find(node: tuple[str, object]) -> tuple[str, object]:
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for point, members in owners.items():
+        if len(members) < 2:  # noqa: PLR2004
+            continue
+        for r in members:
+            first, second = find(("point", point)), find(("ring", r))
+            if first == second:
+                return True
+            parent[first] = second
+    return False
+
+
 def polygon_is_valid(rings: Sequence[Sequence[Point]]) -> bool:
     """Return whether a polygon (exterior ring, then holes) is valid.
 
@@ -269,13 +383,15 @@ def polygon_is_valid(rings: Sequence[Sequence[Point]]) -> bool:
       touching another except a neighbour at their shared vertex, and no
       neighbour folding back along it;
     - rings do not cross: two rings meet only at vertices both have;
-    - every hole lies inside the exterior, and no two holes overlap.
+    - every hole lies inside the exterior, and no two holes overlap;
+    - the interior is connected: rings meeting at shared vertices form no
+      cycle.
 
-    Not checked: that the interior stays connected (a hole meeting the
-    exterior at two vertices cuts it in two). Stricter than 6.1.11 in one
-    case: a ring touching another along an edge's middle (a tangent there
-    is valid) is refused.
+    Stricter than 6.1.11 in one case: a ring touching another along an
+    edge's middle (a tangent there is valid) is refused.
     """
+    if not rings:
+        return False
     cleaned: list[list[_IntPoint]] = []
     for ring in _exact_rings(rings):
         points = [p for i, p in enumerate(ring) if i == 0 or p != ring[i - 1]]
@@ -301,23 +417,7 @@ def polygon_is_valid(rings: Sequence[Sequence[Point]]) -> bool:
             return False
     exterior, holes = cleaned[0], cleaned[1:]
     corners = set(exterior)
-    if any(
-        _position(p, exterior) != 1
-        for hole in holes
-        for p in _arc_points(hole, corners)
-    ):
+    arcs = [p for hole in holes for p in _arc_points(hole, corners)]
+    if any(position != 1 for position in _positions(arcs, exterior)):
         return False
-    boxes = [_box(hole) for hole in holes]
-    for h, hole in enumerate(holes):
-        for g, other in enumerate(holes):
-            mine, theirs = boxes[h], boxes[g]
-            if g == h or (
-                mine[2] < theirs[0]
-                or theirs[2] < mine[0]
-                or mine[3] < theirs[1]
-                or theirs[3] < mine[1]
-            ):
-                continue  # disjoint boxes: no overlap
-            if any(_position(p, other) == 1 for p in _arc_points(hole, set(other))):
-                return False
-    return True
+    return not _holes_overlap(holes) and not _interior_disconnected(cleaned)

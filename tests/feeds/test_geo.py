@@ -1,19 +1,24 @@
 """Tests for circular-zone geometry."""
 
+import itertools
 import math
+import time
 from fractions import Fraction
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds import geo
 from aiomobilitydatabase.feeds.geo import (
     _EARTH_RADIUS_M,
     Circle,
     _candidate_pairs,
     _exact_rings,
     _orientation,
+    _positions,
     _touch,
     great_circle_m,
     in_circle,
@@ -189,6 +194,30 @@ _SQUARE = _ring((0, 0), (4, 0), (4, 4), (0, 4))
             id="holes meeting at a shared vertex",
         ),
         pytest.param([_SQUARE, _SQUARE], False, id="hole over the exterior"),
+        pytest.param(
+            [_SQUARE, _ring((0, 0), (4, 4), (3, 1))],
+            False,
+            id="hole meeting the exterior twice (interior cut in two)",
+        ),
+        pytest.param(
+            [
+                _SQUARE,
+                _ring((0, 0), (2, 1), (1, 2)),
+                _ring((2, 1), (4, 4), (3, 1)),
+            ],
+            False,
+            id="holes chained from the exterior and back (interior cut)",
+        ),
+        pytest.param(
+            [
+                _SQUARE,
+                _ring((0, 0), (2, 1), (1, 2)),
+                _ring((2, 1), (3, 3), (3, 1)),
+            ],
+            True,
+            id="holes chained from the exterior, not back",
+        ),
+        pytest.param([], False, id="no rings"),
         pytest.param(
             [
                 _ring((-10, -10), (10, -10), (10, 10), (-10, 10)),
@@ -495,3 +524,97 @@ def test_exact_rings_are_even_integers_in_proportion(
         assert all(
             Fraction(scaled) == Fraction(value) * factor for value, scaled in pairs
         )
+
+
+def test_many_holes_are_compared_by_sweep_not_all_pairs() -> None:
+    """A lattice of 2,500 holes checks in well under a second each way:
+    holes are compared only with those whose boxes overlap."""
+    side = 50
+    holes = [
+        _ring(
+            (i + 0.25, j + 0.25),
+            (i + 0.75, j + 0.25),
+            (i + 0.75, j + 0.75),
+            (i + 0.25, j + 0.75),
+        )
+        for i in range(side)
+        for j in range(side)
+    ]
+    exterior = _ring((0, 0), (side, 0), (side, side), (0, side))
+    started = time.perf_counter()
+    assert polygon_is_valid([exterior, *holes])
+    assert time.perf_counter() - started < 10
+
+
+def test_fine_detail_in_a_coarse_zone_stays_near_linear() -> None:
+    """A dense run of tiny edges inside one coarse cell is split finer,
+    not paired all against all."""
+    coarse, fine = 3000, 2000
+    points = [
+        (10 * math.cos(math.pi * k / coarse), 10 * math.sin(math.pi * k / coarse))
+        for k in range(coarse + 1)
+    ]
+    points += [(-0.005, -0.001)]
+    points += [
+        (-0.005 + 0.01 * k / fine, -0.001 - (0.0005 if k % 2 else 0))
+        for k in range(fine)
+    ]
+    points += [(0.005, -0.001)]
+    ring = [*points, points[0]]
+    assert sum(1 for _ in _candidate_pairs(_edges([ring]))) < 50 * len(ring)
+    assert polygon_is_valid([ring])
+
+
+@given(
+    segments=st.lists(
+        st.tuples(_SMALL, _SMALL).filter(lambda ab: ab[0] != ab[1]),
+        min_size=2,
+        max_size=30,
+    )
+)
+@settings(max_examples=200)
+def test_split_cells_never_lose_a_touching_pair(
+    segments: list[tuple[tuple[int, int], tuple[int, int]]],
+) -> None:
+    """With every cell of more than two edges split finer, still every
+    pair of segments that meet is a candidate."""
+    [points] = _exact_rings([[point for segment in segments for point in segment]])
+    exact = list(zip(points[::2], points[1::2], strict=True))
+    edges = [(0, i, a, b) for i, (a, b) in enumerate(exact)]
+    with patch.object(geo, "_CROWDED", 2):
+        candidates = set(_candidate_pairs(edges))
+    for i in range(len(exact)):
+        for j in range(i + 1, len(exact)):
+            if _touch(*exact[i], *exact[j]):
+                assert (i, j) in candidates
+
+
+def _position_by_brute_force(p: tuple[int, int], ring: list[tuple[int, int]]) -> int:
+    inside = False
+    for a, b in itertools.pairwise(ring):
+        if (
+            _orientation(a, b, p) == 0
+            and min(a[0], b[0]) <= p[0] <= max(a[0], b[0])
+            and min(a[1], b[1]) <= p[1] <= max(a[1], b[1])
+        ):
+            return 0
+        if (a[1] > p[1]) != (b[1] > p[1]) and (_orientation(a, b, p) > 0) == (
+            b[1] > a[1]
+        ):
+            inside = not inside
+    return 1 if inside else -1
+
+
+@given(
+    ring=st.lists(_SMALL, min_size=3, max_size=8),
+    points=st.lists(_SMALL, max_size=12),
+)
+@settings(max_examples=300)
+def test_one_pass_places_points_as_one_at_a_time(
+    ring: list[tuple[int, int]], points: list[tuple[int, int]]
+) -> None:
+    """The batched ray cast places every point as a per-point cast does."""
+    closed = [*ring, ring[0]]
+    assert _positions(points, closed) == [
+        _position_by_brute_force(point, closed) for point in points
+    ]
