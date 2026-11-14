@@ -251,6 +251,8 @@ def test_repetitions_carry_their_shifted_windows_and_an_unknown_one_is_none(
         },
     )
     services = _services(index, Circle(0.0, 0.0, 10.0))
+    # No exact_times column: "0 or empty", a headway -- approximate windows.
+    assert {s.exact_times for s in services} == {False}
     assert [
         (s.trip_id, s.start_pickup_drop_off_window, s.end_pickup_drop_off_window)
         for s in services
@@ -305,3 +307,63 @@ def test_every_call_serving_a_zone_is_listed_and_nothing_else(
 
     listed, expected = _run(index, body)
     assert listed == expected
+
+
+def test_windows_are_exact_as_frequencies_txt_says(tmp_path: Path) -> None:
+    """A plain trip's windows are as stated; a repetition's are exact for
+    exact_times=1, approximate for 0 (no fixed schedule), unknown when the
+    cell is garbage."""
+    rows = "{t},08:00:00,08:00:00,S0,,,,1,,,\n{t},,,,Z,08:05:00,09:00:00,2,2,2,\n"
+    feed = _with_zone(
+        _feed(
+            trips="route_id,service_id,trip_id,trip_headsign\n"
+            + "".join(f"R,S,{trip},X\n" for trip in ("P", "E", "H", "G")),
+            stop_times=_WINDOWS
+            + "".join(rows.format(t=trip) for trip in ("P", "E", "H", "G")),
+            frequencies="trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "E,08:00:00,08:01:00,600,1\nH,08:00:00,08:01:00,600,0\n"
+            "G,08:00:00,08:01:00,600,x\n",
+        )
+    )
+    services = _services(_build(tmp_path, feed), Circle(0.0, 0.0, 10.0))
+    assert [(s.trip_id, s.exact_times) for s in services] == [
+        ("E#28800", True),
+        ("G#28800", None),
+        ("H#28800", False),
+        ("P", True),
+    ]
+
+
+def test_a_zone_reaching_only_a_later_part_of_a_multipolygon(tmp_path: Path) -> None:
+    """A zone is served when any of its parts overlaps the circle -- here
+    only the second of two."""
+    feed = _feed(
+        stop_times=_WINDOWS
+        + "T,08:00:00,08:00:00,S0,,,,1,,,\n"
+        + "T,,,,M,08:05:00,09:00:00,2,2,2,\n"
+    )
+    far = [[50, 50], [51, 50], [51, 51], [50, 51], [50, 50]]
+    near = [[-1, -1], [1, -1], [1, 1], [-1, 1], [-1, -1]]
+    feed["locations.geojson"] = json.dumps(
+        {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "id": "M",
+                    "properties": {},
+                    "geometry": {
+                        "type": "MultiPolygon",
+                        "coordinates": [[far], [near]],
+                    },
+                }
+            ],
+        }
+    )
+    [service] = _services(_build(tmp_path, feed), Circle(0.0, 0.0, 10.0))
+    assert service.location_id == "M"
+
+    async def body(handle: TransitFeedHandle) -> list[str]:
+        return [location.id for location in handle.locations_in(Circle(0.0, 0.0, 10.0))]
+
+    assert _run(_build(tmp_path, feed), body) == ["M"]

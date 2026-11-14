@@ -132,9 +132,12 @@ def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
     if max(latitudes) < zone.latitude - dlat or min(latitudes) > zone.latitude + dlat:
         return False  # wholly north or south of the circle
     scale = _M_PER_DEG_LAT * math.cos(math.radians(zone.latitude))
-    nearest = _FULL_TURN_DEG * round(
-        (zone.longitude - polygon.exterior[0][1]) / _FULL_TURN_DEG
-    )
+    longitudes = [lon for _lat, lon in polygon.exterior]
+    # Anchored on the zone's middle longitude, not any one vertex: within
+    # half a turn wide, every other copy then lies a quarter turn or more
+    # from the circle, out of its reach.
+    middle = (max(longitudes) + min(longitudes)) / 2
+    nearest = _FULL_TURN_DEG * round((zone.longitude - middle) / _FULL_TURN_DEG)
 
     def overlaps(shift: float) -> bool:
         def plane(ring: Sequence[tuple[float, float]]) -> list[_Plane]:
@@ -157,9 +160,8 @@ def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
             _encloses_origin(hole) for hole in rings[1:]
         )
 
-    longitudes = [lon for _lat, lon in polygon.exterior]
-    # Within half a turn wide, the copy nearest the circle is the only one in
-    # reach of it; a wider zone may reach it from either neighbour too.
+    # A zone wider than half a turn may reach the circle from either
+    # neighbouring copy too.
     turns = (
         (0.0,)
         if max(longitudes) - min(longitudes) <= _HALF_TURN_DEG

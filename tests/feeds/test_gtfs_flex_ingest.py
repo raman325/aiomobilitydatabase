@@ -724,8 +724,6 @@ _RULE_COLUMNS: dict[str, st.SearchStrategy[Any]] = {
     "info_url": _TEXT_CELLS,
     "booking_url": _TEXT_CELLS,
 }
-# The model field each column loads into, where it is not the column name.
-_RULE_FIELDS: dict[str, str] = {}
 
 
 def _csv(columns: list[str], rows: list[dict[str, str]]) -> str:
@@ -748,11 +746,11 @@ def _booking_rules_files(draw: st.DrawFn) -> tuple[str, list[BookingRule]]:
         rule_id = draw(st.one_of(_IDS, st.just("")))
         row = {"booking_rule_id": rule_id}
         values: dict[str, Any] = dict.fromkeys(
-            (_RULE_FIELDS.get(column, column) for column in _RULE_COLUMNS), None
+            (column for column in _RULE_COLUMNS), None
         )
         for column in present:
             row[column], value = draw(_RULE_COLUMNS[column])
-            values[_RULE_FIELDS.get(column, column)] = value
+            values[column] = value
         rows.append(row)
         if rule_id:
             expected[rule_id] = BookingRule(id=rule_id, **values)

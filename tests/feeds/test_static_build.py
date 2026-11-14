@@ -766,6 +766,7 @@ def test_schema_fingerprint_matches_version(tmp_path: Path) -> None:
                 "bikes_allowed",
                 "block_id",
                 "direction_id",
+                "exact_times",
                 "first_secs",
                 "headsign",
                 "id",

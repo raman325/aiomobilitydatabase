@@ -1118,6 +1118,14 @@ class OnDemandService:
     dataset lacks it: an id without its record is a reference the feed
     could not resolve, not an absence. A row naming two places (which the
     spec forbids) keeps both.
+
+    ``exact_times`` says whether the windows are as stated: True on a plain
+    trip and on a repetition of a frequencies.txt trip with
+    ``exact_times=1``; False on a repetition of a headway-based one
+    (``exact_times=0``, service that "does not follow a fixed schedule"),
+    whose windows move with an approximate start, like
+    :attr:`StopArrival.timepoint_exact`; None where frequencies.txt's
+    exact_times is unparseable.
     """
 
     trip_id: str
@@ -1142,6 +1150,7 @@ class OnDemandService:
     drop_off_booking_rule_id: str | None
     drop_off_booking_rule: BookingRule | None
     wheelchair_accessible: WheelchairAccess | None
+    exact_times: bool | None
 
 
 @dataclass(frozen=True)

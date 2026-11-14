@@ -101,6 +101,7 @@ from .static_index import (
     TripCall,
     TripInstanceCalls,
     TripSummary,
+    gtfs_time_offset,
     repetition_trip_id,
 )
 
@@ -1550,11 +1551,6 @@ class _FlexRecords:
             tuple(index.location_groups()),
             tuple(index.booking_rules()),
         )
-
-
-def _seconds(secs: int | None) -> timedelta | None:
-    """Return a stored GTFS time (seconds into its day) as a timedelta."""
-    return None if secs is None else timedelta(seconds=secs)
 
 
 def _serialized[T](lock: threading.Lock, call: Callable[[], T]) -> T:
@@ -3835,8 +3831,8 @@ class TransitFeedHandle:
                 headsign=row.headsign,
                 stop_headsign=row.stop_headsign,
                 stop_sequence=row.stop_sequence,
-                start_pickup_drop_off_window=_seconds(row.start_window_secs),
-                end_pickup_drop_off_window=_seconds(row.end_window_secs),
+                start_pickup_drop_off_window=gtfs_time_offset(row.start_window_secs),
+                end_pickup_drop_off_window=gtfs_time_offset(row.end_window_secs),
                 location_id=row.location_id,
                 location=by_location.get(row.location_id or ""),
                 location_group_id=row.location_group_id,
@@ -3850,6 +3846,7 @@ class TransitFeedHandle:
                 drop_off_booking_rule_id=row.drop_off_booking_rule_id,
                 drop_off_booking_rule=rules.get(row.drop_off_booking_rule_id or ""),
                 wheelchair_accessible=row.wheelchair_accessible,
+                exact_times=row.exact_times,
             )
             for row in rows
             if wanted is None or row.route_id in wanted

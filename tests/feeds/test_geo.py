@@ -743,6 +743,39 @@ _HOLED = FlexPolygon(
             id="the same band from another start vertex",
         ),
         pytest.param(
+            FlexPolygon(
+                exterior=((0, 179.5), (0, -179.5), (1, -179.5), (1, 179.5), (0, 179.5)),
+                holes=(),
+            ),
+            Circle(0.5, -179.9, 50_000.0),
+            True,
+            id="an unsplit band reaching the circle from the copy a turn east",
+        ),
+        pytest.param(
+            FlexPolygon(
+                exterior=(
+                    (0, -179.5),
+                    (1, -179.5),
+                    (1, 179.5),
+                    (0, 179.5),
+                    (0, -179.5),
+                ),
+                holes=(),
+            ),
+            Circle(0.5, -179.9, 50_000.0),
+            True,
+            id="the same band from another start vertex, east copy",
+        ),
+        pytest.param(
+            FlexPolygon(
+                exterior=((0, 0), (0, 179.9), (1, 179.9), (1, 0), (0, 0)),
+                holes=(),
+            ),
+            Circle(0.5, -179.95, 20_000.0),
+            True,
+            id="a zone nearly half a turn wide, its far edge across the antimeridian",
+        ),
+        pytest.param(
             _square(80.0, 10.0, 100),
             _at(80.0, 10.0, 150, 0, 51),
             True,
@@ -957,3 +990,45 @@ def test_the_answer_ignores_the_start_vertex_and_winding(
     reference = FlexPolygon(exterior=(*body, body[0]), holes=())
     answers.add(polygon_overlaps_circle(reference, zone))
     assert len(answers) == 1
+
+
+def _rectangle_reach(
+    south: float, north: float, west: float, east: float, zone: Circle
+) -> bool:
+    """Whether a longitude/latitude rectangle meets a circle, in the scaled
+    plane, over every copy of it within two turns: axis-aligned there, its
+    distance from the centre is a clamp per axis."""
+    scale = _M_PER_DEG * math.cos(math.radians(zone.latitude))
+    dy = max(south - zone.latitude, 0.0, zone.latitude - north) * _M_PER_DEG
+    return any(
+        math.hypot(
+            max(west + turn - zone.longitude, 0.0, zone.longitude - east - turn)
+            * scale,
+            dy,
+        )
+        <= zone.radius_m
+        for turn in (-720.0, -360.0, 0.0, 360.0, 720.0)
+    )
+
+
+@given(
+    west=st.floats(-180, 10),
+    span=st.floats(170, 359),
+    corner=st.integers(0, 3),
+    circle=st.tuples(st.floats(-0.5, 1.5), st.floats(-180, 180), st.floats(0, 100_000)),
+)
+def test_a_wide_zone_answers_as_its_nearest_copy_from_every_start(
+    west: float, span: float, corner: int, circle: tuple[float, float, float]
+) -> None:
+    """Zones 170 to 359 degrees wide, around the antimeridian: from any
+    start corner, the answer is whether any copy a turn or two away
+    reaches the circle (computed independently, by clamping)."""
+    east = west + span
+    assume(east <= 180)
+    corners = [(0.0, west), (0.0, east), (1.0, east), (1.0, west)]
+    rotated = corners[corner:] + corners[:corner]
+    polygon = FlexPolygon(exterior=(*rotated, rotated[0]), holes=())
+    zone = Circle(*circle)
+    assert polygon_overlaps_circle(polygon, zone) is _rectangle_reach(
+        0.0, 1.0, west, east, zone
+    )

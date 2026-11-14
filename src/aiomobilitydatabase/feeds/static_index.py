@@ -98,7 +98,11 @@ CREATE TABLE trips (
     -- An exact_times=0 repetition's headway: the slot of starts
     -- [start_secs, start_secs + slot_secs) a realtime run of the trip may
     -- take in its place. NULL for every trip that keeps exact times.
-    slot_secs INTEGER
+    slot_secs INTEGER,
+    -- A repetition's frequencies.txt exact_times: 1 fixed times, 0 a
+    -- headway that "does not follow a fixed schedule", NULL unparseable.
+    -- NULL on every plain trip (start_secs NULL), whose times are as stated.
+    exact_times INTEGER
 );
 -- GTFS-RT's alternative trip matching names a trip by route, direction and
 -- first departure.
@@ -645,7 +649,7 @@ def _lenient_time(value: str | None) -> int | None:
         return None
 
 
-def _offset(secs: int | None) -> timedelta | None:
+def gtfs_time_offset(secs: int | None) -> timedelta | None:
     """Return a stored GTFS time (seconds into its day) as a timedelta."""
     return None if secs is None else timedelta(seconds=secs)
 
@@ -814,6 +818,7 @@ class OnDemandRow(NamedTuple):
     pickup_booking_rule_id: str | None
     drop_off_booking_rule_id: str | None
     wheelchair_accessible: WheelchairAccess | None
+    exact_times: bool | None
 
 
 @dataclass(frozen=True)
@@ -1396,7 +1401,9 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)"
+        sql = (
+            "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)"
+        )
         for row in reader:
             rows.append(
                 (
@@ -1548,10 +1555,10 @@ class StaticIndex:
             "INSERT OR REPLACE INTO trips "
             "(id, route_id, service_id, headsign, source_trip_id, start_secs, "
             "wheelchair_accessible, bikes_allowed, direction_id, "
-            "short_name, block_id, slot_secs) "
+            "short_name, block_id, slot_secs, exact_times) "
             "SELECT ?, route_id, service_id, headsign, ?, ?, "
             "wheelchair_accessible, bikes_allowed, direction_id, "
-            "short_name, block_id, ? "
+            "short_name, block_id, ?, ? "
             "FROM trips WHERE id = ?"
         )
         stop_times_sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
@@ -1599,6 +1606,7 @@ class StaticIndex:
                         trip_id,
                         rep_start,
                         headway_secs if exact_times == 0 else None,
+                        exact_times,
                         trip_id,
                     )
                 )
@@ -2054,9 +2062,9 @@ class StaticIndex:
                 prior_notice_duration_min=row[2],
                 prior_notice_duration_max=row[3],
                 prior_notice_last_day=row[4],
-                prior_notice_last_time=_offset(row[5]),
+                prior_notice_last_time=gtfs_time_offset(row[5]),
                 prior_notice_start_day=row[6],
-                prior_notice_start_time=_offset(row[7]),
+                prior_notice_start_time=gtfs_time_offset(row[7]),
                 prior_notice_service_id=row[8],
                 message=row[9],
                 pickup_message=row[10],
@@ -2499,13 +2507,16 @@ class StaticIndex:
                     pickup_rule,
                     drop_off_rule,
                     wheelchair,
+                    start_secs,
+                    exact_times,
                 ) in self._conn.execute(
                     "SELECT f.rowid, f.trip_id, t.route_id, t.service_id, "
                     "t.headsign, f.stop_headsign, f.stop_sequence, "
                     "f.start_window_secs, f.end_window_secs, f.location_id, "
                     "f.location_group_id, f.stop_id, f.pickup_type, "
                     "f.drop_off_type, f.pickup_booking_rule_id, "
-                    "f.drop_off_booking_rule_id, t.wheelchair_accessible "
+                    "f.drop_off_booking_rule_id, t.wheelchair_accessible, "
+                    "t.start_secs, t.exact_times "
                     "FROM flex_stop_times f JOIN trips t ON t.id = f.trip_id "
                     f"WHERE f.{column} IN ({','.join('?' * len(chunk))})",
                     chunk,
@@ -2528,6 +2539,13 @@ class StaticIndex:
                         drop_off_booking_rule_id=drop_off_rule,
                         wheelchair_accessible=_enum_or_none(
                             WheelchairAccess, wheelchair
+                        ),
+                        # A plain trip's times are as stated; a repetition's
+                        # as exact as its frequencies.txt row says.
+                        exact_times=(
+                            True
+                            if start_secs is None
+                            else {0: False, 1: True}.get(exact_times)
                         ),
                     )
         return list(found.values())
