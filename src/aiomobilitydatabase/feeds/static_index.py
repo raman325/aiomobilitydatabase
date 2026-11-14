@@ -103,7 +103,8 @@ CREATE TABLE trips (
     -- repetition whose frequencies.txt row says exact_times=1; 0 on a
     -- headway repetition ("does not follow a fixed schedule"); NULL where
     -- exact_times is unparseable, and on a frequencies.txt trip the loader
-    -- cannot repeat (Flex calls only), whose times are only relative.
+    -- cannot repeat (no timed call: Flex calls alone, or none), whose
+    -- windows are the template's, no run's -- read as unknown.
     exact_times INTEGER
 );
 -- GTFS-RT's alternative trip matching names a trip by route, direction and

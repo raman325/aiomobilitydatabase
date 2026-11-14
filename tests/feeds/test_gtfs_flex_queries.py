@@ -322,19 +322,23 @@ def test_windows_are_exact_as_frequencies_txt_says(tmp_path: Path) -> None:
             + "".join(rows.format(t=trip) for trip in ("P", "E", "H", "G")),
             frequencies="trip_id,start_time,end_time,headway_secs,exact_times\n"
             "E,08:00:00,08:01:00,600,1\nH,08:00:00,08:01:00,600,0\n"
-            "G,08:00:00,08:01:00,600,x\n",
+            "G,10:00:00,10:01:00,600,x\n",
         )
     )
     services = _services(_build(tmp_path, feed), Circle(0.0, 0.0, 10.0))
     assert [(s.trip_id, s.exact_times) for s in services] == [
         ("E#28800", True),
-        ("G#28800", None),
+        ("G#36000", None),
         ("H#28800", False),
         ("P", True),
     ]
-    # Unknown exactness on a repetition is not an unknown window: G's run
-    # still has its (shifted) window.
-    assert all(s.start_pickup_drop_off_window is not None for s in services)
+    # Unknown exactness on a repetition is not an unknown window: G's run,
+    # two hours after its template, keeps its window moved with it.
+    unknown = services[1]
+    assert (
+        unknown.start_pickup_drop_off_window,
+        unknown.end_pickup_drop_off_window,
+    ) == (timedelta(hours=10, minutes=5), timedelta(hours=11))
 
 
 def test_a_zone_reaching_only_a_later_part_of_a_multipolygon(tmp_path: Path) -> None:
@@ -392,3 +396,26 @@ def test_a_frequency_trip_of_flex_calls_alone_has_unknown_exactness(
         service.start_pickup_drop_off_window,
         service.end_pickup_drop_off_window,
     ) == ("T", None, None, None)
+
+
+def test_a_repetition_at_the_service_day_start_keeps_its_windows(
+    tmp_path: Path,
+) -> None:
+    """A repetition starting at 00:00:00 has start 0 -- a start, not a
+    missing one: its windows stand."""
+    feed = _with_zone(
+        _feed(
+            stop_times=_WINDOWS
+            + "T,08:00:00,08:00:00,S0,,,,1,,,\n"
+            + "T,,,,Z,08:05:00,09:00:00,2,2,2,\n",
+            frequencies="trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T,00:00:00,00:01:00,600,1\n",
+        )
+    )
+    [service] = _services(_build(tmp_path, feed), Circle(0.0, 0.0, 10.0))
+    assert (
+        service.trip_id,
+        service.exact_times,
+        service.start_pickup_drop_off_window,
+        service.end_pickup_drop_off_window,
+    ) == ("T#0", True, timedelta(minutes=5), timedelta(hours=1))
