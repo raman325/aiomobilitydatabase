@@ -99,9 +99,11 @@ CREATE TABLE trips (
     -- [start_secs, start_secs + slot_secs) a realtime run of the trip may
     -- take in its place. NULL for every trip that keeps exact times.
     slot_secs INTEGER,
-    -- A repetition's frequencies.txt exact_times: 1 fixed times, 0 a
-    -- headway that "does not follow a fixed schedule", NULL unparseable.
-    -- NULL on every plain trip (start_secs NULL), whose times are as stated.
+    -- Whether the trip's times are as stated: 1 on a plain trip and on a
+    -- repetition whose frequencies.txt row says exact_times=1; 0 on a
+    -- headway repetition ("does not follow a fixed schedule"); NULL where
+    -- exact_times is unparseable, and on a frequencies.txt trip the loader
+    -- cannot repeat (Flex calls only), whose times are only relative.
     exact_times INTEGER
 );
 -- GTFS-RT's alternative trip matching names a trip by route, direction and
@@ -1401,9 +1403,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = (
-            "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)"
-        )
+        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,1)"
         for row in reader:
             rows.append(
                 (
@@ -1573,7 +1573,13 @@ class StaticIndex:
                 (trip_id,),
             ).fetchall()
             if not template:
-                continue  # dangling, or Flex calls alone: nothing to anchor
+                # Dangling, or Flex calls alone: nothing to anchor, so kept
+                # as one trip -- whose times frequencies.txt says repeat,
+                # neither exact nor approximate instants: unknown.
+                conn.execute(
+                    "UPDATE trips SET exact_times = NULL WHERE id = ?", (trip_id,)
+                )
+                continue
             flex_template = conn.execute(
                 "SELECT * FROM flex_stop_times WHERE trip_id = ? "
                 "ORDER BY stop_sequence",
@@ -2507,7 +2513,6 @@ class StaticIndex:
                     pickup_rule,
                     drop_off_rule,
                     wheelchair,
-                    start_secs,
                     exact_times,
                 ) in self._conn.execute(
                     "SELECT f.rowid, f.trip_id, t.route_id, t.service_id, "
@@ -2516,7 +2521,7 @@ class StaticIndex:
                     "f.location_group_id, f.stop_id, f.pickup_type, "
                     "f.drop_off_type, f.pickup_booking_rule_id, "
                     "f.drop_off_booking_rule_id, t.wheelchair_accessible, "
-                    "t.start_secs, t.exact_times "
+                    "t.exact_times "
                     "FROM flex_stop_times f JOIN trips t ON t.id = f.trip_id "
                     f"WHERE f.{column} IN ({','.join('?' * len(chunk))})",
                     chunk,
@@ -2540,13 +2545,7 @@ class StaticIndex:
                         wheelchair_accessible=_enum_or_none(
                             WheelchairAccess, wheelchair
                         ),
-                        # A plain trip's times are as stated; a repetition's
-                        # as exact as its frequencies.txt row says.
-                        exact_times=(
-                            True
-                            if start_secs is None
-                            else {0: False, 1: True}.get(exact_times)
-                        ),
+                        exact_times={0: False, 1: True}.get(exact_times),
                     )
         return list(found.values())
 

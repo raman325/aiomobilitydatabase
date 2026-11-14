@@ -367,3 +367,19 @@ def test_a_zone_reaching_only_a_later_part_of_a_multipolygon(tmp_path: Path) -> 
         return [location.id for location in handle.locations_in(Circle(0.0, 0.0, 10.0))]
 
     assert _run(_build(tmp_path, feed), body) == ["M"]
+
+
+def test_a_frequency_trip_of_flex_calls_alone_has_unknown_exactness(
+    tmp_path: Path,
+) -> None:
+    """With no timed call to repeat from, it stays one trip whose windows
+    are only the template's: neither exact nor approximate instants."""
+    feed = _with_zone(
+        _feed(
+            stop_times=_WINDOWS + "T,,,,Z,08:05:00,09:00:00,2,2,2,\n",
+            frequencies="trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T,06:00:00,10:00:00,600,0\n",
+        )
+    )
+    [service] = _services(_build(tmp_path, feed), Circle(0.0, 0.0, 10.0))
+    assert (service.trip_id, service.exact_times) == ("T", None)

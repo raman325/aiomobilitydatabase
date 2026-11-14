@@ -1125,7 +1125,9 @@ class OnDemandService:
     (``exact_times=0``, service that "does not follow a fixed schedule"),
     whose windows move with an approximate start, like
     :attr:`StopArrival.timepoint_exact`; None where frequencies.txt's
-    exact_times is unparseable.
+    exact_times is unparseable, or on a frequencies.txt trip of Flex calls
+    alone (no timed call to repeat from: its windows are only the
+    template's, not instants of any one run).
     """
 
     trip_id: str

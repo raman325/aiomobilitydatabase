@@ -118,9 +118,10 @@ def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
 
     The polygon is moved whole by multiples of 360 degrees of longitude,
     so a zone just across the antimeridian is found without bending any
-    edge: each copy within a turn of the circle is tested (one is not
-    enough for a zone over 180 degrees wide, such as one crossing the
-    antimeridian unsplit, which RFC 7946 reads as spanning the long way).
+    edge: the copy whose middle is nearest the circle is tested, and for a
+    zone over 180 degrees wide (such as one crossing the antimeridian
+    unsplit, which RFC 7946 reads as spanning the long way) its neighbours
+    a turn either way too.
 
     Meant for circles of up to a few hundred kilometres that do not reach a
     pole, like :func:`in_circle`; beyond that the plane bends too far from
