@@ -209,11 +209,16 @@ def _bucket_pairs(
     origin: _IntPoint,
     size: int,
     limit: int | None,
+    *,
+    seen: set[tuple[int, int]] | None = None,
 ) -> Iterator[tuple[int, int]]:
     """Yield pairs of ``members`` sharing a cell of this grid (or a sub-cell).
 
     A crowded cell is re-bucketed on a finer grid clipped to the cell; two
     edges meeting in the cell meet in the sub-cell holding that point.
+    Within one crowded cell, a pair is yielded once however many of its
+    sub-cells it shares (nearly parallel edges share hundreds): ``seen``
+    holds that cell's pairs only.
     """
     buckets: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
     for index in members:
@@ -229,11 +234,17 @@ def _bucket_pairs(
                 (origin[0] + column * size, origin[1] + row * size),
                 sub,
                 -(-size // sub),
+                seen=set() if seen is None else seen,
             )
             continue
         for n, first in enumerate(inside):
             for second in inside[n + 1 :]:
-                yield (first, second) if first < second else (second, first)
+                pair = (first, second) if first < second else (second, first)
+                if seen is not None:
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                yield pair
 
 
 def _candidate_pairs(edges: list[_Edge]) -> Iterator[tuple[int, int]]:
@@ -326,14 +337,16 @@ def _holes_overlap(holes: list[list[_IntPoint]]) -> bool:
     if no arc of either lies inside the other, their interiors are apart.
     """
     boxes = [_box(hole) for hole in holes]
+    corners = [set(hole) for hole in holes]
     active: list[int] = []
     for h in sorted(range(len(holes)), key=lambda k: boxes[k][0]):
         active = [g for g in active if boxes[g][2] >= boxes[h][0]]
         for g in active:
             if boxes[g][3] < boxes[h][1] or boxes[h][3] < boxes[g][1]:
                 continue
-            for inner, outer in ((holes[h], holes[g]), (holes[g], holes[h])):
-                if 1 in _positions(_arc_points(inner, set(outer)), outer):
+            for inner, outer in ((h, g), (g, h)):
+                shared = corners[inner] & corners[outer]
+                if 1 in _positions(_arc_points(holes[inner], shared), holes[outer]):
                     return True
         active.append(h)
     return False

@@ -574,23 +574,30 @@ def test_fine_detail_in_a_coarse_zone_stays_near_linear() -> None:
     assert polygon_is_valid([ring])
 
 
+_WIDE = st.tuples(st.integers(0, 300), st.integers(0, 300))
+
+
 @given(
     segments=st.lists(
-        st.tuples(_SMALL, _SMALL).filter(lambda ab: ab[0] != ab[1]),
+        st.one_of(st.tuples(_SMALL, _SMALL), st.tuples(_WIDE, _WIDE)).filter(
+            lambda ab: ab[0] != ab[1]
+        ),
         min_size=2,
         max_size=30,
-    )
+    ),
+    split=st.sampled_from([2, 3, 8]),
 )
-@settings(max_examples=200)
+@settings(max_examples=300)
 def test_split_cells_never_lose_a_touching_pair(
-    segments: list[tuple[tuple[int, int], tuple[int, int]]],
+    segments: list[tuple[tuple[int, int], tuple[int, int]]], split: int
 ) -> None:
-    """With every cell of more than two edges split finer, still every
+    """With every cell of more than two edges split finer (in halves,
+    thirds or eighths, so sub-cells overhang their parent), still every
     pair of segments that meet is a candidate."""
     [points] = _exact_rings([[point for segment in segments for point in segment]])
     exact = list(zip(points[::2], points[1::2], strict=True))
     edges = [(0, i, a, b) for i, (a, b) in enumerate(exact)]
-    with patch.object(geo, "_CROWDED", 2):
+    with patch.object(geo, "_CROWDED", 2), patch.object(geo, "_SUBDIVISION", split):
         candidates = set(_candidate_pairs(edges))
     for i in range(len(exact)):
         for j in range(i + 1, len(exact)):
