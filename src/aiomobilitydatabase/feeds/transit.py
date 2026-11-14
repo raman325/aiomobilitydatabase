@@ -3340,14 +3340,9 @@ class TransitFeedHandle:
     async def get_alerts(self) -> list[ServiceAlert]:
         """Service alerts across the feed's SA-capable RT sources.
 
-        Alert scoping contract: each alert carries EVERY selector an
-        informed entity named -- agency ids, route ids, route types,
-        direction ids, stop ids, and trip ids. An alert is unscoped
-        ("applies everywhere") ONLY when all six are empty, so an alert
-        naming just an agency, or just a mode, is scoped to that rather
-        than feed-wide. Alert trip references keep the producer's
-        PLAIN trip ids (like vehicles): a display-only association with
-        no per-repetition matching for frequency-based trips.
+        Each alert keeps its selectors as sent (see
+        :class:`~.models.ServiceAlert`): :meth:`ServiceAlert.applies_to`
+        says what it applies to, trip ids being the producer's plain ones.
         """
         messages = await self._fetch_entity_messages(EntityType.SERVICE_ALERTS)
         alerts: list[ServiceAlert] = []

@@ -26,12 +26,14 @@ from .models import (
     BikesAllowed,
     CarriageDetail,
     CongestionLevel,
+    EntitySelector,
     OccupancyStatus,
     PickupDropOffType,
     Route,
     ServiceAlert,
     Stop,
     StopLocationType,
+    TripSelector,
     VehiclePosition,
     VehicleStopStatus,
     WheelchairAccess,
@@ -1380,52 +1382,120 @@ def trip_updates_from_message(message: gtfs_realtime_pb2.FeedMessage) -> TripUpd
     return indexed_trip_updates(trip_update_records(message))
 
 
+# GTFS-RT's "default UI language (e.g., English)"; the library has no UI
+# language of its own, so English is both (as GBFS_LANGUAGE_PREFERENCE).
+_PREFERRED_LANGUAGE = "en"
+
+
 def _first_translation(translated: object) -> str | None:
-    translations = getattr(translated, "translation", None)
-    if not translations:
-        return None
-    for candidate in translations:
-        if candidate.language == "en":
+    """Return a TranslatedString's text in the language the spec picks.
+
+    The spec: the UI language's translation, else the default UI
+    language's (English), else "If some translation has an unspecified
+    language code, that translation is picked". English stands for both
+    languages here, matched by its BCP 47 primary subtag ("en-US" is
+    English). A translation without text is no translation. Where none
+    of those exist, the first translation with text: some text over none,
+    as for GBFS. None when there is none.
+    """
+    usable = [
+        candidate
+        for candidate in getattr(translated, "translation", ())
+        if candidate.text
+    ]
+    for candidate in usable:
+        if candidate.language.split("-")[0].casefold() == _PREFERRED_LANGUAGE:
             return str(candidate.text)
-    return str(translations[0].text)
+    for candidate in usable:
+        if not candidate.language:
+            return str(candidate.text)
+    return str(usable[0].text) if usable else None
+
+
+def _period_start(period: gtfs_realtime_pb2.TimeRange) -> datetime | None:
+    """Return a TimeRange's start: None (minus infinity) only when absent.
+
+    A present value is an instant, 0 the epoch; one past what a datetime
+    holds has not started yet, so it reads as the latest instant.
+    """
+    if not period.HasField("start"):
+        return None
+    try:
+        return datetime.fromtimestamp(period.start, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return datetime.max.replace(tzinfo=UTC)
+
+
+def _period_end(period: gtfs_realtime_pb2.TimeRange) -> datetime | None:
+    """Return a TimeRange's end: None (plus infinity) when absent or past datetime.
+
+    A present value is an instant, 0 the epoch; one past what a datetime
+    holds never comes, as plus infinity.
+    """
+    if not period.HasField("end"):
+        return None
+    try:
+        return datetime.fromtimestamp(period.end, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _trip_selector(trip: gtfs_realtime_pb2.TripDescriptor) -> TripSelector | None:
+    """Return the trip an EntitySelector names, or None where it cannot say.
+
+    A start date or time that is present but does not parse names a run
+    nobody can tell, so the selector names nothing readable.
+    """
+    start_date = _trip_start_date(trip)
+    start_secs = _trip_start_secs(trip)
+    if (trip.start_date and start_date is None) or (
+        trip.start_time and start_secs is None
+    ):
+        return None
+    return TripSelector(
+        trip_id=trip.trip_id or None,
+        route_id=trip.route_id or None,
+        direction_id=trip.direction_id if trip.HasField("direction_id") else None,
+        start_date=start_date,
+        start_secs=start_secs,
+    )
+
+
+def _entity_selectors(alert: gtfs_realtime_pb2.Alert) -> tuple[EntitySelector, ...]:
+    """Every informed_entity the alert names readably, in feed order.
+
+    route_type and direction_id have 0 as a meaningful value (tram, and
+    the feed's first direction), so presence is HasField.
+    """
+    selectors: list[EntitySelector] = []
+    for entity in alert.informed_entity:
+        trip = None
+        if entity.HasField("trip"):
+            trip = _trip_selector(entity.trip)
+            if trip is None:
+                continue
+        selectors.append(
+            EntitySelector(
+                agency_id=entity.agency_id or None,
+                route_id=entity.route_id or None,
+                route_type=entity.route_type if entity.HasField("route_type") else None,
+                direction_id=entity.direction_id
+                if entity.HasField("direction_id")
+                else None,
+                trip=trip,
+                stop_id=entity.stop_id or None,
+            )
+        )
+    return tuple(selectors)
 
 
 def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceAlert]:
-    """Extract service alerts with best-effort English text.
-
-    Scoping: EVERY selector an informed_entity can carry is collected --
-    agency_id, route_id, route_type, direction_id, stop_id and the trip
-    descriptor's trip_id -- so an alert is unscoped (feed-wide) only when
-    all of them are empty. Collecting a subset would make an alert scoped
-    by an uncollected selector (an agency, or a whole mode) read as
-    applying everywhere (see :class:`~.models.ServiceAlert`).
-    """
+    """Extract service alerts, each selector kept whole (see ServiceAlert)."""
     alerts: list[ServiceAlert] = []
     for entity in message.entity:
         if not entity.HasField("alert"):
             continue
         alert = entity.alert
-        agency_ids = sorted(
-            {ie.agency_id for ie in alert.informed_entity if ie.agency_id}
-        )
-        route_ids = sorted({ie.route_id for ie in alert.informed_entity if ie.route_id})
-        # route_type/direction_id have 0 as a meaningful value (tram,
-        # and the feed's first direction), so presence is HasField, not
-        # truthiness.
-        route_types = sorted(
-            {ie.route_type for ie in alert.informed_entity if ie.HasField("route_type")}
-        )
-        direction_ids = sorted(
-            {
-                ie.direction_id
-                for ie in alert.informed_entity
-                if ie.HasField("direction_id")
-            }
-        )
-        stop_ids = sorted({ie.stop_id for ie in alert.informed_entity if ie.stop_id})
-        trip_ids = sorted(
-            {ie.trip.trip_id for ie in alert.informed_entity if ie.trip.trip_id}
-        )
         alerts.append(
             ServiceAlert(
                 id=entity.id,
@@ -1433,46 +1503,29 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
                 description=_first_translation(alert.description_text),
                 tts_header=_first_translation(alert.tts_header_text),
                 tts_description=_first_translation(alert.tts_description_text),
+                # Unset reads as the declared default (proto2's getter):
+                # UNKNOWN_CAUSE, UNKNOWN_EFFECT, UNKNOWN_SEVERITY.
                 cause=_vocab_or_none(
                     AlertCause,
                     _pb_enum_name(gtfs_realtime_pb2.Alert.Cause, alert.cause),
-                )
-                if alert.HasField("cause")
-                else None,
+                ),
                 cause_detail=_first_translation(alert.cause_detail),
                 effect=_vocab_or_none(
                     AlertEffect,
                     _pb_enum_name(gtfs_realtime_pb2.Alert.Effect, alert.effect),
-                )
-                if alert.HasField("effect")
-                else None,
+                ),
                 effect_detail=_first_translation(alert.effect_detail),
-                severity=(
-                    _vocab_or_none(
-                        AlertSeverity,
-                        _pb_enum_name(
-                            gtfs_realtime_pb2.Alert.SeverityLevel,
-                            alert.severity_level,
-                        ),
-                    )
-                    if alert.HasField("severity_level")
-                    else None
+                severity=_vocab_or_none(
+                    AlertSeverity,
+                    _pb_enum_name(
+                        gtfs_realtime_pb2.Alert.SeverityLevel, alert.severity_level
+                    ),
                 ),
                 images=_alert_images(alert.image),
                 image_alternative_text=_first_translation(alert.image_alternative_text),
-                agency_ids=tuple(agency_ids),
-                route_ids=tuple(route_ids),
-                route_types=tuple(route_types),
-                direction_ids=tuple(direction_ids),
-                stop_ids=tuple(stop_ids),
-                trip_ids=tuple(trip_ids),
+                informed_entities=_entity_selectors(alert),
                 active_periods=tuple(
-                    (
-                        _epoch_to_utc(period.start)
-                        if period.HasField("start")
-                        else None,
-                        _epoch_to_utc(period.end) if period.HasField("end") else None,
-                    )
+                    (_period_start(period), _period_end(period))
                     for period in alert.active_period
                 ),
                 url=_first_translation(alert.url),

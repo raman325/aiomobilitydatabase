@@ -23,6 +23,7 @@ from aiomobilitydatabase.feeds.exceptions import (
 from aiomobilitydatabase.feeds.models import (
     AlertCause,
     AlertEffect,
+    AlertSeverity,
     CongestionLevel,
     OccupancyStatus,
     Route,
@@ -738,7 +739,8 @@ def test_alerts_from_message() -> None:
     assert alert.cause is AlertCause.CONSTRUCTION
     assert alert.cause == "CONSTRUCTION"
     assert alert.effect is AlertEffect.DETOUR
-    assert alert.severity is None  # fixture sets no severity_level
+    # The fixture sets no severity_level: its declared default.
+    assert alert.severity is AlertSeverity.UNKNOWN_SEVERITY
     assert alert.route_ids == ("R1",)
     assert alert.stop_ids == ("S1",)
     assert alert.trip_ids == ()  # fixture informs a route and a stop only
@@ -748,11 +750,8 @@ def test_alerts_from_message() -> None:
 
 
 def test_alerts_trip_scoped_not_agency_wide() -> None:
-    """The semantic fix: an alert whose informed entities carry ONLY trip
-    descriptors populates trip_ids -- so it is scoped (to those trips),
-    not mistaken for an unscoped agency-wide alert. Unscoped now means
-    route_ids, stop_ids, AND trip_ids all empty.
-    """
+    """An alert whose informed entities carry only trip descriptors applies
+    to those trips and nothing else."""
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(ALERTS_TRIP_SCOPED)
     (alert,) = alerts_from_message(msg)
@@ -761,6 +760,9 @@ def test_alerts_trip_scoped_not_agency_wide() -> None:
     assert alert.stop_ids == ()
     assert alert.trip_ids == ("T1", "T3")  # sorted, deduplicated
     assert alert.effect is AlertEffect.SIGNIFICANT_DELAYS
+    assert alert.applies_to(trip_id="T1")
+    assert not alert.applies_to(trip_id="T2")
+    assert not alert.applies_to(route_id="R1")
 
 
 def test_pb_enum_name_and_vocab_leniency() -> None:
