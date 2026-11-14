@@ -302,7 +302,9 @@ class TripModifications:
 
     trip_ids: list[str]
     service_dates: frozenset[date]  # never empty: the spec requires them
-    start_secs: frozenset[int]
+    # The start_times that parse; None where the entity lists none (every
+    # run of its trips), empty where none of those it lists parses (none).
+    start_secs: frozenset[int] | None
     modifications: list[Modification]
 
 
@@ -400,6 +402,11 @@ def trip_modifications_from_message(
                 ],
             )
             for modification in modifications.modifications
+            # A StopSelector's fields "cannot be both empty": an end selector
+            # sent empty names no end, and the modification no span.
+            if not modification.HasField("end_stop_selector")
+            or modification.end_stop_selector.HasField("stop_sequence")
+            or modification.end_stop_selector.stop_id
         ]
         if not parsed:
             continue
@@ -410,10 +417,16 @@ def trip_modifications_from_message(
         )
         if not dates:
             continue
-        starts = frozenset(
-            secs
-            for raw in modifications.start_times
-            if (secs := _lenient_start_secs(raw)) is not None
+        # A restriction that does not parse restricts to nothing: it is
+        # never widened to every run.
+        starts = (
+            frozenset(
+                secs
+                for raw in modifications.start_times
+                if (secs := _lenient_start_secs(raw)) is not None
+            )
+            if modifications.start_times
+            else None
         )
         for selected in modifications.selected_trips:
             if trip_ids := list(selected.trip_ids):
@@ -695,16 +708,17 @@ class RealtimeTrip:
     # The key realtime names the run by, where it differs from ``replaces``
     # (an exact_times=0 run's own start): its vehicle names it so.
     run: TripUpdateKey | None = None
-    # A DUPLICATED copy's trip descriptors, its original's (a short name
-    # also from TripProperties, for any extra trip); unknown (None)
-    # otherwise. No realtime-only trip has a block: a block is a vehicle's
-    # sequence of scheduled trips.
+    # A copy's or a schedule run's trip descriptors (a short name also from
+    # TripProperties, for any extra trip); unknown (None) otherwise.
     wheelchair_accessible: WheelchairAccess | None = None
     bikes_allowed: BikesAllowed | None = None
     trip_short_name: str | None = None
-    # An exact_times=0 run's trip's service: it runs on that service's day.
-    # None for any other realtime-only trip, which no calendar runs.
+    # A run the calendar runs (a detoured run, an exact_times=0 run): its
+    # trip's service; None for any other realtime-only trip.
     service_id: str | None = None
+    # A detoured scheduled run's block: it is still that run, in its
+    # vehicle's sequence of trips. No other realtime-only trip has one.
+    block_id: str | None = None
 
 
 @dataclass(frozen=True)

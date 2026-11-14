@@ -18,15 +18,22 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase import EntityType
-from aiomobilitydatabase.feeds.models import ArrivalsQuery, StopArrival, TripQuery
+from aiomobilitydatabase.feeds.models import (
+    ArrivalsQuery,
+    PickupDropOffType,
+    StopArrival,
+    TripQuery,
+)
 from aiomobilitydatabase.feeds.rt import (
+    Modification,
+    ReplacementCall,
     TripStopUpdate,
     TripUpdateEntry,
     resolve_trip_predictions,
     trip_updates_from_message,
 )
-from aiomobilitydatabase.feeds.static_index import TripCall
-from aiomobilitydatabase.feeds.transit import TransitFeedHandle
+from aiomobilitydatabase.feeds.static_index import TripCall, TripInstanceCalls
+from aiomobilitydatabase.feeds.transit import TransitFeedHandle, _modified_calls
 
 from tests.feeds.test_gtfs_schedule_conformance import _feed
 from tests.feeds.test_properties import _build_index_from_files
@@ -2529,10 +2536,11 @@ def test_a_frequency_based_run_keeps_its_service_and_states_no_delay() -> None:
 def test_a_frequency_based_run_is_detoured_as_its_repetition_would_be() -> None:
     """TripModifications apply to the runs they select: a detour of T on
     the day, listing no start_times, reroutes a run at any start -- S1
-    replaced by S2 ten minutes after S0 -- shown as a detoured scheduled
-    run is: its rebuilt schedule, with no prediction. The stop_sequences
-    start at 0, where a detour's replacement calls are numbered 1, 2, ...
-    like the trip's own."""
+    replaced by S2 ten minutes after S0. "TripUpdates for the original
+    trip_id will apply to the modified trip" at the stops it keeps, but
+    "no ETA would be available at the replacement stops". The
+    stop_sequences start at 0, where a detour's replacement calls are
+    numbered 1, 2, ... like the trip's own."""
     files = {
         **_THREE_STOPS,
         "stop_times.txt": (
@@ -2565,9 +2573,9 @@ def test_a_frequency_based_run_is_detoured_as_its_repetition_would_be() -> None:
     entity.trip_modifications.service_dates.append("20260730")
     board, _ = _run_feeds(files, _boards_and_journeys(), [message])
     assert [row for row in board if row[0] in {"T#29400", "T#29520"}] == [
-        ("T#29520", "S0", _at(12), None, None, False),
+        ("T#29520", "S0", _at(12), None, _at(14), False),
         ("T#29520", "S2", _at(22), None, None, False),
-        ("T#29520", "S2", _at(32), None, None, False),
+        ("T#29520", "S2", _at(32), None, _at(36), False),
     ]
 
 
@@ -2685,9 +2693,9 @@ def test_a_run_at_a_stop_only_realtime_defines_carries_that_stop() -> None:
 
 def test_a_detour_naming_start_times_selects_runs_by_their_own_start() -> None:
     """A detour listing start_times selects "the start times in the
-    real-time trip descriptor": one naming 08:12 rebuilds the 08:12 run
-    (no prediction); one naming only the slot's 08:10 start leaves the
-    08:12 run in that slot as its update predicts it."""
+    real-time trip descriptor": one naming 08:12 rebuilds the 08:12 run;
+    one naming only the slot's 08:10 start leaves the 08:12 run in that
+    slot as scheduled. Its update predicts it either way."""
     files = {
         **_THREE_STOPS,
         "frequencies.txt": (
@@ -2695,7 +2703,7 @@ def test_a_detour_naming_start_times_selects_runs_by_their_own_start() -> None:
         ),
     }
     for start_time, s0 in (
-        ("08:12:00", ("T#29520", "S0", _at(12), None, None, False)),
+        ("08:12:00", ("T#29520", "S0", _at(12), None, _at(13), False)),
         ("08:10:00", ("T#29520", "S0", _at(12), None, _at(13), False)),
     ):
         message = _descriptor_message(
@@ -2708,3 +2716,290 @@ def test_a_detour_naming_start_times_selects_runs_by_their_own_start() -> None:
         assert rows[0] == s0
         # Rebuilt, the run calls at S2 in S1's place; otherwise it keeps S1.
         assert ("S1" in {row[1] for row in rows}) is (start_time == "08:10:00")
+
+
+# T calls at S0 08:00, S1 08:10, S2 08:20; S3 is served by no trip.
+_DETOURABLE = {
+    **_THREE_STOPS,
+    "stops.txt": (
+        "stop_id,stop_name,stop_lat,stop_lon\nS0,A,0,0\nS1,B,0,0\nS2,C,0,0\nS3,D,0,0\n"
+    ),
+}
+
+
+def _detour(
+    message: gtfs_realtime_pb2.FeedMessage,
+    *,
+    start: int,
+    end: int | None = None,
+    replacements: Sequence[tuple[str, int]] = (),
+    delay: int = 0,
+    start_times: Sequence[str] = (),
+) -> None:
+    """Add a detour of T on 2026-07-30 from stop_sequence ``start`` (to
+    ``end``, if any): ``replacements`` as (stop, travel time) pairs."""
+    entity = message.entity.add()
+    entity.id = f"detour-{len(message.entity)}"
+    modifications = entity.trip_modifications
+    modification = modifications.modifications.add()
+    modification.start_stop_selector.stop_sequence = start
+    if end is not None:
+        modification.end_stop_selector.stop_sequence = end
+    modification.propagated_modification_delay = delay
+    for stop_id, travel in replacements:
+        replacement = modification.replacement_stops.add()
+        replacement.stop_id = stop_id
+        replacement.travel_time_to_stop = travel
+    modifications.selected_trips.add().trip_ids.append("T")
+    modifications.service_dates.append("20260730")
+    modifications.start_times.extend(start_times)
+
+
+def _detoured_board(
+    message: gtfs_realtime_pb2.FeedMessage,
+) -> list[tuple[object, ...]]:
+    async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
+        [board] = await handle.get_arrivals(
+            [ArrivalsQuery(["S0", "S1", "S2", "S3"], limit=None)],
+            start=_EIGHT - timedelta(minutes=30),
+            end=_EIGHT + timedelta(hours=2),
+        )
+        return [
+            (
+                r.stop_id,
+                r.scheduled_departure,
+                r.predicted_departure,
+                r.delay_seconds,
+                r.pickup_type,
+                r.timepoint_exact,
+            )
+            for r in board
+        ]
+
+    return _run_feeds(_DETOURABLE, body, [message])
+
+
+def test_a_detoured_run_keeps_its_trips_updates_at_the_stops_it_keeps() -> None:
+    """ "TripUpdates for the original trip_id will apply to the modified
+    trip", resolved against "the static GTFS before any TripModifications
+    applied": S0's time (two minutes late) predicts S0 and carries on to S2.
+    "No ETA would be available at the replacement stops": S3, in S1's
+    place, is scheduled only -- with stop_times' defaults (regular pickup,
+    exact times). S2's schedule moved by the detour's five minutes, so the
+    delay against its old one is not reported there."""
+    message = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "stops": [{"stop": "S0", "departure": _at(2)}],
+        }
+    )
+    _detour(message, start=2, end=2, replacements=[("S3", 300)], delay=300)
+    regular = PickupDropOffType.REGULAR
+    assert _detoured_board(message) == [
+        ("S0", _EIGHT, _at(2), 120, regular, True),
+        ("S3", _at(5), None, None, regular, True),
+        ("S2", _at(25), _at(22), None, regular, True),
+    ]
+
+
+def test_a_detoured_run_skips_and_cancels_as_its_trip() -> None:
+    """A SKIPPED stop the detour kept is not served; a cancelled run is
+    shown cancelled at its schedule, never rebuilt."""
+    skipped = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "stops": [{"stop": "S2", "skipped": True}],
+        }
+    )
+    _detour(skipped, start=2, end=2, replacements=[("S3", 300)])
+    assert [row[0] for row in _detoured_board(skipped)] == ["S0", "S3"]
+    canceled = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.CANCELED,
+        }
+    )
+    _detour(canceled, start=2, end=2, replacements=[("S3", 300)])
+    assert [row[0] for row in _detoured_board(canceled)] == ["S0", "S1", "S2"]
+
+
+def test_journeys_follow_a_detour() -> None:
+    """ "The consumer should behave as if the static GTFS would have been
+    modified with the TripModifications": a journey to the stop the detour
+    leaves out is gone, and one to its replacement stop appears, predicted
+    as boards are."""
+    message = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "stops": [{"stop": "S0", "departure": _at(2)}],
+        }
+    )
+    _detour(message, start=2, end=2, replacements=[("S3", 300)], delay=300)
+    _, journeys = _run_feeds(
+        _DETOURABLE,
+        _boards_and_journeys(("S0", "S1"), ("S0", "S3"), ("S0", "S2")),
+        [message],
+    )
+    assert journeys == [
+        [],
+        [("T", _EIGHT, _at(2), None, "Downtown", "R")],
+        [("T", _EIGHT, _at(2), _at(22), "Downtown", "R")],
+    ]
+
+
+def test_a_modification_without_an_end_replaces_no_stop() -> None:
+    """ "If no stop_time is replaced, end_stop_selector must not be
+    provided": replacement stops are inserted before the start stop, and
+    the delay runs from it on. "If a modification affects only the shape
+    (i.e. neither end_stop_selector nor replacement_stops are provided),
+    then the delay propagation begins at the subsequent stop after
+    start_stop_selector"."""
+    inserted = _descriptor_message()
+    _detour(inserted, start=2, replacements=[("S3", 300)], delay=60)
+    assert [row[:2] for row in _detoured_board(inserted)] == [
+        ("S0", _EIGHT),
+        ("S3", _at(5)),
+        ("S1", _at(11)),
+        ("S2", _at(21)),
+    ]
+    shape = _descriptor_message()
+    _detour(shape, start=2, delay=60)
+    assert [row[:2] for row in _detoured_board(shape)] == [
+        ("S0", _EIGHT),
+        ("S1", _at(10)),
+        ("S2", _at(21)),
+    ]
+
+
+def test_a_detours_start_times_name_runs_by_their_start() -> None:
+    """start_times are "start times in the real-time trip descriptor": a
+    plain trip's is its first departure (08:00), and a start_time naming
+    any other, or one that does not parse, names no run -- a restriction
+    is never widened to every run."""
+    for start_times, detoured in (
+        (["08:00:00"], True),
+        (["08:00:30"], False),
+        (["not-a-time"], False),
+    ):
+        message = _descriptor_message()
+        _detour(
+            message, start=2, end=2, replacements=[("S3", 300)], start_times=start_times
+        )
+        assert ("S3" in {row[0] for row in _detoured_board(message)}) is detoured
+
+
+@st.composite
+def _two_spans(draw: st.DrawFn) -> tuple[int, list[tuple[int, int, list[int], int]]]:
+    """A trip of n calls and two disjoint, non-adjacent spans on it, each
+    (first, last, replacement travel times, propagated delay); the first
+    may start the trip, with negative travel times."""
+    n = draw(st.integers(4, 9))
+    a1 = draw(st.integers(0, n - 4))
+    b1 = draw(st.integers(a1, n - 3))
+    a2 = draw(st.integers(b1 + 2, n - 1))
+    b2 = draw(st.integers(a2, n - 1))
+    spans = []
+    for first, last in ((a1, b1), (a2, b2)):
+        low = -300 if first == 0 else 0
+        travels = draw(st.lists(st.integers(low, 900), max_size=3))
+        spans.append((first, last, travels, draw(st.integers(-300, 900))))
+    return n, spans
+
+
+@given(_two_spans())
+def test_modification_delays_accumulate_and_reference_the_stop_before(
+    case: tuple[int, list[tuple[int, int, list[int], int]]],
+) -> None:
+    """Replacement stops are timed from "the stop prior to
+    start_stop_selector" -- the first stop itself, which alone allows a
+    negative travel time, when the modification begins the trip -- and "If
+    multiple modifications apply to the same trip, the delays accumulate
+    as the trip advances": calls between two spans move by the first
+    delay, and the second span's stops and every call after it by both."""
+    n, [(a1, b1, t1, d1), (a2, b2, t2, d2)] = case
+    calls = _calls(n)
+    run = TripInstanceCalls(
+        trip_id="T",
+        source_trip_id="T",
+        start_secs=None,
+        service_date=date(2026, 7, 30),
+        day_start_utc=_EIGHT,
+        route_id="R",
+        service_id="S",
+        headsign=None,
+        wheelchair_accessible=None,
+        bikes_allowed=None,
+        direction_id=None,
+        trip_short_name=None,
+        block_id=None,
+        calls=calls,
+    )
+    modifications = [
+        Modification(
+            start_stop_sequence=calls[first].stop_sequence,
+            start_stop_id=None,
+            end_stop_sequence=calls[last].stop_sequence,
+            end_stop_id=None,
+            propagated_delay_seconds=delay,
+            replacements=[ReplacementCall("X", travel) for travel in travels],
+        )
+        for first, last, travels, delay in ((a1, b1, t1, d1), (a2, b2, t2, d2))
+    ]
+    rebuilt = _modified_calls(run, modifications, {}, {"X": None})  # type: ignore[dict-item]
+
+    def anchor(first: int) -> datetime:
+        reference = calls[first - 1] if first > 0 else calls[first]
+        assert reference.arrival is not None
+        return reference.arrival
+
+    def moved(index: int, seconds: int) -> tuple[str, datetime | None]:
+        arrival = calls[index].arrival
+        assert arrival is not None
+        return calls[index].stop_id, arrival + timedelta(seconds=seconds)
+
+    expected = [
+        *(moved(i, 0) for i in range(a1)),
+        *(("X", anchor(a1) + timedelta(seconds=t)) for t in t1),
+        *(moved(i, d1) for i in range(b1 + 1, a2)),
+        *(("X", anchor(a2) + timedelta(seconds=t + d1)) for t in t2),
+        *(moved(i, d1 + d2) for i in range(b2 + 1, n)),
+    ]
+    assert [(call.stop_id, call.arrival) for call in rebuilt] == expected
+    assert all(call.replacement is (call.stop_id == "X") for call in rebuilt)
+
+
+def test_a_detour_modifies_only_days_its_trip_runs() -> None:
+    """ "A trip_id will only be modified if it runs on a given service
+    date; the trip IS NOT required to run on all of the service dates": a
+    detour also listing a day past the feed's calendar still detours the
+    day T runs."""
+    message = _descriptor_message()
+    _detour(message, start=2, end=2, replacements=[("S3", 300)])
+    message.entity[-1].trip_modifications.service_dates.append("20280105")
+    assert [row[0] for row in _detoured_board(message)] == ["S0", "S3", "S2"]
+
+
+def test_a_modification_with_an_empty_end_selector_is_dropped() -> None:
+    """A StopSelector's fields "cannot be both empty": an end selector sent
+    empty names no end, so the modification names no span and is not
+    applied (half a detour would be worse than none); a deleted run is not
+    rebuilt either."""
+    message = _descriptor_message()
+    _detour(message, start=2, end=2, replacements=[("S3", 300)])
+    message.entity[-1].trip_modifications.modifications[0].end_stop_selector.ClearField(
+        "stop_sequence"
+    )
+    assert [row[0] for row in _detoured_board(message)] == ["S0", "S1", "S2"]
+    deleted = _descriptor_message(
+        {
+            "trip_id": "T",
+            "start_date": "20260730",
+            "relationship": gtfs_realtime_pb2.TripDescriptor.DELETED,
+        }
+    )
+    _detour(deleted, start=2, end=2, replacements=[("S3", 300)])
+    assert _detoured_board(deleted) == []

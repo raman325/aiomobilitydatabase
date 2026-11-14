@@ -407,19 +407,23 @@ def _selector_index(
 ) -> int | None:
     """Resolve a StopSelector to an index into a trip's calls.
 
-    The spec says both fields must match the GTFS feed, so when a selector
+    A selector names one of the trip's own calls, never a replacement stop
+    another modification inserted (its stop_sequence is synthetic). The
+    spec says both fields must match the GTFS feed, so when a selector
     carries both they must agree -- a selector naming stop_sequence 5 and
     stop_id "X" where call 5 is stop "Y" describes no call of this trip,
     and guessing which half the producer meant would silently detour the
     wrong span.
     """
+    if stop_sequence is None and stop_id is None:
+        return None
     for index, call in enumerate(calls):
+        if call.replacement:
+            continue
         if stop_sequence is not None and call.stop_sequence != stop_sequence:
             continue
         if stop_id is not None and call.stop_id != stop_id:
             continue
-        if stop_sequence is None and stop_id is None:
-            return None
         return index
     return None
 
@@ -432,6 +436,18 @@ def _apply_modification(
 ) -> list[TripCall] | None:
     """Replace a span of calls, returning the new sequence.
 
+    The span runs from ``start_stop_selector`` to ``end_stop_selector``,
+    inclusive. Without an end, no stop_time is replaced ("If no stop_time
+    is replaced, end_stop_selector must not be provided"): the replacement
+    stops are inserted before the start call, and the delay propagates
+    from the start call on -- or, for a modification of the shape alone
+    (no replacement stops either), "the delay propagation begins at the
+    subsequent stop after start_stop_selector". Each replacement call is
+    timed from the reference stop (the call before the start; the first
+    call itself where the modification begins the trip), and "the optional
+    fields of stop_times.txt ... are all set to their default values":
+    regular pickup and drop-off, exact times.
+
     Returns None when the modification does not describe this trip -- an
     unresolvable selector, or an end before its start. Dropping it is the
     conservative read: applying half a detour would be worse than applying
@@ -440,11 +456,21 @@ def _apply_modification(
     start = _selector_index(
         calls, modification.start_stop_sequence, modification.start_stop_id
     )
-    end = _selector_index(
-        calls, modification.end_stop_sequence, modification.end_stop_id
-    )
-    if start is None or end is None or end < start:
+    if start is None:
         return None
+    # The calls kept before the replacement stops, and the first call after
+    # them (from which the delay propagates).
+    if modification.end_stop_sequence is None and modification.end_stop_id is None:
+        # Nothing replaced: insertions go just before the start call; the
+        # shape alone moves only the calls after it.
+        kept = resume = start if modification.replacements else start + 1
+    else:
+        end = _selector_index(
+            calls, modification.end_stop_sequence, modification.end_stop_id
+        )
+        if end is None or end < start:
+            return None
+        kept, resume = start, end + 1
     # The reference is the call BEFORE the span -- or the span's own first
     # call when the span starts the trip, which is the only case the spec
     # allows a negative travel_time_to_stop for.
@@ -468,36 +494,31 @@ def _apply_modification(
             continue  # its time lies past the end of datetime: untimed
         replacements.append(
             TripCall(
-                # Synthetic sequence numbers keep the span ordered between
-                # its neighbours without colliding with real ones.
+                # Synthetic: ordered after the reference, flagged so nothing
+                # takes it for one of the trip's own stop_sequences.
                 stop_sequence=reference.stop_sequence * 1000 + offset + 1,
                 stop_id=replacement.stop_id,
                 arrival=when,
                 departure=when,
-                pickup_type=None,
-                drop_off_type=None,
-                timepoint_exact=None,
+                pickup_type=PickupDropOffType.REGULAR,
+                drop_off_type=PickupDropOffType.REGULAR,
+                timepoint_exact=True,
                 stop_headsign=None,
+                replacement=True,
             )
         )
-    tail = calls[end + 1 :]
     delay = modification.propagated_delay_seconds
     shifted = [
-        TripCall(
-            stop_sequence=call.stop_sequence,
-            stop_id=call.stop_id,
-            # A time the delay moves past either end of datetime has no
-            # instant: that end of the call becomes untimed.
+        # A time the delay moves past either end of datetime has no
+        # instant: that end of the call becomes untimed.
+        replace(
+            call,
             arrival=_shifted(call.arrival, delay),
             departure=_shifted(call.departure, delay),
-            pickup_type=call.pickup_type,
-            drop_off_type=call.drop_off_type,
-            timepoint_exact=call.timepoint_exact,
-            stop_headsign=call.stop_headsign,
         )
-        for call in tail
+        for call in calls[resume:]
     ]
-    return calls[:start] + replacements + shifted
+    return calls[:kept] + replacements + shifted
 
 
 def _modified_calls(
@@ -509,7 +530,9 @@ def _modified_calls(
     """Apply every modification of one entity to one trip instance.
 
     Applied latest-span-first so an earlier modification's indices are not
-    invalidated by a later one rewriting the tail.
+    invalidated by a later one rewriting the tail -- and so its propagated
+    delay moves the later one's calls too: "If multiple modifications
+    apply to the same trip, the delays accumulate as the trip advances".
     """
     calls = list(instance.calls)
     ordered = sorted(
@@ -527,67 +550,60 @@ def _modified_calls(
     return calls
 
 
-def _detoured_rows(
-    template: TripInstanceCalls,
-    calls: Sequence[TripCall],
-    shift: timedelta,
-    *,
-    wanted_stops: Collection[str],
-    end: datetime | None,
-    rt_stops: Mapping[str, Stop],
-    stops_by_id: Mapping[str, Stop],
-    route: Route | None,
-) -> list[StopArrival]:
-    """One detoured run's rows at the queried stops.
+def _applicable(
+    entities: Sequence[TripModifications],
+    source_trip_id: str,
+    service_date: date,
+    start_secs: int | None,
+) -> list[Modification]:
+    """Return the modifications of every entity selecting one run.
 
-    ``calls`` were rebuilt on ``template``'s day; ``shift`` moves them to
-    the run's own day (GTFS times are offsets from the day's start, and a
-    detour only adds offsets, so this is exact). Untimed calls are never
-    rows, as in the schedule itself; nor are calls past ``end`` or past the
-    end of datetime.
+    An entity selects a run of a trip it names on one of its service dates
+    ("A trip_id will only be modified if it runs on a given service date",
+    which the caller's run does), and of those listing ``start_times``
+    only the run whose own start -- "the start times in the real-time trip
+    descriptor": a repetition's, a headway-based run's, a plain trip's
+    first departure -- is listed.
     """
-    rows: list[StopArrival] = []
-    for call in calls:
-        if call.stop_id not in wanted_stops or call.departure is None:
-            continue
-        try:
-            departure = call.departure + shift
-            arrival = call.arrival + shift if call.arrival else None
-        except OverflowError:
-            continue  # past the end of datetime: no instant to show
-        if end is not None and departure > end:
-            continue
-        rows.append(
-            StopArrival(
-                stop_id=call.stop_id,
-                # An RT-added stop is the ONLY definition of itself.
-                stop=rt_stops.get(call.stop_id) or stops_by_id.get(call.stop_id),
-                route_id=template.route_id,
-                route=route,
-                trip_id=template.trip_id,
-                service_id=template.service_id,
-                headsign=template.headsign,
-                scheduled_arrival=arrival,
-                scheduled_departure=departure,
-                predicted_arrival=None,
-                predicted_departure=None,
-                delay_seconds=None,
-                realtime=True,
-                canceled=False,
-                vehicle_id=None,
-                vehicle=None,
-                wheelchair_accessible=template.wheelchair_accessible,
-                bikes_allowed=template.bikes_allowed,
-                direction_id=template.direction_id,
-                pickup_type=call.pickup_type,
-                drop_off_type=call.drop_off_type,
-                timepoint_exact=call.timepoint_exact,
-                stop_headsign=call.stop_headsign,
-                trip_short_name=template.trip_short_name,
-                block_id=template.block_id,
-            )
+    return [
+        modification
+        for entity in entities
+        if source_trip_id in entity.trip_ids
+        and service_date in entity.service_dates
+        and (entity.start_secs is None or start_secs in entity.start_secs)
+        for modification in entity.modifications
+    ]
+
+
+def _run_reaches(
+    calls: Sequence[TripCall], window: tuple[datetime, datetime | None] | None
+) -> bool:
+    """Whether a run's calls span any of ``window``.
+
+    ``window`` is (earliest, latest or None): the bounds a query reads
+    scheduled rows within, its grace included. A run wholly outside them
+    has no row there, as no scheduled run does.
+    """
+    if window is None:
+        return True
+    times = [when for call in calls for when in (call.arrival, call.departure) if when]
+    if not times:
+        return False
+    earliest, latest = window
+    return min(times) <= (latest or _LATEST_INSTANT) and max(times) >= earliest
+
+
+def _shifted_calls(calls: Sequence[TripCall], shift: timedelta) -> list[TripCall]:
+    """Return calls moved by ``shift`` (a call moved past datetime goes untimed)."""
+    seconds = round(shift.total_seconds())
+    return [
+        replace(
+            call,
+            arrival=_shifted(call.arrival, seconds),
+            departure=_shifted(call.departure, seconds),
         )
-    return rows
+        for call in calls
+    ]
 
 
 def _replacing(
@@ -645,7 +661,7 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
     calls = (
         stated
         if any(call.scheduled_arrival or call.scheduled_departure for call in stated)
-        else _moved_calls(record.entry, run)
+        else _run_calls(record.entry, run.calls)
     )
     if record.trip_headsign:
         # The original's stop headsigns would override the headsign the
@@ -666,37 +682,62 @@ def _copy(record: TripUpdateRecord, run: TripInstanceCalls) -> RealtimeTrip:
     )
 
 
-def _moved_calls(
-    entry: TripUpdateEntry, run: TripInstanceCalls
+def _run_calls(
+    entry: TripUpdateEntry,
+    calls: Sequence[TripCall],
+    detoured: Sequence[TripCall] | None = None,
 ) -> tuple[RealtimeCall, ...]:
-    """Return a moved run's calls, its updates resolved against them."""
-    resolved = resolve_trip_predictions(entry, run.calls)
-    calls: list[RealtimeCall] = []
-    for call in run.calls:
-        if call.stop_sequence in resolved.skipped:
+    """Return a run's calls with its updates resolved against them.
+
+    The updates are resolved against ``calls``, the run's own schedule, and
+    shown on the run as given or, where a detour rebuilt it, on
+    ``detoured``: "TripUpdates for the original trip_id will apply to the
+    modified trip", and "the static GTFS information used should be from
+    the static GTFS before any TripModifications applied". A call the
+    detour kept takes its prediction ("Real time information can be
+    available to the common stops"), and its delay where the detour left
+    its times alone (elsewhere the delay is against a schedule no longer
+    shown); a replacement stop takes none ("no ETA would be available at
+    the replacement stops"). A skipped call, and one with no time at all,
+    is left out.
+    """
+    resolved = resolve_trip_predictions(entry, calls)
+    own = {call.stop_sequence: call for call in calls}
+    shown: list[RealtimeCall] = []
+    for call in calls if detoured is None else detoured:
+        kept = None if call.replacement else own.get(call.stop_sequence)
+        if kept is not None and call.stop_sequence in resolved.skipped:
             continue
-        predicted = resolved.predictions.get(call.stop_sequence)
+        predicted = (
+            resolved.predictions.get(call.stop_sequence) if kept is not None else None
+        )
         arrival = predicted.arrival if predicted else None
         departure = predicted.departure if predicted else None
         if all(
             when is None for when in (call.arrival, call.departure, arrival, departure)
         ):
             continue
-        calls.append(
+        unmoved = kept is not None and (kept.arrival, kept.departure) == (
+            call.arrival,
+            call.departure,
+        )
+        shown.append(
             RealtimeCall(
                 stop_id=call.stop_id,
                 scheduled_arrival=call.arrival,
                 scheduled_departure=call.departure,
                 arrival=arrival,
                 departure=departure,
-                delay_seconds=predicted.delay_seconds if predicted else None,
+                delay_seconds=predicted.delay_seconds
+                if predicted and unmoved
+                else None,
                 pickup_type=call.pickup_type,
                 drop_off_type=call.drop_off_type,
                 timepoint_exact=call.timepoint_exact,
                 stop_headsign=call.stop_headsign,
             )
         )
-    return tuple(calls)
+    return tuple(shown)
 
 
 def _times_only(entry: TripUpdateEntry) -> TripUpdateEntry:
@@ -719,54 +760,23 @@ def _times_only(entry: TripUpdateEntry) -> TripUpdateEntry:
     )
 
 
-def _detoured(
-    run: TripInstanceCalls,
-    modifications: Sequence[TripModifications],
-    rt_stops: Mapping[str, Stop],
-    static_stops: Mapping[str, Stop],
-) -> TripInstanceCalls:
-    """Return a run with the detours that select it applied.
-
-    As a scheduled run is rebuilt (see :meth:`_apply_trip_modifications`):
-    an entity naming its trip on its service day, listing no start_times or
-    the run's own ("the start times in the real-time trip descriptor").
-    """
-    applicable = [
-        modification
-        for entity in modifications
-        if run.source_trip_id in entity.trip_ids
-        and run.service_date in entity.service_dates
-        and (not entity.start_secs or run.start_secs in entity.start_secs)
-        for modification in entity.modifications
-    ]
-    if not applicable:
-        return run
-    return replace(run, calls=_modified_calls(run, applicable, rt_stops, static_stops))
-
-
 def _slot_run(
     key: TripUpdateKey,
     entry: TripUpdateEntry,
     slot: SlotRun,
-    detoured: TripInstanceCalls,
+    detoured: Sequence[TripCall] | None,
 ) -> RealtimeTrip:
     """Build an exact_times=0 run from the repetition whose slot it takes.
 
     It is its trip at its own start (see :meth:`StaticIndex.slot_runs`),
-    the trip's descriptors its own, its updates' times alone predicting it
-    (:func:`_times_only`). Such service "does not follow a fixed
-    schedule", so no delay is reported against the moved one. A run a
-    detour rebuilds (``detoured``, differing from the slot's) shows that
-    schedule with no prediction, as a detoured scheduled run does (its
-    vehicle, matched by its own start, is still shown). It
-    stands in for that repetition, and its vehicle names it by its own
-    start.
+    rebuilt as ``detoured`` where a detour selects it, the trip's
+    descriptors its own, its updates' times alone predicting it
+    (:func:`_times_only`, :func:`_run_calls`). Such service "does not
+    follow a fixed schedule", so no delay is reported against the moved
+    one. It stands in for that repetition, and its vehicle names it by its
+    own start.
     """
-    run = detoured
-    if run.calls != slot.run.calls:
-        entry = TripUpdateEntry(
-            stop_updates=(), delay_seconds=None, vehicle_id=entry.vehicle_id
-        )
+    run = slot.run
     return RealtimeTrip(
         trip_id=run.trip_id,
         route_id=run.route_id,
@@ -776,7 +786,7 @@ def _slot_run(
         vehicle_id=entry.vehicle_id,
         calls=tuple(
             replace(call, delay_seconds=None)
-            for call in _moved_calls(_times_only(entry), run)
+            for call in _run_calls(_times_only(entry), run.calls, detoured)
         ),
         replaces=(run.source_trip_id, run.service_date, slot.slot_start),
         run=key,
@@ -784,6 +794,34 @@ def _slot_run(
         bikes_allowed=run.bikes_allowed,
         trip_short_name=run.trip_short_name,
         service_id=run.service_id,
+    )
+
+
+def _detoured_run(
+    run: TripInstanceCalls, detoured: Sequence[TripCall], entry: TripUpdateEntry
+) -> RealtimeTrip:
+    """Build a scheduled run a detour rebuilt as ``detoured``, on its day.
+
+    "The consumer should behave as if the static GTFS would have been
+    modified with the TripModifications": it is still that run -- its trip
+    id, descriptors, service and block -- shown in place of its schedule,
+    with its trip's updates resolved as :func:`_run_calls` says.
+    """
+    key = _run_key((run.source_trip_id, run.start_secs), run.service_date)
+    return RealtimeTrip(
+        trip_id=run.trip_id,
+        route_id=run.route_id,
+        direction_id=run.direction_id,
+        headsign=run.headsign,
+        start_date=run.service_date,
+        vehicle_id=entry.vehicle_id,
+        calls=_run_calls(entry, run.calls, detoured),
+        replaces=key,
+        wheelchair_accessible=run.wheelchair_accessible,
+        bikes_allowed=run.bikes_allowed,
+        trip_short_name=run.trip_short_name,
+        service_id=run.service_id,
+        block_id=run.block_id,
     )
 
 
@@ -835,8 +873,8 @@ def _realtime_rows(
 
     There is no stop_times row of their own: the times are the update's
     (its ``scheduled_time`` and predictions; a copy's or a headway-based
-    run's moved schedule), and the stop_time descriptors are those moved
-    calls' own, else unknown -- timepoint included, whose
+    run's moved schedule, a detoured run's rebuilt one), and the stop_time
+    descriptors are those calls' own, else unknown -- timepoint included, whose
     absent-means-exact default only applies to rows in stop_times.
     """
     rows: list[StopArrival] = []
@@ -871,7 +909,7 @@ def _realtime_rows(
                     timepoint_exact=call.timepoint_exact,
                     stop_headsign=call.stop_headsign,
                     trip_short_name=trip.trip_short_name,
-                    block_id=None,  # no realtime-only trip is part of a block
+                    block_id=trip.block_id,
                 )
             )
     return rows
@@ -952,7 +990,7 @@ def _realtime_journeys(
                     is_first=False,
                     is_last=False,
                     trip_short_name=trip.trip_short_name,
-                    block_id=None,  # no realtime-only trip is part of a block
+                    block_id=trip.block_id,
                 )
             )
     return journeys
@@ -1922,6 +1960,8 @@ class TransitFeedHandle:
         *,
         modifications: Sequence[TripModifications] = (),
         rt_stops: Mapping[str, Stop] | None = None,
+        wanted_stops: Collection[str] | None = None,
+        window: tuple[datetime, datetime | None] | None = None,
     ) -> tuple[TripUpdates, _Vehicles]:
         """Match every realtime trip reference to the dated run it names.
 
@@ -1939,9 +1979,11 @@ class TransitFeedHandle:
         that operates (see below) -- it is a scheduled run on a new
         schedule, and replaces nothing. A run of an exact_times=0 trip, at
         whatever start, stands in for the repetition whose headway slot
-        holds it (see :meth:`StaticIndex.slot_runs`), with the detours of
-        ``modifications`` that select it applied (``rt_stops`` defining
-        any stop only realtime does).
+        holds it (see :meth:`StaticIndex.slot_runs`). A run the detours of
+        ``modifications`` select is rebuilt (see :meth:`_detoured_runs`;
+        ``rt_stops`` define any stop only realtime does, and only runs that
+        can reach ``wanted_stops`` within ``window``, when given, are
+        rebuilt).
         TripUpdates from every TU-capable sibling feed then merge: a
         cancellation or deletion anywhere wins, and of several updates for
         one run the most explicit reference wins, then the later feed in
@@ -2070,14 +2112,23 @@ class TransitFeedHandle:
             else trip
             for trip in updates.realtime_trips
         ]
-        # Detours apply where the caller applies them to scheduled runs.
-        slot_runs = [
-            _slot_run(
-                key,
-                updates.trips.pop(key),
-                slots[key],
-                _detoured(slots[key].run, modifications, rt_stops or {}, stops_by_id),
+        realtime_stops = rt_stops or {}
+
+        def slot_detour(slot: SlotRun) -> list[TripCall] | None:
+            """Return the run as the detours selecting it rebuild it, if any do."""
+            run = slot.run
+            applicable = _applicable(
+                modifications, run.source_trip_id, run.service_date, run.start_secs
             )
+            calls = (
+                _modified_calls(run, applicable, realtime_stops, stops_by_id)
+                if applicable
+                else run.calls
+            )
+            return None if calls == run.calls else calls
+
+        slot_runs = [
+            _slot_run(key, updates.trips.pop(key), slots[key], slot_detour(slots[key]))
             for key in list(updates.trips)
             if key in slots
         ]
@@ -2105,6 +2156,16 @@ class TransitFeedHandle:
             if not trip.replaces or trip.replaces in runs
         ]
         updates.realtime_trips.extend(slot_runs)
+        updates.realtime_trips.extend(
+            await self._detoured_runs(
+                updates,
+                modifications,
+                rt_stops=realtime_stops,
+                stops_by_id=stops_by_id,
+                wanted_stops=wanted_stops,
+                window=window,
+            )
+        )
         # A DUPLICATED copy is its original's calls, moved to the copy's
         # start and day, with its StopTimeUpdates resolved against them.
         for record in updates.duplicates:
@@ -2319,9 +2380,8 @@ class TransitFeedHandle:
         (exact_times=0) service has no fixed schedule, and its start_time
         "may be arbitrary": a run at any start is the trip moved there,
         shown in place of the repetition whose headway slot holds it and
-        predicted by its updates' times alone, with no delay reported (a
-        detour of it is shown as a detoured scheduled run is: rebuilt, with
-        no prediction); a removal or replacement of it is one of that
+        predicted by its updates' times alone, with no delay reported, and
+        detoured as any run is; a removal or replacement of it is one of that
         repetition (see :meth:`StaticIndex.slot_runs`). A plain
         (non-frequency) trip's start_time, when given, is its first
         departure, as GTFS-RT requires; any other value names no run.
@@ -2396,12 +2456,14 @@ class TransitFeedHandle:
                 routes_by_id,
                 modifications=modifications,
                 rt_stops=rt_stops,
+                wanted_stops=all_stop_ids,
+                window=(start - grace, end),
             )
-            # Realtime moves exactly the runs it names: those a TripUpdate
-            # addresses and those a detour rebuilds. Both are read whole,
-            # here, with the window applied to their scheduled times -- so
-            # every row realtime can move is present from the first pass,
-            # and the scan below only adds rows that sort at their
+            # Realtime moves exactly the runs TripUpdates address (a detoured
+            # run is realtime's own trip, already built). They are read
+            # whole, here, with the window applied to their scheduled times
+            # -- so every row realtime can move is present from the first
+            # pass, and the scan below only adds rows that sort at their
             # scheduled time.
             batch_stops, batch_routes, batch_headsigns = _pushdown(queries)
             addressed = [
@@ -2416,19 +2478,6 @@ class TransitFeedHandle:
                 if dep.departure >= start - grace
                 and (end is None or dep.departure <= end)
             ]
-            modified_rows, modified_instances = await self._apply_trip_modifications(
-                modifications,
-                set(all_stop_ids),
-                end=end,
-                removed=(
-                    updates.canceled_trips
-                    | updates.deleted_trips
-                    | updates.replaced_trips
-                ),
-                rt_stops=rt_stops,
-                stops_by_id=stops_by_id,
-                routes_by_id=routes_by_id,
-            )
             # Per query, the last instant a matching scheduled departure can
             # occur (None: never) bounds how far the scan reads.
             ceilings = [
@@ -2467,8 +2516,6 @@ class TransitFeedHandle:
                     start=start,
                     end=end,
                     updates=updates,
-                    modified_rows=modified_rows,
-                    modified_instances=modified_instances,
                     stops_by_id=stops_by_id,
                     rt_stops=rt_stops,
                     routes_by_id=routes_by_id,
@@ -2494,9 +2541,9 @@ class TransitFeedHandle:
     async def _addressed_runs(self, updates: TripUpdates) -> list[_TripInstance]:
         """Return the runs TripUpdates predict, as the merge matches them.
 
-        These are the only scheduled runs realtime can move (detours
-        aside), so they are read whole before any scan. Caller holds the
-        reader guard.
+        These are the only scheduled runs realtime can move (a detoured
+        run is realtime's own trip), so they are read whole before any
+        scan. Caller holds the reader guard.
         """
         return sorted(
             {
@@ -2515,8 +2562,6 @@ class TransitFeedHandle:
         start: datetime,
         end: datetime | None,
         updates: TripUpdates,
-        modified_rows: Sequence[StopArrival],
-        modified_instances: Collection[tuple[str, date]],
         stops_by_id: Mapping[str, Stop],
         rt_stops: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
@@ -2525,24 +2570,23 @@ class TransitFeedHandle:
     ) -> list[StopArrival]:
         """Merge one horizon's board over ``all_stop_ids``, sorted.
 
-        ``scheduled`` is every scheduled row read so far. Adds the detoured
-        runs' rebuilt rows (``modified_rows``, replacing those runs'
-        schedule), the realtime overlay and rows of realtime-only trips; rows whose
-        effective departure is before ``start`` are dropped. Caller holds
+        ``scheduled`` is every scheduled row read so far. Adds the realtime
+        overlay and rows of realtime-only trips (detoured runs among them,
+        in place of their schedule); rows whose effective departure is
+        before ``start`` are dropped. Caller holds
         the reader guard and applies per-query filters and limits. Runs
         once per horizon of :meth:`get_arrivals`, with RT already fetched.
         """
-        # The unmodified schedule for these instances describes a route the
-        # vehicle is no longer taking. Keyed by INSTANCE, not by trip: a
-        # detour dated yesterday must not delete today's run of the trip.
         # A deleted run "must not be shown to users" at all, and a replaced
-        # one's schedule "isn't used": its replacement's rows stand instead.
+        # one's schedule "isn't used": its replacement's rows stand instead
+        # -- as a detoured run's do, its schedule describing a route the
+        # vehicle no longer takes. Keyed by run: a detour dated yesterday
+        # must not hide today's run of the trip.
         hidden = updates.deleted_trips | updates.replaced_trips
         scheduled = [
             dep
             for dep in scheduled
-            if (dep.trip_id, dep.service_date) not in modified_instances
-            and _run_key((dep.source_trip_id, dep.start_secs), dep.service_date)
+            if _run_key((dep.source_trip_id, dep.start_secs), dep.service_date)
             not in hidden
         ]
         # Per-row RT matching: each scheduled row's run has exactly one
@@ -2625,7 +2669,6 @@ class TransitFeedHandle:
                 vehicles=vehicles,
             )
         )
-        arrivals.extend(modified_rows)
         # The grace window admitted scheduled rows before `now` so their
         # predictions could attach; now only rows still ahead survive.
         arrivals = [
@@ -2640,9 +2683,10 @@ class TransitFeedHandle:
         # (yesterday's 24:00:00 is today's 00:00:00), and a stable sort then
         # keeps the order rows were appended in: scheduled rows in
         # ``scheduled``'s canonical order (earlier run first), then realtime-only
-        # rows (replacements and NEW/ADDED trips in feed order, then copies),
-        # then detoured runs in run order. Every part of that is fixed before
-        # the scan, so no tie depends on what it read.
+        # rows (replacements and NEW/ADDED trips in feed order, then
+        # headway-based runs, detoured runs in run order, and copies). Every
+        # part of that is fixed before the scan, so no tie depends on what
+        # it read.
         arrivals.sort(
             key=lambda a: (
                 _effective_departure(a, start),
@@ -2716,10 +2760,10 @@ class TransitFeedHandle:
         ids) match RT via ``TripDescriptor.start_time`` exactly as in
         :meth:`get_arrivals`: aligned start_time applies to that one
         exact_times=1 repetition, a start in an exact_times=0 repetition's
-        headway slot names a run shown in its place (not detoured here, as
-        no journey is), and a missing or unmatched start_time applies to no
-        repetition; a plain trip's start_time, when given, is its first
-        departure (any other value names no run).
+        headway slot names a run shown in its place, and a missing or
+        unmatched start_time applies to no repetition; a plain trip's
+        start_time, when given, is its first departure (any other value
+        names no run).
         ``TripDescriptor.start_date`` service-day matching also follows
         :meth:`get_arrivals` exactly: a dated update or cancellation
         affects only its named service day's instance, a date-less one
@@ -2744,11 +2788,33 @@ class TransitFeedHandle:
             if with_vehicles
             else []
         )
+        # Detours apply to journeys as to boards: "the consumer should behave
+        # as if the static GTFS would have been modified".
+        rt_stops: dict[str, Stop] = {}
+        modifications: list[TripModifications] = []
+        for message in tu_messages:
+            rt_stops.update(stops_from_message(message))
+            modifications.extend(trip_modifications_from_message(message))
         async with self._guard.reader():
             routes_by_id = await self._index_read(self._index.routes_by_id)
             stops_by_id = await self._index_read(self._index.stops_by_id)
+            rt_stops = _inherited_rt_stops(
+                rt_stops, stops_by_id, self._index.timezone_name
+            )
             updates, vehicles = await self._matched_realtime(
-                tu_messages, vehicle_messages, start, stops_by_id, routes_by_id
+                tu_messages,
+                vehicle_messages,
+                start,
+                stops_by_id,
+                routes_by_id,
+                modifications=modifications,
+                rt_stops=rt_stops,
+                wanted_stops={
+                    stop_id
+                    for query in queries
+                    for stop_id in (query.origin_stop_id, query.destination_stop_id)
+                },
+                window=(start - grace, end),
             )
             # As in get_arrivals: the runs realtime addresses are read whole
             # up front, so the scan only adds rows at their scheduled time.
@@ -2800,6 +2866,7 @@ class TransitFeedHandle:
                             end=end,
                             updates=updates,
                             stops_by_id=stops_by_id,
+                            rt_stops=rt_stops,
                             routes_by_id=routes_by_id,
                             vehicles=vehicles,
                             memo=memo,
@@ -2824,6 +2891,7 @@ class TransitFeedHandle:
         end: datetime | None,
         updates: TripUpdates,
         stops_by_id: Mapping[str, Stop],
+        rt_stops: Mapping[str, Stop],
         routes_by_id: Mapping[str, Route],
         vehicles: _Vehicles,
         memo: _PredictionMemo,
@@ -2858,7 +2926,8 @@ class TransitFeedHandle:
             origin_stop_id,
             destination_stop_id,
             end=end,
-            stops_by_id=stops_by_id,
+            # A stop realtime defines (a detour's) is defined only there.
+            stops_by_id={**stops_by_id, **rt_stops},
             routes_by_id=routes_by_id,
             vehicles=vehicles,
         )
@@ -3017,61 +3086,56 @@ class TransitFeedHandle:
             for message in messages
         ]
 
-    async def _apply_trip_modifications(
+    async def _detoured_runs(
         self,
+        updates: TripUpdates,
         modifications: Sequence[TripModifications],
-        wanted_stops: set[str],
         *,
-        end: datetime | None,
-        removed: Collection[TripUpdateKey],
         rt_stops: Mapping[str, Stop],
         stops_by_id: Mapping[str, Stop],
-        routes_by_id: Mapping[str, Route],
-    ) -> tuple[list[StopArrival], set[tuple[str, date]]]:
-        """Rebuild every detoured run, whole, around its detours.
+        wanted_stops: Collection[str] | None,
+        window: tuple[datetime, datetime | None] | None,
+    ) -> list[RealtimeTrip]:
+        """Rebuild every scheduled run its detours select, whole.
 
-        A run realtime cancels or deletes (its matched key in ``removed``)
-        is not rebuilt: it does not operate, so its scheduled rows stay to
-        be shown cancelled, or removed, like any other run's.
-
-        Returns the rows the modified runs now produce at the queried stops
-        (scheduled no later than ``end``, if given), and the (trip id,
-        service date) INSTANCES whose original schedule must be discarded.
-        The runs are exactly the ones the entities name: their trips (a
-        frequency template covers its repetitions, narrowed by
-        ``start_times``) on their required ``service_dates``, where the
-        trip's service runs that day -- so they are read whole, once, and
-        no horizon can cut a rebuilt row off. Caller must already hold the
-        reader guard.
-
-        A detour can route a trip through a stop its static schedule never
-        served, so this cannot filter by stop before applying: the whole
-        call sequence is rebuilt, then the queried stops are selected out
-        of the result.
+        The runs are exactly the ones the entities name (see
+        :func:`_applicable`) where the trip's service runs that day, each
+        rebuilt (:func:`_modified_calls`) and shown in place of its schedule
+        (:func:`_detoured_run`), its predictions moving from
+        ``updates.trips`` onto it. A run realtime cancels, deletes or
+        replaces is not rebuilt: it does not operate as scheduled, and its
+        removal or replacement stands. A detour can route a trip through a
+        stop it never served, so with ``wanted_stops`` the trips rebuilt are
+        those calling at one or naming one as a replacement stop, and with
+        ``window`` only the runs with a scheduled time in it
+        (:func:`_run_reaches`). Each trip is rebuilt once per set of
+        modifications and moved to every day it runs (GTFS times are
+        offsets from the day's start, and a detour only adds offsets).
+        Caller holds the reader guard.
         """
         if not modifications:
-            return [], set()
-        # Only trips that can put a row at a queried stop matter: those
-        # calling at one, or whose entity names one as a replacement. Any
-        # other detoured run produces no row here, and dropping its
-        # schedule is invisible to this query.
+            return []
+        removed = (
+            updates.canceled_trips | updates.deleted_trips | updates.replaced_trips
+        )
         source_ids = sorted({tid for mod in modifications for tid in mod.trip_ids})
-        relevant = await self._index_read(
-            self._index.trips_serving, source_ids, sorted(wanted_stops)
-        )
-        relevant |= {
-            source_id
-            for mod in modifications
-            if any(
-                replacement.stop_id in wanted_stops
-                for modification in mod.modifications
-                for replacement in modification.replacements
+        if wanted_stops is not None:
+            relevant = await self._index_read(
+                self._index.trips_serving, source_ids, sorted(wanted_stops)
             )
-            for source_id in mod.trip_ids
-        }
-        concrete = await self._index_read(
-            self._index.concrete_trip_ids, sorted(relevant)
-        )
+            relevant |= {
+                source_id
+                for mod in modifications
+                if any(
+                    replacement.stop_id in wanted_stops
+                    for modification in mod.modifications
+                    for replacement in modification.replacements
+                )
+                for source_id in mod.trip_ids
+            }
+            source_ids = sorted(relevant)
+        concrete = await self._index_read(self._index.concrete_trip_ids, source_ids)
+        plain_starts = await self._index_read(self._index.plain_trip_starts, source_ids)
         days = await self._index_read(
             self._index.run_days,
             sorted(
@@ -3084,9 +3148,6 @@ class TransitFeedHandle:
                 }
             ),
         )
-        # One template run per trip: its calls are offsets from its day's
-        # start, and a detour only adds offsets to them, so each (trip,
-        # modifications) rebuild is computed once and shifted to every day.
         first_day: dict[str, date] = {}
         for trip_id, service_date, _ in days:
             first_day.setdefault(trip_id, service_date)
@@ -3096,65 +3157,48 @@ class TransitFeedHandle:
                 self._index.instance_trip_calls, sorted(first_day.items())
             )
         }
-        flat = [
-            (mod, modification)
-            for mod in modifications
-            for modification in mod.modifications
-        ]
-        # Per producer trip, the modifications naming it (in feed order), so
-        # applicability costs a run's own modifications, not all of them.
-        by_source: dict[str, list[int]] = {}
-        for n, (mod, _) in enumerate(flat):
-            for source_id in dict.fromkeys(mod.trip_ids):
-                by_source.setdefault(source_id, []).append(n)
         rebuilt: dict[tuple[str, tuple[int, ...]], list[TripCall] | None] = {}
-        rows: list[StopArrival] = []
-        touched: set[tuple[str, date]] = set()
+        no_update = TripUpdateEntry(
+            stop_updates=(), delay_seconds=None, vehicle_id=None
+        )
+        trips: list[RealtimeTrip] = []
         for trip_id, service_date, day_start in days:
             template = templates.get(trip_id)
             if template is None:
                 # No calls (a frequency template's own trips row): no run
                 # a detour could rebuild.
                 continue
-            applicable = tuple(
-                n
-                for n in by_source.get(template.source_trip_id, ())
-                if service_date in (mod := flat[n][0]).service_dates
-                # An entity listing start_times addresses specific
-                # repetitions; one listing none addresses every instance.
-                and (not mod.start_secs or template.start_secs in mod.start_secs)
+            source = template.source_trip_id
+            key = _run_key((source, template.start_secs), service_date)
+            applicable = _applicable(
+                modifications,
+                source,
+                service_date,
+                template.start_secs
+                if template.start_secs is not None
+                else plain_starts.get(source),
             )
-            if (
-                not applicable
-                or _run_key(
-                    (template.source_trip_id, template.start_secs), service_date
-                )
-                in removed
-            ):
+            if not applicable or key in removed:
                 continue
-            key = (trip_id, applicable)
-            if key not in rebuilt:
-                modified = _modified_calls(
-                    template, [flat[n][1] for n in applicable], rt_stops, stops_by_id
-                )
-                rebuilt[key] = None if modified == template.calls else modified
-            calls = rebuilt[key]
-            if calls is None:
+            cache_key = (trip_id, tuple(id(m) for m in applicable))
+            if cache_key not in rebuilt:
+                calls = _modified_calls(template, applicable, rt_stops, stops_by_id)
+                rebuilt[cache_key] = None if calls == template.calls else calls
+            detoured = rebuilt[cache_key]
+            if detoured is None:
                 continue
-            touched.add((trip_id, service_date))
-            rows.extend(
-                _detoured_rows(
-                    template,
-                    calls,
-                    day_start - template.day_start_utc,
-                    wanted_stops=wanted_stops,
-                    end=end,
-                    rt_stops=rt_stops,
-                    stops_by_id=stops_by_id,
-                    route=routes_by_id.get(template.route_id),
-                )
+            shift = day_start - template.day_start_utc
+            today = _shifted_calls(detoured, shift)
+            if not _run_reaches(today, window):
+                continue
+            run = replace(
+                template,
+                service_date=service_date,
+                day_start_utc=day_start,
+                calls=_shifted_calls(template.calls, shift),
             )
-        return rows, touched
+            trips.append(_detoured_run(run, today, updates.trips.pop(key, no_update)))
+        return trips
 
     async def get_scheduled_departures(
         self,

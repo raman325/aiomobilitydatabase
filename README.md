@@ -367,10 +367,9 @@ Notes on direct mode:
   it. Service with `exact_times` 0 (or empty) "does not follow a fixed
   schedule", so its repetitions report `timepoint_exact=False`, and
   realtime names its runs by a `start_time` that "may be arbitrary": a run
-  is the trip moved to that start (a detour of it shown as a detoured
-  scheduled run is: rebuilt, with no prediction), shown under its own
-  `{trip_id}#{start_secs}` id in place of the repetition whose headway
-  slot holds it -- one headway from that
+  is the trip moved to that start (and detoured as any run of the trip
+  is), shown under its own `{trip_id}#{start_secs}` id in place of the
+  repetition whose headway slot holds it -- one headway from that
   repetition's start, never past the trip's next repetition. Two runs in
   one slot both show. Only its updates' times predict it ("Delay can only
   be used in case the trip update refers to a scheduled GTFS trip, as
@@ -468,10 +467,25 @@ Notes on direct mode:
   entity REPLACES a span of a trip's calls, so a board that ignored it
   would keep showing departures at stops the vehicle no longer serves, and
   would miss `propagated_modification_delay` on every stop after the
-  detour. Replacement times are measured from the reference stop the spec
-  names, a replacement stop may be defined only by an RT `Stop` entity, and
-  a detour that routes a trip through a stop its static schedule never
-  served shows up there.
+  detour. Boards and journeys alike show the run as rebuilt ("as if the
+  static GTFS would have been modified"): the same trip, service and
+  block, its rows realtime. Replacement times are measured from the
+  reference stop the spec names, a replacement stop may be defined only by
+  an RT `Stop` entity and takes stop_times' defaults (regular pickup and
+  drop-off, exact times), and a detour that routes a trip through a stop
+  its static schedule never served shows up there. A modification
+  replacing no stop (no end selector) inserts its stops before its start
+  stop; one changing only the shape delays the stops after it. Delays of
+  several modifications accumulate. The trip's own TripUpdates still
+  apply, resolved against its schedule before the detour: they predict
+  the stops it keeps (a skipped one is not served, a cancelled run is not
+  rebuilt), with `delay_seconds` only where the detour left the schedule
+  alone, and "no ETA would be available at the replacement stops". An
+  entity listing `start_times` detours only the runs they name -- a plain
+  trip's start is its first departure -- and none if none parses. A
+  replacement stop without `travel_time_to_stop` is left out rather than
+  given an interpolated time. Rebuilt journeys, like every realtime-only
+  trip's, are neither `is_first` nor `is_last`.
 - **Schedule only, never the network**: `get_scheduled_departures()` is the
   schedule-only twin of `get_arrivals()` — same `ArrivalsQuery` batch, same
   window rules, no realtime and no grace. It makes no network request, so a

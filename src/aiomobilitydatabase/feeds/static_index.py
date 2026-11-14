@@ -522,6 +522,9 @@ class TripCall:
     drop_off_type: PickupDropOffType | None
     timepoint_exact: bool | None
     stop_headsign: str | None
+    # A TripModifications replacement stop, not one of the trip's own: its
+    # stop_sequence is synthetic, and no StopTimeUpdate addresses it.
+    replacement: bool = False
 
 
 @dataclass(frozen=True)
