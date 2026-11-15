@@ -539,7 +539,8 @@ Notes on direct mode:
   limit"), `exact_times` (True on a plain trip or an `exact_times=1`
   repetition; False on a headway-based one, whose windows are approximate;
   None when frequencies.txt's value is unparseable, or for a frequencies.txt
-  trip of Flex calls alone, kept as one trip with no windows),
+  trip with no timed call to repeat from, kept as one trip, its windows
+  unknown),
   pickup/drop-off types, and
   each id it names beside its record
   (an id whose record the feed lacks keeps the id, with None for the

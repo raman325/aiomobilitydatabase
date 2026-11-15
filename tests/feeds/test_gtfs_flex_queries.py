@@ -398,6 +398,34 @@ def test_a_frequency_trip_of_flex_calls_alone_has_unknown_exactness(
     ) == ("T", None, None, None)
 
 
+def test_a_frequency_trip_of_windows_around_an_untimed_stop_reads_unknown(
+    tmp_path: Path,
+) -> None:
+    """Windows around an untimed stop leave no timed call to repeat from:
+    kept as one trip, its windows the template's, so unknown."""
+    feed = _with_zone(
+        _feed(
+            stop_times=_WINDOWS
+            + "T,,,,Z,07:00:00,07:50:00,1,2,1,\n"
+            + "T,,,S0,,,,2,,,\n"
+            + "T,,,,Z,08:05:00,09:00:00,3,1,2,\n",
+            frequencies="trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T,06:00:00,10:00:00,600,1\n",
+        )
+    )
+    services = _services(_build(tmp_path, feed), Circle(0.0, 0.0, 10.0))
+    assert [
+        (
+            service.trip_id,
+            service.stop_sequence,
+            service.exact_times,
+            service.start_pickup_drop_off_window,
+            service.end_pickup_drop_off_window,
+        )
+        for service in services
+    ] == [("T", 1, None, None, None), ("T", 3, None, None, None)]
+
+
 def test_a_repetition_at_the_service_day_start_keeps_its_windows(
     tmp_path: Path,
 ) -> None:
