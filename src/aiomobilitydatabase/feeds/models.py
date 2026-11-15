@@ -1073,7 +1073,9 @@ class BookingRule:
     ``timedelta``. Durations are minutes, as the file gives them.
     Every cell is kept as the file states it, even one the spec forbids
     for this ``booking_type``; unparseable cells are None, and an unknown
-    ``booking_type`` is None.
+    ``booking_type`` is None. ``unreadable_fields`` names the prior-notice
+    fields the file states but that can't be parsed: None there means
+    unknown, not absent.
     """
 
     id: str
@@ -1091,6 +1093,7 @@ class BookingRule:
     phone_number: str | None
     info_url: str | None
     booking_url: str | None
+    unreadable_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1183,11 +1186,13 @@ class BookingWindow:
 
     ``earliest`` is None only where the rule sets no earliest time. A rule
     whose window cannot be placed gives no BookingWindow at all, never a
-    guessed one: a field it needs missing; a field the spec forbids for its
-    ``booking_type`` (which field is wrong is unknowable); a contradiction
-    (a duration max under the min, or booking opening after it closes); a
-    count of service days that does not end within a year; a date out of
-    range. Instants are UTC.
+    guessed one: a field it needs missing; a prior-notice field the file
+    states but that can't be parsed (``BookingRule.unreadable_fields``); a
+    field the spec forbids for its ``booking_type`` (which field is wrong
+    is unknowable); a contradiction (a duration max under the min, booking
+    opening after it closes, or a deadline after the window ends, though
+    the spec says "before travel"); a count of service days that does not
+    end within a year; a date out of range. Instants are UTC.
     """
 
     rule: BookingRule

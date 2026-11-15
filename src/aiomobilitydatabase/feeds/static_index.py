@@ -58,7 +58,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -164,14 +164,17 @@ CREATE TABLE location_group_stops (
     location_group_id TEXT NOT NULL, stop_id TEXT NOT NULL
 );
 -- Durations in minutes, as booking_rules.txt gives them; the two Time
--- columns as seconds, like every other GTFS time here.
+-- columns as seconds, like every other GTFS time here. ``unreadable`` names
+-- (space-separated) the prior-notice fields the file states but that can't
+-- be parsed: stored NULL like a blank cell, they are not absent.
 CREATE TABLE booking_rules (
     id TEXT PRIMARY KEY, booking_type INTEGER,
     prior_notice_duration_min INTEGER, prior_notice_duration_max INTEGER,
     prior_notice_last_day INTEGER, prior_notice_last_secs INTEGER,
     prior_notice_start_day INTEGER, prior_notice_start_secs INTEGER,
     prior_notice_service_id TEXT, message TEXT, pickup_message TEXT,
-    drop_off_message TEXT, phone_number TEXT, info_url TEXT, booking_url TEXT
+    drop_off_message TEXT, phone_number TEXT, info_url TEXT, booking_url TEXT,
+    unreadable TEXT
 );
 CREATE TABLE calendar (
     service_id TEXT PRIMARY KEY,
@@ -657,6 +660,17 @@ def _lenient_time(value: str | None) -> int | None:
         return None
 
 
+# booking_rules.txt's prior-notice cells, in table order, and their parsers.
+_NOTICE_FIELDS: tuple[tuple[str, Callable[[str | None], int | None]], ...] = (
+    ("prior_notice_duration_min", _lenient_int),
+    ("prior_notice_duration_max", _lenient_int),
+    ("prior_notice_last_day", _lenient_int),
+    ("prior_notice_last_time", _lenient_time),
+    ("prior_notice_start_day", _lenient_int),
+    ("prior_notice_start_time", _lenient_time),
+)
+
+
 def gtfs_time_offset(secs: int | None) -> timedelta | None:
     """Return a stored GTFS time (seconds into its day) as a timedelta."""
     return None if secs is None else timedelta(seconds=secs)
@@ -830,10 +844,11 @@ class OnDemandRow(NamedTuple):
 
 
 class _ServicePattern(NamedTuple):
-    """A service's calendar.txt (weekdays, start, end), and its ADDED dates."""
+    """A service's calendar.txt (weekdays, start, end), ADDED and REMOVED dates."""
 
     weekly: tuple[tuple[bool, ...], date, date] | None
     added: list[date]
+    removed: set[date]
 
 
 class DatableCall(NamedTuple):
@@ -1930,22 +1945,30 @@ class StaticIndex:
         reader: csv.DictReader[str],
         report: Callable[[], None] | None = None,
     ) -> None:
-        """Load booking_rules.txt: every cell as stated, descriptive (lenient)."""
+        """Load booking_rules.txt: every cell as stated, descriptive (lenient).
+
+        An unparseable prior-notice cell is stored NULL, like a blank one,
+        and named in ``unreadable``: a time the file gives but this library
+        can't read is unknown, never "not stated" (which would read as no
+        limit).
+        """
         rows: list[tuple[object, ...]] = []
-        sql = f"INSERT OR REPLACE INTO booking_rules VALUES ({','.join('?' * 15)})"
+        sql = f"INSERT OR REPLACE INTO booking_rules VALUES ({','.join('?' * 16)})"
         for row in reader:
             if not (rule_id := _cell(row, "booking_rule_id")):
                 continue  # Required: a row without one is no rule
+            notice: dict[str, int | None] = {}
+            unreadable: list[str] = []
+            for field, parse in _NOTICE_FIELDS:
+                cell = row.get(field)
+                notice[field] = parse(cell)
+                if notice[field] is None and cell is not None and cell.strip():
+                    unreadable.append(field)
             rows.append(
                 (
                     rule_id,
                     _lenient_int(row.get("booking_type")),
-                    _lenient_int(row.get("prior_notice_duration_min")),
-                    _lenient_int(row.get("prior_notice_duration_max")),
-                    _lenient_int(row.get("prior_notice_last_day")),
-                    _lenient_time(row.get("prior_notice_last_time")),
-                    _lenient_int(row.get("prior_notice_start_day")),
-                    _lenient_time(row.get("prior_notice_start_time")),
+                    *notice.values(),
                     row.get("prior_notice_service_id") or None,
                     row.get("message") or None,
                     row.get("pickup_message") or None,
@@ -1953,6 +1976,7 @@ class StaticIndex:
                     row.get("phone_number") or None,
                     row.get("info_url") or None,
                     row.get("booking_url") or None,
+                    " ".join(unreadable) or None,
                 )
             )
             if len(rows) >= _BATCH_SIZE:
@@ -2134,6 +2158,7 @@ class StaticIndex:
                 phone_number=row[12],
                 info_url=row[13],
                 booking_url=row[14],
+                unreadable_fields=tuple(row[15].split()) if row[15] else (),
             )
             for row in self._conn.execute(
                 "SELECT id, booking_type, prior_notice_duration_min, "
@@ -2141,7 +2166,7 @@ class StaticIndex:
                 "prior_notice_last_secs, prior_notice_start_day, "
                 "prior_notice_start_secs, prior_notice_service_id, message, "
                 "pickup_message, drop_off_message, phone_number, info_url, "
-                "booking_url FROM booking_rules ORDER BY id"
+                "booking_url, unreadable FROM booking_rules ORDER BY id"
             )
         ]
 
@@ -2638,13 +2663,20 @@ class StaticIndex:
             return []
         first_dates = self._service_first_dates()
         last_dates = self._service_last_dates()
-        # Only the days some call's service can run on are read, so the
-        # cache holds those, not every day an open-ended walk passes.
+        # Only the days some call's service can run on are read, and of
+        # each only the services this query asks about: the calls' own and
+        # the ones their booking rules count days on.
+        wanted = {call.service_id for call in calls} | {
+            rule.prior_notice_service_id
+            for call in calls
+            for rule in (call.pickup_booking_rule, call.drop_off_booking_rule)
+            if rule is not None and rule.prior_notice_service_id is not None
+        }
         active: dict[date, set[str]] = {}
 
         def runs(service_id: str, day: date) -> bool:
             if day not in active:
-                active[day] = self.active_service_ids(day)
+                active[day] = self.active_service_ids(day) & wanted
             return service_id in active[day]
 
         heap: list[tuple[datetime, int, date, datetime]] = []
@@ -2711,11 +2743,12 @@ class StaticIndex:
         return dated
 
     def _service_patterns(self) -> dict[str, _ServicePattern]:
-        """Each service's calendar.txt row and calendar_dates ADDED dates.
+        """Each service's calendar.txt row and calendar_dates exceptions.
 
-        The days it CAN run on (removals are left to
-        :meth:`active_service_ids`): a superset of its active days, which
-        :meth:`_next_service_day` jumps between. Computed once.
+        The days it can run on, less the REMOVED ones (which win over an
+        ADDED one, as in :meth:`active_service_ids`): a superset of its
+        active days, which :meth:`_next_service_day` jumps between.
+        Computed once.
         """
         if self._patterns is not None:
             return self._patterns
@@ -2727,15 +2760,19 @@ class StaticIndex:
             lo, hi = _lenient_date(raw_start), _lenient_date(raw_end)
             weekdays = tuple(day == 1 for day in days)
             if lo is not None and hi is not None and lo <= hi and any(weekdays):
-                patterns[service_id] = _ServicePattern((weekdays, lo, hi), [])
-        for service_id, raw in self._conn.execute(
-            "SELECT service_id, date FROM calendar_dates WHERE exception_type = ?",
-            (_EXCEPTION_SERVICE_ADDED,),
+                patterns[service_id] = _ServicePattern((weekdays, lo, hi), [], set())
+        for service_id, raw, kind in self._conn.execute(
+            "SELECT service_id, date, exception_type FROM calendar_dates "
+            "WHERE exception_type IN (?, ?)",
+            (_EXCEPTION_SERVICE_ADDED, _EXCEPTION_SERVICE_REMOVED),
         ):
-            if (day := _lenient_date(raw)) is not None:
-                patterns.setdefault(service_id, _ServicePattern(None, [])).added.append(
-                    day
-                )
+            if (day := _lenient_date(raw)) is None:
+                continue
+            pattern = patterns.setdefault(service_id, _ServicePattern(None, [], set()))
+            if kind == _EXCEPTION_SERVICE_ADDED:
+                pattern.added.append(day)
+            else:
+                pattern.removed.add(day)
         for pattern in patterns.values():
             pattern.added.sort()
         self._patterns = patterns
@@ -2745,11 +2782,22 @@ class StaticIndex:
         """Return the first day on or after ``day`` the service can run.
 
         The nearer of its calendar.txt weekdays within range (a week at
-        most to look through) and its next ADDED date; None if neither.
+        most to look through) and its next ADDED date, skipping REMOVED
+        dates; None if neither is left.
         """
         pattern = self._service_patterns().get(service_id)
         if pattern is None:
             return None
+        candidate = self._next_possible_day(pattern, day)
+        while candidate is not None and candidate in pattern.removed:
+            if candidate == date.max:
+                return None
+            candidate = self._next_possible_day(pattern, candidate + timedelta(days=1))
+        return candidate
+
+    @staticmethod
+    def _next_possible_day(pattern: _ServicePattern, day: date) -> date | None:
+        """Return the nearer of the next weekday in range and next ADDED date."""
         best: date | None = None
         if pattern.weekly is not None:
             weekdays, lo, hi = pattern.weekly

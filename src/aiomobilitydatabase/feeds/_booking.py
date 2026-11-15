@@ -66,9 +66,10 @@ def booking_window(
     """
     window = _Window(service_date, window_start, window_end, day_start, runs)
     reader = None if rule.booking_type is None else _READERS.get(rule.booking_type)
-    if reader is None or _states_forbidden(rule):
-        # An unknown booking_type says nothing placeable; a field the spec
-        # forbids for this one leaves which field is wrong unknowable.
+    if reader is None or rule.unreadable_fields or _states_forbidden(rule):
+        # An unknown booking_type says nothing placeable; a field the file
+        # states but that can't be read is unknown, not absent; a field the
+        # spec forbids for this type leaves which field is wrong unknowable.
         return None
     try:
         bounds = reader(rule, window)
@@ -77,8 +78,10 @@ def booking_window(
     if bounds is None:
         return None
     earliest, latest = bounds
-    if earliest is not None and earliest > latest:
-        return None  # Opens after it closes: contradictory, not "never".
+    if latest > window_end or (earliest is not None and earliest > latest):
+        # A deadline after every ride (the spec's "before travel"), or
+        # booking opening after it closes: contradictory, not "never".
+        return None
     return BookingWindow(rule=rule, earliest=earliest, latest=latest)
 
 

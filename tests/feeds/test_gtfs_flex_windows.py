@@ -338,6 +338,23 @@ def test_a_sparse_far_calendar_is_walked_by_its_running_days(tmp_path: Path) -> 
     assert reads <= 2
 
 
+def test_an_unreadable_or_late_booking_is_unknown(tmp_path: Path) -> None:
+    """A duration max the feed states but can't be read is unknown, not
+    "no earliest time"; a deadline at 23:00 on the travel day is after the
+    08:00-09:00 window it is "before": contradictory, so no booking."""
+    feed = _zone_feed(
+        "T,,Z,08:00:00,09:00:00,1,2,2,GARBLED,LATE\n",
+        booking_rules="booking_rule_id,booking_type,prior_notice_duration_min,"
+        "prior_notice_duration_max,prior_notice_last_day,prior_notice_last_time\n"
+        "GARBLED,1,30,1440.0,,\nLATE,2,,,0,23:00:00\n",
+    )
+    [window] = _windows(_build(tmp_path, feed), _AT_Z, start=_JULY_30, limit=1)
+    rule = window.service.pickup_booking_rule
+    assert rule is not None
+    assert rule.unreadable_fields == ("prior_notice_duration_max",)
+    assert (window.pickup_booking, window.drop_off_booking) == (None, None)
+
+
 def test_bad_arguments_are_refused(tmp_path: Path) -> None:
     index = partial(_build, tmp_path, _zone_feed("T,,Z,08:00:00,09:00:00,1,2,2,,\n"))
     with pytest.raises(TypeError):
@@ -377,7 +394,9 @@ def _flex_feeds(draw: st.DrawFn) -> dict[str, object]:
     and exceptions; Flex calls with random windows (some past midnight,
     some blank, some ending before they start); a random query."""
     zone_name = draw(st.sampled_from(_ZONES))
-    services: dict[str, tuple[tuple[bool, ...], date, date, dict[date, int]]] = {}
+    services: dict[
+        str, tuple[tuple[bool, ...], date, date, dict[date, frozenset[int]]]
+    ] = {}
     for service_id in ("A", "B", "C")[: draw(st.integers(1, 3))]:
         mask = (
             tuple(draw(st.lists(st.booleans(), min_size=7, max_size=7)))
@@ -386,17 +405,16 @@ def _flex_feeds(draw: st.DrawFn) -> dict[str, object]:
         )
         lo = _FIRST + timedelta(days=draw(st.integers(0, 20)))
         hi = lo + timedelta(days=draw(st.integers(3, _SPAN_DAYS)))
-        exceptions = {
-            _FIRST + timedelta(days=offset): kind
-            for offset, kind in draw(
-                st.lists(
-                    st.tuples(
-                        st.integers(0, _SPAN_DAYS + 5), st.sampled_from([1, 1, 2])
-                    ),
-                    max_size=8,
-                )
+        # A date may be both ADDED and REMOVED: the removal wins.
+        exceptions: dict[date, frozenset[int]] = {}
+        for offset, kind in draw(
+            st.lists(
+                st.tuples(st.integers(0, _SPAN_DAYS + 5), st.sampled_from([1, 1, 2])),
+                max_size=8,
             )
-        }
+        ):
+            day = _FIRST + timedelta(days=offset)
+            exceptions[day] = exceptions.get(day, frozenset()) | {kind}
         services[service_id] = (mask, lo, hi, exceptions)
     calls = []
     for n in range(draw(st.integers(1, 5))):
@@ -443,7 +461,8 @@ def _feed_files(case: dict[str, object]) -> dict[str, str]:
     calendar_dates = "service_id,date,exception_type\n" + "".join(
         f"{sid},{_gtfs(day)},{kind}\n"
         for sid, (_, _, _, exceptions) in services.items()
-        for day, kind in exceptions.items()
+        for day, kinds in exceptions.items()
+        for kind in sorted(kinds)
     )
     trips = "route_id,service_id,trip_id\n" + "".join(
         f"R,{service_id},{trip_id}\n" for trip_id, service_id, _, _ in calls
@@ -464,12 +483,16 @@ def _feed_files(case: dict[str, object]) -> dict[str, str]:
 
 
 def _runs(
-    service: tuple[tuple[bool, ...], date, date, dict[date, int]], day: date
+    service: tuple[tuple[bool, ...], date, date, dict[date, frozenset[int]]],
+    day: date,
 ) -> bool:
     """calendar.txt with calendar_dates.txt over it, a removal winning."""
     mask, lo, hi, exceptions = service
-    if day in exceptions:
-        return exceptions[day] == 1
+    kinds = exceptions.get(day, frozenset())
+    if 2 in kinds:
+        return False
+    if 1 in kinds:
+        return True
     return lo <= day <= hi and mask[day.weekday()]
 
 
@@ -541,16 +564,23 @@ def test_booking_is_placed_on_each_window(
     days: int,
     more: int,
 ) -> None:
-    """Each window's booking: by 17:00 on the ``days``-th day service A
-    runs before the service date, from 08:00 on the ``days + more``-th --
-    counted by hand on the oracle's calendar, a year back at most."""
+    """Each window's pickup booking: by 17:00 on the ``days``-th day
+    service A runs before the service date, from 08:00 on the
+    ``days + more``-th -- counted by hand on the oracle's calendar, a year
+    back at most, and unknown for a deadline after the window ends. Its
+    drop-off booking: same-day, from 2 hours before the window's start to
+    30 minutes before its end."""
     feed = _feed_files(case)
     feed["booking_rules.txt"] = (
-        "booking_rule_id,booking_type,prior_notice_last_day,prior_notice_last_time,"
+        "booking_rule_id,booking_type,prior_notice_duration_min,"
+        "prior_notice_duration_max,prior_notice_last_day,prior_notice_last_time,"
         "prior_notice_start_day,prior_notice_start_time,prior_notice_service_id\n"
-        f"P,2,{days},17:00:00,{days + more},08:00:00,A\n"
+        f"P,2,,,{days},17:00:00,{days + more},08:00:00,A\n"
+        "D,1,30,120,,,,,\n"
     )
-    feed["stop_times.txt"] = feed["stop_times.txt"].replace(",1,2,2,,\n", ",1,2,2,P,\n")
+    feed["stop_times.txt"] = feed["stop_times.txt"].replace(
+        ",1,2,2,,\n", ",1,2,2,P,D\n"
+    )
     index = _build(tmp_path_factory.mktemp("feed"), feed)
     services = case["services"]
     assert isinstance(services, dict)
@@ -575,10 +605,21 @@ def test_booking_is_placed_on_each_window(
         index, _AT_Z, start=case["start"], end=case["end"], limit=case["limit"] or 5
     )
     for window in windows:
+        drop_off = window.drop_off_booking
+        assert drop_off is not None
+        assert drop_off.rule.booking_type is BookingType.SAME_DAY
+        assert (drop_off.earliest, drop_off.latest) == (
+            window.window_start - timedelta(hours=2),
+            window.window_end - timedelta(minutes=30),
+        )
         last = nth_running_day(window.service_date, days)
         first = nth_running_day(window.service_date, days + more)
         booking = window.pickup_booking
-        if last is None or first is None:
+        if (
+            last is None
+            or first is None
+            or day_start(last) + timedelta(hours=17) > window.window_end
+        ):
             assert booking is None
             continue
         assert booking is not None
@@ -587,4 +628,3 @@ def test_booking_is_placed_on_each_window(
             day_start(first) + timedelta(hours=8),
             day_start(last) + timedelta(hours=17),
         )
-        assert window.drop_off_booking is None

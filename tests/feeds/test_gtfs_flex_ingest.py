@@ -708,6 +708,14 @@ _TYPE_CELLS = st.one_of(
 _TEXT = st.text(alphabet=st.characters(blacklist_categories=("Cs", "Cc")), max_size=6)
 _TEXT_CELLS = _TEXT.map(lambda text: (text, text or None))
 
+_NOTICE_COLUMNS = (
+    "prior_notice_duration_min",
+    "prior_notice_duration_max",
+    "prior_notice_last_day",
+    "prior_notice_last_time",
+    "prior_notice_start_day",
+    "prior_notice_start_time",
+)
 _RULE_COLUMNS: dict[str, st.SearchStrategy[Any]] = {
     "booking_type": _TYPE_CELLS,
     "prior_notice_duration_min": _INT_CELLS,
@@ -752,8 +760,16 @@ def _booking_rules_files(draw: st.DrawFn) -> tuple[str, list[BookingRule]]:
             row[column], value = draw(_RULE_COLUMNS[column])
             values[column] = value
         rows.append(row)
+        # A prior-notice cell stated but unparseable is named, in file order.
+        unreadable = tuple(
+            column
+            for column in _NOTICE_COLUMNS
+            if row.get(column, "").strip() and values[column] is None
+        )
         if rule_id:
-            expected[rule_id] = BookingRule(id=rule_id, **values)
+            expected[rule_id] = BookingRule(
+                id=rule_id, **values, unreadable_fields=unreadable
+            )
     return _csv(columns, rows), [expected[key] for key in sorted(expected)]
 
 

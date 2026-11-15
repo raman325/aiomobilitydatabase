@@ -17,6 +17,7 @@ from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds._booking import (
     LOOK_BACK_DAYS,
+    _states_forbidden,
     booking_window,
     counted_day,
 )
@@ -47,6 +48,11 @@ def _rule(booking_type: BookingType | None, **fields: object) -> BookingRule:
         booking_url=None,
     )
     return replace(blank, **fields)  # type: ignore[arg-type]
+
+
+def _on(day: date) -> tuple[datetime, datetime]:
+    """The 09:00-17:00 window on ``day``."""
+    return _midnight(day) + timedelta(hours=9), _midnight(day) + timedelta(hours=17)
 
 
 def _midnight(day: date) -> datetime:
@@ -235,7 +241,7 @@ def test_prior_day_booking_counts_service_days() -> None:
         prior_notice_service_id=_WEEKDAYS,
     )
     monday = date(2026, 11, 16)
-    assert _place(rule, service_date=monday) == (
+    assert _place(rule, service_date=monday, window=_on(monday)) == (
         datetime(2026, 11, 9, tzinfo=UTC),
         datetime(2026, 11, 13, 17, tzinfo=UTC),
     )
@@ -248,7 +254,8 @@ def test_prior_day_booking_counts_calendar_days_without_a_service() -> None:
         prior_notice_last_day=2,
         prior_notice_last_time=timedelta(hours=17),
     )
-    assert _place(rule, service_date=date(2026, 11, 16)) == (
+    monday = date(2026, 11, 16)
+    assert _place(rule, service_date=monday, window=_on(monday)) == (
         None,
         datetime(2026, 11, 14, 17, tzinfo=UTC),
     )
@@ -261,7 +268,8 @@ def test_a_last_day_of_zero_is_the_service_date() -> None:
         prior_notice_last_time=timedelta(hours=7),
         prior_notice_service_id=_WEEKDAYS,
     )
-    assert _place(rule, service_date=date(2026, 11, 15)) == (
+    sunday = date(2026, 11, 15)
+    assert _place(rule, service_date=sunday, window=_on(sunday)) == (
         None,
         datetime(2026, 11, 15, 7, tzinfo=UTC),
     )
@@ -467,3 +475,36 @@ def test_the_look_back_is_bounded() -> None:
     assert (
         counted_day(service_date, 1, "B", lambda s, d: d == far - timedelta(1)) is None
     )
+
+
+# The spec's presence column for each prior-notice field, read as "is it
+# forbidden here": (booking_type, the rule's stated fields) -> forbidden.
+_SPEC_FORBIDDEN = {
+    "prior_notice_duration_min": lambda t, _f: t is not BookingType.SAME_DAY,
+    "prior_notice_duration_max": lambda t, _f: t is not BookingType.SAME_DAY,
+    "prior_notice_last_day": lambda t, _f: t is not BookingType.PRIOR_DAYS,
+    "prior_notice_last_time": lambda _t, f: "prior_notice_last_day" not in f,
+    "prior_notice_start_day": lambda t, f: (
+        t is BookingType.REAL_TIME
+        or (t is BookingType.SAME_DAY and "prior_notice_duration_max" in f)
+    ),
+    "prior_notice_start_time": lambda _t, f: "prior_notice_start_day" not in f,
+    "prior_notice_service_id": lambda t, _f: t is not BookingType.PRIOR_DAYS,
+}
+
+
+@given(
+    booking_type=st.sampled_from(list(BookingType)),
+    stated=st.frozensets(st.sampled_from(sorted(_SPEC_FORBIDDEN))),
+)
+def test_a_rule_stating_any_forbidden_field_is_unknown(
+    booking_type: BookingType, stated: frozenset[str]
+) -> None:
+    """Against the spec's presence table, field by field: a rule stating
+    any field forbidden for its type (or a time without its day) places no
+    window."""
+    rule = _rule(booking_type, **{field: _FORBIDDEN[field] for field in stated})
+    forbidden = any(_SPEC_FORBIDDEN[field](booking_type, stated) for field in stated)
+    assert _states_forbidden(rule) is forbidden
+    if forbidden:
+        assert _place(rule) is None
