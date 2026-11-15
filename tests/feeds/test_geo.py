@@ -1,7 +1,9 @@
 """Tests for circular-zone geometry."""
 
+import decimal
 import itertools
 import math
+import sys
 import time
 from fractions import Fraction
 from typing import Any
@@ -861,6 +863,158 @@ def test_radius_zero_on_a_rectangle_is_its_bounds_check(
     )
     inside = west < x < east and south < y < north
     assert polygon_overlaps_circle(rectangle, _at(lat0, lon0, x, y, 0)) is inside
+
+
+@given(
+    south=st.floats(-70, 69),
+    height=st.floats(1e-6, 1),
+    west=st.floats(-180, 179),
+    reach=st.floats(1e-9, 1),
+    side=st.sampled_from(["south", "north", "west", "east"]),
+    along=st.floats(0, 1),
+)
+def test_a_point_on_a_rectangle_edge_overlaps_at_radius_zero(  # noqa: PLR0917
+    south: float,
+    height: float,
+    west: float,
+    reach: float,
+    side: str,
+    along: float,
+) -> None:
+    """The boundary belongs to the zone: a zero-radius circle on any edge of
+    an axis-aligned rectangle overlaps it, wherever on the edge -- next to
+    either end too -- and however far east the edge lies (up to 180)."""
+    north, east = south + height, west + reach * (180 - west)
+    assume(west < east <= 180)
+    rectangle = _box(south, west, north, east)
+    width = east - west
+    lat, lon = {
+        "south": (south, west + along * width),
+        "north": (north, west + along * width),
+        "west": (south + along * height, west),
+        "east": (south + along * height, east),
+    }[side]
+    assume(south <= lat <= north and west <= lon <= east)
+    assert polygon_overlaps_circle(rectangle, Circle(lat, lon, 0.0))
+
+
+def _box(
+    south: float,
+    west: float,
+    north: float,
+    east: float,
+    holes: tuple[tuple[tuple[float, float], ...], ...] = (),
+) -> FlexPolygon:
+    return FlexPolygon(
+        exterior=(
+            (south, west),
+            (south, east),
+            (north, east),
+            (north, west),
+            (south, west),
+        ),
+        holes=holes,
+    )
+
+
+_PLANE = st.floats(-1e6, 1e6)
+
+
+@given(
+    a=st.tuples(_PLANE, _PLANE),
+    direction=st.tuples(st.floats(-1, 1), st.floats(-1, 1)),
+    length=st.floats(1e-6, 1e3),
+    offset=st.floats(-1e-3, 1e-3),
+)
+def test_segment_distance_is_within_rounding_of_exact(
+    a: tuple[float, float],
+    direction: tuple[float, float],
+    length: float,
+    offset: float,
+) -> None:
+    """Against the exact distance in rationals, within a few ulps of the
+    nearer vertex's magnitude -- including short edges far away with the
+    origin near their line, where a cross product from the far vertex
+    (``a x b``) is off by hundreds."""
+    norm = math.hypot(*direction)
+    assume(norm > 1e-3)
+    ux, uy = direction[0] / norm, direction[1] / norm
+    # Shift the edge so the origin lies near its line: a short edge far away.
+    ax, ay = a[0] + offset * -uy, a[1] + offset * ux
+    ax, ay = ax - (ax * ux + ay * uy) * ux, ay - (ax * ux + ay * uy) * uy
+    start = (ax - ux * length / 2, ay - uy * length / 2)
+    end = (ax + ux * length / 2, ay + uy * length / 2)
+    exact = _exact_segment_distance(start, end)
+    got = geo._segment_distance(start, end)
+    scale = min(math.hypot(*start), math.hypot(*end)) + length
+    assert abs(got - exact) <= 4 * sys.float_info.epsilon * scale
+
+
+def _exact_segment_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """The distance from the origin to ab, exactly in rationals, then rounded."""
+    ax, ay, bx, by = map(Fraction, (*a, *b))
+    dx, dy = bx - ax, by - ay
+    length = dx * dx + dy * dy
+    t = 0 if length == 0 else min(1, max(0, -(ax * dx + ay * dy) / length))
+    x, y = ax + t * dx, ay + t * dy
+    squared = x * x + y * y
+    with decimal.localcontext() as context:
+        context.prec = 80
+        root = (
+            decimal.Decimal(squared.numerator) / decimal.Decimal(squared.denominator)
+        ).sqrt()
+    return float(root)
+
+
+@pytest.mark.parametrize(
+    ("polygon", "zone"),
+    [
+        pytest.param(
+            _box(0.0, 0.0, 1.0, 170.0),
+            Circle(0.046875, 170.0, 0.0),
+            id="east edge of a 170-degree zone",
+        ),
+        pytest.param(
+            _box(0.0, 0.0, 1.0, 1.0),
+            Circle(1.0, 4.12e-263, 0.0),
+            id="next to the far end of the north edge",
+        ),
+        pytest.param(
+            _box(51.4, -0.1278, 51.6, 0.5),
+            Circle(51.6, math.nextafter(-0.1278, 1), 0.0),
+            id="one ulp from a London-sized zone's corner",
+        ),
+        pytest.param(
+            _box(51.0, 0.001, 51.1, 0.011),
+            Circle(51.1, math.nextafter(0.001, 1), 0.0),
+            id="one ulp east of a small zone's corner",
+        ),
+        pytest.param(
+            _box(-1.0, 0.0, 2.0, 2.0, holes=(_box(0.0, 0.5, 1.0, 1.5).exterior,)),
+            Circle(0.109375, 0.5, 0.0),
+            id="on a hole's west edge, where crossings say inside the hole",
+        ),
+        pytest.param(
+            _box(0.0, 179.0, 1.0, 180.0),
+            Circle(0.046875, -180.0, 0.0),
+            id="on an edge at 180, from -180",
+        ),
+        pytest.param(
+            _box(0.0, 0.0, 1.0, 1e-12),
+            Circle(1.0, 5e-324, 0.0),
+            id="a dot product underflowing to zero",
+        ),
+    ],
+)
+def test_a_boundary_point_overlaps_at_radius_zero(
+    polygon: FlexPolygon, zone: Circle
+) -> None:
+    """Rounding never moves a boundary point out. Main's foot-of-the-
+    perpendicular step missed the 170-degree edge, the hole's west edge and
+    the antimeridian copy; an end test read off the far vertex missed the
+    three next to an edge's end; a non-strict end test missed the
+    underflowing dot product."""
+    assert polygon_overlaps_circle(polygon, zone)
 
 
 @given(
