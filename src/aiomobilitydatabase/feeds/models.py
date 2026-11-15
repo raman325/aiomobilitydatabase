@@ -1193,9 +1193,9 @@ class BookingWindow:
     states but that can't be read (``BookingRule.unreadable_fields``); a
     duration max under the min, which no ride's notice can meet; booking
     that, for this window, opens only after it closes, or closes after the
-    window ends though the spec says "before travel"; a
-    count of service days that does not end within a year; a date out of
-    range. Instants are UTC.
+    window ends though the spec says "before travel"; a count of service
+    days that does not end within a year; a date out of range. Instants are
+    UTC.
     """
 
     rule: BookingRule

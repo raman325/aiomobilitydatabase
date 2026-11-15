@@ -106,13 +106,13 @@ def _read_fields(rule: BookingRule) -> set[str]:
         if not stated("prior_notice_duration_max"):
             fields.add("prior_notice_start_day")
     elif rule.booking_type is BookingType.PRIOR_DAYS:
-        fields |= {
-            "prior_notice_last_day",
-            "prior_notice_last_time",
-            "prior_notice_start_day",
-        }
-    if "prior_notice_start_day" in fields and stated("prior_notice_start_day"):
-        fields.add("prior_notice_start_time")
+        fields |= {"prior_notice_last_day", "prior_notice_start_day"}
+    for day, time in (
+        ("prior_notice_last_day", "prior_notice_last_time"),
+        ("prior_notice_start_day", "prior_notice_start_time"),
+    ):
+        if day in fields and stated(day):
+            fields.add(time)
     return fields
 
 

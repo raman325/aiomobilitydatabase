@@ -124,7 +124,10 @@ _FORBIDDEN = {
     "prior_notice_duration_max": 60,
     "prior_notice_last_day": 1,
     "prior_notice_last_time": timedelta(hours=17),
-    "prior_notice_start_day": 3,
+    # Five days back from Friday 2026-11-13: Sunday the 8th on the
+    # calendar, Friday the 6th on _WEEKDAYS -- so counting on a forbidden
+    # service id shows.
+    "prior_notice_start_day": 5,
     "prior_notice_start_time": timedelta(hours=8),
     "prior_notice_service_id": _WEEKDAYS,
 }
@@ -148,6 +151,14 @@ _VALID = {
         ),
         (BookingType.SAME_DAY, "prior_notice_last_day", {}),
         (BookingType.SAME_DAY, "prior_notice_service_id", {}),
+        (
+            BookingType.SAME_DAY,
+            "prior_notice_service_id",
+            {
+                "prior_notice_start_day": 5,
+                "prior_notice_start_time": timedelta(hours=8),
+            },
+        ),
         (
             BookingType.SAME_DAY,
             "prior_notice_start_day",
@@ -183,6 +194,22 @@ def test_an_unreadable_field_counts_only_where_it_is_read() -> None:
         unreadable_fields=("prior_notice_duration_max",),
     )
     assert _place(read) is None
+    # A start day is read for prior-day booking, and for same-day booking
+    # without a max: unreadable there, unknown -- never "no earliest time".
+    for start_day_read in (
+        _rule(
+            BookingType.PRIOR_DAYS,
+            prior_notice_last_day=1,
+            prior_notice_last_time=timedelta(hours=17),
+            unreadable_fields=("prior_notice_start_day",),
+        ),
+        _rule(
+            BookingType.SAME_DAY,
+            prior_notice_duration_min=30,
+            unreadable_fields=("prior_notice_start_day",),
+        ),
+    ):
+        assert _place(start_day_read) is None
     # A start day beside a duration max, and a start time without its day,
     # are forbidden: unreadable there, still ignored.
     beside_max = _rule(
