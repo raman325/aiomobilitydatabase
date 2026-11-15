@@ -289,6 +289,24 @@ def test_stop_windows_and_stop_groups_are_dated_and_tied_by_sequence(
     )
 
 
+def test_added_dates_alone_are_each_dated(tmp_path: Path) -> None:
+    """A service of calendar_dates alone, on consecutive days and from the
+    query's first day: each added date is a running day."""
+    feed = _zone_feed(
+        "T,,Z,08:00:00,09:00:00,1,2,2,,\n",
+        calendar="service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+        "sunday,start_date,end_date\n",
+        calendar_dates="service_id,date,exception_type\n"
+        "S,20260730,1\nS,20260731,1\nS,20260802,1\n",
+    )
+    windows = _windows(_build(tmp_path, feed), _AT_Z, start=_JULY_30, limit=5)
+    assert [w.service_date for w in windows] == [
+        date(2026, 7, 30),
+        date(2026, 7, 31),
+        date(2026, 8, 2),
+    ]
+
+
 def test_a_window_ending_before_it_starts_is_never_dated(tmp_path: Path) -> None:
     """Service "becomes available" and then "ends": 10:00-08:00 says
     neither when, so it gets no date (get_on_demand_services keeps it)."""
@@ -361,15 +379,21 @@ def _flex_feeds(draw: st.DrawFn) -> dict[str, object]:
     zone_name = draw(st.sampled_from(_ZONES))
     services: dict[str, tuple[tuple[bool, ...], date, date, dict[date, int]]] = {}
     for service_id in ("A", "B", "C")[: draw(st.integers(1, 3))]:
-        mask = tuple(draw(st.lists(st.booleans(), min_size=7, max_size=7)))
+        mask = (
+            tuple(draw(st.lists(st.booleans(), min_size=7, max_size=7)))
+            if draw(st.booleans())
+            else (False,) * 7  # calendar_dates alone
+        )
         lo = _FIRST + timedelta(days=draw(st.integers(0, 20)))
         hi = lo + timedelta(days=draw(st.integers(3, _SPAN_DAYS)))
         exceptions = {
             _FIRST + timedelta(days=offset): kind
             for offset, kind in draw(
                 st.lists(
-                    st.tuples(st.integers(0, _SPAN_DAYS + 5), st.sampled_from([1, 2])),
-                    max_size=4,
+                    st.tuples(
+                        st.integers(0, _SPAN_DAYS + 5), st.sampled_from([1, 1, 2])
+                    ),
+                    max_size=8,
                 )
             )
         }
