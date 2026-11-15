@@ -707,6 +707,8 @@ _TYPE_CELLS = st.one_of(
 # newline) and control characters.
 _TEXT = st.text(alphabet=st.characters(blacklist_categories=("Cs", "Cc")), max_size=6)
 _TEXT_CELLS = _TEXT.map(lambda text: (text, text or None))
+# An id cell of whitespace alone is blank.
+_ID_CELLS = _TEXT.map(lambda text: (text, text if text.strip() else None))
 
 _NOTICE_COLUMNS = (
     "prior_notice_duration_min",
@@ -724,7 +726,7 @@ _RULE_COLUMNS: dict[str, st.SearchStrategy[Any]] = {
     "prior_notice_last_time": _TIME_CELLS,
     "prior_notice_start_day": _INT_CELLS,
     "prior_notice_start_time": _TIME_CELLS,
-    "prior_notice_service_id": _TEXT_CELLS,
+    "prior_notice_service_id": _ID_CELLS,
     "message": _TEXT_CELLS,
     "pickup_message": _TEXT_CELLS,
     "drop_off_message": _TEXT_CELLS,

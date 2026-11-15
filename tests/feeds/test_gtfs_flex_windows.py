@@ -373,6 +373,36 @@ def test_booking_counts_on_a_service_no_call_runs(tmp_path: Path) -> None:
     assert window.pickup_booking.latest == datetime(2026, 7, 31, 17, tzinfo=UTC)
 
 
+def test_a_window_ending_before_start_is_skipped_in_year_one(
+    tmp_path: Path,
+) -> None:
+    """Near the first datable instant no first reaching day can be placed
+    by arithmetic, so the walk starts at the service's first day -- and
+    still returns only windows that reach start."""
+    feed = _zone_feed(
+        "T,,Z,08:00:00,09:00:00,1,2,2,,\n",
+        calendar="service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+        "sunday,start_date,end_date\nS,1,1,1,1,1,1,1,00010101,00010110\n",
+    )
+    start = datetime(1, 1, 3, 8, 30, tzinfo=UTC)
+    windows = _windows(_build(tmp_path, feed), _AT_Z, start=start, limit=2)
+    assert [w.service_date for w in windows] == [date(1, 1, 3), date(1, 1, 4)]
+
+
+def test_a_blank_service_id_counts_calendar_days(tmp_path: Path) -> None:
+    """A prior_notice_service_id of whitespace alone is blank: calendar
+    days, so a Monday ride books by 17:00 on Sunday."""
+    feed = _zone_feed(
+        "T,,Z,08:00:00,09:00:00,1,2,2,P,\n",
+        booking_rules="booking_rule_id,booking_type,prior_notice_last_day,"
+        "prior_notice_last_time,prior_notice_service_id\nP,2,1,17:00:00, \n",
+    )
+    monday = datetime(2026, 8, 3, tzinfo=UTC)
+    [window] = _windows(_build(tmp_path, feed), _AT_Z, start=monday, limit=1)
+    assert window.pickup_booking is not None
+    assert window.pickup_booking.latest == datetime(2026, 8, 2, 17, tzinfo=UTC)
+
+
 def test_bad_arguments_are_refused(tmp_path: Path) -> None:
     index = partial(_build, tmp_path, _zone_feed("T,,Z,08:00:00,09:00:00,1,2,2,,\n"))
     with pytest.raises(TypeError):

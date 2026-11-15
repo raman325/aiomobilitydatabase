@@ -1078,7 +1078,7 @@ class StaticIndex:
         self._tz = ZoneInfo(timezone_name)
         self._last_dates: dict[str, date] | None = None
         self._first_dates: dict[str, date] | None = None
-        self._patterns: dict[str, _ServicePattern] | None = None
+        self._patterns: dict[str, _ServicePattern | None] = {}
         self._first_date: date | None = None
         self._first_date_known = False
         self._reach: tuple[int, tuple[int, ...]] | None = None
@@ -1969,7 +1969,7 @@ class StaticIndex:
                     rule_id,
                     _lenient_int(row.get("booking_type")),
                     *notice.values(),
-                    row.get("prior_notice_service_id") or None,
+                    _cell(row, "prior_notice_service_id"),
                     row.get("message") or None,
                     row.get("pickup_message") or None,
                     row.get("drop_off_message") or None,
@@ -2673,6 +2673,7 @@ class StaticIndex:
             if rule is not None and rule.prior_notice_service_id is not None
         }
         active: dict[date, set[str]] = {}
+        self._load_patterns(call.service_id for call in calls)
 
         def runs(service_id: str, day: date) -> bool:
             if day not in active:
@@ -2703,6 +2704,13 @@ class StaticIndex:
                         )
                         continue
                     return  # past the end of datetime: nothing later dates
+                if window_end < start:
+                    # Before start: only near the dated range's start, where
+                    # _first_day_reaching can't place the first reaching day.
+                    candidate = self._next_service_day(
+                        call.service_id, candidate + timedelta(days=1)
+                    )
+                    continue
                 # Like every scan here, never past _LATEST_INSTANT.
                 if window_start <= min(end or _LATEST_INSTANT, _LATEST_INSTANT):
                     heapq.heappush(heap, (window_start, index, candidate, window_end))
@@ -2742,41 +2750,50 @@ class StaticIndex:
                 push(index, day + timedelta(days=1))
         return dated
 
-    def _service_patterns(self) -> dict[str, _ServicePattern]:
-        """Each service's calendar.txt row and calendar_dates exceptions.
+    def _load_patterns(self, service_ids: Iterable[str]) -> None:
+        """Read the calendar of each service not read yet (see _patterns).
 
-        The days it can run on, less the REMOVED ones (which win over an
-        ADDED one, as in :meth:`active_service_ids`): a superset of its
-        active days, which :meth:`_next_service_day` jumps between.
-        Computed once.
+        Each service's calendar.txt row and calendar_dates exceptions: the
+        days it can run on, less the REMOVED ones (which win over an ADDED
+        one, as in :meth:`active_service_ids`) -- a superset of its active
+        days, which :meth:`_next_service_day` jumps between. Only the
+        services a query asks about, so a large calendar_dates.txt is never
+        held whole; kept per service, the index never changes.
         """
-        if self._patterns is not None:
-            return self._patterns
-        patterns: dict[str, _ServicePattern] = {}
-        for service_id, *days, raw_start, raw_end in self._conn.execute(
-            f"SELECT service_id, {', '.join(_WEEKDAY_COLUMNS)}, start_date, "
-            "end_date FROM calendar"
-        ):
-            lo, hi = _lenient_date(raw_start), _lenient_date(raw_end)
-            weekdays = tuple(day == 1 for day in days)
-            if lo is not None and hi is not None and lo <= hi and any(weekdays):
-                patterns[service_id] = _ServicePattern((weekdays, lo, hi), [], set())
-        for service_id, raw, kind in self._conn.execute(
-            "SELECT service_id, date, exception_type FROM calendar_dates "
-            "WHERE exception_type IN (?, ?)",
-            (_EXCEPTION_SERVICE_ADDED, _EXCEPTION_SERVICE_REMOVED),
-        ):
-            if (day := _lenient_date(raw)) is None:
-                continue
-            pattern = patterns.setdefault(service_id, _ServicePattern(None, [], set()))
-            if kind == _EXCEPTION_SERVICE_ADDED:
-                pattern.added.append(day)
-            else:
-                pattern.removed.add(day)
-        for pattern in patterns.values():
-            pattern.added.sort()
-        self._patterns = patterns
-        return patterns
+        missing = sorted(set(service_ids) - self._patterns.keys())
+        for offset in range(0, len(missing), _ID_SLICE):
+            chunk = missing[offset : offset + _ID_SLICE]
+            marks = ",".join("?" * len(chunk))
+            patterns: dict[str, _ServicePattern | None] = dict.fromkeys(chunk)
+            for service_id, *days, raw_start, raw_end in self._conn.execute(
+                f"SELECT service_id, {', '.join(_WEEKDAY_COLUMNS)}, start_date, "
+                f"end_date FROM calendar WHERE service_id IN ({marks})",
+                chunk,
+            ):
+                lo, hi = _lenient_date(raw_start), _lenient_date(raw_end)
+                weekdays = tuple(day == 1 for day in days)
+                if lo is not None and hi is not None and lo <= hi and any(weekdays):
+                    patterns[service_id] = _ServicePattern(
+                        (weekdays, lo, hi), [], set()
+                    )
+            for service_id, raw, kind in self._conn.execute(
+                "SELECT service_id, date, exception_type FROM calendar_dates "
+                f"WHERE service_id IN ({marks}) AND exception_type IN (?, ?)",
+                [*chunk, _EXCEPTION_SERVICE_ADDED, _EXCEPTION_SERVICE_REMOVED],
+            ):
+                if (day := _lenient_date(raw)) is None:
+                    continue
+                pattern = patterns[service_id]
+                if pattern is None:
+                    pattern = patterns[service_id] = _ServicePattern(None, [], set())
+                if kind == _EXCEPTION_SERVICE_ADDED:
+                    pattern.added.append(day)
+                else:
+                    pattern.removed.add(day)
+            for pattern in patterns.values():
+                if pattern is not None:
+                    pattern.added.sort()
+            self._patterns.update(patterns)
 
     def _next_service_day(self, service_id: str, day: date) -> date | None:
         """Return the first day on or after ``day`` the service can run.
@@ -2785,7 +2802,8 @@ class StaticIndex:
         most to look through) and its next ADDED date, skipping REMOVED
         dates; None if neither is left.
         """
-        pattern = self._service_patterns().get(service_id)
+        self._load_patterns([service_id])
+        pattern = self._patterns[service_id]
         if pattern is None:
             return None
         candidate = self._next_possible_day(pattern, day)
@@ -2819,9 +2837,11 @@ class StaticIndex:
     def _first_day_reaching(self, at: datetime, secs: int) -> date | None:
         """Return the first service day D with D's start + ``secs`` >= ``at``.
 
-        None when every day does (``at`` less ``secs`` precedes the dated
-        range). Day starts only increase, so it is the day after the one
-        ``at - secs`` falls in, unless that day starts exactly then.
+        None when ``at`` less ``secs`` precedes the dated range, so no day
+        can be placed by arithmetic: the caller starts at the service's
+        first day and skips windows ending before ``at``. Day starts only
+        increase, so it is the day after the one ``at - secs`` falls in,
+        unless that day starts exactly then.
         """
         try:
             point = at - timedelta(seconds=secs)

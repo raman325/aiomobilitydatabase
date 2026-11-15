@@ -80,7 +80,8 @@ def booking_window(
     earliest, latest = bounds
     if latest > window_end or (earliest is not None and earliest > latest):
         # A deadline after every ride (the spec's "before travel"), or
-        # booking opening after it closes: contradictory, not "never".
+        # booking that for this window opens after it closes: no window,
+        # never one reading "never open" or open too late.
         return None
     return BookingWindow(rule=rule, earliest=earliest, latest=latest)
 
