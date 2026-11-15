@@ -257,6 +257,44 @@ def test_a_frequency_trip_of_flex_calls_alone_is_one_trip(tmp_path: Path) -> Non
     index.close()
 
 
+def test_a_frequency_trip_of_windows_around_untimed_stops_is_one_trip(
+    tmp_path: Path,
+) -> None:
+    """With windows first and last, no fixed call is the trip's first or
+    last stop, so none need a time (and arrival_time is forbidden on the
+    windows): nothing to repeat from, so it stays one unrepeated trip,
+    every call under its own id, instead of failing the feed."""
+    feed = _feed(
+        stop_times=_FLEX_HEADER
+        + "T,,,,Z,,07:00:00,07:50:00,1,2,1\n"
+        + "T,,,S0,,,,,2,,\n"
+        + "T,,,,Z,,08:10:00,09:00:00,3,1,2\n",
+        frequencies="trip_id,start_time,end_time,headway_secs\nT,06:00:00,07:00:00,600\n",
+    )
+    feed["locations.geojson"] = _ZONES
+    index = _build(tmp_path, feed)
+    assert index._conn.execute("SELECT id, exact_times FROM trips").fetchall() == [
+        ("T", None)
+    ]
+    assert _stop_time_rows(index) == [("T", "S0", None, None, 2)]
+    assert [row[:2] for row in _flex_rows(index)] == [("T", 1), ("T", 3)]
+    index.close()
+
+
+def test_an_untimed_first_stop_still_fails_a_frequency_trip(tmp_path: Path) -> None:
+    """Without a window ahead of it, an untimed fixed call IS the trip's
+    first stop, whose time the spec requires: still malformed."""
+    feed = _feed(
+        stop_times=_FLEX_HEADER
+        + "T,,,S0,,,,,1,,\n"
+        + "T,,,,Z,,08:10:00,09:00:00,2,1,2\n",
+        frequencies="trip_id,start_time,end_time,headway_secs\nT,06:00:00,07:00:00,600\n",
+    )
+    feed["locations.geojson"] = _ZONES
+    with pytest.raises(FeedParseError, match="anchor"):
+        _build(tmp_path, feed)
+
+
 # -- GTFS-RT: a Flex call keeps its place in the trip -------------------------
 
 
@@ -631,8 +669,11 @@ def test_flex_rows_change_no_fixed_route_answer(
         )
     )
     # A frequency template whose first stop is untimed fails to anchor, but
-    # with a window ahead of it that stop is not the trip's first.
-    if not (repeated and isinstance(expected, str) and "anchor" in expected):
+    # with a window ahead of it that stop is not the trip's first: the feed
+    # then builds, or fails as before -- never with another error.
+    if repeated and isinstance(expected, str) and "anchor" in expected:
+        assert got == expected or not isinstance(got, str)
+    else:
         assert got == expected
     if not repeated and not isinstance(expected, str):
         assert stored == sorted(

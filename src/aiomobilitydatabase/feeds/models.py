@@ -1104,7 +1104,7 @@ class OnDemandService:
     ``end_pickup_drop_off_window`` are GTFS times: time since the start of
     the service day (noon minus 12 hours). Either is None where the feed
     gives none, where a frequencies.txt repetition would move it before its
-    service day starts, or on a frequencies.txt trip of Flex calls alone
+    service day starts, or on a frequencies.txt trip with no timed call
     (see ``exact_times``) -- unknown, never "no limit".
 
     ``pickup_type``/``drop_off_type`` say whether, and how, a rider may be
@@ -1126,9 +1126,10 @@ class OnDemandService:
     (``exact_times=0``, service that "does not follow a fixed schedule"),
     whose windows move with an approximate start, like
     :attr:`StopArrival.timepoint_exact`; None where frequencies.txt's
-    exact_times is unparseable, and on a frequencies.txt trip of Flex calls
-    alone (no timed call to repeat from: it is kept as one trip, and its
-    windows are None, the template's being no run's).
+    exact_times is unparseable, and on a frequencies.txt trip with no timed
+    call to repeat from (Flex calls alone, or windows around untimed stops:
+    it is kept as one trip, and its windows are None, the template's being
+    no run's).
     """
 
     trip_id: str

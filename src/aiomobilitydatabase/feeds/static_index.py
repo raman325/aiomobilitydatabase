@@ -103,7 +103,8 @@ CREATE TABLE trips (
     -- repetition whose frequencies.txt row says exact_times=1; 0 on a
     -- headway repetition ("does not follow a fixed schedule"); NULL where
     -- exact_times is unparseable, and on a frequencies.txt trip the loader
-    -- cannot repeat (no timed call: Flex calls alone, or none), whose
+    -- cannot repeat (no timed call: Flex calls alone, windows around
+    -- untimed stops, or no calls), whose
     -- windows are the template's, no run's -- read as unknown.
     exact_times INTEGER
 );
@@ -1522,8 +1523,10 @@ class StaticIndex:
         are copied into each repetition with their windows shifted alike;
         the anchor is then the first fixed call that is timed when Flex
         calls come before it (the trip's first stop is a window, with no
-        departure to measure from), and a template of Flex calls alone has
-        no anchor and is kept as one unrepeated trip. An exact_times=0 repetition
+        departure to measure from), and a template with no timed call
+        after its leading window -- Flex calls alone, or windows around
+        untimed stops, whose times the spec makes optional -- has no anchor
+        and is kept as one unrepeated trip. An exact_times=0 repetition
         also keeps its headway as ``slot_secs``: GTFS-RT names such a run by
         a start_time that "may be arbitrary", and :meth:`slot_runs` finds
         the repetition whose slot it starts in.
@@ -1574,14 +1577,6 @@ class StaticIndex:
                 "FROM stop_times WHERE trip_id = ? ORDER BY stop_sequence",
                 (trip_id,),
             ).fetchall()
-            if not template:
-                # Dangling, or Flex calls alone: nothing to anchor, so kept
-                # as one trip -- whose times frequencies.txt says repeat,
-                # neither exact nor approximate instants: unknown.
-                conn.execute(
-                    "UPDATE trips SET exact_times = NULL WHERE id = ?", (trip_id,)
-                )
-                continue
             flex_template = conn.execute(
                 "SELECT * FROM flex_stop_times WHERE trip_id = ? "
                 "ORDER BY stop_sequence",
@@ -1589,9 +1584,23 @@ class StaticIndex:
             ).fetchall()
             # The loader already lets a lone arrival stand in for a blank
             # departure, so this is None only for an untimed first stop.
-            anchor = template[0][2]
-            if flex_template and flex_template[0][1] < template[0][3]:
+            anchor = template[0][2] if template else None
+            leading_window = bool(flex_template) and (
+                not template or flex_template[0][1] < template[0][3]
+            )
+            if leading_window:
+                # The first fixed call is not the trip's first stop, so its
+                # times are optional: anchor on the first timed one.
                 anchor = next((row[2] for row in template if row[2] is not None), None)
+            if anchor is None and (leading_window or not template):
+                # Dangling, Flex calls alone, or windows around untimed
+                # stops: nothing to anchor, so kept as one trip -- whose
+                # times frequencies.txt says repeat, neither exact nor
+                # approximate instants: unknown.
+                conn.execute(
+                    "UPDATE trips SET exact_times = NULL WHERE id = ?", (trip_id,)
+                )
+                continue
             if anchor is None:
                 raise ValueError(
                     f"frequency trip {trip_id!r} has no first-stop time "
