@@ -80,6 +80,7 @@ that fetches and caches the actual data. GBFS needs no extra; GTFS and GTFS-RT
 
 ```python
 import asyncio
+from datetime import UTC, datetime
 
 from aiomobilitydatabase.feeds import (
     ArrivalsQuery,
@@ -155,8 +156,16 @@ async def main() -> None:
         vehicles = await transit.get_vehicles(zone=home)
         alerts = await transit.get_alerts()
 
+        # GTFS-Flex on-demand service: the next windows a ride can be
+        # requested in around home, and whether each can still be booked.
+        for window in await transit.get_on_demand_windows(home, limit=3):
+            booking = window.pickup_booking  # None: no rule, or not placeable
+            bookable = booking.is_open(datetime.now(UTC)) if booking else None
+            print(window.service.route_id, window.window_start, bookable)
+
         # GBFS bike/scooter share:
         bikes = await client.get_gbfs_feed("gbfs-300")
+        info = await bikes.get_system_info()
         stations = await bikes.get_stations(zone=home)
         free_vehicles = await bikes.get_vehicles(zone=home)
 
@@ -546,6 +555,26 @@ Notes on direct mode:
   (an id whose record the feed lacks keeps the id, with None for the
   record). Schedule only, no network. Meant for circles of up to a few
   hundred kilometres that do not reach a pole, like `stops_in`.
+- **On-demand windows on dates, with booking**: `await
+  get_on_demand_windows(zone, start=..., end=..., limit=...,
+  route_ids=...)` places each of those calls on every GTFS service date its
+  trip runs, as an `OnDemandWindow` (`window_start`/`window_end` instants,
+  measured from noon minus 12 hours like every GTFS time), where the window
+  overlaps `[start, end]` -- one under way at `start` counts. Same time
+  rules as `get_scheduled_departures()`: open-ended by default, an
+  open-ended query needs a `limit`; sorted by window start. A call whose
+  window is unknown has no dated window. `pickup_booking`/`drop_off_booking`
+  place the call's booking rules on the window as a `BookingWindow`
+  (`earliest`, `latest`, `is_open(at)`): real-time booking up to the
+  window's end; same-day booking from `prior_notice_duration_max` before
+  its start (or a start day) to `prior_notice_duration_min` before its end;
+  prior-day booking by `prior_notice_last_time` on the
+  `prior_notice_last_day`-th day before the service date, counting the days
+  `prior_notice_service_id` runs where given. Each `booking_type` reads only
+  the columns the spec allows it; `earliest` is None only where the rule
+  sets no earliest time, and a rule that cannot be placed (a field it needs
+  missing, a day count that does not end within a year) gives None, never a
+  guessed window.
 - **Alert scope is the spec's, selector by selector**: `ServiceAlert`
   keeps each `informed_entity` whole as an `EntitySelector` (spec field
   names; a trip as a `TripSelector`, one run of it where it gives a start
@@ -634,10 +663,12 @@ files (`locations.geojson`, `location_groups.txt`, `location_group_stops.txt`,
   raw cell, but nothing interprets it.)
 - `translations.txt` — text is returned as the feed wrote it.
 
-**GTFS-Flex: no dated windows or booking deadlines yet.**
-`get_on_demand_services(zone)` says which on-demand calls serve a place and
-their windows as offsets into the service day, but not yet the dated windows
-of a time range or when a ride can still be booked. A zone-only feed loads
+**GTFS-Flex: no on-demand trip planning or realtime.** Which on-demand
+calls serve a place, their dated windows and when each can be booked are
+answerable (see *On-demand windows on dates, with booking*); journeys that
+mix fixed and on-demand legs, and where a ride picked up in one zone can
+be dropped off, are not, and on-demand windows are schedule only (no
+realtime overlay). A zone-only feed loads
 (stops.txt is optional when `locations.geojson` is present), and a
 `stop_times.txt` row naming a zone, a stop group, or a pickup/drop-off
 window is kept apart from the fixed calls: boards and
@@ -660,7 +691,8 @@ annotated* — and the `stop` entities they define are read.
 polygon geometry while zones here are deliberately circles — supporting it
 means polygon containment, which is a geometry feature rather than another
 document. And `system_hours`, which GBFS 3.0 removed in favour of
-`system_information.opening_hours` (exposed as `GbfsSystemInfo.opening_hours`).
+`system_information.opening_hours` (exposed as `GbfsSystemInfo.opening_hours`,
+from `get_system_info()`).
 
 **Behaviour, not data.** There is no polling loop or scheduler (see *Pull, not
 push*), no write access of any kind, and no cross-feed journey planning.
@@ -774,6 +806,12 @@ The suite combines example-based, property-based, and conformance testing:
     detours with several (or empty) modifications, dated and date-less
     cancellations, feed timestamps behind, ahead of or far from the query,
     and batches whose queries settle at different horizons;
+  - GTFS-Flex: zone validity and circle overlap against exact references
+    (rectangles, convex half-planes, holes, great-circle distance), Flex rows
+    changing no fixed-route answer, every call serving a zone found and
+    nothing else, dated on-demand windows against a brute-force calendar
+    oracle across DST changes (so open-ended equals bounded there too), and
+    booking deadlines against an independent count of service days;
   - the cache as a round trip: a built index and the same index reopened from
     disk answer every query identically, including the stored timezone, and
     `purge_cache` removes exactly the named feed and nothing else for any
