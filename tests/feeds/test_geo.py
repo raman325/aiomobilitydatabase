@@ -867,7 +867,7 @@ def test_radius_zero_on_a_rectangle_is_its_bounds_check(
     south=st.floats(-70, 69),
     height=st.floats(1e-6, 1),
     west=st.floats(-180, 179),
-    width=st.floats(1e-6, 359),
+    reach=st.floats(1e-9, 1),
     side=st.sampled_from(["south", "north", "west", "east"]),
     along=st.floats(0, 1),
 )
@@ -875,24 +875,17 @@ def test_a_point_on_a_rectangle_edge_overlaps_at_radius_zero(  # noqa: PLR0917
     south: float,
     height: float,
     west: float,
-    width: float,
+    reach: float,
     side: str,
     along: float,
 ) -> None:
     """The boundary belongs to the zone: a zero-radius circle on any edge of
-    an axis-aligned rectangle overlaps it, however far east the edge lies
-    (found at a 170-degree-wide zone's east edge, 2026-11-14)."""
-    north, east = south + height, west + width
-    rectangle = FlexPolygon(
-        exterior=(
-            (south, west),
-            (south, east),
-            (north, east),
-            (north, west),
-            (south, west),
-        ),
-        holes=(),
-    )
+    an axis-aligned rectangle overlaps it, wherever on the edge -- next to
+    either end too -- and however far east the edge lies (up to 180)."""
+    north, east = south + height, west + reach * (180 - west)
+    assume(west < east <= 180)
+    rectangle = _box(south, west, north, east)
+    width = east - west
     lat, lon = {
         "south": (south, west + along * width),
         "north": (north, west + along * width),
@@ -903,14 +896,80 @@ def test_a_point_on_a_rectangle_edge_overlaps_at_radius_zero(  # noqa: PLR0917
     assert polygon_overlaps_circle(rectangle, Circle(lat, lon, 0.0))
 
 
-def test_the_east_edge_of_a_wide_zone_overlaps_at_radius_zero() -> None:
-    """The case Hypothesis found: stepping to the foot of the perpendicular
-    left a residue of about 1e-12 m, and a zero radius missed it."""
-    rectangle = FlexPolygon(
-        exterior=((0.0, 0.0), (0.0, 170.0), (1.0, 170.0), (1.0, 0.0), (0.0, 0.0)),
-        holes=(),
+def _box(
+    south: float,
+    west: float,
+    north: float,
+    east: float,
+    holes: tuple[tuple[tuple[float, float], ...], ...] = (),
+) -> FlexPolygon:
+    return FlexPolygon(
+        exterior=(
+            (south, west),
+            (south, east),
+            (north, east),
+            (north, west),
+            (south, west),
+        ),
+        holes=holes,
     )
-    assert polygon_overlaps_circle(rectangle, Circle(0.046875, 170.0, 0.0))
+
+
+@pytest.mark.parametrize(
+    ("polygon", "zone"),
+    [
+        pytest.param(
+            _box(0.0, 0.0, 1.0, 170.0),
+            Circle(0.046875, 170.0, 0.0),
+            id="east edge of a 170-degree zone",
+        ),
+        pytest.param(
+            _box(0.0, 0.0, 1.0, 1.0),
+            Circle(1.0, 4.12e-263, 0.0),
+            id="next to the far end of the north edge",
+        ),
+        pytest.param(
+            _box(51.4, -0.1278, 51.6, 0.5),
+            Circle(51.6, math.nextafter(-0.1278, 1), 0.0),
+            id="one ulp from a London-sized zone's corner",
+        ),
+        pytest.param(
+            _box(51.0, 0.001, 51.1, 0.011),
+            Circle(51.1, math.nextafter(0.001, 1), 0.0),
+            id="one ulp east of a small zone's corner",
+        ),
+        pytest.param(
+            _box(
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                holes=(
+                    (
+                        (0.25, 0.25),
+                        (0.75, 0.25),
+                        (0.75, 0.75),
+                        (0.25, 0.75),
+                        (0.25, 0.25),
+                    ),
+                ),
+            ),
+            Circle(0.75, 0.5, 0.0),
+            id="on a hole's edge",
+        ),
+        pytest.param(
+            _box(0.0, 179.0, 1.0, 180.0),
+            Circle(0.5, -180.0, 0.0),
+            id="on an edge at 180, from -180",
+        ),
+    ],
+)
+def test_a_boundary_point_overlaps_at_radius_zero(
+    polygon: FlexPolygon, zone: Circle
+) -> None:
+    """Rounding never moves a boundary point out: each of these the old
+    foot-of-the-perpendicular step or a far-vertex end test missed."""
+    assert polygon_overlaps_circle(polygon, zone)
 
 
 @given(
