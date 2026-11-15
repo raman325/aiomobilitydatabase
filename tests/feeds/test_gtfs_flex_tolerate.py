@@ -339,6 +339,72 @@ def test_an_untimed_first_or_last_stop_still_fails_a_frequency_trip(
         _build(tmp_path, feed)
 
 
+_SHAPE_ROWS = {
+    "window": "T,,,,Z,,07:00:00,07:50:00,{seq},2,1\n",
+    "timed": "T,08:{minute:02d}:00,08:{minute:02d}:00,S0,,,,,{seq},,\n",
+    "untimed": "T,,,S1,,,,,{seq},,\n",
+}
+
+
+@given(
+    shape=st.lists(st.sampled_from(sorted(_SHAPE_ROWS)), min_size=1, max_size=6).filter(
+        lambda kinds: "window" in kinds
+    )
+)
+@settings(max_examples=80, deadline=None)
+def test_a_frequency_template_repeats_keeps_or_fails_by_its_shape(
+    tmp_path_factory: pytest.TempPathFactory, shape: list[str]
+) -> None:
+    """For any order of windows, timed and untimed stops: it repeats from
+    its first timed call when the trip's first stop is a window, or from
+    its first stop when that is timed; with no time to repeat from it is
+    kept whole -- every call unknown -- only when windows come before AND
+    after its stops, so neither its first nor its last stop is untimed;
+    otherwise it fails."""
+    feed = _feed(
+        stop_times=_FLEX_HEADER
+        + "".join(
+            _SHAPE_ROWS[kind].format(seq=seq, minute=seq)
+            for seq, kind in enumerate(shape, start=1)
+        ),
+        frequencies="trip_id,start_time,end_time,headway_secs\nT,06:00:00,07:00:00,600\n",
+    )
+    feed["locations.geojson"] = _ZONES
+    fixed = [seq for seq, kind in enumerate(shape) if kind != "window"]
+    windows = [seq for seq, kind in enumerate(shape) if kind == "window"]
+    leading = not fixed or windows[0] < fixed[0]
+    trailing = not fixed or windows[-1] > fixed[-1]
+    timed = [seq for seq in fixed if shape[seq] == "timed"]
+    anchored = bool(timed) if leading else bool(fixed) and shape[fixed[0]] == "timed"
+    if not anchored and not (leading and trailing):
+        with pytest.raises(FeedParseError, match="anchor"):
+            _build(tmp_path_factory.mktemp("feed"), feed)
+        return
+    index = _build(tmp_path_factory.mktemp("feed"), feed)
+    try:
+        trips = index._conn.execute(
+            "SELECT id, exact_times FROM trips ORDER BY id"
+        ).fetchall()
+        if anchored:
+            assert [trip_id for trip_id, _ in trips] == [
+                "T",
+                "T#21600",
+                "T#22200",
+                "T#22800",
+                "T#23400",
+                "T#24000",
+                "T#24600",
+            ]
+        else:
+            assert trips == [("T", None)]
+            assert index._conn.execute(
+                "SELECT arrival_secs, departure_secs, timepoint FROM stop_times"
+            ).fetchall() == [(None, None, None)] * len(fixed)
+            assert len(_flex_rows(index)) == len(windows)
+    finally:
+        index.close()
+
+
 # -- GTFS-RT: a Flex call keeps its place in the trip -------------------------
 
 
@@ -647,28 +713,6 @@ def _without_flex(
     return rest, rest.pop("flex_stop_times")
 
 
-def _assert_repeated_or_kept_unknown(zip_bytes: bytes, trip_id: str) -> None:
-    """The frequency trip has repetitions, or is kept as one trip with no
-    timed call, its exactness and every call's unknown."""
-    index = _index_from_zip_bytes(zip_bytes)
-    try:
-        runs = index._conn.execute(
-            "SELECT id, exact_times FROM trips WHERE source_trip_id = ? OR id = ?",
-            (trip_id, trip_id),
-        ).fetchall()
-        if len(runs) > 1:
-            return
-        assert runs == [(trip_id, None)]
-        calls = index._conn.execute(
-            "SELECT arrival_secs, departure_secs, timepoint FROM stop_times "
-            "WHERE trip_id = ?",
-            (trip_id,),
-        ).fetchall()
-        assert all(call == (None, None, None) for call in calls)
-    finally:
-        index.close()
-
-
 @given(base=_random_gtfs_zip(), data=st.data())
 @settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_flex_rows_change_no_fixed_route_answer(
@@ -692,13 +736,12 @@ def test_flex_rows_change_no_fixed_route_answer(
         ]
     trip_ids = sorted({row["trip_id"] for row in fixed})
     repeated = data.draw(st.booleans())
-    repeated_trip = data.draw(st.sampled_from(trip_ids))
     if repeated:
         base = _rezip(
             base,
             **{
                 "frequencies.txt": "trip_id,start_time,end_time,headway_secs\n"
-                f"{repeated_trip},06:00:00,07:00:00,1800\n"
+                f"{data.draw(st.sampled_from(trip_ids))},06:00:00,07:00:00,1800\n"
             },
         )
     flex = data.draw(st.lists(_flex_row(trip_ids, stop_ids), min_size=1, max_size=8))
@@ -724,20 +767,23 @@ def test_flex_rows_change_no_fixed_route_answer(
     )
     expected, no_flex = _without_flex(_outcome(base))
     assert no_flex == []
-    flex_zip = _rezip(
-        base,
-        **{"stop_times.txt": _csv(fieldnames, rows), "locations.geojson": _ZONES},
+    got, stored = _without_flex(
+        _outcome(
+            _rezip(
+                base,
+                **{
+                    "stop_times.txt": _csv(fieldnames, rows),
+                    "locations.geojson": _ZONES,
+                },
+            )
+        )
     )
-    got, stored = _without_flex(_outcome(flex_zip))
     # A frequency template whose first stop is untimed fails to anchor, but
     # with a window ahead of it that stop is not the trip's first: the feed
-    # then builds -- repeated from a later timed call, or kept whole, never
-    # timed, with its exactness unknown -- or fails as before, never with
-    # another error.
+    # then builds (what it stores: see the template-shape property), or
+    # fails as before -- never with another error.
     if repeated and isinstance(expected, str) and "anchor" in expected:
         assert got == expected or not isinstance(got, str)
-        if not isinstance(got, str):
-            _assert_repeated_or_kept_unknown(flex_zip, repeated_trip)
     else:
         assert got == expected
     if not repeated and not isinstance(expected, str):
