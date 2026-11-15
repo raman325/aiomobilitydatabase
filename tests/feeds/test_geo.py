@@ -1,7 +1,9 @@
 """Tests for circular-zone geometry."""
 
+import decimal
 import itertools
 import math
+import sys
 import time
 from fractions import Fraction
 from typing import Any
@@ -915,6 +917,55 @@ def _box(
     )
 
 
+_PLANE = st.floats(-1e6, 1e6)
+
+
+@given(
+    a=st.tuples(_PLANE, _PLANE),
+    direction=st.tuples(st.floats(-1, 1), st.floats(-1, 1)),
+    length=st.floats(1e-6, 1e3),
+    offset=st.floats(-1e-3, 1e-3),
+)
+def test_segment_distance_is_within_rounding_of_exact(
+    a: tuple[float, float],
+    direction: tuple[float, float],
+    length: float,
+    offset: float,
+) -> None:
+    """Against the exact distance in rationals, within a few ulps of the
+    nearer vertex's magnitude -- including short edges far away with the
+    origin near their line, where a cross product from the far vertex
+    (``a x b``) is off by hundreds."""
+    norm = math.hypot(*direction)
+    assume(norm > 1e-3)
+    ux, uy = direction[0] / norm, direction[1] / norm
+    # Shift the edge so the origin lies near its line: a short edge far away.
+    ax, ay = a[0] + offset * -uy, a[1] + offset * ux
+    ax, ay = ax - (ax * ux + ay * uy) * ux, ay - (ax * ux + ay * uy) * uy
+    start = (ax - ux * length / 2, ay - uy * length / 2)
+    end = (ax + ux * length / 2, ay + uy * length / 2)
+    exact = _exact_segment_distance(start, end)
+    got = geo._segment_distance(start, end)
+    scale = min(math.hypot(*start), math.hypot(*end)) + length
+    assert abs(got - exact) <= 4 * sys.float_info.epsilon * scale
+
+
+def _exact_segment_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """The distance from the origin to ab, exactly in rationals, then rounded."""
+    ax, ay, bx, by = map(Fraction, (*a, *b))
+    dx, dy = bx - ax, by - ay
+    length = dx * dx + dy * dy
+    t = 0 if length == 0 else min(1, max(0, -(ax * dx + ay * dy) / length))
+    x, y = ax + t * dx, ay + t * dy
+    squared = x * x + y * y
+    with decimal.localcontext() as context:
+        context.prec = 80
+        root = (
+            decimal.Decimal(squared.numerator) / decimal.Decimal(squared.denominator)
+        ).sqrt()
+    return float(root)
+
+
 @pytest.mark.parametrize(
     ("polygon", "zone"),
     [
@@ -939,36 +990,30 @@ def _box(
             id="one ulp east of a small zone's corner",
         ),
         pytest.param(
-            _box(
-                0.0,
-                0.0,
-                1.0,
-                1.0,
-                holes=(
-                    (
-                        (0.25, 0.25),
-                        (0.75, 0.25),
-                        (0.75, 0.75),
-                        (0.25, 0.75),
-                        (0.25, 0.25),
-                    ),
-                ),
-            ),
-            Circle(0.75, 0.5, 0.0),
-            id="on a hole's edge",
+            _box(-1.0, 0.0, 2.0, 2.0, holes=(_box(0.0, 0.5, 1.0, 1.5).exterior,)),
+            Circle(0.109375, 0.5, 0.0),
+            id="on a hole's west edge, where crossings say inside the hole",
         ),
         pytest.param(
             _box(0.0, 179.0, 1.0, 180.0),
-            Circle(0.5, -180.0, 0.0),
+            Circle(0.046875, -180.0, 0.0),
             id="on an edge at 180, from -180",
+        ),
+        pytest.param(
+            _box(0.0, 0.0, 1.0, 1e-12),
+            Circle(1.0, 5e-324, 0.0),
+            id="a dot product underflowing to zero",
         ),
     ],
 )
 def test_a_boundary_point_overlaps_at_radius_zero(
     polygon: FlexPolygon, zone: Circle
 ) -> None:
-    """Rounding never moves a boundary point out: each of these the old
-    foot-of-the-perpendicular step or a far-vertex end test missed."""
+    """Rounding never moves a boundary point out. Main's foot-of-the-
+    perpendicular step missed the 170-degree edge, the hole's west edge and
+    the antimeridian copy; an end test read off the far vertex missed the
+    three next to an edge's end; a non-strict end test missed the
+    underflowing dot product."""
     assert polygon_overlaps_circle(polygon, zone)
 
 

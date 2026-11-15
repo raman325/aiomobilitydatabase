@@ -90,19 +90,25 @@ def _segment_distance(a: _Plane, b: _Plane) -> float:
     """Return the distance from the origin to the segment ab (planar).
 
     Past either end it is that end's distance, each end judged from its
-    own vertex (``a . d >= 0`` past a, ``b . d <= 0`` past b), so a far
+    own vertex (``a . d > 0`` past a, ``b . d < 0`` past b), so a far
     vertex's magnitude never swamps a near one's. Alongside the segment it
-    is the cross product ``a x d`` over the length: exactly zero for an
-    origin on an edge along an axis, where stepping to the foot of the
-    perpendicular would leave a rounding residue that a zero radius misses,
-    and as precise as ``d`` itself for a short edge far away.
+    is the cross product ``p x d`` over the length, ``p`` the nearer vertex
+    (the product is the same from either): exactly zero for an origin on an
+    edge along an axis, where stepping to the foot of the perpendicular
+    would leave a rounding residue that a zero radius misses, and as
+    precise as the nearer vertex and ``d`` allow. A dot product of exactly
+    zero (or one underflowing to zero) falls through to the cross product,
+    which is then exact at a vertex too.
     """
     dx, dy = b[0] - a[0], b[1] - a[1]
-    if (dx == 0 and dy == 0) or a[0] * dx + a[1] * dy >= 0:
+    if dx == 0 and dy == 0:
         return math.hypot(*a)
-    if b[0] * dx + b[1] * dy <= 0:
+    if a[0] * dx + a[1] * dy > 0:
+        return math.hypot(*a)
+    if b[0] * dx + b[1] * dy < 0:
         return math.hypot(*b)
-    return abs(a[0] * dy - a[1] * dx) / math.hypot(dx, dy)
+    p = a if a[0] * a[0] + a[1] * a[1] <= b[0] * b[0] + b[1] * b[1] else b
+    return abs(p[0] * dy - p[1] * dx) / math.hypot(dx, dy)
 
 
 def _encloses_origin(ring: Sequence[_Plane]) -> bool:
