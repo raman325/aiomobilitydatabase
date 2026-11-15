@@ -403,6 +403,35 @@ def test_a_blank_service_id_counts_calendar_days(tmp_path: Path) -> None:
     assert window.pickup_booking.latest == datetime(2026, 8, 2, 17, tzinfo=UTC)
 
 
+def test_times_past_a_duration_read_unknown_not_a_crash(tmp_path: Path) -> None:
+    """A booking time or a window end too large for a duration (garbage
+    that still fits the column) reads unknown: the feed opens, the call is
+    listed with no window and never dated, and the rule is unreadable."""
+    feed = _zone_feed(
+        "T,,Z,08:00:00,9000000000000:00:00,1,2,2,P,\nT,,Z,08:00:00,09:00:00,2,2,2,P,\n",
+        booking_rules="booking_rule_id,booking_type,prior_notice_last_day,"
+        "prior_notice_last_time\nP,2,1,99999999999:00:00\n",
+    )
+
+    def index() -> StaticIndex:
+        return _build(tmp_path, feed)
+
+    async def body(handle: TransitFeedHandle) -> list[object]:
+        return [
+            (s.stop_sequence, s.end_pickup_drop_off_window)
+            for s in await handle.get_on_demand_services(_AT_Z)
+        ]
+
+    assert _run(index(), body) == [(1, None), (2, timedelta(hours=9))]
+    [window] = _windows(index, _AT_Z, start=_JULY_30, limit=1)
+    assert window.service.stop_sequence == 2
+    rule = window.service.pickup_booking_rule
+    assert rule is not None
+    assert rule.unreadable_fields == ("prior_notice_last_time",)
+    assert rule.prior_notice_last_time is None
+    assert window.pickup_booking is None
+
+
 def test_bad_arguments_are_refused(tmp_path: Path) -> None:
     index = partial(_build, tmp_path, _zone_feed("T,,Z,08:00:00,09:00:00,1,2,2,,\n"))
     with pytest.raises(TypeError):
@@ -452,7 +481,7 @@ def _flex_feeds(draw: st.DrawFn) -> dict[str, object]:
             else (False,) * 7  # calendar_dates alone
         )
         lo = _FIRST + timedelta(days=draw(st.integers(0, 20)))
-        hi = lo + timedelta(days=draw(st.integers(3, _SPAN_DAYS)))
+        hi = lo + timedelta(days=draw(st.integers(0, _SPAN_DAYS)))
         # A date may be both ADDED and REMOVED: the removal wins.
         exceptions: dict[date, frozenset[int]] = {}
         for offset, kind in draw(

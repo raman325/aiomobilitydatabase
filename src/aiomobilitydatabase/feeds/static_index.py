@@ -672,8 +672,18 @@ _NOTICE_FIELDS: tuple[tuple[str, Callable[[str | None], int | None]], ...] = (
 
 
 def gtfs_time_offset(secs: int | None) -> timedelta | None:
-    """Return a stored GTFS time (seconds into its day) as a timedelta."""
-    return None if secs is None else timedelta(seconds=secs)
+    """Return a stored GTFS time (seconds into its day) as a timedelta.
+
+    None for none, and for a time past ``timedelta``'s range (garbage like
+    99999999999:00:00, which still fits the column): unknown, never a
+    crash for every query on the feed.
+    """
+    if secs is None:
+        return None
+    try:
+        return timedelta(seconds=secs)
+    except OverflowError:
+        return None
 
 
 def _flex_ring(ring: list[list[float]]) -> tuple[tuple[float, float], ...]:
@@ -1961,8 +1971,11 @@ class StaticIndex:
             unreadable: list[str] = []
             for field, parse in _NOTICE_FIELDS:
                 cell = row.get(field)
-                notice[field] = parse(cell)
-                if notice[field] is None and cell is not None and cell.strip():
+                value = parse(cell)
+                if parse is _lenient_time and gtfs_time_offset(value) is None:
+                    value = None  # past timedelta's range: not a usable time
+                notice[field] = value
+                if value is None and cell is not None and cell.strip():
                     unreadable.append(field)
             rows.append(
                 (
@@ -2757,8 +2770,10 @@ class StaticIndex:
         days it can run on, less the REMOVED ones (which win over an ADDED
         one, as in :meth:`active_service_ids`) -- a superset of its active
         days, which :meth:`_next_service_day` jumps between. Only the
-        services a query asks about, so a large calendar_dates.txt is never
-        held whole; kept per service, the index never changes.
+        services a query dates are read, in slices, and kept per service
+        (the index never changes): a query over a handful of on-demand
+        services never holds a large calendar_dates.txt, though one over
+        thousands holds theirs.
         """
         missing = sorted(set(service_ids) - self._patterns.keys())
         for offset in range(0, len(missing), _ID_SLICE):
