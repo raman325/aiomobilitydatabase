@@ -1523,10 +1523,11 @@ class StaticIndex:
         are copied into each repetition with their windows shifted alike;
         the anchor is then the first fixed call that is timed when Flex
         calls come before it (the trip's first stop is a window, with no
-        departure to measure from), and a template with no timed call
-        after its leading window -- Flex calls alone, or windows around
-        untimed stops, whose times the spec makes optional -- has no anchor
-        and is kept as one unrepeated trip. An exact_times=0 repetition
+        departure to measure from), and a template with no timed call --
+        Flex calls alone, or untimed stops with windows before and after
+        them, so that none is the first or last stop whose time the spec
+        requires -- has no anchor and is kept as one unrepeated trip, its
+        exactness unknown. An exact_times=0 repetition
         also keeps its headway as ``slot_secs``: GTFS-RT names such a run by
         a start_time that "may be arbitrary", and :meth:`slot_runs` finds
         the repetition whose slot it starts in.
@@ -1592,19 +1593,30 @@ class StaticIndex:
                 # The first fixed call is not the trip's first stop, so its
                 # times are optional: anchor on the first timed one.
                 anchor = next((row[2] for row in template if row[2] is not None), None)
-            if anchor is None and (leading_window or not template):
+            # With a window after them too, no fixed call is the last stop
+            # either, whose time the spec also requires.
+            trailing_window = bool(flex_template) and (
+                not template or flex_template[-1][1] > template[-1][3]
+            )
+            if anchor is None and (
+                not template or (leading_window and trailing_window)
+            ):
                 # Dangling, Flex calls alone, or windows around untimed
                 # stops: nothing to anchor, so kept as one trip -- whose
                 # times frequencies.txt says repeat, neither exact nor
-                # approximate instants: unknown.
+                # approximate instants: unknown, as is each call's exactness.
                 conn.execute(
                     "UPDATE trips SET exact_times = NULL WHERE id = ?", (trip_id,)
+                )
+                conn.execute(
+                    "UPDATE stop_times SET timepoint = NULL WHERE trip_id = ?",
+                    (trip_id,),
                 )
                 continue
             if anchor is None:
                 raise ValueError(
-                    f"frequency trip {trip_id!r} has no first-stop time "
-                    "to anchor repetition offsets"
+                    f"frequency trip {trip_id!r} has an untimed first or last "
+                    "stop, and no time to anchor repetition offsets"
                 )
             conn.execute("DELETE FROM stop_times WHERE trip_id = ?", (trip_id,))
             conn.execute("DELETE FROM flex_stop_times WHERE trip_id = ?", (trip_id,))

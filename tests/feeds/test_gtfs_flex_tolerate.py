@@ -257,37 +257,81 @@ def test_a_frequency_trip_of_flex_calls_alone_is_one_trip(tmp_path: Path) -> Non
     index.close()
 
 
+def _around_untimed(frequencies: str) -> dict[str, str]:
+    """T: a window, an untimed S0, a window -- repeated by ``frequencies``."""
+    feed = _feed(
+        stop_times=_FLEX_HEADER
+        + "T,,,,Z,,07:00:00,07:50:00,1,2,1\n"
+        + "T,,,S0,,,,,2,,\n"
+        + "T,,,,Z,,08:10:00,09:00:00,3,1,2\n",
+        frequencies=frequencies,
+    )
+    feed["locations.geojson"] = _ZONES
+    return feed
+
+
 def test_a_frequency_trip_of_windows_around_untimed_stops_is_one_trip(
     tmp_path: Path,
 ) -> None:
     """With windows first and last, no fixed call is the trip's first or
     last stop, so none need a time (and arrival_time is forbidden on the
     windows): nothing to repeat from, so it stays one unrepeated trip,
-    every call under its own id, instead of failing the feed."""
-    feed = _feed(
-        stop_times=_FLEX_HEADER
-        + "T,,,,Z,,07:00:00,07:50:00,1,2,1\n"
-        + "T,,,S0,,,,,2,,\n"
-        + "T,,,,Z,,08:10:00,09:00:00,3,1,2\n",
-        frequencies="trip_id,start_time,end_time,headway_secs\nT,06:00:00,07:00:00,600\n",
+    every call under its own id, instead of failing the feed. Its
+    exactness is unknown, its calls' too -- even where frequencies.txt
+    says the service is headway-based."""
+    index = _build(
+        tmp_path,
+        _around_untimed(
+            "trip_id,start_time,end_time,headway_secs,exact_times\n"
+            "T,06:00:00,07:00:00,600,\n"
+        ),
     )
-    feed["locations.geojson"] = _ZONES
-    index = _build(tmp_path, feed)
     assert index._conn.execute("SELECT id, exact_times FROM trips").fetchall() == [
         ("T", None)
     ]
     assert _stop_time_rows(index) == [("T", "S0", None, None, 2)]
+    assert index._conn.execute("SELECT timepoint FROM stop_times").fetchall() == [
+        (None,)
+    ]
     assert [row[:2] for row in _flex_rows(index)] == [("T", 1), ("T", 3)]
     index.close()
 
 
-def test_an_untimed_first_stop_still_fails_a_frequency_trip(tmp_path: Path) -> None:
-    """Without a window ahead of it, an untimed fixed call IS the trip's
-    first stop, whose time the spec requires: still malformed."""
+def test_the_kept_trip_never_shows_its_untimed_stop(tmp_path: Path) -> None:
+    """Its stop has no time, so no board shows it."""
+    feed = _around_untimed(
+        "trip_id,start_time,end_time,headway_secs\nT,06:00:00,07:00:00,600\n"
+    )
+    assert _board(_build(tmp_path, feed), ["S0"], hours=48) == []
+
+
+@pytest.mark.parametrize(
+    "stop_times",
+    [
+        pytest.param(
+            "T,,,S0,,,,,1,,\nT,,,,Z,,08:10:00,09:00:00,2,1,2\n",
+            id="untimed first stop",
+        ),
+        pytest.param(
+            "T,,,,Z,,07:00:00,07:50:00,1,2,1\nT,,,S0,,,,,2,,\n",
+            id="untimed last stop",
+        ),
+        pytest.param(
+            "T,,,,Z,,07:00:00,07:50:00,1,2,1\nT,,,S0,,,,,1,,\n"
+            "T,,,,Z,,08:10:00,09:00:00,3,1,2\n",
+            id="untimed stop winning its window's sequence",
+        ),
+    ],
+)
+def test_an_untimed_first_or_last_stop_still_fails_a_frequency_trip(
+    tmp_path: Path, stop_times: str
+) -> None:
+    """An untimed fixed call with no window before it is the trip's first
+    stop, and with none after it the last: the spec requires both times,
+    so the template is still malformed. A fixed call wins a stop_sequence
+    a window repeats, so that window is not before it."""
     feed = _feed(
-        stop_times=_FLEX_HEADER
-        + "T,,,S0,,,,,1,,\n"
-        + "T,,,,Z,,08:10:00,09:00:00,2,1,2\n",
+        stop_times=_FLEX_HEADER + stop_times,
         frequencies="trip_id,start_time,end_time,headway_secs\nT,06:00:00,07:00:00,600\n",
     )
     feed["locations.geojson"] = _ZONES
@@ -603,6 +647,28 @@ def _without_flex(
     return rest, rest.pop("flex_stop_times")
 
 
+def _assert_repeated_or_kept_unknown(zip_bytes: bytes, trip_id: str) -> None:
+    """The frequency trip has repetitions, or is kept as one trip with no
+    timed call, its exactness and every call's unknown."""
+    index = _index_from_zip_bytes(zip_bytes)
+    try:
+        runs = index._conn.execute(
+            "SELECT id, exact_times FROM trips WHERE source_trip_id = ? OR id = ?",
+            (trip_id, trip_id),
+        ).fetchall()
+        if len(runs) > 1:
+            return
+        assert runs == [(trip_id, None)]
+        calls = index._conn.execute(
+            "SELECT arrival_secs, departure_secs, timepoint FROM stop_times "
+            "WHERE trip_id = ?",
+            (trip_id,),
+        ).fetchall()
+        assert all(call == (None, None, None) for call in calls)
+    finally:
+        index.close()
+
+
 @given(base=_random_gtfs_zip(), data=st.data())
 @settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_flex_rows_change_no_fixed_route_answer(
@@ -626,12 +692,13 @@ def test_flex_rows_change_no_fixed_route_answer(
         ]
     trip_ids = sorted({row["trip_id"] for row in fixed})
     repeated = data.draw(st.booleans())
+    repeated_trip = data.draw(st.sampled_from(trip_ids))
     if repeated:
         base = _rezip(
             base,
             **{
                 "frequencies.txt": "trip_id,start_time,end_time,headway_secs\n"
-                f"{data.draw(st.sampled_from(trip_ids))},06:00:00,07:00:00,1800\n"
+                f"{repeated_trip},06:00:00,07:00:00,1800\n"
             },
         )
     flex = data.draw(st.lists(_flex_row(trip_ids, stop_ids), min_size=1, max_size=8))
@@ -657,22 +724,20 @@ def test_flex_rows_change_no_fixed_route_answer(
     )
     expected, no_flex = _without_flex(_outcome(base))
     assert no_flex == []
-    got, stored = _without_flex(
-        _outcome(
-            _rezip(
-                base,
-                **{
-                    "stop_times.txt": _csv(fieldnames, rows),
-                    "locations.geojson": _ZONES,
-                },
-            )
-        )
+    flex_zip = _rezip(
+        base,
+        **{"stop_times.txt": _csv(fieldnames, rows), "locations.geojson": _ZONES},
     )
+    got, stored = _without_flex(_outcome(flex_zip))
     # A frequency template whose first stop is untimed fails to anchor, but
     # with a window ahead of it that stop is not the trip's first: the feed
-    # then builds, or fails as before -- never with another error.
+    # then builds -- repeated from a later timed call, or kept whole, never
+    # timed, with its exactness unknown -- or fails as before, never with
+    # another error.
     if repeated and isinstance(expected, str) and "anchor" in expected:
         assert got == expected or not isinstance(got, str)
+        if not isinstance(got, str):
+            _assert_repeated_or_kept_unknown(flex_zip, repeated_trip)
     else:
         assert got == expected
     if not repeated and not isinstance(expected, str):
