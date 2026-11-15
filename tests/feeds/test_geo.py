@@ -8,7 +8,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds import geo
@@ -23,7 +23,9 @@ from aiomobilitydatabase.feeds.geo import (
     great_circle_m,
     in_circle,
     polygon_is_valid,
+    polygon_overlaps_circle,
 )
+from aiomobilitydatabase.feeds.models import FlexPolygon
 
 LA = (34.0522, -118.2437)
 
@@ -634,3 +636,431 @@ def test_one_pass_places_points_as_one_at_a_time(
     assert _positions(points, closed) == [
         _position_by_brute_force(point, closed) for point in points
     ]
+
+
+# -- Circle and polygon overlap (GTFS-Flex zones) ------------------------------
+
+_M_PER_DEG = _EARTH_RADIUS_M * math.pi / 180.0
+
+
+def _metres_to_degrees(
+    lat0: float, lon0: float, ring: list[tuple[float, float]]
+) -> tuple[tuple[float, float], ...]:
+    """(east, north) metres around (lat0, lon0) as closed (lat, lon) ring."""
+    scale = _M_PER_DEG * math.cos(math.radians(lat0))
+    points = [(lat0 + north / _M_PER_DEG, lon0 + east / scale) for east, north in ring]
+    return (*points, points[0])
+
+
+def _square(lat0: float, lon0: float, half: float) -> FlexPolygon:
+    corners = [(-half, -half), (half, -half), (half, half), (-half, half)]
+    return FlexPolygon(exterior=_metres_to_degrees(lat0, lon0, corners), holes=())
+
+
+def _at(lat0: float, lon0: float, east: float, north: float, radius: float) -> Circle:
+    scale = _M_PER_DEG * math.cos(math.radians(lat0))
+    return Circle(lat0 + north / _M_PER_DEG, lon0 + east / scale, radius)
+
+
+_BASE = (41.0, -87.0)
+# A U: a 400 m square with its top-middle 200 x 300 m cut out.
+_U = FlexPolygon(
+    exterior=_metres_to_degrees(
+        *_BASE,
+        [
+            (-200, -200),
+            (200, -200),
+            (200, 200),
+            (100, 200),
+            (100, -100),
+            (-100, -100),
+            (-100, 200),
+            (-200, 200),
+        ],
+    ),
+    holes=(),
+)
+_HOLED = FlexPolygon(
+    exterior=_square(*_BASE, 500).exterior,
+    holes=(_square(*_BASE, 200).exterior,),
+)
+
+
+# 359 degrees wide, unsplit: a strip along the equator from 179.5 W, up a
+# meridian, and a strip at 39-40 N to 179.5 E. Just east of 180 at the
+# equator only the copy a turn east reaches (its west end); just west of 180
+# at 39.5 N only the copy a turn west (its east end).
+_Z_BAND = FlexPolygon(
+    exterior=(
+        (0, -179.5),
+        (0, 1),
+        (39, 1),
+        (39, 179.5),
+        (40, 179.5),
+        (40, 0),
+        (1, 0),
+        (1, -179.5),
+        (0, -179.5),
+    ),
+    holes=(),
+)
+
+
+@pytest.mark.parametrize(
+    ("polygon", "zone", "overlaps"),
+    [
+        pytest.param(
+            _square(*_BASE, 100), _at(*_BASE, 0, 0, 1), True, id="centre inside"
+        ),
+        pytest.param(
+            _square(*_BASE, 100), _at(*_BASE, 0, 0, 0), True, id="radius 0 inside"
+        ),
+        pytest.param(
+            _square(*_BASE, 100), _at(*_BASE, 100, 0, 0), True, id="radius 0 on an edge"
+        ),
+        pytest.param(
+            _square(*_BASE, 100), _at(*_BASE, 150, 0, 49), False, id="49 m short"
+        ),
+        pytest.param(
+            _square(*_BASE, 100), _at(*_BASE, 150, 0, 51), True, id="edge within 51 m"
+        ),
+        pytest.param(_square(*_BASE, 100), _at(*_BASE, 5000, 0, 100), False, id="far"),
+        pytest.param(_U, _at(*_BASE, 0, 100, 50), False, id="in a concave notch"),
+        pytest.param(_U, _at(*_BASE, 0, 100, 150), True, id="notch, reaching the U"),
+        pytest.param(_HOLED, _at(*_BASE, 0, 0, 100), False, id="in a hole"),
+        pytest.param(
+            _HOLED, _at(*_BASE, 0, 0, 250), True, id="hole, reaching its edge"
+        ),
+        pytest.param(_HOLED, _at(*_BASE, 300, 0, 10), True, id="between hole and edge"),
+        pytest.param(
+            _square(0.0, -179.999, 50),
+            Circle(0.0, 179.9995, 150.0),
+            True,
+            id="just across the antimeridian",
+        ),
+        pytest.param(
+            _square(0.0, 179.9995, 20),
+            Circle(0.0, -179.999, 50.0),
+            False,
+            id="across the antimeridian, out of reach",
+        ),
+        pytest.param(
+            FlexPolygon(
+                exterior=((0, -179), (0, 179), (1, 179), (1, -179), (0, -179)),
+                holes=(),
+            ),
+            Circle(0.5, 179.5, 60_000.0),
+            True,
+            id="an unsplit band the long way round, its 179 edge in reach",
+        ),
+        pytest.param(
+            FlexPolygon(
+                exterior=((0, 179), (1, 179), (1, -179), (0, -179), (0, 179)),
+                holes=(),
+            ),
+            Circle(0.5, 179.5, 60_000.0),
+            True,
+            id="the same band from another start vertex",
+        ),
+        pytest.param(
+            FlexPolygon(
+                exterior=((0, 179.5), (0, -179.5), (1, -179.5), (1, 179.5), (0, 179.5)),
+                holes=(),
+            ),
+            Circle(0.5, -179.9, 50_000.0),
+            True,
+            id="an unsplit band reaching the circle from the copy a turn east",
+        ),
+        pytest.param(
+            FlexPolygon(
+                exterior=(
+                    (0, -179.5),
+                    (1, -179.5),
+                    (1, 179.5),
+                    (0, 179.5),
+                    (0, -179.5),
+                ),
+                holes=(),
+            ),
+            Circle(0.5, -179.9, 50_000.0),
+            True,
+            id="the same band from another start vertex, east copy",
+        ),
+        pytest.param(
+            FlexPolygon(
+                exterior=((0, 0), (0, 179.9), (1, 179.9), (1, 0), (0, 0)),
+                holes=(),
+            ),
+            Circle(0.5, -179.95, 20_000.0),
+            True,
+            id="a zone nearly half a turn wide, its far edge across the antimeridian",
+        ),
+        pytest.param(
+            _Z_BAND,
+            Circle(0.5, 179.9, 70_000.0),
+            True,
+            id="a Z band reached only by its copy a turn east",
+        ),
+        pytest.param(
+            _Z_BAND,
+            Circle(39.5, -179.9, 70_000.0),
+            True,
+            id="a Z band reached only by its copy a turn west",
+        ),
+        pytest.param(
+            _square(80.0, 10.0, 100),
+            _at(80.0, 10.0, 150, 0, 51),
+            True,
+            id="at 80 N, edge within 51 m",
+        ),
+        pytest.param(
+            _square(80.0, 10.0, 100),
+            _at(80.0, 10.0, 150, 0, 49),
+            False,
+            id="at 80 N, 49 m short",
+        ),
+    ],
+)
+def test_polygon_overlaps_circle(
+    polygon: FlexPolygon, zone: Circle, overlaps: bool
+) -> None:
+    assert polygon_overlaps_circle(polygon, zone) is overlaps
+
+
+_LATS = st.floats(-70, 70)
+_LONS = st.floats(-179, 179)
+_METRES = st.floats(-2000, 2000)
+
+
+@given(
+    lat0=_LATS,
+    lon0=_LONS,
+    corner=st.tuples(_METRES, _METRES),
+    size=st.tuples(st.floats(2, 2000), st.floats(2, 2000)),
+    point=st.tuples(_METRES, _METRES),
+)
+def test_radius_zero_on_a_rectangle_is_its_bounds_check(
+    lat0: float,
+    lon0: float,
+    corner: tuple[float, float],
+    size: tuple[float, float],
+    point: tuple[float, float],
+) -> None:
+    """A zero-radius circle overlaps an axis-aligned rectangle exactly when
+    its centre lies within the rectangle's bounds."""
+    west, south = corner
+    east, north = west + size[0], south + size[1]
+    x, y = point
+    # Clear of the boundary, where either answer is within float error.
+    assume(min(abs(x - west), abs(x - east), abs(y - south), abs(y - north)) > 1e-3)
+    rectangle = FlexPolygon(
+        exterior=_metres_to_degrees(
+            lat0, lon0, [(west, south), (east, south), (east, north), (west, north)]
+        ),
+        holes=(),
+    )
+    inside = west < x < east and south < y < north
+    assert polygon_overlaps_circle(rectangle, _at(lat0, lon0, x, y, 0)) is inside
+
+
+@given(
+    origin=st.tuples(_LATS, _LONS),
+    count=st.integers(3, 9),
+    radius=st.floats(50, 2000),
+    turn=st.floats(0, 2 * math.pi),
+    point=st.tuples(_METRES, _METRES),
+)
+def test_radius_zero_on_a_convex_polygon_is_the_half_plane_test(
+    origin: tuple[float, float],
+    count: int,
+    radius: float,
+    turn: float,
+    point: tuple[float, float],
+) -> None:
+    """For a convex polygon (counterclockwise), containment is being left of
+    every edge."""
+    lat0, lon0 = origin
+    corners = [
+        (
+            radius * math.cos(turn + 2 * math.pi * k / count),
+            radius * math.sin(turn + 2 * math.pi * k / count),
+        )
+        for k in range(count)
+    ]
+    sides = [(a, b) for a, b in zip(corners, [*corners[1:], corners[0]], strict=True)]
+    x, y = point
+    crosses = [
+        (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]) for a, b in sides
+    ]
+    assume(all(abs(cross) > 1e-3 for cross in crosses))
+    polygon = FlexPolygon(exterior=_metres_to_degrees(lat0, lon0, corners), holes=())
+    assert polygon_overlaps_circle(polygon, _at(lat0, lon0, x, y, 0)) is all(
+        cross > 0 for cross in crosses
+    )
+
+
+@given(
+    lat0=_LATS, lon0=_LONS, point=st.tuples(st.floats(-190, 190), st.floats(-190, 190))
+)
+def test_a_point_in_a_hole_is_never_contained(
+    lat0: float, lon0: float, point: tuple[float, float]
+) -> None:
+    """Strictly inside a hole (clear of its edges), a zero-radius circle
+    meets no part of the polygon."""
+    holed = FlexPolygon(
+        exterior=_square(lat0, lon0, 500).exterior,
+        holes=(_square(lat0, lon0, 200).exterior,),
+    )
+    assert not polygon_overlaps_circle(holed, _at(lat0, lon0, *point, 0))
+
+
+@given(
+    lat0=_LATS,
+    lon0=_LONS,
+    point=st.tuples(_METRES, _METRES),
+    radius=st.floats(0, 3000),
+    more=st.floats(0, 3000),
+)
+def test_overlap_grows_with_the_radius(
+    lat0: float, lon0: float, point: tuple[float, float], radius: float, more: float
+) -> None:
+    """Overlapping at one radius, a circle overlaps at every larger one."""
+    polygon = (
+        _U
+        if (lat0, lon0) == _BASE
+        else FlexPolygon(
+            exterior=_metres_to_degrees(
+                lat0,
+                lon0,
+                [
+                    (-200, -200),
+                    (200, -200),
+                    (200, 200),
+                    (100, 200),
+                    (100, -100),
+                    (-100, -100),
+                    (-100, 200),
+                    (-200, 200),
+                ],
+            ),
+            holes=(_square(lat0, lon0, 50).exterior,),
+        )
+    )
+    if polygon_overlaps_circle(polygon, _at(lat0, lon0, *point, radius)):
+        assert polygon_overlaps_circle(polygon, _at(lat0, lon0, *point, radius + more))
+
+
+@given(
+    lat0=_LATS,
+    lon0=_LONS,
+    point=st.tuples(st.floats(-20_000, 20_000), st.floats(-20_000, 20_000)),
+    radius=st.floats(0, 5000),
+)
+def test_disjoint_bounding_boxes_never_overlap(
+    lat0: float, lon0: float, point: tuple[float, float], radius: float
+) -> None:
+    """A circle whose bounding box misses the polygon's misses the polygon."""
+    polygon = _square(lat0, lon0, 300)
+    x, y = point
+    if abs(x) > 300 + radius * 1.01 or abs(y) > 300 + radius * 1.01:
+        assert not polygon_overlaps_circle(polygon, _at(lat0, lon0, x, y, radius))
+
+
+@given(
+    lat0=_LATS,
+    lon0=_LONS,
+    bearing=st.floats(0, 2 * math.pi),
+    distance=st.floats(10, 5000),
+)
+def test_reach_matches_great_circle_distance_within_one_percent(
+    lat0: float, lon0: float, bearing: float, distance: float
+) -> None:
+    """A tiny zone ``distance`` away (by great circle) is reached by a radius
+    1% over it and missed by one 1% under -- the planar scaling's stated
+    accuracy within a few kilometres outside polar latitudes."""
+    east, north = distance * math.sin(bearing), distance * math.cos(bearing)
+    zone = _square(lat0, lon0, 0.5)
+    centre = _at(lat0, lon0, east, north, 0)
+    true = great_circle_m(centre.latitude, centre.longitude, lat0, lon0)
+    reach = Circle(centre.latitude, centre.longitude, true * 1.01 + 1)
+    short = Circle(centre.latitude, centre.longitude, max(0.0, true * 0.99 - 1))
+    assert polygon_overlaps_circle(zone, reach)
+    assert not polygon_overlaps_circle(zone, short)
+
+
+@given(
+    origin=st.tuples(st.floats(-80, 80), st.floats(-180, 180)),
+    count=st.integers(3, 9),
+    size=st.floats(50, 2000),
+    shift=st.integers(0, 8),
+    circle=st.tuples(_METRES, _METRES, st.floats(0, 3000)),
+)
+def test_the_answer_ignores_the_start_vertex_and_winding(
+    origin: tuple[float, float],
+    count: int,
+    size: float,
+    shift: int,
+    circle: tuple[float, float, float],
+) -> None:
+    """A ring names the same zone from any start vertex, either way round --
+    near the antimeridian too."""
+    lat0, lon0 = origin
+    corners = [
+        (
+            size * math.cos(2 * math.pi * k / count),
+            size * math.sin(2 * math.pi * k / count),
+        )
+        for k in range(count)
+    ]
+    body = list(_metres_to_degrees(lat0, lon0, corners)[:-1])
+    shift %= len(body)
+    zone = _at(lat0, lon0, *circle)
+    answers = set()
+    for ring in (body[shift:] + body[:shift], (body[shift:] + body[:shift])[::-1]):
+        polygon = FlexPolygon(exterior=(*ring, ring[0]), holes=())
+        answers.add(polygon_overlaps_circle(polygon, zone))
+    reference = FlexPolygon(exterior=(*body, body[0]), holes=())
+    answers.add(polygon_overlaps_circle(reference, zone))
+    assert len(answers) == 1
+
+
+def _rectangle_reach(
+    south: float, north: float, west: float, east: float, zone: Circle
+) -> bool:
+    """Whether a longitude/latitude rectangle meets a circle, in the scaled
+    plane, over every copy of it within two turns: axis-aligned there, its
+    distance from the centre is a clamp per axis."""
+    scale = _M_PER_DEG * math.cos(math.radians(zone.latitude))
+    dy = max(south - zone.latitude, 0.0, zone.latitude - north) * _M_PER_DEG
+    return any(
+        math.hypot(
+            max(west + turn - zone.longitude, 0.0, zone.longitude - east - turn)
+            * scale,
+            dy,
+        )
+        <= zone.radius_m
+        for turn in (-720.0, -360.0, 0.0, 360.0, 720.0)
+    )
+
+
+@given(
+    west=st.floats(-180, 10),
+    span=st.floats(170, 359),
+    corner=st.integers(0, 3),
+    circle=st.tuples(st.floats(-0.5, 1.5), st.floats(-180, 180), st.floats(0, 100_000)),
+)
+def test_a_wide_zone_answers_as_its_nearest_copy_from_every_start(
+    west: float, span: float, corner: int, circle: tuple[float, float, float]
+) -> None:
+    """Zones 170 to 359 degrees wide, around the antimeridian: from any
+    start corner, the answer is whether any copy a turn or two away
+    reaches the circle (computed independently, by clamping)."""
+    east = west + span
+    assume(east <= 180)
+    corners = [(0.0, west), (0.0, east), (1.0, east), (1.0, west)]
+    rotated = corners[corner:] + corners[:corner]
+    polygon = FlexPolygon(exterior=(*rotated, rotated[0]), holes=())
+    zone = Circle(*circle)
+    assert polygon_overlaps_circle(polygon, zone) is _rectangle_reach(
+        0.0, 1.0, west, east, zone
+    )

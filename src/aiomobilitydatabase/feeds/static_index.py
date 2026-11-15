@@ -54,7 +54,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -98,7 +98,14 @@ CREATE TABLE trips (
     -- An exact_times=0 repetition's headway: the slot of starts
     -- [start_secs, start_secs + slot_secs) a realtime run of the trip may
     -- take in its place. NULL for every trip that keeps exact times.
-    slot_secs INTEGER
+    slot_secs INTEGER,
+    -- Whether the trip's times are as stated: 1 on a plain trip and on a
+    -- repetition whose frequencies.txt row says exact_times=1; 0 on a
+    -- headway repetition ("does not follow a fixed schedule"); NULL where
+    -- exact_times is unparseable, and on a frequencies.txt trip the loader
+    -- cannot repeat (no timed call: Flex calls alone, or none), whose
+    -- windows are the template's, no run's -- read as unknown.
+    exact_times INTEGER
 );
 -- GTFS-RT's alternative trip matching names a trip by route, direction and
 -- first departure.
@@ -136,6 +143,10 @@ CREATE TABLE flex_stop_times (
     stop_headsign TEXT
 );
 CREATE INDEX ix_flex_stop_times_trip ON flex_stop_times (trip_id, stop_sequence);
+-- On-demand queries find calls by the place they serve.
+CREATE INDEX ix_flex_stop_times_location ON flex_stop_times (location_id);
+CREATE INDEX ix_flex_stop_times_group ON flex_stop_times (location_group_id);
+CREATE INDEX ix_flex_stop_times_stop ON flex_stop_times (stop_id);
 -- GTFS-Flex zones (locations.geojson). polygons is JSON: a list of
 -- polygons, each a list of rings (the exterior, then its holes), each ring
 -- a list of [latitude, longitude] -- swapped at load from GeoJSON's
@@ -641,6 +652,11 @@ def _lenient_time(value: str | None) -> int | None:
         return None
 
 
+def gtfs_time_offset(secs: int | None) -> timedelta | None:
+    """Return a stored GTFS time (seconds into its day) as a timedelta."""
+    return None if secs is None else timedelta(seconds=secs)
+
+
 def _flex_ring(ring: list[list[float]]) -> tuple[tuple[float, float], ...]:
     return tuple((lat, lon) for lat, lon in ring)
 
@@ -784,6 +800,28 @@ class TripCall:
     # TripModifications selector may name its stop_sequence. ``stop_id``
     # is then the place it names: the stop, zone, or group id.
     on_demand: bool = False
+
+
+class OnDemandRow(NamedTuple):
+    """One flex_stop_times row with its trip's columns (see on_demand_rows)."""
+
+    trip_id: str
+    route_id: str
+    service_id: str
+    headsign: str | None
+    stop_headsign: str | None
+    stop_sequence: int
+    start_window_secs: int | None
+    end_window_secs: int | None
+    location_id: str | None
+    location_group_id: str | None
+    stop_id: str | None
+    pickup_type: PickupDropOffType | None
+    drop_off_type: PickupDropOffType | None
+    pickup_booking_rule_id: str | None
+    drop_off_booking_rule_id: str | None
+    wheelchair_accessible: WheelchairAccess | None
+    exact_times: bool | None
 
 
 @dataclass(frozen=True)
@@ -1366,7 +1404,7 @@ class StaticIndex:
         report: Callable[[], None] | None = None,
     ) -> None:
         rows: list[tuple[object, ...]] = []
-        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)"
+        sql = "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,1)"
         for row in reader:
             rows.append(
                 (
@@ -1505,8 +1543,9 @@ class StaticIndex:
         handling. A row referencing a trip with no stop_times template is
         skipped, matching the loaders' no-referential-checks policy. A
         real trip id that happens to equal a synthetic one (it would need
-        a literal ``#<secs>`` suffix) would be overwritten -- accepted as
-        negligible. Malformed rows (unparseable or missing times,
+        a literal ``#<secs>`` suffix) has its trips row replaced by the
+        repetition's, its calls then read as the repetition's -- accepted
+        as negligible. Malformed rows (unparseable or missing times,
         non-positive headway) raise, mirroring stop_times.
         """
         spans = cls._parse_frequency_spans(reader)
@@ -1518,10 +1557,10 @@ class StaticIndex:
             "INSERT OR REPLACE INTO trips "
             "(id, route_id, service_id, headsign, source_trip_id, start_secs, "
             "wheelchair_accessible, bikes_allowed, direction_id, "
-            "short_name, block_id, slot_secs) "
+            "short_name, block_id, slot_secs, exact_times) "
             "SELECT ?, route_id, service_id, headsign, ?, ?, "
             "wheelchair_accessible, bikes_allowed, direction_id, "
-            "short_name, block_id, ? "
+            "short_name, block_id, ?, ? "
             "FROM trips WHERE id = ?"
         )
         stop_times_sql = "INSERT INTO stop_times VALUES (?,?,?,?,?,?,?,?,?)"
@@ -1536,7 +1575,13 @@ class StaticIndex:
                 (trip_id,),
             ).fetchall()
             if not template:
-                continue  # dangling, or Flex calls alone: nothing to anchor
+                # Dangling, or Flex calls alone: nothing to anchor, so kept
+                # as one trip -- whose times frequencies.txt says repeat,
+                # neither exact nor approximate instants: unknown.
+                conn.execute(
+                    "UPDATE trips SET exact_times = NULL WHERE id = ?", (trip_id,)
+                )
+                continue
             flex_template = conn.execute(
                 "SELECT * FROM flex_stop_times WHERE trip_id = ? "
                 "ORDER BY stop_sequence",
@@ -1569,6 +1614,7 @@ class StaticIndex:
                         trip_id,
                         rep_start,
                         headway_secs if exact_times == 0 else None,
+                        exact_times,
                         trip_id,
                     )
                 )
@@ -2024,9 +2070,9 @@ class StaticIndex:
                 prior_notice_duration_min=row[2],
                 prior_notice_duration_max=row[3],
                 prior_notice_last_day=row[4],
-                prior_notice_last_secs=row[5],
+                prior_notice_last_time=gtfs_time_offset(row[5]),
                 prior_notice_start_day=row[6],
-                prior_notice_start_secs=row[7],
+                prior_notice_start_time=gtfs_time_offset(row[7]),
                 prior_notice_service_id=row[8],
                 message=row[9],
                 pickup_message=row[10],
@@ -2430,6 +2476,85 @@ class StaticIndex:
                 )
             )
         return found
+
+    def on_demand_rows(
+        self,
+        location_ids: Sequence[str],
+        location_group_ids: Sequence[str],
+        stop_ids: Sequence[str],
+    ) -> list[OnDemandRow]:
+        """Return the GTFS-Flex calls serving any of these places.
+
+        A zone by ``location_id``, a stop group by ``location_group_id``, a
+        stop's window by ``stop_id``; each row once, even one naming two of
+        them (which the spec forbids, and the row keeps as stated).
+        """
+        found: dict[int, OnDemandRow] = {}
+        for column, ids in (
+            ("location_id", sorted(set(location_ids))),
+            ("location_group_id", sorted(set(location_group_ids))),
+            ("stop_id", sorted(set(stop_ids))),
+        ):
+            for offset in range(0, len(ids), _ID_SLICE):
+                chunk = ids[offset : offset + _ID_SLICE]
+                for (
+                    rowid,
+                    trip_id,
+                    route_id,
+                    service_id,
+                    headsign,
+                    stop_headsign,
+                    stop_sequence,
+                    start_window,
+                    end_window,
+                    location_id,
+                    location_group_id,
+                    stop_id,
+                    pickup_type,
+                    drop_off_type,
+                    pickup_rule,
+                    drop_off_rule,
+                    wheelchair,
+                    exact_times,
+                    start_secs,
+                ) in self._conn.execute(
+                    "SELECT f.rowid, f.trip_id, t.route_id, t.service_id, "
+                    "t.headsign, f.stop_headsign, f.stop_sequence, "
+                    "f.start_window_secs, f.end_window_secs, f.location_id, "
+                    "f.location_group_id, f.stop_id, f.pickup_type, "
+                    "f.drop_off_type, f.pickup_booking_rule_id, "
+                    "f.drop_off_booking_rule_id, t.wheelchair_accessible, "
+                    "t.exact_times, t.start_secs "
+                    "FROM flex_stop_times f JOIN trips t ON t.id = f.trip_id "
+                    f"WHERE f.{column} IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                ):
+                    # A frequencies.txt trip the loader could not repeat
+                    # (exactness unknown on a trip that is no repetition):
+                    # its windows are the template's, no run's.
+                    unrepeated = exact_times is None and start_secs is None
+                    found[rowid] = OnDemandRow(
+                        trip_id=trip_id,
+                        route_id=route_id,
+                        service_id=service_id,
+                        headsign=headsign,
+                        stop_headsign=stop_headsign,
+                        stop_sequence=stop_sequence,
+                        start_window_secs=None if unrepeated else start_window,
+                        end_window_secs=None if unrepeated else end_window,
+                        location_id=location_id,
+                        location_group_id=location_group_id,
+                        stop_id=stop_id,
+                        pickup_type=_enum_or_none(PickupDropOffType, pickup_type),
+                        drop_off_type=_enum_or_none(PickupDropOffType, drop_off_type),
+                        pickup_booking_rule_id=pickup_rule,
+                        drop_off_booking_rule_id=drop_off_rule,
+                        wheelchair_accessible=_enum_or_none(
+                            WheelchairAccess, wheelchair
+                        ),
+                        exact_times={0: False, 1: True}.get(exact_times),
+                    )
+        return list(found.values())
 
     def concrete_trip_ids(self, source_trip_ids: list[str]) -> dict[str, list[str]]:
         """Map each PRODUCER-facing trip id to its concrete instances.

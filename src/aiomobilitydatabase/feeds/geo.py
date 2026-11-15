@@ -10,6 +10,8 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 
+from .models import FlexPolygon
+
 _EARTH_RADIUS_M = 6_371_000.0
 # Derived from _EARTH_RADIUS_M so it stays consistent with great_circle_m forever.
 _M_PER_DEG_LAT = _EARTH_RADIUS_M * math.pi / 180.0
@@ -77,6 +79,96 @@ def in_circle(zone: Circle, latitude: float, longitude: float) -> bool:
         return False
     distance = great_circle_m(zone.latitude, zone.longitude, latitude, longitude)
     return distance <= zone.radius_m
+
+
+# -- Circle and polygon overlap ------------------------------------------------
+
+type _Plane = tuple[float, float]
+
+
+def _segment_distance(a: _Plane, b: _Plane) -> float:
+    """Return the distance from the origin to the segment ab (planar)."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = dx * dx + dy * dy
+    t = 0.0 if length == 0 else max(0.0, min(1.0, -(a[0] * dx + a[1] * dy) / length))
+    return math.hypot(a[0] + t * dx, a[1] + t * dy)
+
+
+def _encloses_origin(ring: Sequence[_Plane]) -> bool:
+    """Return whether the origin is inside a closed planar ring (crossings)."""
+    inside = False
+    for (x1, y1), (x2, y2) in itertools.pairwise(ring):
+        if (y1 > 0) != (y2 > 0) and x1 + (x2 - x1) * (0 - y1) / (y2 - y1) > 0:
+            inside = not inside
+    return inside
+
+
+def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
+    """Return whether a GTFS-Flex polygon and a circular zone share any point.
+
+    GeoJSON joins positions with "a straight Cartesian line" in longitude
+    and latitude, so the test runs in that plane, scaled to metres around
+    the circle's centre (a degree of latitude is ``_M_PER_DEG_LAT``, of
+    longitude that times the cosine of the centre's latitude). They overlap
+    when the centre lies inside the polygon (inside its exterior and no
+    hole) or any of its edges, holes' included, comes within the radius --
+    so a boundary touching the circle counts. The scaling is exact at the
+    centre and drifts with distance from it: well under 1% within a few
+    kilometres outside polar latitudes.
+
+    The polygon is moved whole by multiples of 360 degrees of longitude,
+    so a zone just across the antimeridian is found without bending any
+    edge: the copy whose middle is nearest the circle is tested, and for a
+    zone over 180 degrees wide (such as one crossing the antimeridian
+    unsplit, which RFC 7946 reads as spanning the long way) its neighbours
+    a turn either way too.
+
+    Meant for circles of up to a few hundred kilometres that do not reach a
+    pole, like :func:`in_circle`; beyond that the plane bends too far from
+    the sphere.
+    """
+    radius = zone.radius_m
+    dlat = radius * _BBOX_SAFETY / _M_PER_DEG_LAT
+    latitudes = [lat for lat, _lon in polygon.exterior]
+    if max(latitudes) < zone.latitude - dlat or min(latitudes) > zone.latitude + dlat:
+        return False  # wholly north or south of the circle
+    scale = _M_PER_DEG_LAT * math.cos(math.radians(zone.latitude))
+    longitudes = [lon for _lat, lon in polygon.exterior]
+    # Anchored on the zone's middle longitude, not any one vertex: within
+    # half a turn wide, every other copy then lies a quarter turn or more
+    # from the circle, out of its reach.
+    middle = (max(longitudes) + min(longitudes)) / 2
+    nearest = _FULL_TURN_DEG * round((zone.longitude - middle) / _FULL_TURN_DEG)
+
+    def overlaps(shift: float) -> bool:
+        def plane(ring: Sequence[tuple[float, float]]) -> list[_Plane]:
+            return [
+                (
+                    (lon + shift - zone.longitude) * scale,
+                    (lat - zone.latitude) * _M_PER_DEG_LAT,
+                )
+                for lat, lon in ring
+            ]
+
+        rings = [plane(polygon.exterior), *(plane(hole) for hole in polygon.holes)]
+        if any(
+            _segment_distance(a, b) <= radius
+            for ring in rings
+            for a, b in itertools.pairwise(ring)
+        ):
+            return True
+        return _encloses_origin(rings[0]) and not any(
+            _encloses_origin(hole) for hole in rings[1:]
+        )
+
+    # A zone wider than half a turn may reach the circle from either
+    # neighbouring copy too.
+    turns = (
+        (0.0,)
+        if max(longitudes) - min(longitudes) <= _HALF_TURN_DEG
+        else (0.0, -_FULL_TURN_DEG, _FULL_TURN_DEG)
+    )
+    return any(overlaps(nearest + turn) for turn in turns)
 
 
 # -- Polygon validity ----------------------------------------------------------

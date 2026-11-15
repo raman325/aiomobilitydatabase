@@ -45,7 +45,7 @@ from .exceptions import (
     SourceConnectionError,
     StaticDataUnavailableError,
 )
-from .geo import Circle, in_circle
+from .geo import Circle, in_circle, polygon_overlaps_circle
 from .models import (
     Agency,
     ArrivalsQuery,
@@ -54,6 +54,7 @@ from .models import (
     FeedInfo,
     FlexLocation,
     LocationGroup,
+    OnDemandService,
     PickupDropOffType,
     Route,
     ServiceAlert,
@@ -100,6 +101,7 @@ from .static_index import (
     TripCall,
     TripInstanceCalls,
     TripSummary,
+    gtfs_time_offset,
     repetition_trip_id,
 )
 
@@ -3767,6 +3769,96 @@ class TransitFeedHandle:
             and stop.longitude is not None
             and in_circle(zone, stop.latitude, stop.longitude)
         ]
+
+    def locations_in(self, zone: Circle) -> list[FlexLocation]:
+        """Return the GTFS-Flex zones overlapping a circular zone (a picker).
+
+        A zone counts when any of its polygons shares a point with the
+        circle -- the circle's centre inside it, or its boundary within the
+        radius (see :func:`~.geo.polygon_overlaps_circle`).
+        """
+        return [
+            location
+            for location in self.flex_locations
+            if any(polygon_overlaps_circle(part, zone) for part in location.polygons)
+        ]
+
+    async def get_on_demand_services(
+        self, zone: Circle, *, route_ids: Sequence[str] | None = None
+    ) -> list[OnDemandService]:
+        """GTFS-Flex calls serving a circular zone -- schedule only, no network.
+
+        A call serves the zone when its place does: a Flex zone overlapping
+        it (:meth:`locations_in`), a stop group with a member stop in it,
+        or a stop in it served within a pickup/drop-off window. One entry
+        per call, whatever days its trip runs (``service_id`` says which;
+        :meth:`get_services_on` resolves a date), narrowed to ``route_ids``
+        when given (None or empty: every route; a bare string is a
+        ``TypeError``, as in :class:`ArrivalsQuery`). Sorted by route, trip
+        and stop_sequence.
+        """
+        if isinstance(route_ids, str):
+            raise TypeError("route_ids must be a sequence of ids, not a str")
+        async with self._guard.reader():
+            flex = self._flex
+            locations = self.locations_in(zone)
+            near = {stop.id for stop in self.stops_in(zone)}
+            groups = [
+                group
+                for group in flex.location_groups
+                if any(stop_id in near for stop_id in group.stop_ids)
+            ]
+            rows = await self._index_read(
+                self._index.on_demand_rows,
+                [location.id for location in locations],
+                [group.id for group in groups],
+                sorted(near),
+            )
+            routes = {route.id: route for route in self._routes}
+            stops = {stop.id: stop for stop in self._stops}
+        wanted = set(route_ids) if route_ids else None
+        # Each place the row names, whichever one matched.
+        by_location = {location.id: location for location in flex.locations}
+        by_group = {group.id: group for group in flex.location_groups}
+        rules = {rule.id: rule for rule in flex.booking_rules}
+
+        services = [
+            OnDemandService(
+                trip_id=row.trip_id,
+                route_id=row.route_id,
+                route=routes.get(row.route_id),
+                service_id=row.service_id,
+                headsign=row.headsign,
+                stop_headsign=row.stop_headsign,
+                stop_sequence=row.stop_sequence,
+                start_pickup_drop_off_window=gtfs_time_offset(row.start_window_secs),
+                end_pickup_drop_off_window=gtfs_time_offset(row.end_window_secs),
+                location_id=row.location_id,
+                location=by_location.get(row.location_id or ""),
+                location_group_id=row.location_group_id,
+                location_group=by_group.get(row.location_group_id or ""),
+                stop_id=row.stop_id,
+                stop=stops.get(row.stop_id or ""),
+                pickup_type=row.pickup_type,
+                drop_off_type=row.drop_off_type,
+                pickup_booking_rule_id=row.pickup_booking_rule_id,
+                pickup_booking_rule=rules.get(row.pickup_booking_rule_id or ""),
+                drop_off_booking_rule_id=row.drop_off_booking_rule_id,
+                drop_off_booking_rule=rules.get(row.drop_off_booking_rule_id or ""),
+                wheelchair_accessible=row.wheelchair_accessible,
+                exact_times=row.exact_times,
+            )
+            for row in rows
+            if wanted is None or row.route_id in wanted
+        ]
+        services.sort(
+            key=lambda service: (
+                service.route_id,
+                service.trip_id,
+                service.stop_sequence,
+            )
+        )
+        return services
 
     def stations_in(self, zone: Circle) -> list[StationGroup]:
         """Boarding stops within a zone, grouped into logical stations.
