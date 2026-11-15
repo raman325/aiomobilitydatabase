@@ -432,6 +432,17 @@ def test_times_past_a_duration_read_unknown_not_a_crash(tmp_path: Path) -> None:
     assert window.pickup_booking is None
 
 
+def test_a_one_day_calendar_range_runs_that_day(tmp_path: Path) -> None:
+    """calendar.txt with start_date == end_date runs on that one day."""
+    feed = _zone_feed(
+        "T,,Z,08:00:00,09:00:00,1,2,2,,\n",
+        calendar="service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+        "sunday,start_date,end_date\nS,1,1,1,1,1,1,1,20260731,20260731\n",
+    )
+    windows = _windows(_build(tmp_path, feed), _AT_Z, start=_JULY_30, limit=3)
+    assert [w.service_date for w in windows] == [date(2026, 7, 31)]
+
+
 def test_bad_arguments_are_refused(tmp_path: Path) -> None:
     index = partial(_build, tmp_path, _zone_feed("T,,Z,08:00:00,09:00:00,1,2,2,,\n"))
     with pytest.raises(TypeError):
