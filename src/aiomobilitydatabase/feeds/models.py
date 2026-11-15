@@ -1074,8 +1074,8 @@ class BookingRule:
     Every cell is kept as the file states it, even one the spec forbids
     for this ``booking_type``; unparseable cells are None, and an unknown
     ``booking_type`` is None. ``unreadable_fields`` names the prior-notice
-    fields the file states but that can't be parsed: None there means
-    unknown, not absent.
+    fields the file states but that can't be read (unparseable, or a time
+    past what a duration holds): None there means unknown, not absent.
     """
 
     id: str
@@ -1187,7 +1187,7 @@ class BookingWindow:
     ``earliest`` is None only where the rule sets no earliest time. A rule
     whose window cannot be placed gives no BookingWindow at all, never a
     guessed one: a field it needs missing; a prior-notice field the file
-    states but that can't be parsed (``BookingRule.unreadable_fields``); a
+    states but that can't be read (``BookingRule.unreadable_fields``); a
     field the spec forbids for its ``booking_type`` (which field is wrong
     is unknowable); a duration max under the min, which no ride's notice
     can meet; booking that, for this window, opens only after it closes, or

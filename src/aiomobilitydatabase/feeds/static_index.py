@@ -166,7 +166,8 @@ CREATE TABLE location_group_stops (
 -- Durations in minutes, as booking_rules.txt gives them; the two Time
 -- columns as seconds, like every other GTFS time here. ``unreadable`` names
 -- (space-separated) the prior-notice fields the file states but that can't
--- be parsed: stored NULL like a blank cell, they are not absent.
+-- be read (unparseable, or a time past what a duration holds): stored NULL
+-- like a blank cell, they are not absent.
 CREATE TABLE booking_rules (
     id TEXT PRIMARY KEY, booking_type INTEGER,
     prior_notice_duration_min INTEGER, prior_notice_duration_max INTEGER,
@@ -1957,8 +1958,9 @@ class StaticIndex:
     ) -> None:
         """Load booking_rules.txt: every cell as stated, descriptive (lenient).
 
-        An unparseable prior-notice cell is stored NULL, like a blank one,
-        and named in ``unreadable``: a time the file gives but this library
+        A prior-notice cell that can't be read -- unparseable, or a time
+        past what a duration holds -- is stored NULL, like a blank one, and
+        named in ``unreadable``: a value the file gives but this library
         can't read is unknown, never "not stated" (which would read as no
         limit).
         """

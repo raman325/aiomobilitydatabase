@@ -3906,8 +3906,9 @@ class TransitFeedHandle:
         a ``limit``, a negative ``limit``, a naive ``start``/``end`` or a
         ``start`` outside 0001-01-03 to 9999-12-01 UTC; ``end < start`` or
         ``limit=0`` gives no windows). A call whose window is unknown (see
-        :class:`OnDemandService`) or ends before it starts has no dated
-        window, and is listed by :meth:`get_on_demand_services` alone; like
+        :class:`OnDemandService`), ends before it starts, or ends past year
+        9999 once placed on a date (garbage) has no dated window, and is
+        listed by :meth:`get_on_demand_services` alone; like
         every scan, none opening after 9999-12-01 UTC is dated. Each window
         carries its booking rules placed on it (:class:`BookingWindow`).
 

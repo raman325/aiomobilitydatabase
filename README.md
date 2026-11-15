@@ -563,8 +563,10 @@ Notes on direct mode:
   overlaps `[start, end]` -- one under way at `start` counts. Same time
   rules as `get_scheduled_departures()`: open-ended by default, an
   open-ended query needs a `limit`; sorted by window start. A call whose
-  window is unknown, or ends before it starts, has no dated window. `pickup_booking`/`drop_off_booking`
-  place the call's booking rules on the window as a `BookingWindow`
+  window is unknown, ends before it starts, or ends past year 9999 once
+  placed on a date (garbage) has no dated window.
+  `pickup_booking`/`drop_off_booking` place the call's booking rules on the
+  window as a `BookingWindow`
   (`earliest`, `latest`, `is_open(at)`): real-time booking up to the
   window's end; same-day booking from `prior_notice_duration_max` before
   its start (or a start day) to `prior_notice_duration_min` before its end;
