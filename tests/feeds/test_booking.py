@@ -17,7 +17,6 @@ from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds._booking import (
     LOOK_BACK_DAYS,
-    _states_forbidden,
     booking_window,
     counted_day,
 )
@@ -160,16 +159,46 @@ _VALID = {
         (BookingType.PRIOR_DAYS, "prior_notice_start_time", {}),
     ],
 )
-def test_a_forbidden_field_leaves_the_rule_unknown(
+def test_a_forbidden_field_is_ignored(
     booking_type: BookingType, field: str, extra: dict[str, object]
 ) -> None:
-    """The spec forbids it for this booking_type, so the rule contradicts
-    itself and which field is wrong is unknowable: no window, never one
-    built by ignoring a field (real-time booking ignoring a stated notice
-    would read bookable up to the ride)."""
+    """The spec forbids it for this booking_type, so it is never read: the
+    rule places the same window as without it."""
     valid = _rule(booking_type, **_VALID[booking_type], **extra)
     assert _place(valid) is not None
-    assert _place(replace(valid, **{field: _FORBIDDEN[field]})) is None
+    assert _place(replace(valid, **{field: _FORBIDDEN[field]})) == _place(valid)
+
+
+def test_an_unreadable_field_counts_only_where_it_is_read() -> None:
+    """An unreadable duration on real-time booking is a forbidden field,
+    ignored; an unreadable duration max on same-day booking is read, so
+    unknown."""
+    forbidden = _rule(
+        BookingType.REAL_TIME, unreadable_fields=("prior_notice_duration_min",)
+    )
+    assert _place(forbidden) == (None, _WE)
+    read = _rule(
+        BookingType.SAME_DAY,
+        prior_notice_duration_min=30,
+        unreadable_fields=("prior_notice_duration_max",),
+    )
+    assert _place(read) is None
+    # A start day beside a duration max, and a start time without its day,
+    # are forbidden: unreadable there, still ignored.
+    beside_max = _rule(
+        BookingType.SAME_DAY,
+        prior_notice_duration_min=30,
+        prior_notice_duration_max=60,
+        unreadable_fields=("prior_notice_start_day",),
+    )
+    assert _place(beside_max) == (_WS - timedelta(hours=1), _WE - timedelta(minutes=30))
+    without_day = _rule(
+        BookingType.PRIOR_DAYS,
+        prior_notice_last_day=0,
+        prior_notice_last_time=timedelta(hours=7),
+        unreadable_fields=("prior_notice_start_time",),
+    )
+    assert _place(without_day) == (None, datetime(2026, 11, 13, 7, tzinfo=UTC))
 
 
 def test_a_contradictory_rule_is_unknown() -> None:
@@ -493,18 +522,36 @@ _SPEC_FORBIDDEN = {
 }
 
 
+def _allowed(booking_type: BookingType, stated: frozenset[str]) -> frozenset[str]:
+    """The stated fields left once every forbidden one is struck out --
+    repeatedly, as striking a day out forbids its time."""
+    kept = set(stated)
+    while drop := {f for f in kept if _SPEC_FORBIDDEN[f](booking_type, kept)}:
+        kept -= drop
+    return frozenset(kept)
+
+
 @given(
     booking_type=st.sampled_from(list(BookingType)),
     stated=st.frozensets(st.sampled_from(sorted(_SPEC_FORBIDDEN))),
+    data=st.data(),
 )
-def test_a_rule_stating_any_forbidden_field_is_unknown(
-    booking_type: BookingType, stated: frozenset[str]
+def test_forbidden_fields_are_ignored_field_by_field(
+    booking_type: BookingType, stated: frozenset[str], data: st.DataObject
 ) -> None:
-    """Against the spec's presence table, field by field: a rule stating
-    any field forbidden for its type (or a time without its day) places no
-    window."""
-    rule = _rule(booking_type, **{field: _FORBIDDEN[field] for field in stated})
-    forbidden = any(_SPEC_FORBIDDEN[field](booking_type, stated) for field in stated)
-    assert _states_forbidden(rule) is forbidden
-    if forbidden:
+    """Against the spec's presence table, field by field: a rule places
+    exactly what it places with every forbidden field struck out -- unless
+    a field it still reads is unreadable, which leaves it unknown."""
+    unreadable = data.draw(
+        st.frozensets(st.sampled_from(sorted(stated - {"prior_notice_service_id"})))
+        if stated - {"prior_notice_service_id"}
+        else st.just(frozenset())
+    )
+    values = {f: _FORBIDDEN[f] for f in stated if f not in unreadable}
+    rule = _rule(booking_type, **values, unreadable_fields=tuple(sorted(unreadable)))
+    allowed = _allowed(booking_type, stated)
+    if unreadable & allowed:
         assert _place(rule) is None
+        return
+    stripped = _rule(booking_type, **{f: v for f, v in values.items() if f in allowed})
+    assert _place(rule) == _place(stripped)

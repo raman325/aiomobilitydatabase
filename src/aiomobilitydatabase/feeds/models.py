@@ -1107,8 +1107,9 @@ class OnDemandService:
     ``end_pickup_drop_off_window`` are GTFS times: time since the start of
     the service day (noon minus 12 hours). Either is None where the feed
     gives none, where a frequencies.txt repetition would move it before its
-    service day starts, or on a frequencies.txt trip with no timed call
-    (see ``exact_times``) -- unknown, never "no limit".
+    service day starts, on a frequencies.txt trip with no timed call (see
+    ``exact_times``), or past what a duration holds (garbage) -- unknown,
+    never "no limit".
 
     ``pickup_type``/``drop_off_type`` say whether, and how, a rider may be
     picked up or dropped off there ("travel is possible from one stop or
@@ -1172,7 +1173,9 @@ class BookingWindow:
     only). For a drop-off it is measured from the drop-off's own window,
     so ``latest`` bounds a booking that the ride's pickup may need sooner;
     on a headway-based repetition it is as approximate as the window (see
-    ``OnDemandService.exact_times``). Each ``booking_type`` reads:
+    ``OnDemandService.exact_times``). Each ``booking_type`` reads only the
+    fields the spec allows it -- a forbidden one the file states is
+    ignored -- as follows:
 
     - ``REAL_TIME``: up to the window's end; no earliest time.
     - ``SAME_DAY``: up to ``prior_notice_duration_min`` minutes before the
@@ -1186,12 +1189,11 @@ class BookingWindow:
 
     ``earliest`` is None only where the rule sets no earliest time. A rule
     whose window cannot be placed gives no BookingWindow at all, never a
-    guessed one: a field it needs missing; a prior-notice field the file
+    guessed one: a field it needs missing; a field it reads that the file
     states but that can't be read (``BookingRule.unreadable_fields``); a
-    field the spec forbids for its ``booking_type`` (which field is wrong
-    is unknowable); a duration max under the min, which no ride's notice
-    can meet; booking that, for this window, opens only after it closes, or
-    closes after the window ends though the spec says "before travel"; a
+    duration max under the min, which no ride's notice can meet; booking
+    that, for this window, opens only after it closes, or closes after the
+    window ends though the spec says "before travel"; a
     count of service days that does not end within a year; a date out of
     range. Instants are UTC.
     """

@@ -572,14 +572,15 @@ Notes on direct mode:
   its start (or a start day) to `prior_notice_duration_min` before its end;
   prior-day booking by `prior_notice_last_time` on the
   `prior_notice_last_day`-th day before the service date, counting the days
-  `prior_notice_service_id` runs where given. `earliest` is None only where
-  the rule sets no earliest time, and a rule that cannot be placed gives
-  None, never a guessed window: a field it needs missing, a column it
-  states but that can't be read (`BookingRule.unreadable_fields`), a column
-  the spec forbids for its `booking_type` (which column is wrong is
-  unknowable), a duration max under the min, booking that for this window
-  opens only after it closes or closes after the window it is "before",
-  or a day count that does not end within a year.
+  `prior_notice_service_id` runs where given. Each `booking_type` reads
+  only the columns the spec allows it; a forbidden one is ignored.
+  `earliest` is None only where the rule sets no earliest time, and a rule
+  that cannot be placed gives None, never a guessed window: a field it
+  needs missing, a column it reads that the file states but that can't be
+  read (`BookingRule.unreadable_fields`), a duration max under the min,
+  booking that for this window opens only after it closes or closes after
+  the window it is "before", or a day count that does not end within a
+  year.
 - **Alert scope is the spec's, selector by selector**: `ServiceAlert`
   keeps each `informed_entity` whole as an `EntitySelector` (spec field
   names; a trip as a `TripSelector`, one run of it where it gives a start

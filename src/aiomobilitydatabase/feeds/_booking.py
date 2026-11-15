@@ -66,10 +66,10 @@ def booking_window(
     """
     window = _Window(service_date, window_start, window_end, day_start, runs)
     reader = None if rule.booking_type is None else _READERS.get(rule.booking_type)
-    if reader is None or rule.unreadable_fields or _states_forbidden(rule):
-        # An unknown booking_type says nothing placeable; a field the file
-        # states but that can't be read is unknown, not absent; a field the
-        # spec forbids for this type leaves which field is wrong unknowable.
+    if reader is None or set(rule.unreadable_fields) & _read_fields(rule):
+        # An unknown booking_type says nothing placeable; a field this type
+        # reads that the file states but can't be read is unknown, not
+        # absent. A field the spec forbids for the type is never read.
         return None
     try:
         bounds = reader(rule, window)
@@ -86,33 +86,34 @@ def booking_window(
     return BookingWindow(rule=rule, earliest=earliest, latest=latest)
 
 
-_DURATIONS = ("prior_notice_duration_min", "prior_notice_duration_max")
-_LAST = ("prior_notice_last_day", "prior_notice_last_time")
-_START = ("prior_notice_start_day", "prior_notice_start_time")
+def _read_fields(rule: BookingRule) -> set[str]:
+    """Return the prior-notice fields the rule's booking_type reads.
 
-
-def _states_forbidden(rule: BookingRule) -> bool:
-    """Whether the rule states a field the spec forbids for its booking_type.
-
-    Real-time booking allows none of the prior-notice fields; same-day
-    booking no last day, service, or start day beside a duration max;
-    prior-day booking no durations. A last or start time is forbidden
-    without its day.
+    Only those the spec allows it: none for real-time booking; for
+    same-day booking the durations, and a start day (with its time) only
+    without a duration max; for prior-day booking the last and start days
+    and times. A time is read only with its day. Every other field the
+    file states -- forbidden for the type -- is ignored.
     """
-    forbidden: list[str] = []
-    if rule.booking_type is BookingType.REAL_TIME:
-        forbidden += [*_DURATIONS, *_LAST, *_START, "prior_notice_service_id"]
-    elif rule.booking_type is BookingType.SAME_DAY:
-        forbidden += [*_LAST, "prior_notice_service_id"]
-        if rule.prior_notice_duration_max is not None:
-            forbidden.append("prior_notice_start_day")
+    unreadable = set(rule.unreadable_fields)
+
+    def stated(field: str) -> bool:
+        return getattr(rule, field) is not None or field in unreadable
+
+    fields: set[str] = set()
+    if rule.booking_type is BookingType.SAME_DAY:
+        fields |= {"prior_notice_duration_min", "prior_notice_duration_max"}
+        if not stated("prior_notice_duration_max"):
+            fields.add("prior_notice_start_day")
     elif rule.booking_type is BookingType.PRIOR_DAYS:
-        forbidden += _DURATIONS
-    if rule.prior_notice_last_day is None:
-        forbidden.append("prior_notice_last_time")
-    if rule.prior_notice_start_day is None:
-        forbidden.append("prior_notice_start_time")
-    return any(getattr(rule, name) is not None for name in forbidden)
+        fields |= {
+            "prior_notice_last_day",
+            "prior_notice_last_time",
+            "prior_notice_start_day",
+        }
+    if "prior_notice_start_day" in fields and stated("prior_notice_start_day"):
+        fields.add("prior_notice_start_time")
+    return fields
 
 
 @dataclass(frozen=True)
