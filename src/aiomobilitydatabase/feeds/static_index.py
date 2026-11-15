@@ -7,7 +7,9 @@ event loop is never blocked (a hard Home Assistant requirement).
 
 from __future__ import annotations
 
+import bisect
 import csv
+import heapq
 import io
 import json
 import os
@@ -25,6 +27,7 @@ from typing import IO, Any, NamedTuple
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ._booking import booking_window
 from .exceptions import FeedParseError
 from .geo import polygon_is_valid
 from .models import (
@@ -32,6 +35,7 @@ from .models import (
     BikesAllowed,
     BookingRule,
     BookingType,
+    BookingWindow,
     FeedInfo,
     FlexLocation,
     FlexPolygon,
@@ -54,7 +58,7 @@ from .models import (
 # stale cache pass validation and then fail on the first query for a
 # column it does not have. test_schema_fingerprint_matches_version
 # fails if the two drift apart.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 _BATCH_SIZE = 5000
 _SECONDS_OR_MINUTES_PER_UNIT = 60
 
@@ -160,14 +164,18 @@ CREATE TABLE location_group_stops (
     location_group_id TEXT NOT NULL, stop_id TEXT NOT NULL
 );
 -- Durations in minutes, as booking_rules.txt gives them; the two Time
--- columns as seconds, like every other GTFS time here.
+-- columns as seconds, like every other GTFS time here. ``unreadable`` names
+-- (space-separated) the prior-notice fields the file states but that can't
+-- be read (unparseable, or a time past what a duration holds): stored NULL
+-- like a blank cell, they are not absent.
 CREATE TABLE booking_rules (
     id TEXT PRIMARY KEY, booking_type INTEGER,
     prior_notice_duration_min INTEGER, prior_notice_duration_max INTEGER,
     prior_notice_last_day INTEGER, prior_notice_last_secs INTEGER,
     prior_notice_start_day INTEGER, prior_notice_start_secs INTEGER,
     prior_notice_service_id TEXT, message TEXT, pickup_message TEXT,
-    drop_off_message TEXT, phone_number TEXT, info_url TEXT, booking_url TEXT
+    drop_off_message TEXT, phone_number TEXT, info_url TEXT, booking_url TEXT,
+    unreadable TEXT
 );
 CREATE TABLE calendar (
     service_id TEXT PRIMARY KEY,
@@ -653,9 +661,30 @@ def _lenient_time(value: str | None) -> int | None:
         return None
 
 
+# booking_rules.txt's prior-notice cells, in table order, and their parsers.
+_NOTICE_FIELDS: tuple[tuple[str, Callable[[str | None], int | None]], ...] = (
+    ("prior_notice_duration_min", _lenient_int),
+    ("prior_notice_duration_max", _lenient_int),
+    ("prior_notice_last_day", _lenient_int),
+    ("prior_notice_last_time", _lenient_time),
+    ("prior_notice_start_day", _lenient_int),
+    ("prior_notice_start_time", _lenient_time),
+)
+
+
 def gtfs_time_offset(secs: int | None) -> timedelta | None:
-    """Return a stored GTFS time (seconds into its day) as a timedelta."""
-    return None if secs is None else timedelta(seconds=secs)
+    """Return a stored GTFS time (seconds into its day) as a timedelta.
+
+    None for none, and for a time past ``timedelta``'s range (garbage like
+    99999999999:00:00, which still fits the column): unknown, never a
+    crash for every query on the feed.
+    """
+    if secs is None:
+        return None
+    try:
+        return timedelta(seconds=secs)
+    except OverflowError:
+        return None
 
 
 def _flex_ring(ring: list[list[float]]) -> tuple[tuple[float, float], ...]:
@@ -823,6 +852,35 @@ class OnDemandRow(NamedTuple):
     drop_off_booking_rule_id: str | None
     wheelchair_accessible: WheelchairAccess | None
     exact_times: bool | None
+
+
+class _ServicePattern(NamedTuple):
+    """A service's calendar.txt (weekdays, start, end), ADDED and REMOVED dates."""
+
+    weekly: tuple[tuple[bool, ...], date, date] | None
+    added: list[date]
+    removed: set[date]
+
+
+class DatableCall(NamedTuple):
+    """One on-demand call to date: its service, window and booking rules."""
+
+    service_id: str
+    start_window_secs: int
+    end_window_secs: int
+    pickup_booking_rule: BookingRule | None
+    drop_off_booking_rule: BookingRule | None
+
+
+class DatedCall(NamedTuple):
+    """One call's window on one service date (see on_demand_windows)."""
+
+    call: int
+    service_date: date
+    window_start: datetime
+    window_end: datetime
+    pickup_booking: BookingWindow | None
+    drop_off_booking: BookingWindow | None
 
 
 @dataclass(frozen=True)
@@ -1031,6 +1089,7 @@ class StaticIndex:
         self._tz = ZoneInfo(timezone_name)
         self._last_dates: dict[str, date] | None = None
         self._first_dates: dict[str, date] | None = None
+        self._patterns: dict[str, _ServicePattern | None] = {}
         self._first_date: date | None = None
         self._first_date_known = False
         self._reach: tuple[int, tuple[int, ...]] | None = None
@@ -1897,29 +1956,42 @@ class StaticIndex:
         reader: csv.DictReader[str],
         report: Callable[[], None] | None = None,
     ) -> None:
-        """Load booking_rules.txt: every cell as stated, descriptive (lenient)."""
+        """Load booking_rules.txt: every cell as stated, descriptive (lenient).
+
+        A prior-notice cell that can't be read -- unparseable, or a time
+        past what a duration holds -- is stored NULL, like a blank one, and
+        named in ``unreadable``: a value the file gives but this library
+        can't read is unknown, never "not stated" (which would read as no
+        limit).
+        """
         rows: list[tuple[object, ...]] = []
-        sql = f"INSERT OR REPLACE INTO booking_rules VALUES ({','.join('?' * 15)})"
+        sql = f"INSERT OR REPLACE INTO booking_rules VALUES ({','.join('?' * 16)})"
         for row in reader:
             if not (rule_id := _cell(row, "booking_rule_id")):
                 continue  # Required: a row without one is no rule
+            notice: dict[str, int | None] = {}
+            unreadable: list[str] = []
+            for field, parse in _NOTICE_FIELDS:
+                cell = row.get(field)
+                value = parse(cell)
+                if parse is _lenient_time and gtfs_time_offset(value) is None:
+                    value = None  # past timedelta's range: not a usable time
+                notice[field] = value
+                if value is None and cell is not None and cell.strip():
+                    unreadable.append(field)
             rows.append(
                 (
                     rule_id,
                     _lenient_int(row.get("booking_type")),
-                    _lenient_int(row.get("prior_notice_duration_min")),
-                    _lenient_int(row.get("prior_notice_duration_max")),
-                    _lenient_int(row.get("prior_notice_last_day")),
-                    _lenient_time(row.get("prior_notice_last_time")),
-                    _lenient_int(row.get("prior_notice_start_day")),
-                    _lenient_time(row.get("prior_notice_start_time")),
-                    row.get("prior_notice_service_id") or None,
+                    *notice.values(),
+                    _cell(row, "prior_notice_service_id"),
                     row.get("message") or None,
                     row.get("pickup_message") or None,
                     row.get("drop_off_message") or None,
                     row.get("phone_number") or None,
                     row.get("info_url") or None,
                     row.get("booking_url") or None,
+                    " ".join(unreadable) or None,
                 )
             )
             if len(rows) >= _BATCH_SIZE:
@@ -2101,6 +2173,7 @@ class StaticIndex:
                 phone_number=row[12],
                 info_url=row[13],
                 booking_url=row[14],
+                unreadable_fields=tuple(row[15].split()) if row[15] else (),
             )
             for row in self._conn.execute(
                 "SELECT id, booking_type, prior_notice_duration_min, "
@@ -2108,7 +2181,7 @@ class StaticIndex:
                 "prior_notice_last_secs, prior_notice_start_day, "
                 "prior_notice_start_secs, prior_notice_service_id, message, "
                 "pickup_message, drop_off_message, phone_number, info_url, "
-                "booking_url FROM booking_rules ORDER BY id"
+                "booking_url, unreadable FROM booking_rules ORDER BY id"
             )
         ]
 
@@ -2576,6 +2649,227 @@ class StaticIndex:
                         exact_times={0: False, 1: True}.get(exact_times),
                     )
         return list(found.values())
+
+    def on_demand_windows(
+        self,
+        calls: Sequence[DatableCall],
+        start: datetime,
+        end: datetime | None,
+        limit: int | None,
+    ) -> list[DatedCall]:
+        """Date each call's window on the service days it runs, in order.
+
+        On service date D a call's window spans its offsets from D's start
+        (:meth:`_service_day_start`, so DST days measure from noon minus 12
+        hours). It is kept when the call's service runs on D and the window
+        overlaps ``[start, end]``, both ends inclusive (``end`` None: no
+        upper bound) -- the same bounds a departure board keeps. Returned in
+        ``(window_start, call index)`` order, cut to ``limit``.
+
+        Each call walks its days forward, from the first whose window can
+        reach ``start`` to the last its service can run, and the walks are
+        merged by window start, so an open-ended query stops at its
+        ``limit``-th window. Each kept window carries its booking rules
+        placed on it (see :func:`._booking.booking_window`). A window
+        whose start or end lies beyond ``datetime`` (garbage times) is
+        never dated.
+        """
+        if limit == 0:
+            return []
+        first_dates = self._service_first_dates()
+        last_dates = self._service_last_dates()
+        # Only the days some call's service can run on are read, and of
+        # each only the services this query asks about: the calls' own and
+        # the ones their booking rules count days on.
+        wanted = {call.service_id for call in calls} | {
+            rule.prior_notice_service_id
+            for call in calls
+            for rule in (call.pickup_booking_rule, call.drop_off_booking_rule)
+            if rule is not None and rule.prior_notice_service_id is not None
+        }
+        active: dict[date, set[str]] = {}
+        self._load_patterns(call.service_id for call in calls)
+
+        def runs(service_id: str, day: date) -> bool:
+            if day not in active:
+                active[day] = self.active_service_ids(day) & wanted
+            return service_id in active[day]
+
+        heap: list[tuple[datetime, int, date, datetime]] = []
+
+        def push(index: int, day: date) -> None:
+            """Queue the call's window on ``day``, or the next datable day.
+
+            Nothing is queued once the window starts after ``end``.
+            """
+            call = calls[index]
+            last = last_dates[call.service_id]
+            candidate = self._next_service_day(call.service_id, day)
+            while candidate is not None and candidate <= last:
+                try:
+                    day_start = self._service_day_start(candidate)
+                    window_start = day_start + timedelta(seconds=call.start_window_secs)
+                    window_end = day_start + timedelta(seconds=call.end_window_secs)
+                except OverflowError:
+                    if candidate.year == 1:
+                        # A year-1 day east of UTC starts before datetime
+                        # does; a later one may not.
+                        candidate = self._next_service_day(
+                            call.service_id, candidate + timedelta(days=1)
+                        )
+                        continue
+                    return  # past the end of datetime: nothing later dates
+                if window_end < start:
+                    # Before start: only near the dated range's start, where
+                    # _first_day_reaching can't place the first reaching day.
+                    candidate = self._next_service_day(
+                        call.service_id, candidate + timedelta(days=1)
+                    )
+                    continue
+                # Like every scan here, never past _LATEST_INSTANT.
+                if window_start <= min(end or _LATEST_INSTANT, _LATEST_INSTANT):
+                    heapq.heappush(heap, (window_start, index, candidate, window_end))
+                return
+
+        for index, call in enumerate(calls):
+            first = first_dates.get(call.service_id)
+            if first is None or call.service_id not in last_dates:
+                continue  # its service never runs
+            reaching = self._first_day_reaching(start, call.end_window_secs)
+            push(index, first if reaching is None else max(first, reaching))
+
+        dated: list[DatedCall] = []
+        while heap:
+            window_start, index, day, window_end = heapq.heappop(heap)
+            call = calls[index]
+            if runs(call.service_id, day):
+                pickup, drop_off = (
+                    None
+                    if rule is None
+                    else booking_window(
+                        rule,
+                        day,
+                        window_start,
+                        window_end,
+                        day_start=self._service_day_start,
+                        runs=runs,
+                    )
+                    for rule in (call.pickup_booking_rule, call.drop_off_booking_rule)
+                )
+                dated.append(
+                    DatedCall(index, day, window_start, window_end, pickup, drop_off)
+                )
+                if limit is not None and len(dated) >= limit:
+                    break
+            if day < date.max:
+                push(index, day + timedelta(days=1))
+        return dated
+
+    def _load_patterns(self, service_ids: Iterable[str]) -> None:
+        """Read the calendar of each service not read yet (see _patterns).
+
+        Each service's calendar.txt row and calendar_dates exceptions: the
+        days it can run on, less the REMOVED ones (which win over an ADDED
+        one, as in :meth:`active_service_ids`) -- a superset of its active
+        days, which :meth:`_next_service_day` jumps between. Only the
+        services a query dates are read, in slices, and kept per service
+        (the index never changes): a query over a handful of on-demand
+        services never holds a large calendar_dates.txt, though one over
+        thousands holds theirs.
+        """
+        missing = sorted(set(service_ids) - self._patterns.keys())
+        for offset in range(0, len(missing), _ID_SLICE):
+            chunk = missing[offset : offset + _ID_SLICE]
+            marks = ",".join("?" * len(chunk))
+            patterns: dict[str, _ServicePattern | None] = dict.fromkeys(chunk)
+            for service_id, *days, raw_start, raw_end in self._conn.execute(
+                f"SELECT service_id, {', '.join(_WEEKDAY_COLUMNS)}, start_date, "
+                f"end_date FROM calendar WHERE service_id IN ({marks})",
+                chunk,
+            ):
+                lo, hi = _lenient_date(raw_start), _lenient_date(raw_end)
+                weekdays = tuple(day == 1 for day in days)
+                if lo is not None and hi is not None and lo <= hi and any(weekdays):
+                    patterns[service_id] = _ServicePattern(
+                        (weekdays, lo, hi), [], set()
+                    )
+            for service_id, raw, kind in self._conn.execute(
+                "SELECT service_id, date, exception_type FROM calendar_dates "
+                f"WHERE service_id IN ({marks}) AND exception_type IN (?, ?)",
+                [*chunk, _EXCEPTION_SERVICE_ADDED, _EXCEPTION_SERVICE_REMOVED],
+            ):
+                if (day := _lenient_date(raw)) is None:
+                    continue
+                pattern = patterns[service_id]
+                if pattern is None:
+                    pattern = patterns[service_id] = _ServicePattern(None, [], set())
+                if kind == _EXCEPTION_SERVICE_ADDED:
+                    pattern.added.append(day)
+                else:
+                    pattern.removed.add(day)
+            for pattern in patterns.values():
+                if pattern is not None:
+                    pattern.added.sort()
+            self._patterns.update(patterns)
+
+    def _next_service_day(self, service_id: str, day: date) -> date | None:
+        """Return the first day on or after ``day`` the service can run.
+
+        The nearer of its calendar.txt weekdays within range (a week at
+        most to look through) and its next ADDED date, skipping REMOVED
+        dates; None if neither is left.
+        """
+        self._load_patterns([service_id])
+        pattern = self._patterns[service_id]
+        if pattern is None:
+            return None
+        candidate = self._next_possible_day(pattern, day)
+        while candidate is not None and candidate in pattern.removed:
+            if candidate == date.max:
+                return None
+            candidate = self._next_possible_day(pattern, candidate + timedelta(days=1))
+        return candidate
+
+    @staticmethod
+    def _next_possible_day(pattern: _ServicePattern, day: date) -> date | None:
+        """Return the nearer of the next weekday in range and next ADDED date."""
+        best: date | None = None
+        if pattern.weekly is not None:
+            weekdays, lo, hi = pattern.weekly
+            candidate = max(day, lo)
+            for _ in range(7):
+                if candidate > hi:
+                    break
+                if weekdays[candidate.weekday()]:
+                    best = candidate
+                    break
+                if candidate == date.max:
+                    break
+                candidate += timedelta(days=1)
+        index = bisect.bisect_left(pattern.added, day)
+        if index < len(pattern.added) and (best is None or pattern.added[index] < best):
+            best = pattern.added[index]
+        return best
+
+    def _first_day_reaching(self, at: datetime, secs: int) -> date | None:
+        """Return the first service day D with D's start + ``secs`` >= ``at``.
+
+        None when ``at`` less ``secs`` precedes the dated range, so no day
+        can be placed by arithmetic: the caller starts at the service's
+        first day and skips windows ending before ``at``. Day starts only
+        increase, so it is the day after the one ``at - secs`` falls in,
+        unless that day starts exactly then.
+        """
+        try:
+            point = at - timedelta(seconds=secs)
+        except OverflowError:
+            return None
+        if point < _EARLIEST_INSTANT:
+            return None
+        day = self._service_day_of(point)
+        if self._service_day_start(day) == point:
+            return day
+        return day + timedelta(days=1)
 
     def concrete_trip_ids(self, source_trip_ids: list[str]) -> dict[str, list[str]]:
         """Map each PRODUCER-facing trip id to its concrete instances.

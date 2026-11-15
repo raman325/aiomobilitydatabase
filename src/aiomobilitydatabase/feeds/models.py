@@ -1073,7 +1073,9 @@ class BookingRule:
     ``timedelta``. Durations are minutes, as the file gives them.
     Every cell is kept as the file states it, even one the spec forbids
     for this ``booking_type``; unparseable cells are None, and an unknown
-    ``booking_type`` is None.
+    ``booking_type`` is None. ``unreadable_fields`` names the prior-notice
+    fields the file states but that can't be read (unparseable, or a time
+    past what a duration holds): None there means unknown, not absent.
     """
 
     id: str
@@ -1091,6 +1093,7 @@ class BookingRule:
     phone_number: str | None
     info_url: str | None
     booking_url: str | None
+    unreadable_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1104,8 +1107,9 @@ class OnDemandService:
     ``end_pickup_drop_off_window`` are GTFS times: time since the start of
     the service day (noon minus 12 hours). Either is None where the feed
     gives none, where a frequencies.txt repetition would move it before its
-    service day starts, or on a frequencies.txt trip with no timed call
-    (see ``exact_times``) -- unknown, never "no limit".
+    service day starts, on a frequencies.txt trip with no timed call (see
+    ``exact_times``), or past what a duration holds (garbage) -- unknown,
+    never "no limit".
 
     ``pickup_type``/``drop_off_type`` say whether, and how, a rider may be
     picked up or dropped off there ("travel is possible from one stop or
@@ -1155,6 +1159,78 @@ class OnDemandService:
     drop_off_booking_rule: BookingRule | None
     wheelchair_accessible: WheelchairAccess | None
     exact_times: bool | None
+
+
+@dataclass(frozen=True)
+class BookingWindow:
+    """When a ride in one on-demand window can be booked, under ``rule``.
+
+    The span of booking times valid for SOME ride in the window: a ride
+    late in the window may be booked later than one early in it. It is
+    measured from this call's own window (the "travel" the rule counts
+    back from) and its service date; days before travel are calendar days,
+    or the days ``prior_notice_service_id`` runs (``booking_type=2``
+    only). For a drop-off it is measured from the drop-off's own window,
+    so ``latest`` bounds a booking that the ride's pickup may need sooner;
+    on a headway-based repetition it is as approximate as the window (see
+    ``OnDemandService.exact_times``). Each ``booking_type`` reads only the
+    fields the spec allows it -- a forbidden one the file states is
+    ignored -- as follows:
+
+    - ``REAL_TIME``: up to the window's end; no earliest time.
+    - ``SAME_DAY``: up to ``prior_notice_duration_min`` minutes before the
+      window's end; from ``prior_notice_duration_max`` minutes before its
+      start, else from ``prior_notice_start_time`` on the
+      ``prior_notice_start_day``-th day before, else no earliest time.
+    - ``PRIOR_DAYS``: up to ``prior_notice_last_time`` on the
+      ``prior_notice_last_day``-th day before; from
+      ``prior_notice_start_time`` on the ``prior_notice_start_day``-th day
+      before, else no earliest time.
+
+    ``earliest`` is None only where the rule sets no earliest time. A rule
+    whose window cannot be placed gives no BookingWindow at all, never a
+    guessed one: a field it needs missing; a field it reads that the file
+    states but that can't be read (``BookingRule.unreadable_fields``); a
+    duration max under the min, which no ride's notice can meet; booking
+    that, for this window, opens only after it closes, or closes after the
+    window ends though the spec says "before travel"; a count of service
+    days that does not end within a year; a date out of range. Instants are
+    UTC.
+    """
+
+    rule: BookingRule
+    earliest: datetime | None
+    latest: datetime
+
+    def is_open(self, at: datetime) -> bool:
+        """Whether a booking made at ``at`` (timezone-aware) is in this window.
+
+        Both ends count: a booking exactly at ``earliest`` or ``latest`` is
+        on time.
+        """
+        return (self.earliest is None or at >= self.earliest) and at <= self.latest
+
+
+@dataclass(frozen=True)
+class OnDemandWindow:
+    """One dated window of a GTFS-Flex call: ``service`` on ``service_date``.
+
+    ``window_start``/``window_end`` are the call's
+    ``start_pickup_drop_off_window``/``end_pickup_drop_off_window`` placed
+    on the GTFS service date (UTC instants), approximate where
+    ``service.exact_times`` is False and of unknown exactness where it is
+    None. ``pickup_booking``/``drop_off_booking`` place the call's booking
+    rules on this window (see :class:`BookingWindow`); None where the call
+    names no rule, names one the dataset lacks (``service`` keeps the id),
+    or names one whose window cannot be placed.
+    """
+
+    service: OnDemandService
+    service_date: date
+    window_start: datetime
+    window_end: datetime
+    pickup_booking: BookingWindow | None
+    drop_off_booking: BookingWindow | None
 
 
 @dataclass(frozen=True)
