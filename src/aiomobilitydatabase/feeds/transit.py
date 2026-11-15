@@ -55,6 +55,7 @@ from .models import (
     FlexLocation,
     LocationGroup,
     OnDemandService,
+    OnDemandWindow,
     PickupDropOffType,
     Route,
     ServiceAlert,
@@ -94,6 +95,7 @@ from .rt import (
 from .static_index import (
     _EARLIEST_INSTANT,
     _LATEST_INSTANT,
+    DatableCall,
     ScheduledDeparture,
     ScheduledTrip,
     SlotRun,
@@ -1264,6 +1266,24 @@ def _utc_window(
             f"{_LATEST_INSTANT}, got {start!r}"
         )
     return utc_start, utc_end
+
+
+def _datable(service: OnDemandService) -> DatableCall:
+    """Return the fields :meth:`StaticIndex.on_demand_windows` dates a call by.
+
+    Only calls with both window ends known are dated; GTFS times are whole
+    seconds, so the offsets convert back exactly.
+    """
+    assert service.start_pickup_drop_off_window is not None
+    assert service.end_pickup_drop_off_window is not None
+    second = timedelta(seconds=1)
+    return DatableCall(
+        service_id=service.service_id,
+        start_window_secs=service.start_pickup_drop_off_window // second,
+        end_window_secs=service.end_pickup_drop_off_window // second,
+        pickup_booking_rule=service.pickup_booking_rule,
+        drop_off_booking_rule=service.drop_off_booking_rule,
+    )
 
 
 def _require_bound(end: datetime | None, limits: Sequence[int | None]) -> None:
@@ -3800,22 +3820,28 @@ class TransitFeedHandle:
         if isinstance(route_ids, str):
             raise TypeError("route_ids must be a sequence of ids, not a str")
         async with self._guard.reader():
-            flex = self._flex
-            locations = self.locations_in(zone)
-            near = {stop.id for stop in self.stops_in(zone)}
-            groups = [
-                group
-                for group in flex.location_groups
-                if any(stop_id in near for stop_id in group.stop_ids)
-            ]
-            rows = await self._index_read(
-                self._index.on_demand_rows,
-                [location.id for location in locations],
-                [group.id for group in groups],
-                sorted(near),
-            )
-            routes = {route.id: route for route in self._routes}
-            stops = {stop.id: stop for stop in self._stops}
+            return await self._on_demand_services(zone, route_ids)
+
+    async def _on_demand_services(
+        self, zone: Circle, route_ids: Sequence[str] | None
+    ) -> list[OnDemandService]:
+        """:meth:`get_on_demand_services`, under a reader guard the caller holds."""
+        flex = self._flex
+        locations = self.locations_in(zone)
+        near = {stop.id for stop in self.stops_in(zone)}
+        groups = [
+            group
+            for group in flex.location_groups
+            if any(stop_id in near for stop_id in group.stop_ids)
+        ]
+        rows = await self._index_read(
+            self._index.on_demand_rows,
+            [location.id for location in locations],
+            [group.id for group in groups],
+            sorted(near),
+        )
+        routes = {route.id: route for route in self._routes}
+        stops = {stop.id: stop for stop in self._stops}
         wanted = set(route_ids) if route_ids else None
         # Each place the row names, whichever one matched.
         by_location = {location.id: location for location in flex.locations}
@@ -3859,6 +3885,68 @@ class TransitFeedHandle:
             )
         )
         return services
+
+    async def get_on_demand_windows(
+        self,
+        zone: Circle,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int | None = None,
+        route_ids: Sequence[str] | None = None,
+    ) -> list[OnDemandWindow]:
+        """Dated GTFS-Flex windows serving a circular zone -- schedule only.
+
+        Each :meth:`get_on_demand_services` call (same zone, same
+        ``route_ids``) placed on every GTFS service date its trip runs,
+        where the window overlaps ``[start, end]``: one under way at
+        ``start`` counts, as does one opening exactly at ``end``. Same time
+        rules as :meth:`get_scheduled_departures` (``start`` defaulting to
+        now, open-ended by default, ``ValueError`` for ``end=None`` without
+        a ``limit``, a negative ``limit``, a naive ``start``/``end`` or a
+        ``start`` outside 0001-01-03 to 9999-12-01 UTC; ``end < start`` or
+        ``limit=0`` gives no windows). A call whose window is unknown (see
+        :class:`OnDemandService`) has no dated window, and is listed by
+        :meth:`get_on_demand_services` alone. Each window carries its
+        booking rules placed on it (:class:`BookingWindow`).
+
+        Sorted by window start, trip and stop_sequence, cut to ``limit``.
+        """
+        if isinstance(route_ids, str):
+            raise TypeError("route_ids must be a sequence of ids, not a str")
+        if limit is not None and limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        _require_bound(end, [limit])
+        start, end = _utc_window(start, end)
+        if limit == 0 or (end is not None and end < start):
+            return []
+        async with self._guard.reader():
+            services = [
+                service
+                for service in await self._on_demand_services(zone, route_ids)
+                if service.start_pickup_drop_off_window is not None
+                and service.end_pickup_drop_off_window is not None
+            ]
+            # The tie-break order: trip, then stop_sequence.
+            services.sort(key=lambda service: (service.trip_id, service.stop_sequence))
+            dated = await self._index_read(
+                self._index.on_demand_windows,
+                [_datable(service) for service in services],
+                start,
+                end,
+                limit,
+            )
+        return [
+            OnDemandWindow(
+                service=services[call.call],
+                service_date=call.service_date,
+                window_start=call.window_start,
+                window_end=call.window_end,
+                pickup_booking=call.pickup_booking,
+                drop_off_booking=call.drop_off_booking,
+            )
+            for call in dated
+        ]
 
     def stations_in(self, zone: Circle) -> list[StationGroup]:
         """Boarding stops within a zone, grouped into logical stations.

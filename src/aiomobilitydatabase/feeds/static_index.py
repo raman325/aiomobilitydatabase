@@ -8,6 +8,7 @@ event loop is never blocked (a hard Home Assistant requirement).
 from __future__ import annotations
 
 import csv
+import heapq
 import io
 import json
 import os
@@ -25,6 +26,7 @@ from typing import IO, Any, NamedTuple
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ._booking import booking_window
 from .exceptions import FeedParseError
 from .geo import polygon_is_valid
 from .models import (
@@ -32,6 +34,7 @@ from .models import (
     BikesAllowed,
     BookingRule,
     BookingType,
+    BookingWindow,
     FeedInfo,
     FlexLocation,
     FlexPolygon,
@@ -823,6 +826,27 @@ class OnDemandRow(NamedTuple):
     drop_off_booking_rule_id: str | None
     wheelchair_accessible: WheelchairAccess | None
     exact_times: bool | None
+
+
+class DatableCall(NamedTuple):
+    """One on-demand call to date: its service, window and booking rules."""
+
+    service_id: str
+    start_window_secs: int
+    end_window_secs: int
+    pickup_booking_rule: BookingRule | None
+    drop_off_booking_rule: BookingRule | None
+
+
+class DatedCall(NamedTuple):
+    """One call's window on one service date (see on_demand_windows)."""
+
+    call: int
+    service_date: date
+    window_start: datetime
+    window_end: datetime
+    pickup_booking: BookingWindow | None
+    drop_off_booking: BookingWindow | None
 
 
 @dataclass(frozen=True)
@@ -2576,6 +2600,118 @@ class StaticIndex:
                         exact_times={0: False, 1: True}.get(exact_times),
                     )
         return list(found.values())
+
+    def on_demand_windows(
+        self,
+        calls: Sequence[DatableCall],
+        start: datetime,
+        end: datetime | None,
+        limit: int | None,
+    ) -> list[DatedCall]:
+        """Date each call's window on the service days it runs, in order.
+
+        On service date D a call's window spans its offsets from D's start
+        (:meth:`_service_day_start`, so DST days measure from noon minus 12
+        hours). It is kept when the call's service runs on D and the window
+        overlaps ``[start, end]``, both ends inclusive (``end`` None: no
+        upper bound) -- the same bounds a departure board keeps. Returned in
+        ``(window_start, call index)`` order, cut to ``limit``.
+
+        Each call walks its days forward, from the first whose window can
+        reach ``start`` to the last its service can run, and the walks are
+        merged by window start, so an open-ended query stops at its
+        ``limit``-th window. Each kept window carries its booking rules
+        placed on it (see :func:`._booking.booking_window`). A window
+        whose start or end lies beyond ``datetime`` (garbage times) is
+        never dated.
+        """
+        if limit == 0:
+            return []
+        first_dates = self._service_first_dates()
+        last_dates = self._service_last_dates()
+        active: dict[date, set[str]] = {}
+
+        def runs(service_id: str, day: date) -> bool:
+            if day not in active:
+                active[day] = self.active_service_ids(day)
+            return service_id in active[day]
+
+        heap: list[tuple[datetime, int, date, datetime]] = []
+
+        def push(index: int, day: date) -> None:
+            """Queue the call's window on ``day``, or the next datable day.
+
+            Nothing is queued once the window starts after ``end``.
+            """
+            call = calls[index]
+            last = last_dates[call.service_id]
+            while day <= last:
+                try:
+                    day_start = self._service_day_start(day)
+                    window_start = day_start + timedelta(seconds=call.start_window_secs)
+                    window_end = day_start + timedelta(seconds=call.end_window_secs)
+                except OverflowError:
+                    if day.year == 1:
+                        # A year-1 day east of UTC starts before datetime
+                        # does; a later one may not.
+                        day += timedelta(days=1)
+                        continue
+                    return  # past the end of datetime: nothing later dates
+                if end is None or window_start <= end:
+                    heapq.heappush(heap, (window_start, index, day, window_end))
+                return
+
+        for index, call in enumerate(calls):
+            first = first_dates.get(call.service_id)
+            if first is None or call.service_id not in last_dates:
+                continue  # its service never runs
+            reaching = self._first_day_reaching(start, call.end_window_secs)
+            push(index, first if reaching is None else max(first, reaching))
+
+        dated: list[DatedCall] = []
+        while heap:
+            window_start, index, day, window_end = heapq.heappop(heap)
+            call = calls[index]
+            if runs(call.service_id, day):
+                pickup, drop_off = (
+                    None
+                    if rule is None
+                    else booking_window(
+                        rule,
+                        day,
+                        window_start,
+                        window_end,
+                        day_start=self._service_day_start,
+                        runs=runs,
+                    )
+                    for rule in (call.pickup_booking_rule, call.drop_off_booking_rule)
+                )
+                dated.append(
+                    DatedCall(index, day, window_start, window_end, pickup, drop_off)
+                )
+                if limit is not None and len(dated) >= limit:
+                    break
+            if day < date.max:
+                push(index, day + timedelta(days=1))
+        return dated
+
+    def _first_day_reaching(self, at: datetime, secs: int) -> date | None:
+        """Return the first service day D with D's start + ``secs`` >= ``at``.
+
+        None when every day does (``at`` less ``secs`` precedes the dated
+        range). Day starts only increase, so it is the day after the one
+        ``at - secs`` falls in, unless that day starts exactly then.
+        """
+        try:
+            point = at - timedelta(seconds=secs)
+        except OverflowError:
+            return None
+        if point < _EARLIEST_INSTANT:
+            return None
+        day = self._service_day_of(point)
+        if self._service_day_start(day) == point:
+            return day
+        return day + timedelta(days=1)
 
     def concrete_trip_ids(self, source_trip_ids: list[str]) -> dict[str, list[str]]:
         """Map each PRODUCER-facing trip id to its concrete instances.

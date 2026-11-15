@@ -1158,6 +1158,68 @@ class OnDemandService:
 
 
 @dataclass(frozen=True)
+class BookingWindow:
+    """When a ride in one on-demand window can be booked, under ``rule``.
+
+    The span of booking times valid for SOME ride in the window: a ride
+    late in the window may be booked later than one early in it. It is
+    measured from this call's own window (the "travel" the rule counts
+    back from) and its service date; days before travel are calendar days,
+    or the days ``prior_notice_service_id`` runs (``booking_type=2``
+    only). Each ``booking_type`` reads only the fields the spec allows it:
+
+    - ``REAL_TIME``: up to the window's end; no earliest time.
+    - ``SAME_DAY``: up to ``prior_notice_duration_min`` minutes before the
+      window's end; from ``prior_notice_duration_max`` minutes before its
+      start, else from ``prior_notice_start_time`` on the
+      ``prior_notice_start_day``-th day before, else no earliest time.
+    - ``PRIOR_DAYS``: up to ``prior_notice_last_time`` on the
+      ``prior_notice_last_day``-th day before; from
+      ``prior_notice_start_time`` on the ``prior_notice_start_day``-th day
+      before, else no earliest time.
+
+    ``earliest`` is None only where the rule sets no earliest time. A rule
+    whose window cannot be placed -- a field it needs missing, a count of
+    service days that does not end within a year, a date out of range --
+    gives no BookingWindow at all, never a guessed one. Instants are UTC.
+    """
+
+    rule: BookingRule
+    earliest: datetime | None
+    latest: datetime
+
+    def is_open(self, at: datetime) -> bool:
+        """Whether a booking made at ``at`` (timezone-aware) is in this window.
+
+        Both ends count: a booking exactly at ``earliest`` or ``latest`` is
+        on time.
+        """
+        return (self.earliest is None or at >= self.earliest) and at <= self.latest
+
+
+@dataclass(frozen=True)
+class OnDemandWindow:
+    """One dated window of a GTFS-Flex call: ``service`` on ``service_date``.
+
+    ``window_start``/``window_end`` are the call's
+    ``start_pickup_drop_off_window``/``end_pickup_drop_off_window`` placed
+    on the GTFS service date (UTC instants), approximate where
+    ``service.exact_times`` is False and of unknown exactness where it is
+    None. ``pickup_booking``/``drop_off_booking`` place the call's booking
+    rules on this window (see :class:`BookingWindow`); None where the call
+    names no rule, names one the dataset lacks (``service`` keeps the id),
+    or names one whose window cannot be placed.
+    """
+
+    service: OnDemandService
+    service_date: date
+    window_start: datetime
+    window_end: datetime
+    pickup_booking: BookingWindow | None
+    drop_off_booking: BookingWindow | None
+
+
+@dataclass(frozen=True)
 class GbfsVehicleType:
     """One vehicle type a GBFS system rents.
 
