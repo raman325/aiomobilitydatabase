@@ -87,11 +87,21 @@ type _Plane = tuple[float, float]
 
 
 def _segment_distance(a: _Plane, b: _Plane) -> float:
-    """Return the distance from the origin to the segment ab (planar)."""
+    """Return the distance from the origin to the segment ab (planar).
+
+    Past either end it is that end's distance; alongside the segment, the
+    cross product over its length -- exactly zero for an origin on an edge
+    along an axis, where stepping to the foot of the perpendicular would
+    leave a rounding residue that a zero radius misses.
+    """
     dx, dy = b[0] - a[0], b[1] - a[1]
     length = dx * dx + dy * dy
-    t = 0.0 if length == 0 else max(0.0, min(1.0, -(a[0] * dx + a[1] * dy) / length))
-    return math.hypot(a[0] + t * dx, a[1] + t * dy)
+    along = -(a[0] * dx + a[1] * dy)
+    if length == 0 or along <= 0:
+        return math.hypot(*a)
+    if along >= length:
+        return math.hypot(*b)
+    return abs(a[0] * b[1] - a[1] * b[0]) / math.sqrt(length)
 
 
 def _encloses_origin(ring: Sequence[_Plane]) -> bool:

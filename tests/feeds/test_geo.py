@@ -864,6 +864,56 @@ def test_radius_zero_on_a_rectangle_is_its_bounds_check(
 
 
 @given(
+    south=st.floats(-70, 69),
+    height=st.floats(1e-6, 1),
+    west=st.floats(-180, 179),
+    width=st.floats(1e-6, 359),
+    side=st.sampled_from(["south", "north", "west", "east"]),
+    along=st.floats(0, 1),
+)
+def test_a_point_on_a_rectangle_edge_overlaps_at_radius_zero(  # noqa: PLR0917
+    south: float,
+    height: float,
+    west: float,
+    width: float,
+    side: str,
+    along: float,
+) -> None:
+    """The boundary belongs to the zone: a zero-radius circle on any edge of
+    an axis-aligned rectangle overlaps it, however far east the edge lies
+    (found at a 170-degree-wide zone's east edge, 2026-11-14)."""
+    north, east = south + height, west + width
+    rectangle = FlexPolygon(
+        exterior=(
+            (south, west),
+            (south, east),
+            (north, east),
+            (north, west),
+            (south, west),
+        ),
+        holes=(),
+    )
+    lat, lon = {
+        "south": (south, west + along * width),
+        "north": (north, west + along * width),
+        "west": (south + along * height, west),
+        "east": (south + along * height, east),
+    }[side]
+    assume(south <= lat <= north and west <= lon <= east)
+    assert polygon_overlaps_circle(rectangle, Circle(lat, lon, 0.0))
+
+
+def test_the_east_edge_of_a_wide_zone_overlaps_at_radius_zero() -> None:
+    """The case Hypothesis found: stepping to the foot of the perpendicular
+    left a residue of about 1e-12 m, and a zero radius missed it."""
+    rectangle = FlexPolygon(
+        exterior=((0.0, 0.0), (0.0, 170.0), (1.0, 170.0), (1.0, 0.0), (0.0, 0.0)),
+        holes=(),
+    )
+    assert polygon_overlaps_circle(rectangle, Circle(0.046875, 170.0, 0.0))
+
+
+@given(
     origin=st.tuples(_LATS, _LONS),
     count=st.integers(3, 9),
     radius=st.floats(50, 2000),
