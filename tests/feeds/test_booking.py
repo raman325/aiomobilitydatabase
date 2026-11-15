@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -81,16 +82,8 @@ def _place(
 
 def test_real_time_booking_runs_to_the_window_end() -> None:
     """Real-time booking has no earliest time, and a ride late in the window
-    can be booked up to its end; the duration columns it forbids are
-    ignored."""
+    can be booked up to its end."""
     assert _place(_rule(BookingType.REAL_TIME)) == (None, _WE)
-    forbidden = _rule(
-        BookingType.REAL_TIME,
-        prior_notice_duration_min=30,
-        prior_notice_last_day=1,
-        prior_notice_last_time=timedelta(hours=17),
-    )
-    assert _place(forbidden) == (None, _WE)
 
 
 # -- booking_type=1 -----------------------------------------------------------
@@ -114,7 +107,6 @@ def test_same_day_booking_may_open_on_a_start_day() -> None:
         prior_notice_duration_min=30,
         prior_notice_start_day=3,
         prior_notice_start_time=timedelta(hours=8),
-        prior_notice_service_id=_WEEKDAYS,
     )
     assert _place(rule) == (
         datetime(2026, 11, 10, 8, tzinfo=UTC),
@@ -122,17 +114,95 @@ def test_same_day_booking_may_open_on_a_start_day() -> None:
     )
 
 
-def test_a_start_day_beside_a_duration_max_is_ignored() -> None:
-    """The spec forbids a start day for booking_type=1 with a duration max:
-    the max decides."""
-    rule = _rule(
-        BookingType.SAME_DAY,
-        prior_notice_duration_min=30,
-        prior_notice_duration_max=60,
-        prior_notice_start_day=3,
-        prior_notice_start_time=timedelta(hours=8),
+_FORBIDDEN = {
+    "prior_notice_duration_min": 30,
+    "prior_notice_duration_max": 60,
+    "prior_notice_last_day": 1,
+    "prior_notice_last_time": timedelta(hours=17),
+    "prior_notice_start_day": 3,
+    "prior_notice_start_time": timedelta(hours=8),
+    "prior_notice_service_id": _WEEKDAYS,
+}
+_VALID = {
+    BookingType.REAL_TIME: {},
+    BookingType.SAME_DAY: {"prior_notice_duration_min": 30},
+    BookingType.PRIOR_DAYS: {
+        "prior_notice_last_day": 1,
+        "prior_notice_last_time": timedelta(hours=17),
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("booking_type", "field", "extra"),
+    [
+        *(
+            (BookingType.REAL_TIME, field, {})
+            for field in _FORBIDDEN
+            if field != "prior_notice_start_time"
+        ),
+        (BookingType.SAME_DAY, "prior_notice_last_day", {}),
+        (BookingType.SAME_DAY, "prior_notice_service_id", {}),
+        (
+            BookingType.SAME_DAY,
+            "prior_notice_start_day",
+            {"prior_notice_duration_max": 60},
+        ),
+        (BookingType.SAME_DAY, "prior_notice_start_time", {}),
+        (BookingType.PRIOR_DAYS, "prior_notice_duration_min", {}),
+        (BookingType.PRIOR_DAYS, "prior_notice_duration_max", {}),
+        (BookingType.PRIOR_DAYS, "prior_notice_start_time", {}),
+    ],
+)
+def test_a_forbidden_field_leaves_the_rule_unknown(
+    booking_type: BookingType, field: str, extra: dict[str, object]
+) -> None:
+    """The spec forbids it for this booking_type, so the rule contradicts
+    itself and which field is wrong is unknowable: no window, never one
+    built by ignoring a field (real-time booking ignoring a stated notice
+    would read bookable up to the ride)."""
+    valid = _rule(booking_type, **_VALID[booking_type], **extra)
+    assert _place(valid) is not None
+    assert _place(replace(valid, **{field: _FORBIDDEN[field]})) is None
+
+
+def test_a_contradictory_rule_is_unknown() -> None:
+    """A duration max under the min allows no ride; booking opening after
+    its deadline never opens: both contradictions, not windows."""
+    assert (
+        _place(
+            _rule(
+                BookingType.SAME_DAY,
+                prior_notice_duration_min=120,
+                prior_notice_duration_max=30,
+            ),
+            window=(_WS, _WS + timedelta(hours=4)),
+        )
+        is None
     )
-    assert _place(rule) == (_WS - timedelta(hours=1), _WE - timedelta(minutes=30))
+    assert (
+        _place(
+            _rule(
+                BookingType.PRIOR_DAYS,
+                prior_notice_last_day=7,
+                prior_notice_last_time=timedelta(hours=17),
+                prior_notice_start_day=1,
+                prior_notice_start_time=timedelta(hours=8),
+            )
+        )
+        is None
+    )
+    assert (
+        _place(
+            _rule(
+                BookingType.SAME_DAY,
+                prior_notice_duration_min=30,
+                prior_notice_start_day=0,
+                prior_notice_start_time=timedelta(hours=20),
+            )
+        )
+        is None
+    )
 
 
 def test_same_day_booking_without_its_minimum_is_unknown() -> None:
@@ -172,14 +242,11 @@ def test_prior_day_booking_counts_service_days() -> None:
 
 
 def test_prior_day_booking_counts_calendar_days_without_a_service() -> None:
-    """With no service id, ``prior_notice_last_day=2`` is two calendar days;
-    the duration columns booking_type=2 forbids are ignored."""
+    """With no service id, ``prior_notice_last_day=2`` is two calendar days."""
     rule = _rule(
         BookingType.PRIOR_DAYS,
         prior_notice_last_day=2,
         prior_notice_last_time=timedelta(hours=17),
-        prior_notice_duration_min=30,
-        prior_notice_duration_max=60,
     )
     assert _place(rule, service_date=date(2026, 11, 16)) == (
         None,
@@ -304,10 +371,16 @@ def test_same_day_bounds_are_exact(
         prior_notice_duration_min=minimum,
         prior_notice_duration_max=maximum,
     )
-    assert _place(rule, service_date=start.date(), window=(start, end)) == (
-        None if maximum is None else start - timedelta(minutes=maximum),
-        end - timedelta(minutes=minimum),
-    )
+    placed = _place(rule, service_date=start.date(), window=(start, end))
+    if maximum is not None and maximum < minimum:
+        assert placed is None  # no ride's notice can be both
+        return
+    earliest = None if maximum is None else start - timedelta(minutes=maximum)
+    latest = end - timedelta(minutes=minimum)
+    if earliest is not None and earliest > latest:
+        assert placed is None
+        return
+    assert placed == (earliest, latest)
 
 
 _DAY0 = date(2026, 1, 1)

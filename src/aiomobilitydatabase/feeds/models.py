@@ -1166,7 +1166,10 @@ class BookingWindow:
     measured from this call's own window (the "travel" the rule counts
     back from) and its service date; days before travel are calendar days,
     or the days ``prior_notice_service_id`` runs (``booking_type=2``
-    only). Each ``booking_type`` reads only the fields the spec allows it:
+    only). For a drop-off it is measured from the drop-off's own window,
+    so ``latest`` bounds a booking that the ride's pickup may need sooner;
+    on a headway-based repetition it is as approximate as the window (see
+    ``OnDemandService.exact_times``). Each ``booking_type`` reads:
 
     - ``REAL_TIME``: up to the window's end; no earliest time.
     - ``SAME_DAY``: up to ``prior_notice_duration_min`` minutes before the
@@ -1179,9 +1182,12 @@ class BookingWindow:
       before, else no earliest time.
 
     ``earliest`` is None only where the rule sets no earliest time. A rule
-    whose window cannot be placed -- a field it needs missing, a count of
-    service days that does not end within a year, a date out of range --
-    gives no BookingWindow at all, never a guessed one. Instants are UTC.
+    whose window cannot be placed gives no BookingWindow at all, never a
+    guessed one: a field it needs missing; a field the spec forbids for its
+    ``booking_type`` (which field is wrong is unknowable); a contradiction
+    (a duration max under the min, or booking opening after it closes); a
+    count of service days that does not end within a year; a date out of
+    range. Instants are UTC.
     """
 
     rule: BookingRule

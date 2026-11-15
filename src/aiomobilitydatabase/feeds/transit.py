@@ -3906,9 +3906,9 @@ class TransitFeedHandle:
         a ``limit``, a negative ``limit``, a naive ``start``/``end`` or a
         ``start`` outside 0001-01-03 to 9999-12-01 UTC; ``end < start`` or
         ``limit=0`` gives no windows). A call whose window is unknown (see
-        :class:`OnDemandService`) has no dated window, and is listed by
-        :meth:`get_on_demand_services` alone. Each window carries its
-        booking rules placed on it (:class:`BookingWindow`).
+        :class:`OnDemandService`) or ends before it starts has no dated
+        window, and is listed by :meth:`get_on_demand_services` alone. Each
+        window carries its booking rules placed on it (:class:`BookingWindow`).
 
         Sorted by window start, trip and stop_sequence, cut to ``limit``.
         """
@@ -3926,6 +3926,10 @@ class TransitFeedHandle:
                 for service in await self._on_demand_services(zone, route_ids)
                 if service.start_pickup_drop_off_window is not None
                 and service.end_pickup_drop_off_window is not None
+                # Service "becomes available" then "ends": a window ending
+                # before it starts says neither when.
+                and service.start_pickup_drop_off_window
+                <= service.end_pickup_drop_off_window
             ]
             # The tie-break order: trip, then stop_sequence.
             services.sort(key=lambda service: (service.trip_id, service.stop_sequence))

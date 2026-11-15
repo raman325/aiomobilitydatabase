@@ -66,8 +66,10 @@ def booking_window(
     """
     window = _Window(service_date, window_start, window_end, day_start, runs)
     reader = None if rule.booking_type is None else _READERS.get(rule.booking_type)
-    if reader is None:
-        return None  # An unknown booking_type says nothing placeable.
+    if reader is None or _states_forbidden(rule):
+        # An unknown booking_type says nothing placeable; a field the spec
+        # forbids for this one leaves which field is wrong unknowable.
+        return None
     try:
         bounds = reader(rule, window)
     except OverflowError:
@@ -75,7 +77,38 @@ def booking_window(
     if bounds is None:
         return None
     earliest, latest = bounds
+    if earliest is not None and earliest > latest:
+        return None  # Opens after it closes: contradictory, not "never".
     return BookingWindow(rule=rule, earliest=earliest, latest=latest)
+
+
+_DURATIONS = ("prior_notice_duration_min", "prior_notice_duration_max")
+_LAST = ("prior_notice_last_day", "prior_notice_last_time")
+_START = ("prior_notice_start_day", "prior_notice_start_time")
+
+
+def _states_forbidden(rule: BookingRule) -> bool:
+    """Whether the rule states a field the spec forbids for its booking_type.
+
+    Real-time booking allows none of the prior-notice fields; same-day
+    booking no last day, service, or start day beside a duration max;
+    prior-day booking no durations. A last or start time is forbidden
+    without its day.
+    """
+    forbidden: list[str] = []
+    if rule.booking_type is BookingType.REAL_TIME:
+        forbidden += [*_DURATIONS, *_LAST, *_START, "prior_notice_service_id"]
+    elif rule.booking_type is BookingType.SAME_DAY:
+        forbidden += [*_LAST, "prior_notice_service_id"]
+        if rule.prior_notice_duration_max is not None:
+            forbidden.append("prior_notice_start_day")
+    elif rule.booking_type is BookingType.PRIOR_DAYS:
+        forbidden += _DURATIONS
+    if rule.prior_notice_last_day is None:
+        forbidden.append("prior_notice_last_time")
+    if rule.prior_notice_start_day is None:
+        forbidden.append("prior_notice_start_time")
+    return any(getattr(rule, name) is not None for name in forbidden)
 
 
 @dataclass(frozen=True)
@@ -116,9 +149,11 @@ def _same_day(rule: BookingRule, window: _Window) -> _Bounds:
         return None  # Required for booking_type=1.
     latest = window.end - timedelta(minutes=rule.prior_notice_duration_min)
     if rule.prior_notice_duration_max is not None:
+        if rule.prior_notice_duration_max < rule.prior_notice_duration_min:
+            return None  # No ride's notice can be both: contradictory.
         return window.start - timedelta(minutes=rule.prior_notice_duration_max), latest
-    # prior_notice_start_day is allowed only without a duration max, and
-    # prior_notice_service_id is forbidden here: calendar days.
+    # Without a duration max, a start day may say when booking opens, in
+    # calendar days (prior_notice_service_id is type 2's alone).
     if rule.prior_notice_start_day is None:
         return None, latest
     earliest = window.at(

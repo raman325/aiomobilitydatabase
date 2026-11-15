@@ -7,6 +7,7 @@ event loop is never blocked (a hard Home Assistant requirement).
 
 from __future__ import annotations
 
+import bisect
 import csv
 import heapq
 import io
@@ -828,6 +829,13 @@ class OnDemandRow(NamedTuple):
     exact_times: bool | None
 
 
+class _ServicePattern(NamedTuple):
+    """A service's calendar.txt (weekdays, start, end), and its ADDED dates."""
+
+    weekly: tuple[tuple[bool, ...], date, date] | None
+    added: list[date]
+
+
 class DatableCall(NamedTuple):
     """One on-demand call to date: its service, window and booking rules."""
 
@@ -1055,6 +1063,7 @@ class StaticIndex:
         self._tz = ZoneInfo(timezone_name)
         self._last_dates: dict[str, date] | None = None
         self._first_dates: dict[str, date] | None = None
+        self._patterns: dict[str, _ServicePattern] | None = None
         self._first_date: date | None = None
         self._first_date_known = False
         self._reach: tuple[int, tuple[int, ...]] | None = None
@@ -2629,6 +2638,8 @@ class StaticIndex:
             return []
         first_dates = self._service_first_dates()
         last_dates = self._service_last_dates()
+        # Only the days some call's service can run on are read, so the
+        # cache holds those, not every day an open-ended walk passes.
         active: dict[date, set[str]] = {}
 
         def runs(service_id: str, day: date) -> bool:
@@ -2645,20 +2656,24 @@ class StaticIndex:
             """
             call = calls[index]
             last = last_dates[call.service_id]
-            while day <= last:
+            candidate = self._next_service_day(call.service_id, day)
+            while candidate is not None and candidate <= last:
                 try:
-                    day_start = self._service_day_start(day)
+                    day_start = self._service_day_start(candidate)
                     window_start = day_start + timedelta(seconds=call.start_window_secs)
                     window_end = day_start + timedelta(seconds=call.end_window_secs)
                 except OverflowError:
-                    if day.year == 1:
+                    if candidate.year == 1:
                         # A year-1 day east of UTC starts before datetime
                         # does; a later one may not.
-                        day += timedelta(days=1)
+                        candidate = self._next_service_day(
+                            call.service_id, candidate + timedelta(days=1)
+                        )
                         continue
                     return  # past the end of datetime: nothing later dates
-                if end is None or window_start <= end:
-                    heapq.heappush(heap, (window_start, index, day, window_end))
+                # Like every scan here, never past _LATEST_INSTANT.
+                if window_start <= min(end or _LATEST_INSTANT, _LATEST_INSTANT):
+                    heapq.heappush(heap, (window_start, index, candidate, window_end))
                 return
 
         for index, call in enumerate(calls):
@@ -2694,6 +2709,64 @@ class StaticIndex:
             if day < date.max:
                 push(index, day + timedelta(days=1))
         return dated
+
+    def _service_patterns(self) -> dict[str, _ServicePattern]:
+        """Each service's calendar.txt row and calendar_dates ADDED dates.
+
+        The days it CAN run on (removals are left to
+        :meth:`active_service_ids`): a superset of its active days, which
+        :meth:`_next_service_day` jumps between. Computed once.
+        """
+        if self._patterns is not None:
+            return self._patterns
+        patterns: dict[str, _ServicePattern] = {}
+        for service_id, *days, raw_start, raw_end in self._conn.execute(
+            f"SELECT service_id, {', '.join(_WEEKDAY_COLUMNS)}, start_date, "
+            "end_date FROM calendar"
+        ):
+            lo, hi = _lenient_date(raw_start), _lenient_date(raw_end)
+            weekdays = tuple(day == 1 for day in days)
+            if lo is not None and hi is not None and lo <= hi and any(weekdays):
+                patterns[service_id] = _ServicePattern((weekdays, lo, hi), [])
+        for service_id, raw in self._conn.execute(
+            "SELECT service_id, date FROM calendar_dates WHERE exception_type = ?",
+            (_EXCEPTION_SERVICE_ADDED,),
+        ):
+            if (day := _lenient_date(raw)) is not None:
+                patterns.setdefault(service_id, _ServicePattern(None, [])).added.append(
+                    day
+                )
+        for pattern in patterns.values():
+            pattern.added.sort()
+        self._patterns = patterns
+        return patterns
+
+    def _next_service_day(self, service_id: str, day: date) -> date | None:
+        """Return the first day on or after ``day`` the service can run.
+
+        The nearer of its calendar.txt weekdays within range (a week at
+        most to look through) and its next ADDED date; None if neither.
+        """
+        pattern = self._service_patterns().get(service_id)
+        if pattern is None:
+            return None
+        best: date | None = None
+        if pattern.weekly is not None:
+            weekdays, lo, hi = pattern.weekly
+            candidate = max(day, lo)
+            for _ in range(7):
+                if candidate > hi:
+                    break
+                if weekdays[candidate.weekday()]:
+                    best = candidate
+                    break
+                if candidate == date.max:
+                    break
+                candidate += timedelta(days=1)
+        index = bisect.bisect_left(pattern.added, day)
+        if index < len(pattern.added) and (best is None or pattern.added[index] < best):
+            best = pattern.added[index]
+        return best
 
     def _first_day_reaching(self, at: datetime, secs: int) -> date | None:
         """Return the first service day D with D's start + ``secs`` >= ``at``.

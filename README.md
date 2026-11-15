@@ -563,18 +563,19 @@ Notes on direct mode:
   overlaps `[start, end]` -- one under way at `start` counts. Same time
   rules as `get_scheduled_departures()`: open-ended by default, an
   open-ended query needs a `limit`; sorted by window start. A call whose
-  window is unknown has no dated window. `pickup_booking`/`drop_off_booking`
+  window is unknown, or ends before it starts, has no dated window. `pickup_booking`/`drop_off_booking`
   place the call's booking rules on the window as a `BookingWindow`
   (`earliest`, `latest`, `is_open(at)`): real-time booking up to the
   window's end; same-day booking from `prior_notice_duration_max` before
   its start (or a start day) to `prior_notice_duration_min` before its end;
   prior-day booking by `prior_notice_last_time` on the
   `prior_notice_last_day`-th day before the service date, counting the days
-  `prior_notice_service_id` runs where given. Each `booking_type` reads only
-  the columns the spec allows it; `earliest` is None only where the rule
-  sets no earliest time, and a rule that cannot be placed (a field it needs
-  missing, a day count that does not end within a year) gives None, never a
-  guessed window.
+  `prior_notice_service_id` runs where given. `earliest` is None only where
+  the rule sets no earliest time, and a rule that cannot be placed gives
+  None, never a guessed window: a field it needs missing, a column the spec
+  forbids for its `booking_type` (which column is wrong is unknowable), a
+  contradiction (a duration max under the min, booking opening after it
+  closes), or a day count that does not end within a year.
 - **Alert scope is the spec's, selector by selector**: `ServiceAlert`
   keeps each `informed_entity` whole as an `EntitySelector` (spec field
   names; a trip as a `TripSelector`, one run of it where it gives a start
