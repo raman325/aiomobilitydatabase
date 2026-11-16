@@ -564,10 +564,41 @@ _BAD_LOCATIONS = [
     "https://",
     "https:///x",
     "https:x",
+    # The page's own scheme too: a Location with a scheme is used as it is
+    # (RFC 3986 section 5.2.2), never given the base's host.
+    "http:",
+    "http://",
+    "http:///x",
+    "HTTP:///x",
+    "http:x",
     "http://a%3Ab@127.0.0.1:9/x",  # RFC 7617: no colon in a Basic user-id
     "http://a%0Ab:p@127.0.0.1:9/x",  # RFC 7617: no control character either
     "http://a:p%00x@127.0.0.1:9/x",
+    "http://%E2%82%AC:p@127.0.0.1:9/x",  # Basic auth sends Latin-1 only
+    "http://u:%E2%82%AC@127.0.0.1:9/x",
 ]
+
+
+@pytest.mark.parametrize("location", ["http:///x", "http:x", "HTTP:///x", "http:"])
+@pytest.mark.parametrize("api_key", [None, "secret"])
+async def test_a_location_with_a_scheme_and_no_host_never_borrows_the_base_host(
+    mock_api: MockApi, location: str, api_key: str | None
+) -> None:
+    """RFC 3986 section 5.2.2: a reference with a scheme is the target as
+    written. Joined onto the base, ``http:///x`` became the producer's own
+    ``/x`` -- requested, the secret header with it; it names no host."""
+    mock_api.get("/rt.pb", status=302, headers={"Location": location})
+    mock_api.get("/x", body=b"", content_type=PB)
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError, match="invalid URL"):
+            await fetch_feed_message(
+                session,
+                mock_api.url("/rt.pb"),
+                auth_type=2 if api_key else None,
+                api_key_name="X-Key" if api_key else None,
+                api_key=api_key,
+            )
+    assert [r.path for r in mock_api.requests] == ["/rt.pb"]
 
 
 @pytest.mark.parametrize("location", _BAD_LOCATIONS)
@@ -835,16 +866,20 @@ _COLON_LOGINS = ["http://a%3Ab@127.0.0.1:9/feed", "http://%3A@127.0.0.1:9/feed"]
 
 
 @pytest.mark.parametrize("url", _COLON_LOGINS)
-async def test_a_colon_login_fails_at_the_boundary_at_every_entry_point(
+async def test_a_colon_login_is_refused_before_the_request_at_every_entry_point(
     direct_client: MobilityFeedsClient, url: str
 ) -> None:
-    with pytest.raises(SourceConnectionError, match="Request failed"):
+    """RFC 7617 section 2: a user-id ends at its first colon, so none can
+    hold one. The caller's own URL is a ValueError up front; a URL from
+    data is the guard's SourceConnectionError -- neither reaches aiohttp,
+    which failed mid-request."""
+    with pytest.raises(ValueError, match="colon"):
         await direct_client.get_gbfs_feed_from_url(url)
-    with pytest.raises(SourceConnectionError, match="Request failed"):
+    with pytest.raises(ValueError, match="colon"):
         await direct_client.get_transit_feed_from_urls(url)
     async with aiohttp.ClientSession() as session:
         for by_hand in (False, True):
-            with pytest.raises(SourceConnectionError, match="Request failed"):
+            with pytest.raises(SourceConnectionError, match="colon"):
                 await fetch_feed_message(
                     session,
                     url,
@@ -1000,22 +1035,94 @@ def test_credentials_with_a_control_character_are_refused(url: str) -> None:
         _require_http_url(url, "test URL")
 
 
-async def test_a_mid_request_error_echoes_no_request_header(mock_api: MockApi) -> None:
-    """An error's own text can carry every request header (aiohttp's
-    pure-Python writer); the SourceConnectionError names its type only."""
-    mock_api.get(
-        "/rt.pb",
-        status=302,
-        headers={
-            "Location": mock_api.url("/x").replace("http://", "http://%E2%82%AC@")
-        },
-    )
+_UNSENDABLE_CREDENTIALS = [
+    ("http://%E2%82%AC:pw@127.0.0.1:9/f", "outside Latin-1"),
+    ("http://\u20ac:pw@127.0.0.1:9/f", "outside Latin-1"),
+    ("http://u:p%E2%82%AC@127.0.0.1:9/f", "outside Latin-1"),
+    ("http://:%F0%9F%9A%B2@127.0.0.1:9/f", "outside Latin-1"),  # password alone
+    ("http://a%3Ab:p@127.0.0.1:9/f", "colon"),
+    ("http://a%0Ab:p@127.0.0.1:9/f", "control character"),
+]
+
+
+@pytest.mark.parametrize(("url", "reason"), _UNSENDABLE_CREDENTIALS)
+def test_credentials_basic_auth_cant_send_are_refused_by_the_guard(
+    url: str, reason: str
+) -> None:
+    """Basic auth sends credentials as Latin-1, a user-id without a colon:
+    aiohttp failed mid-request ("Request failed (UnicodeEncodeError)") on
+    anything else. A producer's URL is refused before the request."""
+    with pytest.raises(SourceConnectionError, match=reason) as caught:
+        _require_http_url(url, "test URL")
+    assert "pw" not in str(caught.value)
+
+
+@pytest.mark.parametrize(("url", "reason"), _UNSENDABLE_CREDENTIALS)
+async def test_caller_url_credentials_basic_auth_cant_send_are_a_value_error(
+    mock_api: MockApi, url: str, reason: str
+) -> None:
+    """The caller's own URL is the caller's input: refused up front, a
+    ValueError, before any request."""
+    url = url.replace("127.0.0.1:9", URL(mock_api.url("/")).raw_authority)
     async with aiohttp.ClientSession() as session:
+        client = MobilityFeedsClient(session=session)
+        with pytest.raises(ValueError, match=reason) as caught:
+            await client.get_gbfs_feed_from_url(url)
+        assert not isinstance(caught.value, MobilityDatabaseError)
+        with pytest.raises(ValueError, match=reason):
+            await client.get_transit_feed_from_urls(url)
+        with pytest.raises(ValueError, match=reason):
+            await client.get_transit_feed_from_urls(
+                mock_api.url(STATIC_PATH), service_alerts_urls=[url]
+            )
+    assert mock_api.requests == []
+
+
+@given(
+    user=st.text(max_size=8),
+    password=st.text(max_size=8),
+)
+@settings(max_examples=300)
+def test_url_credentials_are_refused_exactly_when_basic_auth_cant_send_them(
+    user: str, password: str
+) -> None:
+    """The guard's allowlist: Latin-1, no control character, no colon in
+    the user-id. Whatever it passes, Basic auth encodes."""
+    url = str(URL.build(scheme="http", host="h", user=user, password=password))
+    parsed = URL(url)
+    sent_user, sent_password = parsed.user or "", parsed.password or ""
+    sendable = ":" not in sent_user and all(
+        ch >= " " and ch != "\x7f" and ord(ch) <= 0xFF
+        for ch in sent_user + sent_password
+    )
+    try:
+        _require_http_url(url, "test URL")
+    except SourceConnectionError:
+        assert not sendable
+    else:
+        assert sendable
+        f"{sent_user}:{sent_password}".encode("latin-1")
+
+
+async def test_a_mid_request_error_echoes_no_request_header(
+    mock_api: MockApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error's own text can carry every request header (aiohttp's
+    pure-Python writer); the SourceConnectionError names its type only,
+    and carries nothing of it along."""
+
+    async def failing(*_args: object, **kwargs: object) -> None:
+        raise UnicodeEncodeError("latin-1", f"{kwargs['headers']}", 0, 1, "no")
+
+    async with aiohttp.ClientSession() as session:
+        monkeypatch.setattr(session, "request", failing)
         with pytest.raises(SourceConnectionError) as caught:
             await fetch_feed_message(
                 session, mock_api.url("/rt.pb"), headers={"X-Secret": "TOPSECRET"}
             )
-    assert "TOPSECRET" not in str(caught.value)
+    assert str(caught.value) == "Request failed (UnicodeEncodeError)"
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -1607,3 +1714,31 @@ async def test_gbfs_credentials_go_only_to_the_discovery_origin(where: str) -> N
         assert "authorization" not in seen
     else:
         assert seen["authorization"] == "Bearer GbfsSecret"
+
+
+async def test_a_producer_url_with_credentials_beside_an_authorization_header(
+    mock_api: MockApi,
+) -> None:
+    """A discovery document naming an endpoint with credentials, fetched with
+    the caller's Authorization header: which to send isn't the library's to
+    pick, so neither is, and nothing reaches the endpoint."""
+    endpoint = mock_api.url("/si").replace("http://", "http://u:p@")
+    mock_api.get(
+        "/gbfs.json",
+        payload={
+            "last_updated": 0,
+            "ttl": 0,
+            "version": "2.3",
+            "data": {
+                "en": {"feeds": [{"name": "system_information", "url": endpoint}]}
+            },
+        },
+    )
+    async with MobilityFeedsClient() as client:
+        handle = await client.get_gbfs_feed_from_url(
+            mock_api.url("/gbfs.json"), headers={"Authorization": "Bearer Tok"}
+        )
+        with pytest.raises(SourceConnectionError, match="can't both be sent") as caught:
+            await handle.get_system_info()
+    assert caught.value.__context__ is None
+    assert "/si" not in [r.path for r in mock_api.requests]

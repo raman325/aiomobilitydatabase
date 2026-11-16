@@ -599,6 +599,33 @@ def test_huge_values_are_capped_not_crashes() -> None:
     assert _fresh({"Cache-Control": "max-age=60", "Age": huge}) == Freshness(0.0)
 
 
+@given(
+    zeros=st.integers(0, 6000),
+    max_age=st.integers(0, 3 * 10**9),
+    age=st.integers(0, 3 * 10**9),
+)
+def test_leading_zeros_never_change_a_delta_seconds(
+    zeros: int, max_age: int, age: int
+) -> None:
+    """RFC 9111 section 1.2.2 delta-seconds is 1*DIGIT: leading zeros carry
+    no value, however many (int() alone refuses more than 4300 digits), and
+    any value above 2^31 is read as 2^31 -- in max-age and Age alike."""
+    pad = "0" * zeros
+    capped_max_age = min(max_age, 2_147_483_648)
+    capped_age = min(age, 2_147_483_648)
+    padded = _fresh({"Cache-Control": f"max-age={pad}{max_age}", "Age": f"{pad}{age}"})
+    assert padded == Freshness(float(max(0, capped_max_age - capped_age)))
+    assert padded == _fresh({"Cache-Control": f"max-age={max_age}", "Age": str(age)})
+
+
+def test_a_long_run_of_leading_zeros_reads_the_digits_after_it() -> None:
+    pad = "0" * 5000
+    assert _fresh({"Cache-Control": f"max-age={pad}60"}) == Freshness(60.0)
+    assert _fresh({"Cache-Control": f'max-age="{pad}60"'}) == Freshness(60.0)
+    assert _fresh({"Cache-Control": "max-age=60", "Age": f"{pad}20"}) == Freshness(40.0)
+    assert _fresh({"Cache-Control": f"max-age={pad}"}) == Freshness(0.0)
+
+
 def test_a_list_valued_age_uses_its_first_member() -> None:
     # Layered CDNs append: RFC 9111 has a cache use the first value.
     assert _fresh({"Cache-Control": "max-age=60", "Age": "50, 50"}) == Freshness(10.0)

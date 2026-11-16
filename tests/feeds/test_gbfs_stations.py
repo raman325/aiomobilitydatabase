@@ -298,6 +298,28 @@ def test_endpoints_from_discovery_bad_feeds_still_tries_language_blocks() -> Non
 
 
 @pytest.mark.parametrize(
+    "en",
+    [
+        pytest.param({"feeds": []}, id="empty"),
+        pytest.param(
+            {"feeds": [{"name": "x"}, {"url": "https://e.com/y"}]}, id="unusable"
+        ),
+        pytest.param({"feeds": [{"name": "", "url": ""}, "junk"]}, id="blank"),
+    ],
+)
+def test_a_preferred_language_listing_nothing_usable_falls_to_the_next(
+    en: dict[str, object],
+) -> None:
+    """2.x discovery: an "en" block that yields no usable name/url pair
+    names nothing to prefer -- the first block that does is the table."""
+    usable = [{"name": "system_information", "url": "https://e.com/fr"}]
+    document = {"data": {"en": en, "de": {"feeds": []}, "fr": {"feeds": usable}}}
+    assert _endpoints_from_discovery(document) == {
+        "system_information": "https://e.com/fr"
+    }
+
+
+@pytest.mark.parametrize(
     "ttl",
     [
         pytest.param("60s", id="unit-suffixed-string"),
@@ -582,6 +604,30 @@ async def test_station_full_status_and_information_surface(
     assert removed.is_returning is True
     assert removed.bikes_disabled is None  # absent, not zero
     assert removed.address is None
+
+
+async def test_station_flags_read_only_true_false_or_0_1(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """A GBFS Boolean is true/false (1/0 as some producers send): 0.5, -1
+    or a 1e999 the JSON parser overflows to infinity is unknown, not True."""
+    _mock_catalog(mock_api)
+    mock_api.get("/gbfs/station_information.json", payload=STATION_INFO_23)
+    status = copy.deepcopy(STATION_STATUS_23)
+    st1, st2 = status["data"]["stations"][:2]
+    st1.update(is_renting="@inf", is_returning=0.5, is_installed=1)
+    st2.update(is_renting="@-inf", is_returning=0, is_installed=-1)
+    body = json.dumps(status).replace('"@inf"', "1e999").replace('"@-inf"', "-1e999")
+    mock_api.get(
+        "/gbfs/station_status.json", body=body.encode(), content_type="application/json"
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    by_id = {station.id: station for station in await handle.get_stations()}
+    flags = [
+        (s.is_renting, s.is_returning, s.is_installed)
+        for s in (by_id[st1["station_id"]], by_id[st2["station_id"]])
+    ]
+    assert flags == [(None, None, True), (None, False, None)]
 
 
 async def test_system_info_full_surface(
