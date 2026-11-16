@@ -1376,13 +1376,16 @@ class StaticIndex:
         for filename, loader in files:
             if filename not in names:
                 continue  # build() has already rejected a missing required file
-            _read_csv(
-                archive,
-                filename,
-                lambda fp, reader, loader=loader, done=completed: loader(
-                    conn, reader, _reporter(progress, fp, done, total)
-                ),
-            )
+
+            def read(
+                fp: IO[bytes],
+                reader: csv.DictReader[str],
+                loader: Callable[..., None] = loader,
+                done: int = completed,
+            ) -> None:
+                loader(conn, reader, _reporter(progress, fp, done, total))
+
+            _read_csv(archive, filename, read)
             completed += archive.getinfo(filename).file_size
             if progress is not None:
                 progress(completed, total)
