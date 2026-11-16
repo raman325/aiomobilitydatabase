@@ -400,7 +400,7 @@ async def test_an_endpoint_url_aiohttp_cannot_parse_is_a_connection_error(
     ]
     mock_api.get("/gbfs/gbfs.json", payload=_doc({"feeds": feeds}))
     handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
-    with pytest.raises(SourceConnectionError, match="malformed URL"):
+    with pytest.raises(SourceConnectionError):
         await handle.get_stations()
 
 
@@ -408,7 +408,7 @@ async def test_an_endpoint_url_aiohttp_cannot_parse_is_a_connection_error(
 async def test_a_discovery_url_aiohttp_cannot_parse_is_a_connection_error(
     direct_client: MobilityFeedsClient, url: str
 ) -> None:
-    with pytest.raises(SourceConnectionError, match="malformed URL"):
+    with pytest.raises(SourceConnectionError):
         await direct_client.get_gbfs_feed_from_url(url)
 
 

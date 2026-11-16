@@ -24,7 +24,6 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import aiohttp
 from google.transit import gtfs_realtime_pb2
 
 from ..models import (
@@ -36,10 +35,9 @@ from ..models import (
     SourceInfo,
 )
 from ._freshness import FreshnessCache, _etag, header_fields
-from ._redirects import open_response
+from ._redirects import get_withholding, network
 from ._urls import (
     _require_http_url,  # deliberate friend access: shared data-origin URL guard
-    describe,
     redact,
 )
 from .const import STATIC_DB_FILENAME
@@ -1921,25 +1919,19 @@ class TransitFeedHandle:
         both earlier and cheaper.
         """
         session = client._get_session()  # deliberate friend access
-        try:
-            resp = await open_response(
-                session.head(
-                    direct.static_url,
-                    headers=dict(direct.headers) if direct.headers else None,
-                    allow_redirects=True,  # match GET: probe the final URL
-                    timeout=aiohttp.ClientTimeout(total=client.timeout_seconds),
-                ),
-                direct.static_url,
-            )
-            async with resp:
-                if resp.status in _DATASET_STATUSES and (
-                    etag := _strong_etag(resp.headers)
-                ):
-                    return f"etag:{etag}"
-        except (TimeoutError, aiohttp.ClientError) as err:
-            raise SourceConnectionError(
-                f"Error probing {redact(direct.static_url)}: {describe(err)}"
-            ) from err
+        async with get_withholding(
+            session,
+            direct.static_url,
+            params={},
+            headers=dict(direct.headers) if direct.headers else {},
+            total=client.timeout_seconds,
+            secret=None,
+            method="HEAD",  # every redirect followed, as the GET will be
+        ) as (resp, _history):
+            if resp.status in _DATASET_STATUSES and (
+                etag := _strong_etag(resp.headers)
+            ):
+                return f"etag:{etag}"
         return None
 
     @classmethod
@@ -2054,70 +2046,64 @@ class TransitFeedHandle:
         left unfollowed raise :class:`SourceConnectionError`.
         """
         session = client._get_session()  # deliberate friend access
-        try:
-            resp = await open_response(
-                session.get(
-                    source.url,
-                    headers=dict(source.headers) if source.headers else None,
-                    timeout=aiohttp.ClientTimeout(
-                        total=None, sock_read=client.timeout_seconds
-                    ),
-                ),
-                source.url,
-            )
-            async with resp:
-                if resp.status >= HTTPStatus.BAD_REQUEST:
-                    raise SourceConnectionError(
-                        f"Dataset fetch failed ({resp.status}) for "
-                        f"{redact(source.url)}",
-                        status=resp.status,
-                    )
-                if resp.status not in _DATASET_STATUSES:
-                    raise SourceConnectionError(
-                        f"Dataset URL answered {resp.status} without a dataset: "
-                        f"{redact(source.url)}",
-                        status=resp.status,
-                    )
-                etag = _strong_etag(resp.headers)
-                total_bytes = resp.content_length
-                done_bytes = 0
-                last_emitted = 0
-                first_chunk = True
-                # File writes stay off the event loop: consumers (for
-                # example Home Assistant) run this on their loop and a
-                # large dataset means thousands of 64 KiB writes.
-                fp = await asyncio.to_thread(zip_path.open, "wb")
-                try:
-                    async for chunk in resp.content.iter_chunked(1 << 16):
-                        await asyncio.to_thread(fp.write, chunk)
-                        done_bytes += len(chunk)
-                        if on_progress is not None and (
-                            first_chunk
-                            or done_bytes - last_emitted >= _PROGRESS_CHUNK_BYTES
-                        ):
-                            on_progress(
-                                StaticBuildProgress(
-                                    phase="download",
-                                    done_bytes=done_bytes,
-                                    total_bytes=total_bytes,
-                                )
+        shown = redact(source.url)
+        async with get_withholding(
+            session,
+            source.url,
+            params={},
+            headers=dict(source.headers) if source.headers else {},
+            total=None,
+            secret=None,
+            sock_read=client.timeout_seconds,
+        ) as (resp, _history):
+            if resp.status >= HTTPStatus.BAD_REQUEST:
+                raise SourceConnectionError(
+                    f"Dataset fetch failed ({resp.status})",
+                    status=resp.status,
+                    url=shown,
+                )
+            if resp.status not in _DATASET_STATUSES:
+                raise SourceConnectionError(
+                    f"Dataset URL answered {resp.status} without a dataset",
+                    status=resp.status,
+                    url=shown,
+                )
+            etag = _strong_etag(resp.headers)
+            total_bytes = resp.content_length
+            done_bytes = 0
+            last_emitted = 0
+            first_chunk = True
+            # File writes stay off the event loop: consumers (for example
+            # Home Assistant) run this on their loop and a large dataset
+            # means thousands of 64 KiB writes. Only the reads are network
+            # steps (the boundary); a write's OSError and a raising
+            # on_progress propagate as they are.
+            fp = await asyncio.to_thread(zip_path.open, "wb")
+            try:
+                while chunk := await network(resp.content.read(1 << 16), source.url):
+                    await asyncio.to_thread(fp.write, chunk)
+                    done_bytes += len(chunk)
+                    if on_progress is not None and (
+                        first_chunk
+                        or done_bytes - last_emitted >= _PROGRESS_CHUNK_BYTES
+                    ):
+                        on_progress(
+                            StaticBuildProgress(
+                                phase="download",
+                                done_bytes=done_bytes,
+                                total_bytes=total_bytes,
                             )
-                            last_emitted = done_bytes
-                            first_chunk = False
-                finally:
-                    await asyncio.to_thread(fp.close)
-                if on_progress is not None:
-                    on_progress(
-                        StaticBuildProgress(
-                            phase="download",
-                            done_bytes=done_bytes,
-                            total_bytes=total_bytes,
                         )
+                        last_emitted = done_bytes
+                        first_chunk = False
+            finally:
+                await asyncio.to_thread(fp.close)
+            if on_progress is not None:
+                on_progress(
+                    StaticBuildProgress(
+                        phase="download", done_bytes=done_bytes, total_bytes=total_bytes
                     )
-        except (TimeoutError, aiohttp.ClientError) as err:
-            raise SourceConnectionError(
-                f"Error downloading dataset: {describe(err)}"
-            ) from err
+                )
         return etag
 
     @staticmethod

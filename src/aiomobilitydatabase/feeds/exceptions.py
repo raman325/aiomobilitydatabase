@@ -15,12 +15,22 @@ class MobilityFeedsError(MobilityDatabaseError):
 
 
 class SourceConnectionError(MobilityFeedsError):
-    """A producer or GBFS endpoint could not be reached or errored."""
+    """A producer or GBFS endpoint could not be reached or errored.
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
-        """Initialize with a message and optional HTTP status."""
+    The message is the library's own: never a URL, a response body or
+    another library's error text, any of which can carry a credential.
+    ``status`` is the HTTP status when there was one, and ``url`` the URL
+    asked for without its credentials, query or fragment (None when it
+    doesn't parse).
+    """
+
+    def __init__(
+        self, message: str, *, status: int | None = None, url: str | None = None
+    ) -> None:
+        """Initialize with a message, and the HTTP status and URL when known."""
         super().__init__(message)
         self.status = status
+        self.url = url
 
 
 class SourceAuthenticationError(MobilityFeedsError):
@@ -28,7 +38,16 @@ class SourceAuthenticationError(MobilityFeedsError):
 
 
 class FeedParseError(MobilityFeedsError):
-    """A feed payload could not be parsed (protobuf, GBFS JSON, or GTFS zip)."""
+    """A feed payload could not be parsed (protobuf, GBFS JSON, or GTFS zip).
+
+    ``url`` is the document's URL, without credentials, query or fragment,
+    when one was fetched (None otherwise).
+    """
+
+    def __init__(self, message: str, *, url: str | None = None) -> None:
+        """Initialize with a message and, for a fetched document, its URL."""
+        super().__init__(message)
+        self.url = url
 
 
 class StaticDataUnavailableError(MobilityFeedsError):

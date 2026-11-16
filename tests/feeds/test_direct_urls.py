@@ -20,6 +20,7 @@ from aiomobilitydatabase.feeds._urls import _require_http_url
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
+    MobilityFeedsError,
     SourceConnectionError,
 )
 from aiomobilitydatabase.feeds.models import ArrivalsQuery, StaticBuildProgress
@@ -243,7 +244,7 @@ async def test_direct_transit_head_ok_without_validators(
 async def test_direct_transit_probe_unreachable_raises(
     direct_client: MobilityFeedsClient,
 ) -> None:
-    with pytest.raises(SourceConnectionError, match="Error probing"):
+    with pytest.raises(SourceConnectionError, match="Request failed"):
         await direct_client.get_transit_feed_from_urls("http://127.0.0.1:1/gtfs.zip")
 
 
@@ -498,16 +499,17 @@ _URL_TEXT = st.tuples(
 @settings(max_examples=500)
 def test_the_url_guard_passes_only_urls_a_request_can_be_made_to(url: str) -> None:
     """_require_http_url either refuses with SourceConnectionError or lets
-    through an http(s) URL that aiohttp parses -- never a bare ValueError
-    later, when the cache predicts the request's header fields."""
+    through UTF-8 text that parses as an http(s) URL with a host (what
+    yarl would request unchanged); anything else a request trips on is
+    the network boundary's."""
     try:
         _require_http_url(url, "test URL")
     except SourceConnectionError:
         return
+    url.encode("utf-8")
     parsed = URL(url)
     assert parsed.scheme in ("http", "https")
     assert parsed.raw_host  # RFC 9110 section 4.2.1: never an empty host
-    parsed.raw_host.encode("idna")  # what the resolver will do
 
 
 @pytest.mark.parametrize(
@@ -516,17 +518,16 @@ def test_the_url_guard_passes_only_urls_a_request_can_be_made_to(url: str) -> No
         "http://127.0.0.1:99999/rt.pb",
         "http://[::1/rt.pb",
         "http://[::1]:@/rt.pb",
-        "http://a..b/rt.pb",
     ],
 )
 async def test_an_rt_url_aiohttp_cannot_parse_is_refused_up_front(
     mock_api: MockApi, direct_client: MobilityFeedsClient, url: str
 ) -> None:
-    with pytest.raises(SourceConnectionError, match="malformed URL"):
+    with pytest.raises(SourceConnectionError, match="doesn't parse"):
         await direct_client.get_transit_feed_from_urls(
             mock_api.url(STATIC_PATH), trip_updates_urls=[url]
         )
-    with pytest.raises(SourceConnectionError, match="malformed URL"):
+    with pytest.raises(SourceConnectionError, match="doesn't parse"):
         await direct_client.get_transit_feed_from_urls(url)
     assert mock_api.requests == []
 
@@ -537,14 +538,13 @@ async def test_an_rt_url_aiohttp_cannot_parse_is_refused_up_front(
         "http://127.0.0.1:99999/rt.pb",
         "http://[::1/rt.pb",
         "http://[::1]:@/rt.pb",
-        "http://a..b/rt.pb",
     ],
 )
 async def test_predicting_an_rt_request_refuses_an_unparseable_url(url: str) -> None:
     """A catalog feed's producer_url never passed the up-front check: the
     cache's request prediction must refuse it, not raise yarl's ValueError."""
     async with aiohttp.ClientSession() as session:
-        with pytest.raises(SourceConnectionError, match="malformed URL"):
+        with pytest.raises(SourceConnectionError, match="doesn't parse"):
             feed_request_fields(session, url)
 
 
@@ -664,7 +664,7 @@ async def test_a_punycode_label_that_wont_decode_is_still_fetched_by_hand(
 def test_a_url_with_no_host_is_refused(url: str) -> None:
     """RFC 9110 section 4.2.1: a recipient MUST reject an http(s) URI with
     an empty host as invalid."""
-    with pytest.raises(SourceConnectionError, match="malformed URL"):
+    with pytest.raises(SourceConnectionError, match="names no host"):
         _require_http_url(url, "test URL")
 
 
@@ -673,7 +673,7 @@ async def test_an_rt_url_with_no_host_is_refused_with_a_header_key(url: str) -> 
     """With a header key the library follows redirects by hand, whose URL
     arithmetic raised a bare ValueError on a host-less URL."""
     async with aiohttp.ClientSession() as session:
-        with pytest.raises(SourceConnectionError, match="malformed URL"):
+        with pytest.raises(SourceConnectionError, match="names no host"):
             await fetch_feed_message(
                 session, url, auth_type=2, api_key_name="X-Key", api_key="k"
             )
@@ -752,7 +752,7 @@ async def test_an_api_key_header_name_that_is_no_field_name_is_refused(
     async with aiohttp.ClientSession() as session:
         if not name:  # an empty name sends no key at all
             return
-        with pytest.raises(SourceConnectionError, match="no HTTP header field name"):
+        with pytest.raises(SourceConnectionError, match="Request failed"):
             await fetch_feed_message(
                 session,
                 "http://127.0.0.1:1/rt.pb",
@@ -766,23 +766,16 @@ _COLON_LOGINS = ["http://a%3Ab@127.0.0.1:9/feed", "http://%3A@127.0.0.1:9/feed"]
 
 
 @pytest.mark.parametrize("url", _COLON_LOGINS)
-def test_a_user_name_with_a_colon_is_refused(url: str) -> None:
-    """aiohttp raised a bare ValueError building its Basic credentials."""
-    with pytest.raises(SourceConnectionError, match="user name holds a colon"):
-        _require_http_url(url, "test URL")
-
-
-@pytest.mark.parametrize("url", _COLON_LOGINS)
-async def test_a_colon_login_is_refused_at_every_entry_point(
+async def test_a_colon_login_fails_at_the_boundary_at_every_entry_point(
     direct_client: MobilityFeedsClient, url: str
 ) -> None:
-    with pytest.raises(SourceConnectionError, match="user name holds a colon"):
+    with pytest.raises(SourceConnectionError, match="Request failed"):
         await direct_client.get_gbfs_feed_from_url(url)
-    with pytest.raises(SourceConnectionError, match="user name holds a colon"):
+    with pytest.raises(SourceConnectionError, match="Request failed"):
         await direct_client.get_transit_feed_from_urls(url)
     async with aiohttp.ClientSession() as session:
         for by_hand in (False, True):
-            with pytest.raises(SourceConnectionError, match="user name holds a colon"):
+            with pytest.raises(SourceConnectionError, match="Request failed"):
                 await fetch_feed_message(
                     session,
                     url,
@@ -813,12 +806,12 @@ async def test_a_header_http_cant_carry_is_the_callers_mistake(
     mock_api: MockApi, direct_client: MobilityFeedsClient, headers: dict[str, str]
 ) -> None:
     """Refused up front as ValueError -- so a ValueError mid-request is
-    always the producer's (open_response's SourceConnectionError)."""
-    with pytest.raises(ValueError, match="HTTP"):
+    always the producer's (the network boundary's SourceConnectionError)."""
+    with pytest.raises(ValueError, match=r"visible ASCII|field name"):
         await direct_client.get_transit_feed_from_urls(
             mock_api.url(STATIC_PATH), headers=headers
         )
-    with pytest.raises(ValueError, match="HTTP"):
+    with pytest.raises(ValueError, match=r"visible ASCII|field name"):
         await direct_client.get_gbfs_feed_from_url(
             mock_api.url("/gbfs/gbfs.json"), headers=headers
         )
@@ -829,12 +822,12 @@ async def test_an_api_key_http_cant_carry_is_the_callers_mistake(
     mock_api: MockApi, direct_client: MobilityFeedsClient
 ) -> None:
     for api_key in ("k\r\nX-Evil: 1", "k\ud800ey", "k\udcffey"):
-        with pytest.raises(ValueError, match="HTTP can't carry"):
+        with pytest.raises(ValueError, match="visible ASCII"):
             await direct_client.get_transit_feed("mdb-1", api_key=api_key)
     assert mock_api.requests == []
 
 
-async def test_a_tab_or_text_in_a_header_value_is_fine(
+async def test_a_tab_or_visible_ascii_in_a_header_value_is_fine(
     mock_api: MockApi, direct_client: MobilityFeedsClient
 ) -> None:
     feeds = [{"name": "system_information", "url": mock_api.url("/gbfs/si.json")}]
@@ -843,10 +836,16 @@ async def test_a_tab_or_text_in_a_header_value_is_fine(
         payload={"ttl": 0, "last_updated": 0, "data": {"feeds": feeds}},
     )
     handle = await direct_client.get_gbfs_feed_from_url(
-        mock_api.url("/gbfs/gbfs.json"), headers={"X-Note": "a\tb café"}
+        mock_api.url("/gbfs/gbfs.json"), headers={"X-Note": "a\tb c ~!"}
     )
     assert handle is not None
-    assert mock_api.requests[0].headers["X-Note"].startswith("a\tb")
+    assert mock_api.requests[0].headers["X-Note"].startswith("a\tb c ~!")
+    # The allowlist is visible ASCII: other text is refused, not sent as
+    # whatever bytes aiohttp would make of it.
+    with pytest.raises(ValueError, match="visible ASCII"):
+        await direct_client.get_gbfs_feed_from_url(
+            mock_api.url("/gbfs/gbfs.json"), headers={"X-Note": "caf\u00e9"}
+        )
 
 
 # st.lists, not st.text: st.text never yields a lone surrogate.
@@ -1005,7 +1004,7 @@ async def test_a_session_default_aiohttp_would_refuse_is_the_callers_mistake(
 def test_a_url_that_isnt_utf_8_text_is_refused(url: str) -> None:
     """yarl drops a lone surrogate: the request would go to another URL, or
     with other credentials."""
-    with pytest.raises(SourceConnectionError, match="malformed URL"):
+    with pytest.raises(SourceConnectionError, match="isn't UTF-8 text"):
         _require_http_url(url, "test URL")
 
 
@@ -1026,7 +1025,7 @@ async def test_a_redirect_to_a_url_that_isnt_utf_8_text_is_refused(
 
 async def test_a_query_key_name_that_isnt_text_is_refused() -> None:
     async with aiohttp.ClientSession() as session:
-        with pytest.raises(SourceConnectionError, match="query can carry"):
+        with pytest.raises(SourceConnectionError, match="isn't text"):
             await fetch_feed_message(
                 session,
                 "http://127.0.0.1:9/rt.pb",
@@ -1039,11 +1038,20 @@ async def test_a_query_key_name_that_isnt_text_is_refused() -> None:
 # -- Secrets stay out of error text --------------------------------------------------
 
 
-def test_a_refused_url_shows_no_credentials() -> None:
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://user:SECRETPW@x/?key=SECRETKEY",
+        "http://user:SECRET%0APW@x/?key=SECRETKEY",
+    ],
+)
+def test_a_refused_url_shows_no_credentials(url: str) -> None:
+    """The message is the guard's reason alone; the URL, on .url, has no
+    credentials, query or fragment."""
     with pytest.raises(SourceConnectionError) as caught:
-        _require_http_url("https://user:SECRETPW@a..b/x?key=SECRETKEY", "test URL")
-    assert "SECRETPW" not in str(caught.value)
-    assert "SECRETKEY" not in str(caught.value)
+        _require_http_url(url, "test URL")
+    for shown in (str(caught.value), caught.value.url or ""):
+        assert "SECRET" not in shown
 
 
 async def test_a_redirect_loop_shows_no_query_api_key(mock_api: MockApi) -> None:
@@ -1075,3 +1083,139 @@ async def test_an_unrequestable_url_shows_no_credentials(mock_api: MockApi) -> N
         with pytest.raises(SourceConnectionError) as caught:
             await fetch_feed_message(session, url)
     assert "SECRETPW" not in str(caught.value)
+
+
+# -- The network boundary, as a property ----------------------------------------------
+
+_FEED_SECRETS = ("HdrSecret123", "QrySecret456", "UrlPw789")
+
+
+async def _raw_feed_server(response: bytes) -> tuple[asyncio.Server, str]:
+    """Answer every request with ``response`` verbatim."""
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(response)
+            await writer.drain()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+
+
+_FEED_STATUS = st.sampled_from(
+    [
+        b"HTTP/1.1 200 OK",
+        b"HTTP/1.1 302 Found",
+        b"HTTP/1.1 307 X",
+        b"HTTP/1.1 304 X",
+        b"HTTP/1.1 401 X",
+        b"HTTP/1.1 500 X",
+        b"HTTP/1.1 999 X",
+        b"garbage",
+        b"",
+    ]
+)
+_FEED_HEADERS = st.sampled_from(
+    [
+        b"Content-Type: application/json; charset=base64",
+        b"Content-Type: \x80\xc3\xa9",
+        b"X-Echo: HdrSecret123\x00",
+        b"Echo QrySecret456",
+        b"X-Echo: UrlPw789\rx",
+        b"Location: /next?key=QrySecret456",
+        b"Location: http://u:UrlPw789@127.0.0.1:9/x",
+        b"Location: \xff\xfe",
+        b"Location: http://[::1]:@/x",
+        b"Location: https:",
+        b"Location: http://a..b/x",
+        b"Location: //[::1/x",
+        b'ETag: "v\xff1"',
+        b"Content-Encoding: gzip",
+        b"Content-Length: 99999",
+        b"Transfer-Encoding: chunked",
+        b'Cache-Control: max-age="6\\"',
+        b"Expires: \xc5\xbfat, 01 Aug 2026 00:00:00 GMT",
+    ]
+)
+_FEED_BODIES = st.sampled_from(
+    [
+        b"",
+        b'{"data": {}}',
+        b"[" * 3000,
+        b'{"a":1,"a":2}',
+        b"\xed\xa0\x80",
+        b"\x08\x96\x01",
+        b"HdrSecret123 QrySecret456 UrlPw789",
+    ]
+)
+_FEED_RESPONSES = st.builds(
+    lambda status, headers, body: (
+        status + b"\r\n" + b"".join(h + b"\r\n" for h in headers) + b"\r\n" + body
+    ),
+    _FEED_STATUS,
+    st.lists(_FEED_HEADERS, max_size=4),
+    _FEED_BODIES,
+)
+
+
+@given(
+    response=_FEED_RESPONSES,
+    path=st.sampled_from(["gbfs", "rt-header", "rt-query", "static"]),
+)
+@settings(max_examples=300, deadline=None)
+def test_any_answer_gives_a_library_result_and_no_secret_in_any_message(
+    response: bytes, path: str
+) -> None:
+    """The feeds' boundary as a property: whatever bytes a producer sends --
+    malformed, redirecting anywhere, echoing the credentials -- a fetch
+    returns or raises a library error, and no secret (a header key, a query
+    key, a URL password) appears in any message, chained one, or .url."""
+
+    async def scenario() -> BaseException | None:
+        server, base = await _raw_feed_server(response)
+        url = base.replace("http://", "http://user:UrlPw789@") + "/feed"
+        try:
+            async with MobilityFeedsClient() as client:
+                try:
+                    if path == "gbfs":
+                        await asyncio.wait_for(
+                            client.get_gbfs_feed_from_url(
+                                url, headers={"X-Key": "HdrSecret123"}
+                            ),
+                            10,
+                        )
+                    elif path == "static":
+                        await asyncio.wait_for(
+                            client.get_transit_feed_from_urls(url), 10
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            fetch_feed_message(
+                                client._get_session(),
+                                url,
+                                auth_type=2 if path == "rt-header" else 1,
+                                api_key_name="X-Key",
+                                api_key="HdrSecret123"
+                                if path == "rt-header"
+                                else "QrySecret456",
+                                timeout_seconds=5,
+                            ),
+                            10,
+                        )
+                except (MobilityFeedsError, MobilityDatabaseError) as err:
+                    return err
+            return None
+        finally:
+            server.close()
+
+    err = asyncio.run(scenario())
+    while err is not None:
+        shown = str(err) + " " + str(getattr(err, "url", "") or "")
+        for secret in _FEED_SECRETS:
+            assert secret not in shown, (type(err).__name__, shown)
+        err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)

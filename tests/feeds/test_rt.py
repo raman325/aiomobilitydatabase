@@ -259,30 +259,35 @@ async def test_a_timeout_of_none_or_less_is_no_bound_with_or_without_header_auth
 )
 # aiohttp 3.14 deprecates session ``auth``; older floors still have it.
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-async def test_session_credentials_fail_a_header_auth_hop_to_another_origin(
+async def test_session_credentials_are_shed_at_a_header_auth_hop_to_another_origin(
     mock_api: MockApi, credential: str
 ) -> None:
-    """A request can't shed its session's default credentials, and
-    following a redirect is optional: such a hop is never sent.
-    """
+    """A request can't shed its session's default credentials, so the hop
+    to another origin goes through a session without them (sharing the
+    connector), the header-auth secret withheld too."""
     mock_api.get(
         "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
     )
+    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
     options: dict[str, object] = (
         {"auth": aiohttp.BasicAuth("user", "pass")}
         if credential == "auth"
         else {"headers": {credential: "secret"}}
     )
     async with aiohttp.ClientSession(**options) as session:  # type: ignore[arg-type]
-        with pytest.raises(SourceConnectionError, match="credentials"):
-            await fetch_feed_message(
-                session,
-                mock_api.url("/rt"),
-                auth_type=2,
-                api_key_name="X-Api-Key",
-                api_key="secret123",
-            )
-    assert [r.path for r in mock_api.requests] == ["/rt"]
+        response = await fetch_feed_message(
+            session,
+            mock_api.url("/rt"),
+            auth_type=2,
+            api_key_name="X-Api-Key",
+            api_key="secret123",
+        )
+    assert response.value is not None
+    assert len(response.value.entity) == 2
+    away = mock_api.requests[-1]
+    assert away.path == "/rt/x"
+    sent = {name.lower() for name in away.headers}
+    assert not sent & {credential.lower(), "authorization", "x-api-key"}
 
 
 async def test_session_credentials_follow_a_header_auth_hop_within_the_origin(
@@ -390,7 +395,8 @@ async def test_the_timeout_bounds_the_whole_redirect_chain(
                 api_key="v",
                 timeout_seconds=1.0,
             )
-    assert isinstance(excinfo.value.__cause__, TimeoutError)
+    # Named by type only (the boundary passes no cause on).
+    assert "Timeout" in str(excinfo.value) or "timed out" in str(excinfo.value)
 
 
 async def test_a_deadline_spent_between_hops_sends_no_further_request(
@@ -453,12 +459,12 @@ async def test_a_query_auth_feed_is_revalidated_conditionally(
     assert all(r.query["k"] == "v" for r in mock_api.requests)
 
 
-async def test_a_credentialed_session_revalidates_across_origins_unconditionally(
+async def test_a_credentialed_session_revalidates_across_origins(
     mock_api: MockApi,
 ) -> None:
-    """Without a header key, a redirect away that a hand-made request can't
-    strip the session's credentials from is asked again unconditionally:
-    aiohttp follows it and drops them itself -- never a failure."""
+    """The hop away goes through a session without the caller's default
+    credentials -- never a failure -- and revalidates the resource the
+    validators came from."""
     url = mock_api.url("/rt")
     away = _elsewhere(mock_api.url("/rt/away"))
     for _ in range(3):
@@ -474,7 +480,9 @@ async def test_a_credentialed_session_revalidates_across_origins_unconditionally
     away_hits = [r.headers for r in mock_api.requests if r.path == "/rt/away"]
     assert len(away_hits) == 2
     assert not any("Authorization" in hit for hit in away_hits)
-    assert not any("If-None-Match" in hit for hit in away_hits)
+    # The validators came from /rt/away, so its own request revalidates
+    # (RFC 9111 section 4.3.1); the session's Authorization never crosses.
+    assert away_hits[1].get("If-None-Match") == '"v1"'
 
 
 def test_vehicles_from_message() -> None:

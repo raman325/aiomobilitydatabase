@@ -12,9 +12,7 @@ import csv
 import heapq
 import io
 import json
-import math
 import os
-import re
 import sqlite3
 import tempfile
 import zipfile
@@ -30,6 +28,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ._booking import booking_window
+from ._numbers import ascii_number
 from .exceptions import FeedParseError
 from .geo import polygon_is_valid
 from .models import (
@@ -258,14 +257,6 @@ _WEEKDAY_COLUMNS = (
 )
 
 
-# A GTFS Float written in ASCII: a sign, digits with an optional fraction (or
-# a bare fraction), an optional exponent. float() also reads other scripts'
-# digits, PEP 515 grouping ("1_0"), "inf" and "nan".
-_ASCII_DECIMAL = re.compile(
-    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
-)
-
-
 def _coordinate(value: str, field: str, limit: float) -> float | None:
     """Parse a stop_lat/stop_lon cell: None when blank.
 
@@ -275,10 +266,10 @@ def _coordinate(value: str, field: str, limit: float) -> float | None:
     always has: a spelling float() alone would accept is no more a
     coordinate than ``abc``, nor is latitude 200 a place.
     """
-    if not (text := value.strip()):
+    if not value.strip():
         return None
-    parsed = float(text) if _ASCII_DECIMAL.fullmatch(text) else math.nan
-    if not math.isfinite(parsed):
+    parsed = ascii_number(value)  # spaces and tabs only: no Unicode strip
+    if parsed is None:
         raise ValueError(f"{field} is not a finite decimal number: {value!r}")
     if not -limit <= parsed <= limit:
         raise ValueError(f"{field} is outside -{limit} to {limit}: {value!r}")

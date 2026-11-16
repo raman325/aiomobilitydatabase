@@ -54,7 +54,9 @@ def test_unrelated_import_error_propagates_unchanged(
     fixture_import = builtins.__import__
 
     def failing_import(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "aiohttp":
+        # hashlib: an import transit makes before protobuf's (any unrelated
+        # failure there must propagate unchanged, not as the extra's hint).
+        if name == "hashlib":
             raise ImportError("unrelated breakage", name="somethingelse")
         return fixture_import(name, *args, **kwargs)
 

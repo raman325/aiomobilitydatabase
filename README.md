@@ -717,7 +717,7 @@ each define their own subtree beneath it, so you can catch broadly
 | `MobilityDatabaseRateLimitError` | catalog | Rate limited (429) |
 | `MobilityDatabaseApiError` | catalog | Any other 4xx/5xx (carries `.status` and `.body`) |
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
-| `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP) |
+| `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP, `.url`) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
 | `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180) |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
@@ -733,12 +733,20 @@ mistakes rather than feed problems, and raise the builtin `ValueError`:
 method for an id of `""`, `"."` or `".."`, which no URL can carry as one path
 segment.
 
-So does a feeds handle factory, for a caller input HTTP or aiohttp can't
-carry -- in `headers=`, the `api_key`, or an injected session's default headers
-and `auth`: a field name that isn't a token, a value holding a control
-character or no UTF-8 text (a lone surrogate), an `auth` that can't be
-encoded, or an `Authorization` header beside a session `auth` or credentials in
-the URL. Error messages never show a URL's credentials or query.
+So does a feeds handle factory, for a caller input outside its allowlist --
+in `headers=`, the `api_key`, or an injected session's default headers and
+`auth`: header names are tokens, and values (and Basic credentials) visible
+ASCII; an `Authorization` header can't go beside a session `auth` or
+credentials in the URL.
+
+Exception messages are written by the library alone: never a URL, a response
+body, or another library's error text, any of which can carry a credential.
+`SourceConnectionError` and `FeedParseError` carry the URL asked for on
+`.url` (without credentials, query or fragment), and the HTTP status on
+`.status`. Every redirect is followed by the library, each target checked
+like the first URL; a hop to another origin sheds the request's credentials
+(and the session's own, through a session sharing its connector and cookie
+jar).
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`

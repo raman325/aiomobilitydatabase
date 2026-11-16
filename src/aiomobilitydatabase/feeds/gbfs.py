@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from collections.abc import Mapping
@@ -11,8 +10,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
-import aiohttp
-
+from .._json import loads as json_loads
 from ._freshness import (
     FreshnessCache,
     Response,
@@ -23,10 +21,10 @@ from ._freshness import (
 from ._freshness import hops as _hops
 from ._frozen import FrozenDict
 from ._language import is_preferred_language
-from ._redirects import get_withholding
+from ._numbers import ascii_number
+from ._redirects import get_withholding, network
 from ._urls import (  # deliberate friend access: shared URL guard
     _require_http_url,
-    describe,
     redact,
 )
 from .exceptions import FeedParseError, SourceConnectionError
@@ -57,29 +55,6 @@ _RFC3339 = re.compile(
 )
 
 
-def _reject_constant(name: str) -> None:
-    """Refuse ``NaN``/``Infinity``: Python's json accepts them, JSON does not."""
-    raise ValueError(f"{name} is not valid JSON")
-
-
-def _decode_json(body: bytes) -> object:
-    """Parse a GBFS document's bytes as JSON.
-
-    From the bytes, never the response's ``charset``: RFC 8259 section 8.1
-    has JSON exchanged between systems be UTF-8, and its section 11 gives a
-    charset parameter no effect on a compliant recipient. Decoding by it
-    would read a UTF-8 "Caf\u00e9" sent as ``charset=iso-8859-1`` as
-    mojibake, and raise LookupError for one that is no text encoding
-    (``charset=base64``). ``json.loads`` detects UTF-8 (a BOM ignored, as
-    RFC 8259 allows). Decoded as strict UTF-8 first: ``json.loads`` on the
-    bytes would also take UTF-16/32, and encoded surrogates (surrogatepass).
-    """
-    return json.loads(body.decode("utf-8-sig"), parse_constant=_reject_constant)
-
-
-# A number written in ASCII: float() alone also reads other scripts' digits,
-# "1_0", "inf" and "nan".
-_ASCII_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 # GBFS Date: "ISO 8601 Complete Date Extended Format: YYYY-MM-DD".
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
@@ -177,6 +152,8 @@ def _coordinate(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         return None
+    if isinstance(value, str):
+        return ascii_number(value)  # float() alone takes other scripts' digits
     try:
         coordinate = float(value)
     except (OverflowError, ValueError):
@@ -360,8 +337,9 @@ def _ttl_seconds(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         return None
-    if isinstance(value, str) and not _ASCII_NUMBER.fullmatch(value.strip(" \t")):
-        return None  # float() also reads other scripts' digits and 1_0
+    if isinstance(value, str):
+        ttl = ascii_number(value)  # float() alone takes other scripts' digits
+        return ttl if ttl is not None and ttl >= 0 else None
     try:
         ttl = float(value)
     except (OverflowError, ValueError):
@@ -557,66 +535,56 @@ class GbfsFeedHandle:
         _require_http_url(url, context)
         session = client._get_session()  # deliberate friend access
         requested_at = datetime.now(UTC)
+        shown = redact(url)
+        async with get_withholding(
+            session,
+            url,
+            params={},
+            headers=dict(headers) if headers else {},
+            total=client.timeout_seconds,
+            secret=None,
+            conditional=None if validators is None else validators.request_headers(),
+            conditional_url=None if validators is None else validators.url,
+        ) as (resp, history):
+            received_at = datetime.now(UTC)
+            fields = header_fields(resp.headers)
+            if resp.status == HTTPStatus.NOT_MODIFIED:
+                if validators is None:
+                    raise SourceConnectionError(
+                        "GBFS endpoint answered 304 to an unconditional request",
+                        status=int(HTTPStatus.NOT_MODIFIED),
+                        url=shown,
+                    )
+                return Response(
+                    value=None,
+                    fields=fields,
+                    requested_at=requested_at,
+                    received_at=received_at,
+                    hops=_hops(resp, history),
+                    url=str(resp.url),
+                )
+            if resp.status >= HTTPStatus.BAD_REQUEST:
+                raise SourceConnectionError(
+                    f"GBFS endpoint error {resp.status}", status=resp.status, url=shown
+                )
+            if resp.status not in (
+                HTTPStatus.OK,
+                HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
+            ):
+                raise SourceConnectionError(
+                    f"GBFS endpoint answered {resp.status} without a document",
+                    status=resp.status,
+                    url=shown,
+                )
+            raw = await network(resp.read(), url)
+            hops = _hops(resp, history)
+            answered = str(resp.url)
         try:
-            async with get_withholding(
-                session,
-                url,
-                params={},
-                headers=dict(headers) if headers else {},
-                total=client.timeout_seconds,
-                secret=None,
-                conditional=(
-                    None if validators is None else validators.request_headers()
-                ),
-                conditional_url=None if validators is None else validators.url,
-            ) as (resp, history):
-                received_at = datetime.now(UTC)
-                fields = header_fields(resp.headers)
-                if resp.status == HTTPStatus.NOT_MODIFIED:
-                    if validators is None:
-                        raise SourceConnectionError(
-                            f"GBFS endpoint answered 304 to an unconditional "
-                            f"request: {redact(url)}",
-                            status=int(HTTPStatus.NOT_MODIFIED),
-                        )
-                    return Response(
-                        value=None,
-                        fields=fields,
-                        requested_at=requested_at,
-                        received_at=received_at,
-                        hops=_hops(resp, history),
-                        url=str(resp.url),
-                    )
-                if resp.status >= HTTPStatus.BAD_REQUEST:
-                    raise SourceConnectionError(
-                        f"GBFS endpoint error {resp.status}: {redact(url)}",
-                        status=resp.status,
-                    )
-                if resp.status not in (
-                    HTTPStatus.OK,
-                    HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
-                ):
-                    raise SourceConnectionError(
-                        f"GBFS endpoint answered {resp.status} without a document: "
-                        f"{redact(url)}",
-                        status=resp.status,
-                    )
-                try:
-                    document = _decode_json(await resp.read())
-                except (ValueError, RecursionError) as err:
-                    # RecursionError: json raises it for nesting deeper than
-                    # the interpreter's stack, a few kilobytes of brackets.
-                    raise FeedParseError(
-                        f"Malformed GBFS JSON from {redact(url)}"
-                    ) from err
-                hops = _hops(resp, history)
-                answered = str(resp.url)
-        except (TimeoutError, aiohttp.ClientError) as err:
-            raise SourceConnectionError(
-                f"Error fetching {redact(url)}: {describe(err)}"
-            ) from err
+            document = json_loads(raw)
+        except ValueError as err:
+            raise FeedParseError("Malformed GBFS JSON", url=shown) from err
         if not isinstance(document, dict) or "data" not in document:
-            raise FeedParseError(f"GBFS document missing data envelope: {redact(url)}")
+            raise FeedParseError("GBFS document missing data envelope", url=shown)
         return Response(
             value=document,
             fields=fields,
