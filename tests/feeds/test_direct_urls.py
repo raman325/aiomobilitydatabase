@@ -1,6 +1,7 @@
 """Tests for direct-URL mode: transit and GBFS handles without the catalog."""
 
 import asyncio
+import base64
 import io
 import zipfile
 from collections.abc import AsyncGenerator
@@ -21,6 +22,7 @@ from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
     MobilityFeedsError,
+    SourceAuthenticationError,
     SourceConnectionError,
 )
 from aiomobilitydatabase.feeds.models import ArrivalsQuery, StaticBuildProgress
@@ -743,16 +745,20 @@ def test_any_redirect_ends_in_a_library_exception(location: str, by_hand: bool) 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("name", ["X-Key\r\nX-Evil", "X Key", "X-Key:", "", "Kl\u00e9"])
+@pytest.mark.parametrize(
+    "name",
+    ["X-Key\r\nX-Evil", "X Key", "X-Key:", "X:Key", "", "Kl\u00e9", "X-K\ud800ey"],
+)
 async def test_an_api_key_header_name_that_is_no_field_name_is_refused(
     name: str,
 ) -> None:
-    """api_key_parameter_name is catalog data: a CR LF in it raised a bare
-    ValueError from aiohttp mid-request."""
+    """api_key_parameter_name is catalog data, and a bad one doesn't always
+    raise: compiled aiohttp dropped a lone surrogate (sending X-Key) and sent
+    X:Key as written (read as field X). Refused before the request."""
     async with aiohttp.ClientSession() as session:
         if not name:  # an empty name sends no key at all
             return
-        with pytest.raises(SourceConnectionError, match="Request failed"):
+        with pytest.raises(SourceConnectionError, match="no header field name"):
             await fetch_feed_message(
                 session,
                 "http://127.0.0.1:1/rt.pb",
@@ -908,9 +914,11 @@ async def test_credentials_that_cant_all_be_sent_are_the_callers_mistake(
     auth = aiohttp.BasicAuth(*session_auth) if session_auth else None
     async with aiohttp.ClientSession(auth=auth) as session:
         client = MobilityFeedsClient(session=session)
-        with pytest.raises(ValueError, match="can't go with"):
+        # One Authorization field per request; a session auth is refused
+        # outright (it would ride on every request).
+        with pytest.raises(ValueError, match=r"can't go with|every request"):
             await client.get_gbfs_feed_from_url(url, headers=headers)
-        with pytest.raises(ValueError, match="can't go with"):
+        with pytest.raises(ValueError, match=r"can't go with|every request"):
             await client.get_transit_feed_from_urls(url, headers=headers)
 
 
@@ -948,17 +956,14 @@ async def test_a_mid_request_error_echoes_no_request_header(mock_api: MockApi) -
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-async def test_a_session_auth_beside_url_credentials_sends_the_urls(
-    mock_api: MockApi,
-) -> None:
-    """aiohttp accepts the pair and sends the URL's credentials: no mistake."""
-    mock_api.get("/gbfs/gbfs.json", status=503)
+async def test_a_session_auth_is_refused(mock_api: MockApi) -> None:
+    """It would ride on every request, to every origin: the shared policy."""
     url = mock_api.url("/gbfs/gbfs.json").replace("http://", "http://u:p@")
     async with aiohttp.ClientSession(auth=aiohttp.BasicAuth("sess", "ion")) as session:
         client = MobilityFeedsClient(session=session)
-        with pytest.raises(SourceConnectionError):
+        with pytest.raises(ValueError, match="every request"):
             await client.get_gbfs_feed_from_url(url)
-    assert mock_api.requests[0].headers["Authorization"] == "Basic dTpw"  # u:p
+    assert mock_api.requests == []
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -1254,3 +1259,170 @@ async def test_a_location_that_isnt_utf_8_is_never_followed(by_hand_key: bool) -
     finally:
         server.close()
     assert paths == [b"/feed"]
+
+
+# -- Two origins: what a hop may carry, and what a message may show -------------------
+
+_A_STATUS = st.sampled_from(
+    [b"200 OK", b"301 X", b"302 X", b"303 X", b"307 X", b"401 X", b"500 X"]
+)
+_A_HEADERS = st.lists(
+    st.sampled_from(
+        [
+            # (No echo inside a Location: a producer putting the credential
+            # into its own redirect hands it over itself.)
+            b"Location: {B}/next",
+            b"Location: {B}/next?k=1",
+            b"Location: http://other:pw@{BHOST}/x",
+            b"Location: /same",
+            b"Content-Type: text/{echo}",
+            b"X-Echo: {echo}",
+            b'ETag: "{echo}"',
+        ]
+    ),
+    max_size=3,
+)
+_A_BODIES = st.sampled_from(
+    [b"", b"{echo}", b'{"data": {"x": "{echo}"}}', b"\x08\x96\x01"]
+)
+
+
+@given(
+    a_answer=st.tuples(_A_STATUS, _A_HEADERS, _A_BODIES),
+    path=st.sampled_from(["gbfs", "rt-header", "rt-query", "static"]),
+)
+@settings(max_examples=300, deadline=None)
+def test_a_hop_to_another_origin_carries_no_credential_and_no_message_shows_one(  # noqa: PLR0915
+    a_answer: tuple[bytes, list[bytes], bytes], path: str
+) -> None:
+    """Origin A answers anything -- echoing the request into headers and
+    bodies, redirecting to origin B (another port) or within itself. Origin
+    B records what reaches it and echoes it back. B must never receive a
+    credential addressed to A (the Authorization header, the header-auth
+    key, the URL's password), and no exception message, chained one or .url
+    may show one -- in any case, base64 Basic form included."""
+    password, header_secret, query_secret, bearer = (
+        "UrlPw789",
+        "HdrSecret123",
+        "QrySecret456",
+        "BearerSecret000",
+    )
+    basic = base64.b64encode(f"user:{password}".encode()).decode()
+    secrets = (password, header_secret, query_secret, bearer, basic)
+    b_requests: list[bytes] = []
+
+    def echo_of(request: bytes) -> bytes:
+        return request.replace(b"\r", b" ").replace(b"\n", b" ")
+
+    async def handle_b(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            request = await reader.readuntil(b"\r\n\r\n")
+            b_requests.append(request)
+            body = echo_of(request)
+            writer.write(
+                b"HTTP/1.1 500 X\r\nX-Echo: "
+                + body
+                + b"\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\n\r\n"
+                + body
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+
+    async def scenario() -> BaseException | None:
+        server_b = await asyncio.start_server(handle_b, "127.0.0.1", 0)
+        b_host = f"127.0.0.1:{server_b.sockets[0].getsockname()[1]}"
+
+        async def handle_a(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            try:
+                request = await reader.readuntil(b"\r\n\r\n")
+                status, headers, body = a_answer
+                fill = {
+                    b"{B}": f"http://{b_host}".encode(),
+                    b"{BHOST}": b_host.encode(),
+                    b"{echo}": echo_of(request),
+                }
+                lines = []
+                for template in headers:
+                    line = template
+                    for key, value in fill.items():
+                        line = line.replace(key, value)
+                    lines.append(line)
+                payload = body.replace(b"{echo}", echo_of(request))
+                writer.write(
+                    b"HTTP/1.1 "
+                    + status
+                    + b"\r\n"
+                    + b"".join(h + b"\r\n" for h in lines)
+                    + b"Content-Length: "
+                    + str(len(payload)).encode()
+                    + b"\r\n\r\n"
+                    + payload
+                )
+                await writer.drain()
+            finally:
+                writer.close()
+
+        server_a = await asyncio.start_server(handle_a, "127.0.0.1", 0)
+        a_port = server_a.sockets[0].getsockname()[1]
+        url = f"http://user:{password}@127.0.0.1:{a_port}/feed"
+        try:
+            async with MobilityFeedsClient() as client:
+                try:
+                    if path == "gbfs":
+                        call = client.get_gbfs_feed_from_url(url)
+                    elif path == "static":
+                        call = client.get_transit_feed_from_urls(url)
+                    else:
+                        call = fetch_feed_message(
+                            client._get_session(),
+                            url,
+                            auth_type=2 if path == "rt-header" else 1,
+                            api_key_name="X-Key",
+                            api_key=header_secret
+                            if path == "rt-header"
+                            else query_secret,
+                            headers={"X-Trace": "ok"},
+                            timeout_seconds=5,
+                        )
+                    await asyncio.wait_for(call, 10)
+                except (MobilityFeedsError, MobilityDatabaseError) as err:
+                    return err
+            return None
+        finally:
+            server_a.close()
+            server_b.close()
+
+    err = asyncio.run(scenario())
+    for request in b_requests:
+        text = request.decode("latin-1").lower()
+        for secret in (password, header_secret, basic):
+            assert secret.lower() not in text, request
+    while err is not None:
+        shown = (str(err) + " " + str(getattr(err, "url", "") or "")).lower()
+        for secret in secrets:
+            assert secret.lower() not in shown, (type(err).__name__, shown)
+        err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)
+
+
+async def test_a_session_raising_for_status_keeps_the_status_mapping(
+    mock_api: MockApi,
+) -> None:
+    """Every request opts out of the session's raise_for_status: a 404 stays
+    a SourceConnectionError with its status, a 401 a SourceAuthenticationError."""
+    mock_api.get("/gbfs/gbfs.json", status=404)
+    mock_api.get("/rt.pb", status=401)
+    async with aiohttp.ClientSession(raise_for_status=True) as session:
+        client = MobilityFeedsClient(session=session)
+        with pytest.raises(SourceConnectionError) as caught:
+            await client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+        assert caught.value.status == 404
+        with pytest.raises(SourceAuthenticationError) as auth:
+            await fetch_feed_message(session, mock_api.url("/rt.pb"))
+        assert auth.value.status == 401

@@ -733,20 +733,22 @@ mistakes rather than feed problems, and raise the builtin `ValueError`:
 method for an id of `""`, `"."` or `".."`, which no URL can carry as one path
 segment.
 
-So does a feeds handle factory, for a caller input outside its allowlist --
-in `headers=`, the `api_key`, or an injected session's default headers and
-`auth`: header names are tokens, and values (and Basic credentials) visible
-ASCII; an `Authorization` header can't go beside a session `auth` or
-credentials in the URL.
+So does a feeds handle factory, for a caller input outside its allowlist:
+`headers=` names must be tokens and their values visible ASCII, as must the
+`api_key`; an `Authorization` header can't go beside credentials in the URL.
+An injected session may carry no credential -- no `auth`, no
+`Authorization`, `Cookie` or `Proxy-Authorization` default -- since it would
+ride on every request, to every origin (pass credentials per request instead,
+in `headers=`).
 
 Exception messages are written by the library alone: never a URL, a response
 body, or another library's error text, any of which can carry a credential.
 `SourceConnectionError` and `FeedParseError` carry the URL asked for on
 `.url` (without credentials, query or fragment), and the HTTP status on
 `.status`. Every redirect is followed by the library, each target checked
-like the first URL; a hop to another origin sheds the request's credentials
-(and the session's own, through a session sharing its connector and cookie
-jar).
+like the first URL; a hop to another origin sheds the request's credentials.
+(Messages from a static build may quote the dataset's own cells: published
+feed data, not anything sent or received over HTTP.)
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`

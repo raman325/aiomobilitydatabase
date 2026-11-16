@@ -21,21 +21,20 @@ or reaching another URL than the producer named:
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from http import HTTPStatus
 from time import monotonic
 
 import aiohttp
 from yarl import URL
 
+from .._http import CREDENTIAL_HEADERS, REQUEST_OPTIONS, require_session
 from ._urls import URL_ERRORS, redact, require_requestable
 from .exceptions import MobilityFeedsError, SourceConnectionError
 
 # aiohttp's own redirect limit: the tenth redirect raises.
 _MAX_REDIRECTS = 10
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-# Credentials aiohttp itself drops when a redirect leaves the origin.
-_ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization"})
 
 
 async def network[T](awaitable: Awaitable[T], url: str) -> T:
@@ -65,13 +64,13 @@ def _origin(url: URL) -> tuple[str, str | None, int | None]:
     return url.scheme, url.raw_host, url.port
 
 
-def _remaining(deadline: float | None) -> float | None:
+def _remaining(deadline: float | None, url: str) -> float | None:
     """Seconds left before ``deadline`` (None: no bound); none left raises."""
     if deadline is None:
         return None
     remaining = deadline - monotonic()
     if remaining <= 0:
-        raise SourceConnectionError("Request timed out")
+        raise SourceConnectionError("Request timed out", url=redact(url))
     return remaining
 
 
@@ -88,19 +87,6 @@ def _same_resource(target: URL, query: Mapping[str, str] | None, other: URL) -> 
     return asked.with_query(None) == other.with_query(None) and sorted(
         asked.query.items()
     ) == sorted(other.query.items())
-
-
-def _bare(session: aiohttp.ClientSession) -> aiohttp.ClientSession:
-    """Return a session with ``session``'s connector and cookie jar only.
-
-    Not its default headers or ``auth``; closing it leaves the connector open.
-    """
-    return aiohttp.ClientSession(
-        connector=session.connector,
-        connector_owner=False,
-        cookie_jar=session.cookie_jar,
-        requote_redirect_url=session.requote_redirect_url,
-    )
 
 
 def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str) -> URL:
@@ -146,10 +132,9 @@ async def get_withholding(
     ``secret`` header is never sent again, nor are the Authorization, Cookie
     and Proxy-Authorization headers aiohttp drops there, nor credentials in
     the URL (which, as on aiohttp's redirects, follow hops within their
-    origin). A session's own defaults among those (its ``auth`` or such
-    default headers) ride on every request it makes, so from that hop on
-    requests go through a session without them, sharing the caller's
-    connector and cookie jar -- as aiohttp would drop them following itself.
+    origin). The session itself carries no credential (the shared policy,
+    :func:`.._http.require_session`, checked here too), so there is none of
+    its own to shed.
 
     ``conditional`` are the cache's validators (If-None-Match and
     If-Modified-Since), for the resource at ``conditional_url`` (None:
@@ -163,62 +148,58 @@ async def get_withholding(
     into a GET (RFC 9110 section 15.4.4). The caller reads the body through
     :func:`network`.
     """
-    async with AsyncExitStack() as stack:  # closes a bare session, if one opens
-        deadline = monotonic() + total if total is not None and total > 0 else None
-        requester = session
-        withheld = _ORIGIN_CREDENTIALS | ({secret.lower()} if secret else set())
-        session_credentials = getattr(session, "auth", None) is not None or any(
-            name.lower() in withheld for name in session.headers
+    if session.closed:
+        raise RuntimeError("the session is closed")  # the caller's, not a source's
+    require_session(session)
+    deadline = monotonic() + total if total is not None and total > 0 else None
+    withheld = CREDENTIAL_HEADERS | ({secret.lower()} if secret else set())
+    history: list[aiohttp.ClientResponse] = []
+    target = URL(url)
+    sent = dict(headers)
+    validated = URL(conditional_url) if conditional_url is not None else target
+    query = params or None
+    # Credentials in the URL: sent for the first hop, and kept while the
+    # chain stays in their origin.
+    userinfo = (target.user, target.password) if target.user is not None else None
+    userinfo_origin = _origin(target)
+    while True:
+        remaining = _remaining(deadline, url)
+        # The validators go to the resource they came from, and only to it.
+        asked = _same_resource(target, query, validated)
+        hop_headers = {**sent, **conditional} if conditional and asked else sent
+        response = await network(
+            session.request(
+                method,
+                target,
+                params=query,
+                headers=hop_headers or None,
+                timeout=aiohttp.ClientTimeout(total=remaining, sock_read=sock_read),
+                **REQUEST_OPTIONS,
+            ),
+            url,
         )
-        history: list[aiohttp.ClientResponse] = []
-        target = URL(url)
-        sent = dict(headers)
-        validated = URL(conditional_url) if conditional_url is not None else target
-        query = params or None
-        # Credentials in the URL: sent for the first hop, and kept while the
-        # chain stays in their origin.
-        userinfo = (target.user, target.password) if target.user is not None else None
-        userinfo_origin = _origin(target)
-        while True:
-            remaining = _remaining(deadline)
-            # The validators go to the resource they came from, and only to it.
-            asked = _same_resource(target, query, validated)
-            hop_headers = {**sent, **conditional} if conditional and asked else sent
-            response = await network(
-                requester.request(
-                    method,
-                    target,
-                    params=query,
-                    headers=hop_headers or None,
-                    timeout=aiohttp.ClientTimeout(total=remaining, sock_read=sock_read),
-                    allow_redirects=False,
-                ),
-                url,
-            )
-            location = response.headers.get("Location")
-            if response.status not in _REDIRECT_STATUSES or location is None:
-                try:
-                    yield response, history
-                finally:
-                    response.release()
-                return
-            response.release()
-            history.append(response)
-            if len(history) >= _MAX_REDIRECTS:
-                raise SourceConnectionError("Too many redirects", url=redact(url))
-            following = _resolve(response.url, location, session, url)
-            origin = _origin(following)
-            if origin != _origin(response.url):
-                if session_credentials and requester is session:
-                    requester = await stack.enter_async_context(_bare(session))
-                sent = {k: v for k, v in sent.items() if k.lower() not in withheld}
-                userinfo = None
-            if following.user is not None:
-                # Credentials the Location gives are addressed to its origin.
-                userinfo = (following.user, following.password)
-                userinfo_origin = origin
-            elif userinfo is not None and origin == userinfo_origin:
-                following = following.with_user(userinfo[0]).with_password(userinfo[1])
-            if response.status == HTTPStatus.SEE_OTHER and method != "HEAD":
-                method = "GET"
-            target, query = following, None
+        location = response.headers.get("Location")
+        if response.status not in _REDIRECT_STATUSES or location is None:
+            try:
+                yield response, history
+            finally:
+                response.release()
+            return
+        response.release()
+        history.append(response)
+        if len(history) >= _MAX_REDIRECTS:
+            raise SourceConnectionError("Too many redirects", url=redact(url))
+        following = _resolve(response.url, location, session, url)
+        origin = _origin(following)
+        if origin != _origin(response.url):
+            sent = {k: v for k, v in sent.items() if k.lower() not in withheld}
+            userinfo = None
+        if following.user is not None:
+            # Credentials the Location gives are addressed to its origin.
+            userinfo = (following.user, following.password)
+            userinfo_origin = origin
+        elif userinfo is not None and origin == userinfo_origin:
+            following = following.with_user(userinfo[0]).with_password(userinfo[1])
+        if response.status == HTTPStatus.SEE_OTHER and method != "HEAD":
+            method = "GET"
+        target, query = following, None

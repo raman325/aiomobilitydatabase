@@ -254,54 +254,65 @@ async def test_a_timeout_of_none_or_less_is_no_bound_with_or_without_header_auth
 
 
 @pytest.mark.parametrize(
-    "credential",
-    ["Authorization", "cookie", "Proxy-Authorization", "x-api-key", "auth"],
+    "credential", ["Authorization", "cookie", "Proxy-Authorization", "auth"]
 )
 # aiohttp 3.14 deprecates session ``auth``; older floors still have it.
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-async def test_session_credentials_are_shed_at_a_header_auth_hop_to_another_origin(
+async def test_a_session_carrying_a_credential_is_refused(
     mock_api: MockApi, credential: str
 ) -> None:
-    """A request can't shed its session's default credentials, so the hop
-    to another origin goes through a session without them (sharing the
-    connector), the header-auth secret withheld too."""
-    mock_api.get(
-        "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
-    )
-    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
+    """A session's auth or credential default rides on every request, to
+    every origin -- a redirect target's, the catalog API's -- where no
+    request can shed it: the shared policy refuses such a session (pass a
+    credential per request instead), before anything is sent."""
     options: dict[str, object] = (
         {"auth": aiohttp.BasicAuth("user", "pass")}
         if credential == "auth"
         else {"headers": {credential: "secret"}}
     )
     async with aiohttp.ClientSession(**options) as session:  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="every request"):
+            await fetch_feed_message(session, mock_api.url("/rt"))
+    assert mock_api.requests == []
+
+
+async def test_request_credentials_are_shed_at_a_hop_to_another_origin(
+    mock_api: MockApi,
+) -> None:
+    """Credentials passed per request -- a header-auth key and an
+    Authorization header -- stop at the origin they were addressed to."""
+    mock_api.get(
+        "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
+    )
+    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
+    async with aiohttp.ClientSession() as session:
         response = await fetch_feed_message(
             session,
             mock_api.url("/rt"),
             auth_type=2,
             api_key_name="X-Api-Key",
             api_key="secret123",
+            headers={"Authorization": "Bearer s"},
         )
     assert response.value is not None
-    assert len(response.value.entity) == 2
     away = mock_api.requests[-1]
     assert away.path == "/rt/x"
-    sent = {name.lower() for name in away.headers}
-    assert not sent & {credential.lower(), "authorization", "x-api-key"}
+    assert not {n.lower() for n in away.headers} & {"authorization", "x-api-key"}
 
 
-async def test_session_credentials_follow_a_header_auth_hop_within_the_origin(
+async def test_request_credentials_follow_a_hop_within_the_origin(
     mock_api: MockApi,
 ) -> None:
     mock_api.get("/rt", status=308, headers={"Location": "/rt/x"})
     mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
-    async with aiohttp.ClientSession(headers={"Authorization": "Bearer s"}) as session:
+    async with aiohttp.ClientSession() as session:
         await fetch_feed_message(
             session,
             mock_api.url("/rt"),
             auth_type=2,
             api_key_name="X-Api-Key",
             api_key="secret123",
+            headers={"Authorization": "Bearer s"},
         )
     assert mock_api.requests[1].headers["X-Api-Key"] == "secret123"
     assert mock_api.requests[1].headers["Authorization"] == "Bearer s"
@@ -459,12 +470,11 @@ async def test_a_query_auth_feed_is_revalidated_conditionally(
     assert all(r.query["k"] == "v" for r in mock_api.requests)
 
 
-async def test_a_credentialed_session_revalidates_across_origins(
+async def test_a_credentialed_fetch_revalidates_across_origins(
     mock_api: MockApi,
 ) -> None:
-    """The hop away goes through a session without the caller's default
-    credentials -- never a failure -- and revalidates the resource the
-    validators came from."""
+    """The hop away sheds the request's Authorization -- never a failure --
+    and revalidates the resource the validators came from."""
     url = mock_api.url("/rt")
     away = _elsewhere(mock_api.url("/rt/away"))
     for _ in range(3):
@@ -473,8 +483,10 @@ async def test_a_credentialed_session_revalidates_across_origins(
     for _ in range(2):
         mock_api.get("/rt/away", body=VEHICLE_POSITIONS, content_type=PB, headers=fresh)
     cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
-    async with aiohttp.ClientSession(headers={"Authorization": "Bearer s"}) as session:
-        fetch = partial(fetch_feed_message, session, url)
+    async with aiohttp.ClientSession() as session:
+        fetch = partial(
+            fetch_feed_message, session, url, headers={"Authorization": "Bearer s"}
+        )
         await cache.get(url, fetch)
         assert len((await cache.get(url, fetch)).entity) == 2
     away_hits = [r.headers for r in mock_api.requests if r.path == "/rt/away"]

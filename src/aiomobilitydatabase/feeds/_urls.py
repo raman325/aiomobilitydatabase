@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from yarl import URL
 
+from .._http import is_token, is_visible, require_session
 from .exceptions import SourceConnectionError
 
 if TYPE_CHECKING:
@@ -28,12 +29,6 @@ _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 # What parsing a URL with yarl can raise: ValueError (UnicodeError among
 # them), and IndexError for some malformed authorities.
 URL_ERRORS = (ValueError, IndexError)
-# RFC 9110 section 5.1: a field name is a token.
-_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-# The header values (and API key, and Basic credentials) a caller may hand
-# over: visible ASCII, space and tab -- an allowlist. RFC 9110 section 5.5
-# allows obs-text too, but no client library sends it the same way.
-_VISIBLE = re.compile(r"[\t\x20-\x7e]*")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")  # RFC 5234 CTL
 
 
@@ -47,38 +42,26 @@ def require_caller_inputs(
     headers: Mapping[str, str] | None = None,
     api_key: str | None = None,
 ) -> None:
-    """Raise ValueError for a caller input outside the allowlist.
+    """Raise ValueError for a caller input outside the shared allowlist.
 
-    Checked when a handle is made: every header (the session's defaults with
-    ``headers``) is a token name with a visible-ASCII value, as is the
-    ``api_key`` and a session ``auth``'s login and password (the login
-    without a colon, RFC 7617 section 2). An Authorization header beside a
-    session ``auth`` or credentials in the caller's URLs is refused too:
-    one request carries one Authorization field. (A session ``auth`` beside
-    URL credentials is fine: the URL's are sent.)
+    Checked when a handle is made (:mod:`.._http`): the session's defaults
+    (sendable, no credential), every ``headers`` entry (a token name, a
+    visible-ASCII value) and the ``api_key`` (visible ASCII). An
+    Authorization header beside credentials in the caller's URLs is refused
+    too: one request carries one Authorization field.
     """
-    for name, value in (*session.headers.items(), *(headers or {}).items()):
-        if not (isinstance(name, str) and _FIELD_NAME.fullmatch(name)):
+    require_session(session)
+    for name, value in (headers or {}).items():
+        if not is_token(name):
             raise ValueError(f"header name {name!r} is no HTTP field name")
-        if not (isinstance(value, str) and _VISIBLE.fullmatch(value)):
+        if not is_visible(value):
             raise ValueError(f"header {name!r} must be visible ASCII")
-    if api_key is not None and not _VISIBLE.fullmatch(api_key):
+    if api_key is not None and not is_visible(api_key):
         raise ValueError("api_key must be visible ASCII")
-    auth = getattr(session, "auth", None)
-    if auth is not None and not (
-        _VISIBLE.fullmatch(auth.login)
-        and _VISIBLE.fullmatch(auth.password)
-        and ":" not in auth.login
+    if any(name.lower() == "authorization" for name in headers or {}) and any(
+        _has_credentials(url) for url in urls
     ):
-        raise ValueError("the session's auth must be visible ASCII, the login no colon")
-    names = (*session.headers, *(headers or {}))
-    if any(name.lower() == "authorization" for name in names) and (
-        auth is not None or any(_has_credentials(url) for url in urls)
-    ):
-        raise ValueError(
-            "an Authorization header can't go with credentials in the URL "
-            "or the session's auth"
-        )
+        raise ValueError("an Authorization header can't go with credentials in the URL")
 
 
 def _has_credentials(url: str) -> bool:
@@ -145,7 +128,7 @@ def _require_http_url(url: str, context: str) -> None:
             parsed = URL(url)
             scheme = parsed.scheme.lower()
             if scheme not in _ALLOWED_URL_SCHEMES:
-                reason = f"unsupported URL scheme {scheme!r}"
+                reason = "unsupported URL scheme"  # the scheme is the source's text
             else:
                 require_requestable(parsed)
                 return

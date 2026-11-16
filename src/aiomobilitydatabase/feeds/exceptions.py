@@ -34,7 +34,19 @@ class SourceConnectionError(MobilityFeedsError):
 
 
 class SourceAuthenticationError(MobilityFeedsError):
-    """The producer rejected the supplied credentials (401/403)."""
+    """The producer rejected the supplied credentials (401/403).
+
+    ``status`` is that status, and ``url`` the URL asked for without its
+    credentials, query or fragment.
+    """
+
+    def __init__(
+        self, message: str, *, status: int | None = None, url: str | None = None
+    ) -> None:
+        """Initialize with a message, and the HTTP status and URL when known."""
+        super().__init__(message)
+        self.status = status
+        self.url = url
 
 
 class FeedParseError(MobilityFeedsError):

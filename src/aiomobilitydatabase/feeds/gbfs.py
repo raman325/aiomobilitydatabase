@@ -581,8 +581,9 @@ class GbfsFeedHandle:
             answered = str(resp.url)
         try:
             document = json_loads(raw)
-        except ValueError as err:
-            raise FeedParseError("Malformed GBFS JSON", url=shown) from err
+        except ValueError:
+            # Not from err: a JSONDecodeError holds the whole body (.doc).
+            raise FeedParseError("Malformed GBFS JSON", url=shown) from None
         if not isinstance(document, dict) or "data" not in document:
             raise FeedParseError("GBFS document missing data envelope", url=shown)
         return Response(

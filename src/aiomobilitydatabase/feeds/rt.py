@@ -13,6 +13,7 @@ from typing import Any
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
+from .._http import is_text, is_token
 from ._freshness import Response, Validators, header_fields, request_fields
 from ._freshness import hops as _hops
 from ._language import is_preferred_language
@@ -120,17 +121,22 @@ def _feed_request(
     params: dict[str, str] = {}
     req_headers: dict[str, str] = dict(headers) if headers else {}
     if api_key is not None and api_key_name:
+        # The name is catalog data, and a bad one doesn't always raise: yarl
+        # drops a lone surrogate from a query name, and compiled aiohttp from
+        # a header name (or sends X:Key, which the server reads as X) -- a
+        # different request, not an error. Refused, the name kept out of
+        # the message.
         if auth_type == _AUTH_TYPE_QUERY_PARAM:
-            try:
-                api_key_name.encode("utf-8")
-            except UnicodeEncodeError:
-                # Catalog data: yarl would drop a lone surrogate and send the
-                # key under another name -- another request, not an error.
+            if not is_text(api_key_name):
                 raise SourceConnectionError(
                     "The feed's api_key_parameter_name isn't text"
-                ) from None
+                )
             params[api_key_name] = api_key
         elif auth_type == _AUTH_TYPE_HEADER:
+            if not is_token(api_key_name):
+                raise SourceConnectionError(
+                    "The feed's api_key_parameter_name is no header field name"
+                )
             req_headers[api_key_name] = api_key
     return params, req_headers
 
@@ -201,7 +207,9 @@ async def fetch_feed_message(
         received_at = datetime.now(UTC)
         if resp.status in _AUTH_STATUSES:
             raise SourceAuthenticationError(
-                f"Producer rejected credentials ({resp.status})"
+                f"Producer rejected credentials ({resp.status})",
+                status=resp.status,
+                url=shown,
             )
         fields = header_fields(resp.headers)
         # 304 is the producer confirming the bytes are unchanged, so
@@ -241,8 +249,8 @@ async def fetch_feed_message(
     message = gtfs_realtime_pb2.FeedMessage()
     try:
         await asyncio.to_thread(message.ParseFromString, raw)
-    except Exception as err:  # DecodeError subclasses Exception, not a shared base
-        raise FeedParseError("Undecodable GTFS-RT protobuf", url=shown) from err
+    except Exception:  # DecodeError subclasses Exception, not a shared base
+        raise FeedParseError("Undecodable GTFS-RT protobuf", url=shown) from None
     return Response(
         value=message,
         fields=fields,
