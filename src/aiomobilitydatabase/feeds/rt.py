@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -18,7 +17,7 @@ from ._freshness import Response, Validators, header_fields, request_fields
 from ._freshness import hops as _hops
 from ._language import is_preferred_language
 from ._redirects import get_withholding
-from ._urls import _require_http_url
+from ._urls import FIELD_NAME, _require_http_url
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
     AlertCause,
@@ -48,8 +47,6 @@ _AUTH_STATUSES = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
 
 _AUTH_TYPE_QUERY_PARAM = 1
 _AUTH_TYPE_HEADER = 2
-# RFC 9110 section 5.1: a field name is a token.
-_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
 # The RT identity a TripDescriptor addresses: (trip_id, start_date,
 # start_secs). start_date pins ONE service day's instance of the trip
@@ -126,7 +123,7 @@ def _feed_request(
         if auth_type == _AUTH_TYPE_QUERY_PARAM:
             params[api_key_name] = api_key
         elif auth_type == _AUTH_TYPE_HEADER:
-            if not _FIELD_NAME.fullmatch(api_key_name):
+            if not FIELD_NAME.fullmatch(api_key_name):
                 # The name is catalog data; aiohttp would raise a bare
                 # ValueError for a CR or LF in it, mid-request.
                 raise SourceConnectionError(

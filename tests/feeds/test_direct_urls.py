@@ -561,6 +561,7 @@ _BAD_LOCATIONS = [
     "https://",
     "https:///x",
     "https:x",
+    "http://a%3Ab@127.0.0.1:9/x",  # RFC 7617: no colon in a Basic user-id
 ]
 
 
@@ -693,7 +694,17 @@ _LOCATION_TEXT = st.tuples(
     ),
     st.lists(
         st.sampled_from(
-            [*"ab1:[]@/.%?#-", "::1", "xn--", "..", "99999", chr(0xE9), chr(0x3002)]
+            [
+                *"ab1:[]@/.%?#-",
+                "::1",
+                "xn--",
+                "..",
+                "99999",
+                "%3A",
+                "%3a@",
+                chr(0xE9),
+                chr(0x3002),
+            ]
         ),
         max_size=8,
     ).map("".join),
@@ -747,3 +758,87 @@ async def test_an_api_key_header_name_that_is_no_field_name_is_refused(
                 api_key_name=name,
                 api_key="k",
             )
+
+
+_COLON_LOGINS = ["http://a%3Ab@127.0.0.1:9/feed", "http://%3A@127.0.0.1:9/feed"]
+
+
+@pytest.mark.parametrize("url", _COLON_LOGINS)
+def test_a_user_name_with_a_colon_is_refused(url: str) -> None:
+    """aiohttp raised a bare ValueError building its Basic credentials."""
+    with pytest.raises(SourceConnectionError, match="user name holds a colon"):
+        _require_http_url(url, "test URL")
+
+
+@pytest.mark.parametrize("url", _COLON_LOGINS)
+async def test_a_colon_login_is_refused_at_every_entry_point(
+    direct_client: MobilityFeedsClient, url: str
+) -> None:
+    with pytest.raises(SourceConnectionError, match="user name holds a colon"):
+        await direct_client.get_gbfs_feed_from_url(url)
+    with pytest.raises(SourceConnectionError, match="user name holds a colon"):
+        await direct_client.get_transit_feed_from_urls(url)
+    async with aiohttp.ClientSession() as session:
+        for by_hand in (False, True):
+            with pytest.raises(SourceConnectionError, match="user name holds a colon"):
+                await fetch_feed_message(
+                    session,
+                    url,
+                    auth_type=2 if by_hand else None,
+                    api_key_name="X-Key" if by_hand else None,
+                    api_key="k" if by_hand else None,
+                )
+
+
+def test_a_password_may_hold_a_colon() -> None:
+    """Only the user-id can't: RFC 7617 splits at its first colon."""
+    _require_http_url("http://user:pa%3Ass@127.0.0.1:9/feed", "test URL")
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-Key\r\nX-Evil": "1"},
+        {"X Key": "1"},
+        {"X-Key": "a\r\nX-Evil: 1"},
+        {"X-Key": "a\x00b"},
+        {"X-Key": "a\x7f"},
+    ],
+)
+async def test_a_header_http_cant_carry_is_the_callers_mistake(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, headers: dict[str, str]
+) -> None:
+    """Refused up front as ValueError -- so a ValueError mid-request is
+    always the producer's (open_response's SourceConnectionError)."""
+    with pytest.raises(ValueError, match="HTTP"):
+        await direct_client.get_transit_feed_from_urls(
+            mock_api.url(STATIC_PATH), headers=headers
+        )
+    with pytest.raises(ValueError, match="HTTP"):
+        await direct_client.get_gbfs_feed_from_url(
+            mock_api.url("/gbfs/gbfs.json"), headers=headers
+        )
+    assert mock_api.requests == []
+
+
+async def test_an_api_key_http_cant_carry_is_the_callers_mistake(
+    mock_api: MockApi, direct_client: MobilityFeedsClient
+) -> None:
+    with pytest.raises(ValueError, match="control character"):
+        await direct_client.get_transit_feed("mdb-1", api_key="k\r\nX-Evil: 1")
+    assert mock_api.requests == []
+
+
+async def test_a_tab_or_text_in_a_header_value_is_fine(
+    mock_api: MockApi, direct_client: MobilityFeedsClient
+) -> None:
+    feeds = [{"name": "system_information", "url": mock_api.url("/gbfs/si.json")}]
+    mock_api.get(
+        "/gbfs/gbfs.json",
+        payload={"ttl": 0, "last_updated": 0, "data": {"feeds": feeds}},
+    )
+    handle = await direct_client.get_gbfs_feed_from_url(
+        mock_api.url("/gbfs/gbfs.json"), headers={"X-Note": "a\tb café"}
+    )
+    assert handle is not None
+    assert mock_api.requests[0].headers["X-Note"].startswith("a\tb")

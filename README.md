@@ -733,6 +733,10 @@ mistakes rather than feed problems, and raise the builtin `ValueError`:
 method for an id of `""`, `"."` or `".."`, which no URL can carry as one path
 segment.
 
+So does a feeds handle factory, for a `headers=` entry or an `api_key` that
+HTTP can't carry: a field name that isn't a token, or a value holding a control
+character.
+
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`
 means the **producer** rejected the feed-specific `api_key` you passed to

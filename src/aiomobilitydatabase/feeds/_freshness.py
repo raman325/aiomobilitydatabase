@@ -41,8 +41,10 @@ _QUOTED_STRING = re.compile(
     r'"(?:[^\x00-\x08\x0a-\x1f\x7f"\\]|\\[^\x00-\x08\x0a-\x1f\x7f])*"'
 )
 # etagc is any visible character but DQUOTE, plus obs-text -- which arrives
-# decoded (aiohttp: UTF-8 with surrogateescape), so anything non-ASCII.
-_ENTITY_TAG = re.compile(r'(W/)?"[^\x00-\x20"\x7f]*"')
+# decoded (aiohttp: UTF-8 with surrogateescape), so anything non-ASCII but
+# the lone surrogates standing for bytes that weren't UTF-8: aiohttp drops
+# those when it sends a header, so the tag would come back as another one.
+_ENTITY_TAG = re.compile(r'(W/)?"[^\x00-\x20"\x7f\udc80-\udcff]*"')
 # RFC 9110 section 5.6.3: optional whitespace is space and tab, nothing else
 # (str.strip() would also eat NBSP, NEL, U+2028 and friends).
 _OWS = " \t"

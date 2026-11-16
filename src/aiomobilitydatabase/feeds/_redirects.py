@@ -17,7 +17,7 @@ from time import monotonic
 import aiohttp
 from yarl import URL
 
-from ._urls import URL_ERRORS, require_resolvable_host
+from ._urls import URL_ERRORS, require_requestable
 from .exceptions import SourceConnectionError
 
 # aiohttp's own redirect limit: the tenth redirect raises.
@@ -26,10 +26,12 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 # Credentials aiohttp itself drops when a redirect leaves the origin.
 _ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization"})
 # What a request can raise mid-flight, unwrapped, for a URL it reaches by a
-# redirect aiohttp follows itself: aiohttp wraps only a ValueError from the
-# Location, not yarl's IndexError, nor the resolver's UnicodeError for a
-# host it can't IDNA-encode.
-_UNREQUESTABLE = (IndexError, UnicodeError)
+# redirect aiohttp follows itself: yarl's IndexError for some Locations, the
+# resolver's UnicodeError for a host it can't IDNA-encode, and ValueError --
+# aiohttp's own, building Basic credentials from a user name holding a colon
+# (a%3Ab@). Caller headers are checked when a handle is made
+# (_urls.require_header_fields), so a ValueError here is the producer's.
+_UNREQUESTABLE = (IndexError, ValueError)  # UnicodeError is a ValueError
 
 
 async def open_response(
@@ -89,7 +91,7 @@ def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str)
     try:
         following = base.join(URL(location, encoded=not session.requote_redirect_url))
         _origin(following)
-        require_resolvable_host(following)
+        require_requestable(following)
     except URL_ERRORS as err:
         raise SourceConnectionError(
             f"Producer redirected to an invalid URL ({location!r}): {url}"

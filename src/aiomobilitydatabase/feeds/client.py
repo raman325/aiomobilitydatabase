@@ -15,6 +15,7 @@ import aiohttp
 from ..client import MobilityDatabaseClient
 from ..exceptions import MobilityDatabaseError
 from ._extra import load_transit_handle
+from ._urls import require_header_fields
 from .const import DEFAULT_TIMEOUT_SECONDS
 from .gbfs import GbfsFeedHandle
 from .models import StaticBuildProgress
@@ -210,6 +211,7 @@ class MobilityFeedsClient:
         callback's own scheduling, so it cannot abort a build already in
         progress.
         """
+        require_header_fields(None, api_key)
         return await load_transit_handle().create(
             self,
             feed_id,
@@ -251,6 +253,7 @@ class MobilityFeedsClient:
         :meth:`purge_cache`). ``on_progress`` and ``rt_min_interval``
         follow the same contracts as :meth:`get_transit_feed`.
         """
+        require_header_fields(headers)
         return await load_transit_handle().create_from_urls(
             self,
             static_url,
@@ -278,8 +281,10 @@ class MobilityFeedsClient:
         point; its published feed list replaces catalog endpoint
         resolution. Returns the same handle type as :meth:`get_gbfs_feed`.
         ``headers`` apply to the discovery fetch and every document fetch
-        for the handle. Like any aiohttp request headers they follow
-        redirects, to another origin too: aiohttp drops only
+        for the handle (a name that isn't an HTTP token, or a value with a
+        control character, raises ``ValueError``). Like any aiohttp request
+        headers they follow redirects, to another origin too: aiohttp drops only
         Authorization, Cookie and Proxy-Authorization there.
         """
+        require_header_fields(headers)
         return await GbfsFeedHandle.create_from_url(self, discovery_url, headers)

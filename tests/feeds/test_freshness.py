@@ -2744,3 +2744,18 @@ def test_each_character_is_qdtext_or_quotable_by_the_grammar(
     arg = form.format(chr(code))
     parsed = freshness_module._directive(f"ext={arg}")
     assert (parsed is not None) == _reference_quoted_string(arg)
+
+
+@pytest.mark.parametrize("etag", ['"v\udcff1"', 'W/"\udc80"', '"ok\udcc3\udca9"'])
+def test_an_etag_holding_bytes_that_werent_utf8_validates_nothing(etag: str) -> None:
+    """aiohttp decodes such bytes as lone surrogates and drops them when it
+    sends the header, so If-None-Match would name another entity-tag -- one
+    a 304 could answer for a representation never stored."""
+    assert _validators({"ETag": etag}) is None
+
+
+def test_an_etag_holding_utf8_text_still_validates() -> None:
+    """Decoded UTF-8 goes back out as the same bytes."""
+    validators = _validators({"ETag": '"caf\u00e9"'})
+    assert validators is not None
+    assert validators.request_headers()["If-None-Match"] == '"caf\u00e9"'
