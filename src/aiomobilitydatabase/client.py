@@ -11,6 +11,7 @@ from typing import Any, Self
 from urllib.parse import quote
 
 import aiohttp
+from mashumaro import DataClassDictMixin
 
 from .const import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -72,8 +73,50 @@ def _quote_segment(segment: str) -> str:
     segment instead of injecting extra segments, a query string, or a
     fragment. Additive-safe: ids already restricted to unreserved characters
     (the overwhelming common case) are returned unchanged.
+
+    Raises ``ValueError`` for ``""``, ``"."`` and ``".."``: no encoding
+    makes them one segment. Empty, the path names the collection instead;
+    the dot segments are removed when the URL is resolved (RFC 3986
+    section 5.2.4), and percent-encoding them changes nothing, since
+    ``%2E`` is the same unreserved ``.`` (section 2.3).
     """
+    if segment in ("", ".", ".."):
+        raise ValueError(f"{segment!r} cannot be sent as an id: it is no path segment")
     return quote(segment, safe="")
+
+
+# What decoding a JSON value into a model can raise: mashumaro's MissingField
+# (a LookupError) and InvalidFieldValue (a ValueError), TypeError or
+# AttributeError for a value of the wrong JSON type, and RecursionError for
+# nesting deeper than the interpreter's stack.
+_DECODE_ERRORS = (LookupError, ValueError, TypeError, AttributeError, RecursionError)
+
+
+def _one[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> ModelT:
+    """Decode one API object, or raise MobilityDatabaseConnectionError.
+
+    The body of a 200 is the server's data, so anything it holds that is not
+    the documented object is an invalid payload, never a bare decoding error.
+    """
+    if not isinstance(data, dict):
+        raise MobilityDatabaseConnectionError(
+            f"API returned {type(data).__name__}, not a {model.__name__} object"
+        )
+    try:
+        return model.from_dict(data)
+    except _DECODE_ERRORS as err:
+        raise MobilityDatabaseConnectionError(
+            f"API returned an invalid {model.__name__}: {err}"
+        ) from err
+
+
+def _many[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> list[ModelT]:
+    """Decode an API array of objects, or raise MobilityDatabaseConnectionError."""
+    if not isinstance(data, list):
+        raise MobilityDatabaseConnectionError(
+            f"API returned {type(data).__name__}, not an array of {model.__name__}"
+        )
+    return [_one(model, item) for item in data]
 
 
 def encode_params(params: dict[str, Any]) -> dict[str, str]:
@@ -193,11 +236,16 @@ class MobilityDatabaseClient:
                             f"Unable to obtain access token ({resp.status}): {body}"
                         )
                     data = await resp.json()
-            except (TimeoutError, aiohttp.ClientError, ValueError) as err:
+            except (
+                TimeoutError,
+                aiohttp.ClientError,
+                ValueError,
+                RecursionError,
+            ) as err:
                 raise MobilityDatabaseConnectionError(
                     f"Error requesting access token: {err}"
                 ) from err
-            token = AccessToken.from_dict(data)
+            token = _one(AccessToken, data)
             expiration = token.expiration_datetime_utc
             if expiration.tzinfo is None:
                 expiration = expiration.replace(tzinfo=UTC)
@@ -253,7 +301,7 @@ class MobilityDatabaseClient:
                     raise MobilityDatabaseApiError(resp.status, await resp.text())
                 try:
                     return await resp.json()
-                except (aiohttp.ContentTypeError, ValueError) as err:
+                except (aiohttp.ContentTypeError, ValueError, RecursionError) as err:
                     raise MobilityDatabaseConnectionError(
                         "API returned invalid JSON"
                     ) from err
@@ -267,7 +315,7 @@ class MobilityDatabaseClient:
     async def get_metadata(self) -> Metadata:
         """Get metadata about the API."""
         data = await self._request("GET", "/v1/metadata")
-        return Metadata.from_dict(data)
+        return _one(Metadata, data)
 
     async def get_feeds(
         self,
@@ -292,12 +340,12 @@ class MobilityDatabaseClient:
                 "is_official": is_official,
             },
         )
-        return [Feed.from_dict(item) for item in data]
+        return _many(Feed, data)
 
     async def get_feed(self, feed_id: str) -> Feed:
         """Get a single feed by ID."""
         data = await self._request("GET", f"/v1/feeds/{_quote_segment(feed_id)}")
-        return Feed.from_dict(data)
+        return _one(Feed, data)
 
     async def get_gtfs_feeds(
         self,
@@ -332,12 +380,12 @@ class MobilityDatabaseClient:
                 "is_official": is_official,
             },
         )
-        return [GtfsFeed.from_dict(item) for item in data]
+        return _many(GtfsFeed, data)
 
     async def get_gtfs_feed(self, feed_id: str) -> GtfsFeed:
         """Get a single GTFS feed by ID."""
         data = await self._request("GET", f"/v1/gtfs_feeds/{_quote_segment(feed_id)}")
-        return GtfsFeed.from_dict(data)
+        return _one(GtfsFeed, data)
 
     async def get_gtfs_rt_feeds(
         self,
@@ -368,14 +416,14 @@ class MobilityDatabaseClient:
                 "is_official": is_official,
             },
         )
-        return [GtfsRtFeed.from_dict(item) for item in data]
+        return _many(GtfsRtFeed, data)
 
     async def get_gtfs_rt_feed(self, feed_id: str) -> GtfsRtFeed:
         """Get a single GTFS Realtime feed by ID."""
         data = await self._request(
             "GET", f"/v1/gtfs_rt_feeds/{_quote_segment(feed_id)}"
         )
-        return GtfsRtFeed.from_dict(data)
+        return _one(GtfsRtFeed, data)
 
     async def get_gbfs_feeds(
         self,
@@ -406,12 +454,12 @@ class MobilityDatabaseClient:
                 "version": version,
             },
         )
-        return [GbfsFeed.from_dict(item) for item in data]
+        return _many(GbfsFeed, data)
 
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeed:
         """Get a single GBFS feed by ID."""
         data = await self._request("GET", f"/v1/gbfs_feeds/{_quote_segment(feed_id)}")
-        return GbfsFeed.from_dict(data)
+        return _one(GbfsFeed, data)
 
     async def get_gtfs_feed_datasets(
         self,
@@ -435,14 +483,14 @@ class MobilityDatabaseClient:
                 "downloaded_before": downloaded_before,
             },
         )
-        return [GtfsDataset.from_dict(item) for item in data]
+        return _many(GtfsDataset, data)
 
     async def get_gtfs_feed_gtfs_rt_feeds(self, feed_id: str) -> list[GtfsRtFeed]:
         """Get GTFS Realtime feeds related to a GTFS feed."""
         data = await self._request(
             "GET", f"/v1/gtfs_feeds/{_quote_segment(feed_id)}/gtfs_rt_feeds"
         )
-        return [GtfsRtFeed.from_dict(item) for item in data]
+        return _many(GtfsRtFeed, data)
 
     async def get_gtfs_feed_availability(
         self,
@@ -466,14 +514,14 @@ class MobilityDatabaseClient:
                 "sort": sort,
             },
         )
-        return GtfsFeedAvailability.from_dict(data)
+        return _one(GtfsFeedAvailability, data)
 
     async def get_dataset_gtfs(self, dataset_id: str) -> GtfsDataset:
         """Get a single GTFS dataset by ID."""
         data = await self._request(
             "GET", f"/v1/datasets/gtfs/{_quote_segment(dataset_id)}"
         )
-        return GtfsDataset.from_dict(data)
+        return _one(GtfsDataset, data)
 
     async def search_feeds(
         self,
@@ -510,7 +558,7 @@ class MobilityDatabaseClient:
                 "license_tags": license_tags,
             },
         )
-        return SearchResults.from_dict(data)
+        return _one(SearchResults, data)
 
     async def get_locations(
         self,
@@ -535,7 +583,7 @@ class MobilityDatabaseClient:
                 "offset": offset,
             },
         )
-        return LocationSearchResults.from_dict(data)
+        return _one(LocationSearchResults, data)
 
     async def get_licenses(
         self, *, limit: int | None = None, offset: int | None = None
@@ -544,16 +592,16 @@ class MobilityDatabaseClient:
         data = await self._request(
             "GET", "/v1/licenses", params={"limit": limit, "offset": offset}
         )
-        return [License.from_dict(item) for item in data]
+        return _many(License, data)
 
     async def get_license(self, license_id: str) -> LicenseWithRules:
         """Get a single license, including its rules."""
         data = await self._request("GET", f"/v1/licenses/{_quote_segment(license_id)}")
-        return LicenseWithRules.from_dict(data)
+        return _one(LicenseWithRules, data)
 
     async def get_matching_licenses(self, license_url: str) -> list[MatchingLicense]:
         """Match a license URL against the license database."""
         data = await self._request(
             "POST", "/v1/licenses:match", json_body={"license_url": license_url}
         )
-        return [MatchingLicense.from_dict(item) for item in data]
+        return _many(MatchingLicense, data)
