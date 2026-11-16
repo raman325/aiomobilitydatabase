@@ -109,13 +109,14 @@ def _timeout_seconds(request_timeout: object) -> float:
     API's fault.
     """
     seconds = math.nan
-    if isinstance(request_timeout, int | float) and not isinstance(
-        request_timeout, bool
+    if isinstance(request_timeout, bool) or not isinstance(
+        request_timeout, int | float
     ):
-        try:
-            seconds = float(request_timeout)
-        except OverflowError:
-            seconds = math.inf
+        raise TypeError("request_timeout must be a number of seconds")
+    try:
+        seconds = float(request_timeout)
+    except OverflowError:
+        seconds = math.inf
     if not 0 < seconds < math.inf:
         raise ValueError("request_timeout must be a finite positive number of seconds")
     return seconds
@@ -157,26 +158,42 @@ def _encode_scalar(value: Any) -> str:
     if isinstance(value, Enum):
         return _encode_scalar(value.value)
     if isinstance(value, datetime):
-        # RFC 3339 section 5.6 requires an offset; a naive time names no
-        # instant, and the API would have to guess the zone. Sent in UTC: the
-        # same instant, and an offset RFC 3339 can write (hours and minutes;
-        # Python allows seconds, isoformat writes "+00:19:32").
-        if value.utcoffset() is None:
-            raise ValueError("a query datetime must be timezone-aware")
-        try:
-            return value.astimezone(UTC).isoformat()
-        except OverflowError:
-            pass  # raised below, outside the except
-        raise ValueError("a query datetime has no UTC time datetime can hold")
+        return _encode_datetime(value)
+    # The base types' own spellings: a subclass's (numpy 2's np.float64
+    # repr is "np.float64(2.5)") would be sent as the value.
     if isinstance(value, int):
-        return str(value)
+        return int.__repr__(value)
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("a query parameter is no finite number")
-        return repr(value)
+        return float.__repr__(value)
     if isinstance(value, str):
-        return require_text(value, "a query parameter")
+        return require_text(str.__str__(value), "a query parameter")
     raise TypeError(f"a query parameter can't be a {type(value).__name__}")
+
+
+def _encode_datetime(value: datetime) -> str:
+    """Encode an aware datetime as RFC 3339, in UTC; ValueError otherwise.
+
+    RFC 3339 section 5.6 requires an offset: a naive time names no instant,
+    and the API would have to guess the zone. Sent in UTC: the same instant,
+    and an offset RFC 3339 can write (hours and minutes; Python allows
+    seconds, and isoformat writes "+00:19:32"). Errors are raised after the
+    except block, in the library's words: a tzinfo's own (a broken one) or
+    an OverflowError (no UTC time datetime can hold) aren't passed on.
+    """
+    try:
+        aware = value.utcoffset() is not None
+        encoded = value.astimezone(UTC).isoformat() if aware else None
+    except (ValueError, TypeError):
+        failure = "a query datetime's tzinfo gives no usable offset"
+    except OverflowError:
+        failure = "a query datetime has no UTC time datetime can hold"
+    else:
+        if encoded is not None:
+            return encoded
+        failure = "a query datetime must be timezone-aware"
+    raise ValueError(failure)
 
 
 def _quote_segment(segment: str) -> str:

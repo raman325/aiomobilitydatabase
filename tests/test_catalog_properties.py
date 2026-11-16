@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import copy
 import math
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -461,3 +461,43 @@ def test_a_query_datetime_with_no_utc_time_is_refused(value: datetime) -> None:
     ValueError, not an OverflowError."""
     with pytest.raises(ValueError, match="UTC"):
         encode_params({"downloaded_after": value})
+
+
+class _ShownInt(int):
+    def __repr__(self) -> str:
+        return "nope"
+
+    __str__ = __repr__
+
+
+class _ShownFloat(float):
+    def __repr__(self) -> str:
+        return "np.float64(2.5)"  # numpy 2's spelling
+
+    __str__ = __repr__
+
+
+class _ShownStr(str):
+    def __str__(self) -> str:
+        return "other"
+
+
+def test_a_number_or_text_subclass_is_sent_as_its_value() -> None:
+    """Its own repr or str would be sent as the value: the base spelling is."""
+    assert encode_params(
+        {"limit": _ShownInt(3), "lat": _ShownFloat(2.5), "q": _ShownStr("x")}
+    ) == {"limit": "3", "lat": "2.5", "q": "x"}
+
+
+class _BrokenZone(tzinfo):
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        return timedelta(days=2)  # past the +-24h datetime allows
+
+    def dst(self, dt: datetime | None) -> None:
+        return None
+
+
+def test_a_datetime_whose_tzinfo_is_broken_is_refused_in_the_librarys_words() -> None:
+    with pytest.raises(ValueError, match="no usable offset") as caught:
+        encode_params({"downloaded_after": datetime(2024, 1, 1, tzinfo=_BrokenZone())})
+    assert caught.value.__context__ is None

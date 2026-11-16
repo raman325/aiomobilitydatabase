@@ -94,13 +94,17 @@ def test_a_refresh_token_that_isnt_text_is_refused(token: Any) -> None:
         MobilityDatabaseClient(token)
 
 
-@pytest.mark.parametrize(
-    "timeout", [0, -1, math.nan, math.inf, -math.inf, 10**400, True, "5", None]
-)
-def test_a_request_timeout_that_isnt_a_positive_number_is_refused(
-    timeout: Any,
+@pytest.mark.parametrize("timeout", [0, -1, math.nan, math.inf, -math.inf, 10**400])
+def test_a_request_timeout_that_isnt_a_finite_positive_number_is_refused(
+    timeout: float,
 ) -> None:
     with pytest.raises(ValueError, match="request_timeout"):
+        MobilityDatabaseClient("t", request_timeout=timeout)
+
+
+@pytest.mark.parametrize("timeout", [True, "5", None, b"5"])
+def test_a_request_timeout_that_isnt_a_number_is_a_type_error(timeout: Any) -> None:
+    with pytest.raises(TypeError, match="request_timeout"):
         MobilityDatabaseClient("t", request_timeout=timeout)
 
 
