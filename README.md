@@ -289,9 +289,10 @@ Notes on direct mode:
   12h" of the service day, in elapsed time as GTFS specifies, so on a
   DST-change day they are off local midnight by the size of the jump. An
   open-ended query with no limit raises `ValueError`, as do a naive
-  (timezone-less) or unrepresentable `start`/`end`, and a `start` (less
-  `grace`) outside 0001-01-03 to 9999-12-01 UTC, where service days can
-  be dated, and a negative `grace`.
+  (timezone-less) or unrepresentable `start`/`end`, a window opening where
+  service days can't be dated (`start - grace` before 0001-01-03 00:00
+  UTC, or `start` at or after 9999-12-01 00:00 UTC), and a negative
+  `grace`.
   `end` bounds scheduled times (a realtime-only trip's `scheduled_time`,
   or its predicted time where it gives none); a delayed trip predicted
   past it still shows.

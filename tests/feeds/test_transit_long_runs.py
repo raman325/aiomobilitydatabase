@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from google.transit import gtfs_realtime_pb2
+from hypothesis import example, given
+from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds import transit as transit_module
 from aiomobilitydatabase.feeds.models import ArrivalsQuery, StopArrival, TripQuery
@@ -796,6 +798,9 @@ def test_a_year_one_service_day_never_raises_the_ceiling() -> None:
     index.close()
 
 
+_UNDATABLE = r"start - grace must be at or after|must not be negative"
+
+
 @pytest.mark.parametrize(
     ("timezone", "start", "grace"),
     [
@@ -822,18 +827,16 @@ def test_a_start_outside_the_dated_range_is_rejected(
     )
 
     async def body(handle: TransitFeedHandle) -> None:
-        with pytest.raises(ValueError, match=r"must fall between|must not be negative"):
+        with pytest.raises(ValueError, match=_UNDATABLE):
             await handle.get_arrivals(
                 [ArrivalsQuery(["A"], limit=1)], start=start, grace=grace
             )
-        with pytest.raises(ValueError, match=r"must fall between|must not be negative"):
+        with pytest.raises(ValueError, match=_UNDATABLE):
             await handle.get_upcoming_trips(
                 [TripQuery("A", "B", limit=1)], start=start, grace=grace
             )
         if not grace:
-            with pytest.raises(
-                ValueError, match=r"must fall between|must not be negative"
-            ):
+            with pytest.raises(ValueError, match=_UNDATABLE):
                 await handle.get_scheduled_departures(
                     [ArrivalsQuery(["A"], limit=1)], start=start
                 )
@@ -1109,6 +1112,73 @@ def test_the_window_itself_rejects_a_negative_grace() -> None:
         transit_module._utc_window(
             datetime(2026, 6, 10, tzinfo=UTC), None, timedelta(hours=-2)
         )
+
+
+_FLOOR = datetime(1, 1, 3, tzinfo=UTC)
+_CEILING = datetime(9999, 12, 1, tzinfo=UTC)
+_TICK = timedelta(microseconds=1)
+
+
+@pytest.mark.parametrize(
+    ("start", "grace", "accepted"),
+    [
+        # start - grace may sit exactly on the floor, not a tick before it.
+        (_FLOOR, timedelta(0), True),
+        (_FLOOR + timedelta(hours=1), timedelta(hours=1), True),
+        (_FLOOR - _TICK, timedelta(0), False),
+        (_FLOOR + timedelta(hours=1), timedelta(hours=1) + _TICK, False),
+        # start must be before the ceiling, whatever grace reaches back.
+        (_CEILING - _TICK, timedelta(0), True),
+        (_CEILING - _TICK, timedelta(days=30), True),
+        (_CEILING, timedelta(0), False),
+        (_CEILING, timedelta(days=30), False),
+    ],
+)
+def test_the_window_bounds_are_exactly_as_documented(
+    start: datetime, grace: timedelta, accepted: bool
+) -> None:
+    """``start - grace`` no earlier than 0001-01-03 00:00 UTC and ``start``
+    before 9999-12-01 00:00 UTC (excluded) -- the docstrings' and the
+    message's words."""
+    if accepted:
+        assert transit_module._utc_window(start, None, grace) == (start, None)
+    else:
+        with pytest.raises(ValueError) as caught:
+            transit_module._utc_window(start, None, grace)
+        assert str(caught.value) == (
+            "start - grace must be at or after 0001-01-03 00:00:00+00:00, and "
+            "start before 9999-12-01 00:00:00+00:00; "
+            f"got start={start!r}, grace={grace!r}"
+        )
+
+
+@given(
+    start=st.datetimes(
+        min_value=datetime(1, 1, 1),
+        timezones=st.just(UTC),
+    ),
+    grace=st.timedeltas(min_value=timedelta(0), max_value=timedelta(days=10)),
+)
+@example(start=_FLOOR, grace=timedelta(0))
+@example(start=_FLOOR, grace=_TICK)
+@example(start=_CEILING - _TICK, grace=timedelta(days=1))
+@example(start=_CEILING, grace=timedelta(days=1))
+def test_the_window_accepts_exactly_the_documented_range(
+    start: datetime, grace: timedelta
+) -> None:
+    """For any start and grace: accepted iff start - grace >= the floor and
+    start < the ceiling."""
+    try:
+        opens = start - grace >= _FLOOR
+    except OverflowError:  # reaches back past datetime itself
+        opens = False
+    expected = opens and start < _CEILING
+    try:
+        transit_module._utc_window(start, None, grace)
+    except ValueError:
+        assert not expected
+    else:
+        assert expected
 
 
 def test_a_stop_time_longer_than_datetime_spans_crashes_nothing() -> None:
