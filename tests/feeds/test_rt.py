@@ -1,15 +1,21 @@
 """Tests for GTFS-RT fetching (auth, errors) and protobuf parsing."""
 
 import asyncio
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
+from pathlib import Path
 
 import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from google.transit import gtfs_realtime_pb2
+from hypothesis import given
+from hypothesis import strategies as st
 from yarl import URL
 
 from aiomobilitydatabase.feeds import _redirects as redirects_module
@@ -35,6 +41,7 @@ from aiomobilitydatabase.feeds.rt import (
     TripUpdateEntry,
     _lenient_service_date,
     _lenient_start_secs,
+    _parse_feed_message,
     _pb_enum_name,
     _vocab_or_none,
     alerts_from_message,
@@ -125,6 +132,120 @@ async def test_fetch_garbage_maps_to_feed_parse_error(mock_api: MockApi) -> None
     mock_api.get("/rt", body=b"\x00\x01 not protobuf \xff" * 10, content_type=PB)
     with pytest.raises(FeedParseError):
         await _fetch(mock_api)
+
+
+def _with_string_bytes(field: str, payload: bytes) -> bytes:
+    """A serialized FeedMessage whose string ``field`` holds ``payload``.
+
+    The field is filled with a placeholder of the payload's length, then
+    the placeholder's bytes are swapped for it: the length prefix stays
+    right, so the protobuf framing is intact whatever the bytes are.
+    """
+    placeholder = "~" * len(payload)
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    entity = message.entity.add()
+    entity.id = "e1"
+    if field == "header.gtfs_realtime_version":
+        message.header.gtfs_realtime_version = placeholder
+    elif field == "entity.id":
+        entity.id = placeholder
+    elif field == "trip.start_time":
+        entity.trip_update.trip.trip_id = "T"
+        entity.trip_update.trip.start_time = placeholder
+    elif field == "trip.trip_id":
+        entity.trip_update.trip.trip_id = placeholder
+    elif field == "alert.header_text":
+        entity.alert.header_text.translation.add(text=placeholder, language="en")
+    elif field == "trip_modifications.service_dates":  # a repeated string
+        entity.trip_modifications.service_dates.extend(["20260730", placeholder])
+    raw = message.SerializeToString()
+    assert raw.count(placeholder.encode()) == 1
+    return raw.replace(placeholder.encode(), payload)
+
+
+_STRING_FIELDS = [
+    "header.gtfs_realtime_version",
+    "entity.id",
+    "trip.start_time",
+    "trip.trip_id",
+    "alert.header_text",
+    "trip_modifications.service_dates",
+]
+
+
+@pytest.mark.parametrize("field", _STRING_FIELDS)
+async def test_a_string_field_that_isnt_utf_8_is_a_feed_parse_error(
+    mock_api: MockApi, field: str
+) -> None:
+    """A protobuf string is UTF-8 text: a feed carrying other bytes in one
+    is malformed. upb parsed it and handed back bytes, on which reading a
+    start_time raised a bare TypeError; the pure-Python runtime raises
+    while parsing. Either way the library raises FeedParseError, chaining
+    nothing."""
+    mock_api.get("/rt", body=_with_string_bytes(field, b"\xff\xfe:00"), content_type=PB)
+    with pytest.raises(FeedParseError, match="Undecodable GTFS-RT protobuf") as caught:
+        await _fetch(mock_api)
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+@given(
+    field=st.sampled_from(_STRING_FIELDS), payload=st.binary(min_size=1, max_size=12)
+)
+def test_a_feed_parses_exactly_when_its_strings_are_utf_8(
+    field: str, payload: bytes
+) -> None:
+    """Whatever bytes a string field holds: UTF-8 text parses (and reads
+    back as that text); anything else refuses the whole message."""
+    try:
+        text: str | None = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    message = gtfs_realtime_pb2.FeedMessage()
+    try:
+        parsed = _parse_feed_message(message, _with_string_bytes(field, payload))
+    except Exception:  # the pure-Python runtime refuses while parsing
+        parsed = False
+    assert parsed is (text is not None)
+    if field == "trip.start_time" and text is not None:
+        assert message.entity[0].trip_update.trip.start_time == text
+
+
+_PURE_PYTHON_CHECK = """
+from google.protobuf.internal import api_implementation
+from google.transit import gtfs_realtime_pb2
+from aiomobilitydatabase.feeds.rt import _parse_feed_message
+from tests.feeds.test_rt import _STRING_FIELDS, _with_string_bytes
+
+assert api_implementation.Type() == "python", api_implementation.Type()
+for field in _STRING_FIELDS:
+    for payload, expected in ((b"\\xff\\xfe:00", False), ("é:00".encode(), True)):
+        message = gtfs_realtime_pb2.FeedMessage()
+        try:
+            parsed = _parse_feed_message(message, _with_string_bytes(field, payload))
+        except Exception:
+            parsed = False
+        assert parsed is expected, (field, payload)
+print("ok")
+"""
+
+
+def test_the_pure_python_protobuf_runtime_refuses_the_same_feeds() -> None:
+    """The check holds on the pure-Python runtime too (chosen at import,
+    hence a fresh interpreter), where the parse itself refuses."""
+    env = {**os.environ, "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"}
+    result = subprocess.run(
+        [sys.executable, "-c", _PURE_PYTHON_CHECK],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+        cwd=Path(__file__).resolve().parents[2],  # where ``tests`` imports from
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
 
 
 async def test_fetch_rejects_non_http_scheme() -> None:

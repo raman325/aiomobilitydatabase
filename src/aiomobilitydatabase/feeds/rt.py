@@ -282,11 +282,9 @@ async def fetch_feed_message(
         answered = str(resp.url)
     message = gtfs_realtime_pb2.FeedMessage()
     try:
-        await asyncio.to_thread(message.ParseFromString, raw)
+        decoded = await asyncio.to_thread(_parse_feed_message, message, raw)
     except Exception:  # DecodeError subclasses Exception, not a shared base
         decoded = False
-    else:
-        decoded = True
     if not decoded:  # outside the except: nothing of the error rides along
         raise FeedParseError("Undecodable GTFS-RT protobuf", url=shown)
     return Response(
@@ -309,6 +307,32 @@ _RT_WHEELCHAIR = {
     "WHEELCHAIR_INACCESSIBLE": WheelchairAccess.NOT_POSSIBLE,
     "UNKNOWN": WheelchairAccess.UNKNOWN,
 }
+
+
+def _parse_feed_message(message: gtfs_realtime_pb2.FeedMessage, raw: bytes) -> bool:
+    """Parse ``raw`` into ``message``; False when a string field isn't text.
+
+    A protobuf ``string`` is UTF-8 text by the language's definition, so a
+    feed carrying other bytes in one is malformed, whichever runtime reads
+    it: the pure-Python one raises while parsing, but upb accepts a proto2
+    string's invalid UTF-8 and hands it back as ``bytes``, which every
+    reader downstream (start_time, ids, translations) would trip on. Every
+    string field is checked once here -- extensions a loaded module
+    registers included -- so no reader needs to.
+    """
+    message.ParseFromString(raw)
+    pending: list[Any] = [message]
+    while pending:
+        for described, value in pending.pop().ListFields():
+            if described.type == described.TYPE_STRING:
+                # A singular field's value, or a repeated field's container.
+                values = (value,) if isinstance(value, str | bytes) else value
+                if not all(isinstance(item, str) for item in values):
+                    return False
+            elif described.type in (described.TYPE_MESSAGE, described.TYPE_GROUP):
+                singular = hasattr(value, "ListFields")
+                pending.extend((value,) if singular else value)
+    return True
 
 
 def _rt_wheelchair(
