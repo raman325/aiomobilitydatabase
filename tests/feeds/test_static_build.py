@@ -6,6 +6,8 @@ import sqlite3
 import traceback
 import zipfile
 from collections.abc import Mapping
+from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds._numbers import exact_number
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import StopLocationType
 from aiomobilitydatabase.feeds.static_index import (
@@ -1017,6 +1020,11 @@ def test_an_ascii_decimal_coordinate_reads_as_written(
         (3, "180.0001"),
         (3, "-181"),
         (3, "1e300"),
+        # Past the limit as written, though each one's double is the limit.
+        (2, "90.000000000000001"),
+        (2, "-90.0000000000000000000000000001"),
+        (3, "180.00000000000001"),
+        (3, "-1800000000000000000000000000001e-28"),
     ],
 )
 def test_a_coordinate_outside_wgs84_fails_the_build(
@@ -1033,7 +1041,15 @@ def test_a_coordinate_outside_wgs84_fails_the_build(
 
 
 @pytest.mark.parametrize(
-    ("lat", "lon"), [("90", "180"), ("-90", "-180"), ("+90.0", "-180.000")]
+    ("lat", "lon"),
+    [
+        ("90", "180"),
+        ("-90", "-180"),
+        ("+90.0", "-180.000"),
+        ("9e1", "18000000000000000000000000000000e-29"),
+        # Inside as written; its double is the limit, which is a place.
+        ("89.99999999999999999", "-179.99999999999999999"),
+    ],
 )
 def test_the_wgs84_edges_are_coordinates(tmp_path: Path, lat: str, lon: str) -> None:
     files = dict(_FILES)
@@ -1046,6 +1062,50 @@ def test_the_wgs84_edges_are_coordinates(tmp_path: Path, lat: str, lon: str) -> 
     )
     assert (stored[2], stored[3]) == (float(lat), float(lon))
     index.close()
+
+
+_LIMIT_OFFSETS = st.integers(1, 40).map(lambda places: Decimal(10) ** -places)
+
+
+@given(
+    limit=st.sampled_from([90, 180]),
+    side=st.sampled_from([-1, 1]),
+    offset=st.one_of(_LIMIT_OFFSETS, _LIMIT_OFFSETS.map(lambda d: -d), st.just(0)),
+    spelling=st.sampled_from(["plain", "exponent"]),
+)
+def test_a_coordinate_is_in_range_exactly_as_written(
+    limit: int, side: int, offset: Decimal, spelling: str
+) -> None:
+    """At any distance from either limit, however small: refused iff the
+    text's own value is past it -- even where its double is the limit."""
+    value = side * (limit + offset)
+    text = f"{value:f}" if spelling == "plain" else f"{value:E}"
+    inside = abs(Fraction(text)) <= limit  # an exact oracle, not Decimal
+    if inside:
+        assert _coordinate(text, "stop_lat", limit) == float(text)
+    else:
+        with pytest.raises(ValueError, match="outside"):
+            _coordinate(text, "stop_lat", limit)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("90.000000000000001", Decimal("90.000000000000001")),
+        (" -.5e1\t", Decimal(-5)),
+        # Exponents past what Decimal holds: infinitely far, or zero.
+        ("9e9999999999999999999999", Decimal("Infinity")),
+        ("-9e9999999999999999999999", Decimal("-Infinity")),
+        ("9e-9999999999999999999999", Decimal(0)),
+        ("0.0e9999999999999999999999", Decimal(0)),
+        ("1_0", None),
+        ("nan", None),
+    ],
+)
+def test_exact_number_reads_the_value_as_written(
+    text: str, expected: Decimal | None
+) -> None:
+    assert exact_number(text) == expected
 
 
 # -- A row shorter than its header is malformed, in every file --------------------

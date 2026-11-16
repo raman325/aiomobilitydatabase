@@ -533,7 +533,8 @@ Notes on direct mode:
   groups with their `stop_ids`), and `transit.booking_rules` (every
   `booking_rules.txt` column; `BookingType` for `booking_type`). A Feature
   without an id, or with a geometry that is not a well-formed Polygon or
-  MultiPolygon, is skipped whole -- including a polygon that is not valid as
+  MultiPolygon (a position past ±90/±180 as written counts, as for stops), is
+  skipped whole -- including a polygon that is not valid as
   GTFS-Flex requires (OGC Simple Features 6.1.11): a ring crossing itself or
   another, a hole outside its exterior or overlapping another hole, or holes
   touching the exterior and each other so as to cut the zone in two. A
@@ -724,7 +725,7 @@ each define their own subtree beneath it, so you can catch broadly
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
 | `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP, `.url`) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
-| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180) |
+| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
 
 The GBFS and GTFS-RT parse paths are **total** with respect to this table:

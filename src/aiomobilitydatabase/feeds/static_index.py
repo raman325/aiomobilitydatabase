@@ -20,6 +20,7 @@ import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from enum import IntEnum
 from pathlib import Path
 from typing import IO, Any, NamedTuple
@@ -28,7 +29,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .._json import loads as json_loads
 from ._booking import booking_window
-from ._numbers import ascii_number
+from ._numbers import ascii_number, exact_number
 from .exceptions import FeedParseError
 from .geo import polygon_is_valid
 from .models import (
@@ -268,14 +269,17 @@ def _coordinate(value: str, field: str, limit: float) -> float | None:
     limit]`` (90 for a latitude, 180 for a longitude: WGS84 has no other)
     raises ValueError, the build's FeedParseError, as an unreadable cell
     always has: a spelling float() alone would accept is no more a
-    coordinate than ``abc``, nor is latitude 200 a place.
+    coordinate than ``abc``, nor is latitude 200 a place. The range is
+    checked on the value as written, before it becomes a double:
+    ``90.000000000000001`` is past the pole, though its double is 90.0.
     """
     if not value.strip():
         return None
     parsed = ascii_number(value)  # spaces and tabs only: no Unicode strip
-    if parsed is None:
+    exact = exact_number(value)
+    if parsed is None or exact is None:
         raise _RefusedError(f"{field} is not a finite decimal number: {value!r}")
-    if not -limit <= parsed <= limit:
+    if not -limit <= exact <= limit:
         raise _RefusedError(f"{field} is outside -{limit} to {limit}: {value!r}")
     return parsed
 
@@ -595,21 +599,34 @@ def _json_member(archive: zipfile.ZipFile, filename: str) -> object:
     Through the shared strict decoder (:func:`.._json.loads`: strict UTF-8,
     unique names, no ``NaN``), keeping a string with a lone surrogate for the
     Feature it sits in to be judged (skipped, or the name None) rather than
-    the whole file. Integers parse as floats:
-    every number here is a coordinate, and
-    ``int`` refuses a digit string past CPython's length limit, which would
-    fail the whole file over one Feature's value (it is out of range, and
-    the Feature is skipped). RecursionError too: json raises it for arrays
-    nested deeper than the interpreter's stack, which a hostile file can do
-    in a few kilobytes.
+    the whole file. Every number parses as the exact Decimal it spells
+    (see :func:`._numbers.exact_number`): every number here is a
+    coordinate, whose range is checked as written before it becomes a
+    double, and ``int`` refuses a digit string past CPython's length limit,
+    which would fail the whole file over one Feature's value (it is out of
+    range, and the Feature is skipped). RecursionError too: json raises it
+    for arrays nested deeper than the interpreter's stack, which a hostile
+    file can do in a few kilobytes.
     """
     fp = _open_member(archive, filename)
     with fp:
         try:
-            return json_loads(fp.read(), parse_int=float, lone_surrogates=True)
+            return json_loads(
+                fp.read(),
+                parse_int=_json_number,
+                parse_float=_json_number,
+                lone_surrogates=True,
+            )
         except _READ_ERRORS as err:
             reason = _reason(err)
     raise FeedParseError(f"Malformed {filename}: {reason}")
+
+
+def _json_number(text: str) -> Decimal:
+    """One JSON number token as the exact value it spells."""
+    number = exact_number(text)
+    assert number is not None  # JSON's number grammar is a subset of ours
+    return number
 
 
 # A GeoJSON linear ring "is a closed LineString with four or more positions".
@@ -624,9 +641,10 @@ def _ring(value: object) -> _Ring | None:
     """One GeoJSON linear ring as ``[latitude, longitude]`` pairs, or None.
 
     Each position is an array of numbers, ``[longitude, latitude]`` in
-    range with an optional altitude after (ignored); the ring has four or
-    more positions and is closed -- its first and last positions "MUST
-    contain identical values" -- as RFC 7946 requires. Winding order is not
+    range -- as written, before it becomes a double, as for stops.txt --
+    with an optional altitude after (ignored); the ring has four or more
+    positions and is closed -- its first and last positions "MUST contain
+    identical values" -- as RFC 7946 requires. Winding order is not
     checked: "parsers SHOULD NOT reject Polygons that do not follow the
     right-hand rule".
     """
@@ -641,15 +659,15 @@ def _ring(value: object) -> _Ring | None:
         if (
             not isinstance(position, list)
             or len(position) < 2  # noqa: PLR2004
-            or not all(type(number) is float for number in position)
+            or not all(type(number) is Decimal for number in position)
         ):
-            return None  # parse_int=float: every JSON number is a float here
+            return None  # see _json_member: every JSON number is a Decimal here
         lon, lat = position[0], position[1]
         if not (-_MAX_LONGITUDE <= lon <= _MAX_LONGITUDE) or not (
             -_MAX_LATITUDE <= lat <= _MAX_LATITUDE
         ):
             return None
-        ring.append([lat, lon])
+        ring.append([float(lat), float(lon)])
     return ring
 
 
