@@ -184,7 +184,7 @@ async def test_document_fetch_unreachable_raises_source_connection_error(
     mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
     mock_api.get("/v1/gbfs_feeds/gbfs-300", payload=feed)
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
-    with pytest.raises(SourceConnectionError, match="Error fetching"):
+    with pytest.raises(SourceConnectionError, match="Request failed"):
         await handle.get_system_info()
 
 

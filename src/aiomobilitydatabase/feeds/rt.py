@@ -13,11 +13,12 @@ from typing import Any
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
+from .._http import is_text, is_token
 from ._freshness import Response, Validators, header_fields, request_fields
 from ._freshness import hops as _hops
 from ._language import is_preferred_language
-from ._redirects import get_withholding
-from ._urls import _require_http_url
+from ._redirects import get_withholding, network
+from ._urls import _require_http_url, redact
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
     AlertCause,
@@ -107,6 +108,35 @@ def _vocab_or_none[StrEnumT: StrEnum](
         return None
 
 
+# Header names catalog data may not use for an API key: each one changes
+# where the request goes, how it is framed, or what is answered (RFC 9110
+# sections 7.2, 7.6.1, 8.6, 13 and 14; RFC 9112 section 6), so a key under
+# it is a different request -- or reaches a proxy instead of the producer.
+_RESERVED_HEADERS = frozenset(
+    {
+        "connection",
+        "content-encoding",
+        "content-length",
+        "content-type",
+        "expect",
+        "host",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "range",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+
 def _feed_request(
     auth_type: int | None,
     api_key_name: str | None,
@@ -120,9 +150,27 @@ def _feed_request(
     params: dict[str, str] = {}
     req_headers: dict[str, str] = dict(headers) if headers else {}
     if api_key is not None and api_key_name:
+        # The name is catalog data, and a bad one doesn't always raise: yarl
+        # drops a lone surrogate from a query name, and compiled aiohttp from
+        # a header name (or sends X:Key, which the server reads as X) -- a
+        # different request, not an error. Refused, the name kept out of
+        # the message.
         if auth_type == _AUTH_TYPE_QUERY_PARAM:
+            if not is_text(api_key_name):
+                raise SourceConnectionError(
+                    "The feed's api_key_parameter_name isn't text"
+                )
             params[api_key_name] = api_key
         elif auth_type == _AUTH_TYPE_HEADER:
+            if not is_token(api_key_name):
+                raise SourceConnectionError(
+                    "The feed's api_key_parameter_name is no header field name"
+                )
+            if api_key_name.lower() in _RESERVED_HEADERS:
+                raise SourceConnectionError(
+                    "The feed's api_key_parameter_name names a header that "
+                    "changes the request, not one an API key can go in"
+                )
             req_headers[api_key_name] = api_key
     return params, req_headers
 
@@ -141,6 +189,7 @@ def feed_request_fields(
     Unconditional: what a stored response's Vary is matched against (see
     :func:`~._freshness.request_fields`; None when they can't be known).
     """
+    _require_http_url(url, "GTFS-RT producer URL")  # request_fields parses it
     _params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
     return request_fields(session, url, req_headers)
 
@@ -178,62 +227,68 @@ async def fetch_feed_message(
     params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
     requested_at = datetime.now(UTC)
     secret = api_key_name if auth_type == _AUTH_TYPE_HEADER and api_key else None
-    try:
-        async with get_withholding(
-            session,
-            url,
-            params=params,
-            headers=req_headers,
-            total=timeout_seconds,
-            secret=secret,
-            conditional=None if validators is None else validators.request_headers(),
-            conditional_url=None if validators is None else validators.url,
-        ) as (resp, history):
-            received_at = datetime.now(UTC)
-            if resp.status in _AUTH_STATUSES:
-                raise SourceAuthenticationError(
-                    f"Producer rejected credentials ({resp.status}): {url}"
-                )
-            fields = header_fields(resp.headers)
-            # 304 is the producer confirming the bytes are unchanged, so
-            # reusing the previous parse is not a staleness risk.
-            if resp.status == HTTPStatus.NOT_MODIFIED:
-                if validators is None:
-                    # Unsolicited: there is no previous parse to reuse. A
-                    # misbehaving proxy must raise the library's own error.
-                    raise SourceConnectionError(
-                        f"Producer answered 304 to an unconditional request: {url}",
-                        status=int(HTTPStatus.NOT_MODIFIED),
-                    )
-                return Response(
-                    value=None,
-                    fields=fields,
-                    requested_at=requested_at,
-                    received_at=received_at,
-                    hops=_hops(resp, history),
-                    url=str(resp.url),
-                )
-            if resp.status >= HTTPStatus.BAD_REQUEST:
+    shown = redact(url)
+    async with get_withholding(
+        session,
+        url,
+        params=params,
+        headers=req_headers,
+        total=timeout_seconds,
+        secret=secret,
+        conditional=None if validators is None else validators.request_headers(),
+        conditional_url=None if validators is None else validators.url,
+    ) as (resp, history):
+        received_at = datetime.now(UTC)
+        if resp.status in _AUTH_STATUSES:
+            raise SourceAuthenticationError(
+                f"Producer rejected credentials ({resp.status})",
+                status=resp.status,
+                url=shown,
+            )
+        fields = header_fields(resp.headers)
+        # 304 is the producer confirming the bytes are unchanged, so
+        # reusing the previous parse is not a staleness risk.
+        if resp.status == HTTPStatus.NOT_MODIFIED:
+            if validators is None:
+                # Unsolicited: there is no previous parse to reuse. A
+                # misbehaving proxy must raise the library's own error.
                 raise SourceConnectionError(
-                    f"Producer error {resp.status}: {url}", status=resp.status
+                    "Producer answered 304 to an unconditional request",
+                    status=int(HTTPStatus.NOT_MODIFIED),
+                    url=shown,
                 )
-            if resp.status not in _FEED_STATUSES:
-                # A 204, a 300, a 3xx left unfollowed: no feed to parse (an
-                # empty body parses as an empty FeedMessage).
-                raise SourceConnectionError(
-                    f"Producer answered {resp.status} without a feed: {url}",
-                    status=resp.status,
-                )
-            raw = await resp.read()
-            hops = _hops(resp, history)
-            answered = str(resp.url)
-    except (TimeoutError, aiohttp.ClientError) as err:
-        raise SourceConnectionError(f"Error fetching {url}: {err}") from err
+            return Response(
+                value=None,
+                fields=fields,
+                requested_at=requested_at,
+                received_at=received_at,
+                hops=_hops(resp, history),
+                url=str(resp.url),
+            )
+        if resp.status >= HTTPStatus.BAD_REQUEST:
+            raise SourceConnectionError(
+                f"Producer error {resp.status}", status=resp.status, url=shown
+            )
+        if resp.status not in _FEED_STATUSES:
+            # A 204, a 300, a 3xx left unfollowed: no feed to parse (an
+            # empty body parses as an empty FeedMessage).
+            raise SourceConnectionError(
+                f"Producer answered {resp.status} without a feed",
+                status=resp.status,
+                url=shown,
+            )
+        raw = await network(resp.read(), url)
+        hops = _hops(resp, history)
+        answered = str(resp.url)
     message = gtfs_realtime_pb2.FeedMessage()
     try:
         await asyncio.to_thread(message.ParseFromString, raw)
-    except Exception as err:  # DecodeError subclasses Exception, not a shared base
-        raise FeedParseError(f"Undecodable GTFS-RT protobuf from {url}") from err
+    except Exception:  # DecodeError subclasses Exception, not a shared base
+        decoded = False
+    else:
+        decoded = True
+    if not decoded:  # outside the except: nothing of the error rides along
+        raise FeedParseError("Undecodable GTFS-RT protobuf", url=shown)
     return Response(
         value=message,
         fields=fields,

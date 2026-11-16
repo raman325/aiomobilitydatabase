@@ -1,47 +1,83 @@
-"""GET with redirects followed by hand, withholding headers they mustn't carry.
+"""The feeds' network boundary: every request, and every redirect, by hand.
 
-aiohttp drops Authorization, Cookie and Proxy-Authorization when a
-redirect leaves the origin, but forwards every other header -- including
-a header-auth API key, and the cache's own validators. RFC 9110 section
-15.4 says to remove both: fields with security implications when the
-origin changes, and validators the cache added on any redirect. A
-request carrying either is fetched through here.
+Two rules keep producer-controlled input from escaping as a bare exception
+or reaching another URL than the producer named:
+
+- :func:`network` is the only place a network await can fail. Whatever
+  aiohttp or yarl raise there -- which exceptions they raise varies by
+  version and build -- is a :class:`SourceConnectionError` named by its type
+  alone, raised after the ``except`` so not even its context rides along:
+  its text can quote the request, a credential with it. Only network
+  awaits go through it, never a caller's callback or a file write, which
+  keep their own exceptions.
+- :func:`get_withholding` follows every redirect itself, through one loop:
+  each Location is checked like a first URL (:func:`._urls.require_requestable`)
+  before anything is sent to it. aiohttp never follows one, so no hop can
+  skip the check. The loop also withholds, from the first hop to another
+  origin on, what RFC 9110 section 15.4 says to remove there: fields with
+  security implications (a header-auth secret, and the Authorization, Cookie
+  and Proxy-Authorization aiohttp would drop) and validators the cache added.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 from time import monotonic
 
 import aiohttp
 from yarl import URL
 
-from .exceptions import SourceConnectionError
+from .._http import CREDENTIAL_HEADERS, REQUEST_OPTIONS, URL_ERRORS, require_session
+from ._urls import _require_http_url, redact, require_requestable
+from .exceptions import MobilityFeedsError, SourceConnectionError
 
 # aiohttp's own redirect limit: the tenth redirect raises.
 _MAX_REDIRECTS = 10
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-# Credentials aiohttp itself drops when a redirect leaves the origin.
-_ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization"})
+
+
+async def network[T](awaitable: Awaitable[T], url: str) -> T:
+    """Await one network step; any failure is SourceConnectionError.
+
+    The boundary (see the module docstring): a library error passes
+    through, anything else is named by type, without its text.
+    """
+    try:
+        return await awaitable
+    except MobilityFeedsError:
+        raise
+    except Exception as err:
+        failure = type(err).__name__
+    # Outside the except: from None would only hide the original, still
+    # attached as the context.
+    raise SourceConnectionError(f"Request failed ({failure})", url=redact(url))
 
 
 def _origin(url: URL) -> tuple[str, str | None, int | None]:
     """RFC 6454 origin: an explicit default port names the same origin.
 
     (yarl's ``URL.origin()`` keeps an explicit ``:443``, so it can't be
-    compared directly.)
+    compared directly.) The host in its ASCII form, as RFC 6454 compares
+    it: decoding punycode (``url.host``) raises for a label such as
+    ``xn--`` that a request can still be made to.
     """
-    return url.scheme, url.host, url.port
+    return url.scheme, url.raw_host, url.port
 
 
-def _remaining(deadline: float | None) -> float | None:
+def same_origin(a: str, b: str) -> bool:
+    """Return whether two checked URLs share an RFC 6454 origin."""
+    return _origin(URL(a)) == _origin(URL(b))
+
+
+def _remaining(deadline: float | None, url: str) -> float | None:
     """Seconds left before ``deadline`` (None: no bound); none left raises."""
     if deadline is None:
         return None
     remaining = deadline - monotonic()
     if remaining <= 0:
-        raise TimeoutError
+        raise SourceConnectionError("Request timed out", url=redact(url))
     return remaining
 
 
@@ -61,19 +97,27 @@ def _same_resource(target: URL, query: Mapping[str, str] | None, other: URL) -> 
 
 
 def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str) -> URL:
-    """Resolve a Location as aiohttp does; only an HTTP(S) URL is followed."""
+    """Resolve a Location as aiohttp would; refuse what no request can go to.
+
+    The same checks as a first URL: UTF-8 text (yarl drops a lone surrogate,
+    naming another URL), a host the resolver can encode, credentials Basic
+    auth can carry -- and an http(s) scheme.
+    """
     try:
+        location.encode("utf-8")
         following = base.join(URL(location, encoded=not session.requote_redirect_url))
-        _origin(following)
-    except ValueError as err:
+        require_requestable(following)
+    except URL_ERRORS:
+        pass
+    else:
+        if following.scheme in ("http", "https"):
+            return following
         raise SourceConnectionError(
-            f"Producer redirected to an invalid URL ({location!r}): {url}"
-        ) from err
-    if following.scheme not in ("http", "https"):
-        raise SourceConnectionError(
-            f"Producer redirected to a non-HTTP URL ({following}): {url}"
+            "Producer redirected to a non-HTTP URL", url=redact(url)
         )
-    return following
+    raise SourceConnectionError(
+        "Producer redirected to an invalid URL", url=redact(url)
+    )
 
 
 @asynccontextmanager
@@ -87,67 +131,64 @@ async def get_withholding(
     secret: str | None,
     conditional: Mapping[str, str] | None = None,
     conditional_url: str | None = None,
+    method: str = "GET",
+    sock_read: float | None = None,
 ) -> AsyncIterator[tuple[aiohttp.ClientResponse, Sequence[aiohttp.ClientResponse]]]:
-    """GET ``url``; yield the final response and the redirects followed.
+    """Request ``url``; yield the final response and the redirects followed.
+
+    Every redirect is followed here (see the module docstring), up to
+    aiohttp's own limit. From the first hop to another origin on, the
+    ``secret`` header is never sent again, nor are the Authorization, Cookie
+    and Proxy-Authorization headers aiohttp drops there, nor credentials in
+    the URL (which, as on aiohttp's redirects, follow hops within their
+    origin). The session itself carries no credential (the shared policy,
+    :func:`.._http.require_session`, checked here too), so there is none of
+    its own to shed.
 
     ``conditional`` are the cache's validators (If-None-Match and
     If-Modified-Since), for the resource at ``conditional_url`` (None:
     ``url``): sent only on a hop asking for exactly that resource. Never
     carried along a redirect to another (RFC 9110 section 15.4 step 2.4),
     and never sent to a URL that redirected to the one they came from
-    (RFC 9111 section 4.3.1) -- whose own request then gets them. Where a
-    hop by hand can't withhold the session's own credentials (below) and
-    no ``secret`` is at stake, the request is made again unconditionally,
-    aiohttp following the redirects and dropping them itself.
+    (RFC 9111 section 4.3.1) -- whose own request then gets them.
 
-    Without a ``secret`` header or ``conditional`` aiohttp follows
-    redirects itself. Otherwise they are followed here: from the first hop
-    to another origin on, the secret is never sent again, nor are the
-    Authorization, Cookie and Proxy-Authorization headers aiohttp drops
-    there, nor credentials in the URL (which, as on aiohttp's redirects,
-    follow hops within their origin).
-
-    A session's own defaults among those (its ``auth`` or such default
-    headers) ride on every request it makes, so a hop to another origin
-    that would carry them fails instead (:class:`SourceConnectionError`):
-    following a redirect is optional (RFC 9110 section 15.4), sending
-    them on is not. So does a Location that isn't an HTTP(S) URL. The
-    redirects followed, their limit and how a Location resolves are
-    aiohttp's. ``total`` seconds bound the whole fetch, every hop and the
-    body read, as aiohttp's own ``total`` does (``None``, zero or less:
-    no bound).
+    ``total`` seconds bound every hop (``None``, zero or less: no bound);
+    ``sock_read`` bounds each read. A 303 turns a request other than HEAD
+    into a GET (RFC 9110 section 15.4.4). The caller reads the body through
+    :func:`network`.
     """
-    if secret is None and not conditional:
-        async with session.get(
-            url,
-            params=params or None,
-            headers=headers or None,
-            timeout=aiohttp.ClientTimeout(total=total),
-        ) as response:
-            yield response, response.history
-        return
+    if session.closed:
+        raise RuntimeError("the session is closed")  # the caller's, not a source's
+    require_session(session)
+    # Callers check first, naming what they fetch; checked here too, so no
+    # path reaches the network with a URL yarl would change or can't send.
+    _require_http_url(url, "a URL")
     deadline = monotonic() + total if total is not None and total > 0 else None
-    withheld = _ORIGIN_CREDENTIALS | ({secret.lower()} if secret else set())
+    withheld = CREDENTIAL_HEADERS | ({secret.lower()} if secret else set())
     history: list[aiohttp.ClientResponse] = []
     target = URL(url)
     sent = dict(headers)
     validated = URL(conditional_url) if conditional_url is not None else target
     query = params or None
-    # Credentials in the URL: aiohttp sends them for the first hop, and its
-    # own redirects keep sending them while the chain stays in their origin.
+    # Credentials in the URL: sent for the first hop, and kept while the
+    # chain stays in their origin.
     userinfo = (target.user, target.password) if target.user is not None else None
     userinfo_origin = _origin(target)
     while True:
-        remaining = _remaining(deadline)
+        remaining = _remaining(deadline, url)
         # The validators go to the resource they came from, and only to it.
         asked = _same_resource(target, query, validated)
         hop_headers = {**sent, **conditional} if conditional and asked else sent
-        response = await session.get(
-            target,
-            params=query,
-            headers=hop_headers or None,
-            timeout=aiohttp.ClientTimeout(total=remaining),
-            allow_redirects=False,
+        response = await network(
+            session.request(
+                method,
+                target,
+                params=query,
+                headers=hop_headers or None,
+                timeout=aiohttp.ClientTimeout(total=remaining, sock_read=sock_read),
+                **REQUEST_OPTIONS,
+            ),
+            url,
         )
         location = response.headers.get("Location")
         if response.status not in _REDIRECT_STATUSES or location is None:
@@ -159,19 +200,10 @@ async def get_withholding(
         response.release()
         history.append(response)
         if len(history) >= _MAX_REDIRECTS:
-            raise SourceConnectionError(f"Too many redirects fetching {url}")
+            raise SourceConnectionError("Too many redirects", url=redact(url))
         following = _resolve(response.url, location, session, url)
         origin = _origin(following)
         if origin != _origin(response.url):
-            if session.auth is not None or any(
-                name.lower() in withheld for name in session.headers
-            ):
-                if secret is None:
-                    break  # only validators made this hand-followed: retry
-                raise SourceConnectionError(
-                    f"Producer redirected to another origin ({following.origin()}) "
-                    f"and the session carries credentials that can't be withheld: {url}"
-                )
             sent = {k: v for k, v in sent.items() if k.lower() not in withheld}
             userinfo = None
         if following.user is not None:
@@ -180,12 +212,6 @@ async def get_withholding(
             userinfo_origin = origin
         elif userinfo is not None and origin == userinfo_origin:
             following = following.with_user(userinfo[0]).with_password(userinfo[1])
+        if response.status == HTTPStatus.SEE_OTHER and method != "HEAD":
+            method = "GET"
         target, query = following, None
-    remaining = _remaining(deadline)
-    async with session.get(
-        url,
-        params=params or None,
-        headers=headers or None,
-        timeout=aiohttp.ClientTimeout(total=remaining),
-    ) as response:
-        yield response, response.history

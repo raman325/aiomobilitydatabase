@@ -213,8 +213,9 @@ Notes on direct mode:
   storage; direct mode fetches **your** URL, with the optional `headers`
   applied to the static download and every GTFS-RT/GBFS fetch the handle
   makes. Like any aiohttp request headers they follow redirects, to another
-  origin too (aiohttp drops only `Authorization`, `Cookie` and
-  `Proxy-Authorization` there).
+  origin too, except `Authorization`, `Cookie` and `Proxy-Authorization`,
+  which go to the URL's own origin only -- also when a GBFS discovery
+  document places an endpoint at another origin.
 - RT URLs are declared per layer (`trip_updates_urls`,
   `vehicle_positions_urls`, `service_alerts_urls`), so each operation only
   fetches sources that can serve it. A combined feed listed under several
@@ -640,11 +641,13 @@ Notes on direct mode:
 - **Producer authentication**: pass `api_key=` to `get_transit_feed()`; it is
   applied per the catalog's `authentication_type` (query parameter or header) —
   distinct from the refresh token used to authenticate with the catalog itself.
-  A header key is never sent to another origin: from the first redirect that
-  leaves the producer's origin on, it is left off, along with credentials in
-  the URL. If your session itself carries `Authorization`, `Cookie` or
-  `Proxy-Authorization` defaults (or `auth`), which can't be left off, such a
-  redirect fails with `SourceConnectionError` instead of being followed.
+  The one key goes to every GTFS-RT feed the catalog links to the handle and
+  marks as needing authentication, at each feed's own origin -- which can be
+  another vendor's than the agency's that issued the key, as the catalog
+  lists them. A redirect never carries a header key to another origin: from
+  the first redirect that leaves the feed's origin on, it is left off, along
+  with credentials in the URL. (A session carrying credentials of its own,
+  which couldn't be left off, is refused when the handle is made; see below.)
 - **Zones are circles** (matching Home Assistant zone entities); GBFS vehicle
   filtering happens client-side because GBFS feeds are full-system dumps by
   design, with no server-side geo-query.
@@ -718,7 +721,7 @@ each define their own subtree beneath it, so you can catch broadly
 | `MobilityDatabaseRateLimitError` | catalog | Rate limited (429) |
 | `MobilityDatabaseApiError` | catalog | Any other 4xx/5xx (carries `.status` and `.body`) |
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
-| `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP) |
+| `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP, `.url`) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
 | `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180) |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
@@ -758,6 +761,24 @@ a URL's credentials or query, or another library's error text (any of which
 can echo a token). A response's status and body are attributes
 (`MobilityDatabaseApiError.status`/`.body`, and on
 `MobilityDatabaseAuthenticationError` when the API answered) -- yours to log.
+
+So does a feeds handle factory, for a caller input outside its allowlist:
+`headers=` names must be tokens and their values visible ASCII, as must the
+`api_key`; an `Authorization` header can't go beside credentials in the URL.
+An injected session may carry no credential -- no `auth`, no
+`Authorization`, `Cookie` or `Proxy-Authorization` default, no cookie set
+without a domain (`ClientSession(cookies=...)`) -- since it would
+ride on every request, to every origin (pass credentials per request instead,
+in `headers=`).
+
+Exception messages are written by the library alone: never a URL, a response
+body, or another library's error text, any of which can carry a credential.
+`SourceConnectionError` and `FeedParseError` carry the URL asked for on
+`.url` (without credentials, query or fragment), and the HTTP status on
+`.status`. Every redirect is followed by the library, each target checked
+like the first URL; a hop to another origin sheds the request's credentials.
+(Messages from a static build may quote the dataset's own cells: published
+feed data, not anything sent or received over HTTP.)
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`

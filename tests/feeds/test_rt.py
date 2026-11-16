@@ -254,49 +254,65 @@ async def test_a_timeout_of_none_or_less_is_no_bound_with_or_without_header_auth
 
 
 @pytest.mark.parametrize(
-    "credential",
-    ["Authorization", "cookie", "Proxy-Authorization", "x-api-key", "auth"],
+    "credential", ["Authorization", "cookie", "Proxy-Authorization", "auth"]
 )
 # aiohttp 3.14 deprecates session ``auth``; older floors still have it.
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-async def test_session_credentials_fail_a_header_auth_hop_to_another_origin(
+async def test_a_session_carrying_a_credential_is_refused(
     mock_api: MockApi, credential: str
 ) -> None:
-    """A request can't shed its session's default credentials, and
-    following a redirect is optional: such a hop is never sent.
-    """
-    mock_api.get(
-        "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
-    )
+    """A session's auth or credential default rides on every request, to
+    every origin -- a redirect target's, the catalog API's -- where no
+    request can shed it: the shared policy refuses such a session (pass a
+    credential per request instead), before anything is sent."""
     options: dict[str, object] = (
         {"auth": aiohttp.BasicAuth("user", "pass")}
         if credential == "auth"
         else {"headers": {credential: "secret"}}
     )
     async with aiohttp.ClientSession(**options) as session:  # type: ignore[arg-type]
-        with pytest.raises(SourceConnectionError, match="credentials"):
-            await fetch_feed_message(
-                session,
-                mock_api.url("/rt"),
-                auth_type=2,
-                api_key_name="X-Api-Key",
-                api_key="secret123",
-            )
-    assert [r.path for r in mock_api.requests] == ["/rt"]
+        with pytest.raises(ValueError, match="every request"):
+            await fetch_feed_message(session, mock_api.url("/rt"))
+    assert mock_api.requests == []
 
 
-async def test_session_credentials_follow_a_header_auth_hop_within_the_origin(
+async def test_request_credentials_are_shed_at_a_hop_to_another_origin(
+    mock_api: MockApi,
+) -> None:
+    """Credentials passed per request -- a header-auth key and an
+    Authorization header -- stop at the origin they were addressed to."""
+    mock_api.get(
+        "/rt", status=302, headers={"Location": _elsewhere(mock_api.url("/rt/x"))}
+    )
+    mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
+    async with aiohttp.ClientSession() as session:
+        response = await fetch_feed_message(
+            session,
+            mock_api.url("/rt"),
+            auth_type=2,
+            api_key_name="X-Api-Key",
+            api_key="secret123",
+            headers={"Authorization": "Bearer s"},
+        )
+    assert response.value is not None
+    away = mock_api.requests[-1]
+    assert away.path == "/rt/x"
+    assert not {n.lower() for n in away.headers} & {"authorization", "x-api-key"}
+
+
+async def test_request_credentials_follow_a_hop_within_the_origin(
     mock_api: MockApi,
 ) -> None:
     mock_api.get("/rt", status=308, headers={"Location": "/rt/x"})
     mock_api.get("/rt/x", body=VEHICLE_POSITIONS, content_type=PB)
-    async with aiohttp.ClientSession(headers={"Authorization": "Bearer s"}) as session:
+    async with aiohttp.ClientSession() as session:
         await fetch_feed_message(
             session,
             mock_api.url("/rt"),
             auth_type=2,
             api_key_name="X-Api-Key",
             api_key="secret123",
+            headers={"Authorization": "Bearer s"},
         )
     assert mock_api.requests[1].headers["X-Api-Key"] == "secret123"
     assert mock_api.requests[1].headers["Authorization"] == "Bearer s"
@@ -390,7 +406,8 @@ async def test_the_timeout_bounds_the_whole_redirect_chain(
                 api_key="v",
                 timeout_seconds=1.0,
             )
-    assert isinstance(excinfo.value.__cause__, TimeoutError)
+    # Named by type only (the boundary passes no cause on).
+    assert "Timeout" in str(excinfo.value) or "timed out" in str(excinfo.value)
 
 
 async def test_a_deadline_spent_between_hops_sends_no_further_request(
@@ -453,12 +470,11 @@ async def test_a_query_auth_feed_is_revalidated_conditionally(
     assert all(r.query["k"] == "v" for r in mock_api.requests)
 
 
-async def test_a_credentialed_session_revalidates_across_origins_unconditionally(
+async def test_a_credentialed_fetch_revalidates_across_origins(
     mock_api: MockApi,
 ) -> None:
-    """Without a header key, a redirect away that a hand-made request can't
-    strip the session's credentials from is asked again unconditionally:
-    aiohttp follows it and drops them itself -- never a failure."""
+    """The hop away sheds the request's Authorization -- never a failure --
+    and revalidates the resource the validators came from."""
     url = mock_api.url("/rt")
     away = _elsewhere(mock_api.url("/rt/away"))
     for _ in range(3):
@@ -467,14 +483,18 @@ async def test_a_credentialed_session_revalidates_across_origins_unconditionally
     for _ in range(2):
         mock_api.get("/rt/away", body=VEHICLE_POSITIONS, content_type=PB, headers=fresh)
     cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache()
-    async with aiohttp.ClientSession(headers={"Authorization": "Bearer s"}) as session:
-        fetch = partial(fetch_feed_message, session, url)
+    async with aiohttp.ClientSession() as session:
+        fetch = partial(
+            fetch_feed_message, session, url, headers={"Authorization": "Bearer s"}
+        )
         await cache.get(url, fetch)
         assert len((await cache.get(url, fetch)).entity) == 2
     away_hits = [r.headers for r in mock_api.requests if r.path == "/rt/away"]
     assert len(away_hits) == 2
     assert not any("Authorization" in hit for hit in away_hits)
-    assert not any("If-None-Match" in hit for hit in away_hits)
+    # The validators came from /rt/away, so its own request revalidates
+    # (RFC 9111 section 4.3.1); the session's Authorization never crosses.
+    assert away_hits[1].get("If-None-Match") == '"v1"'
 
 
 def test_vehicles_from_message() -> None:

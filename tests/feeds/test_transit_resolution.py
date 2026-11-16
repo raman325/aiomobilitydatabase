@@ -121,7 +121,7 @@ async def test_hosted_dataset_unreachable_raises_source_connection_error(
     mock_api.get("/v1/feeds/mdb-100", payload=feed)
     mock_api.get("/v1/gtfs_feeds/mdb-100", payload=feed)
     mock_api.get("/v1/gtfs_feeds/mdb-100/gtfs_rt_feeds", payload=[])
-    with pytest.raises(SourceConnectionError, match="Error downloading dataset"):
+    with pytest.raises(SourceConnectionError, match="Request failed"):
         await feeds_client.get_transit_feed("mdb-100")
 
 

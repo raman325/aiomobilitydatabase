@@ -10,8 +10,8 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
-import aiohttp
-
+from .._http import CREDENTIAL_HEADERS
+from .._json import loads as json_loads
 from ._freshness import (
     FreshnessCache,
     Response,
@@ -22,8 +22,12 @@ from ._freshness import (
 from ._freshness import hops as _hops
 from ._frozen import FrozenDict
 from ._language import is_preferred_language
-from ._redirects import get_withholding
-from ._urls import _require_http_url  # deliberate friend access: shared URL guard
+from ._numbers import ascii_number
+from ._redirects import get_withholding, network, same_origin
+from ._urls import (  # deliberate friend access: shared URL guard
+    _require_http_url,
+    redact,
+)
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
 from .models import (
@@ -50,12 +54,15 @@ _RFC3339 = re.compile(
     r"((?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60))(\.[0-9]+)?"
     r"([Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
 )
+
+
 # GBFS Date: "ISO 8601 Complete Date Extended Format: YYYY-MM-DD".
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
 # Every whole number up to here is exactly a float, and back.
 _EXACT_FLOAT = 2**53
+_MALFORMED = object()  # json_loads refused the body
 
 
 def _record_id(value: Any) -> str | None:
@@ -107,9 +114,17 @@ def _localized(value: Any) -> str | None:
 
 
 def _version_key(version: str | None) -> tuple[int, ...]:
+    """Sort key of a GBFS version ("2.3", "3.0"); (0,) when it isn't one.
+
+    ASCII digits only: ``int()`` also reads other scripts' digits, spaces
+    and ``_`` grouping, so a corrupt "\uff13.0" would sort as 3.0.
+    """
+    parts = (version or "0").split(".")
+    if not all(part.isascii() and part.isdigit() for part in parts):
+        return (0,)
     try:
-        return tuple(int(part) for part in (version or "0").split("."))
-    except ValueError:
+        return tuple(int(part) for part in parts)
+    except ValueError:  # past CPython's int-string digit limit
         return (0,)
 
 
@@ -139,6 +154,8 @@ def _coordinate(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         return None
+    if isinstance(value, str):
+        return ascii_number(value)  # float() alone takes other scripts' digits
     try:
         coordinate = float(value)
     except (OverflowError, ValueError):
@@ -177,8 +194,11 @@ def _reported_at(value: Any) -> datetime | None:
     is REQUIRED (section 5.6): one without (``2026-07-31T12:13:20``), a
     bare date, or another ISO 8601 form names no instant, so None -- GBFS
     defines no default zone. A leap second (``:60``) reads as the second
-    before it. Anything else -- including a bool, which is an int in Python
-    -- degrades to None like every other malformed scalar at this boundary.
+    before it. The instant is returned in UTC, as every feeds-layer
+    timestamp is; one UTC can't hold (year 1 ahead of UTC, 9999 behind
+    it) is None. Anything else -- including a bool, which is an int in
+    Python -- degrades to None like every other malformed scalar at this
+    boundary.
     """
     if isinstance(value, bool):
         return None
@@ -193,8 +213,10 @@ def _reported_at(value: Any) -> datetime | None:
             clock = clock[:-2] + "59"
         offset = "+00:00" if offset in ("Z", "z") else offset
         try:
-            return datetime.fromisoformat(f"{day}T{clock}{fraction or ''}{offset}")
-        except ValueError:
+            return datetime.fromisoformat(
+                f"{day}T{clock}{fraction or ''}{offset}"
+            ).astimezone(UTC)
+        except (OverflowError, ValueError):
             return None
     return None
 
@@ -317,6 +339,9 @@ def _ttl_seconds(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         return None
+    if isinstance(value, str):
+        ttl = ascii_number(value)  # float() alone takes other scripts' digits
+        return ttl if ttl is not None and ttl >= 0 else None
     try:
         ttl = float(value)
     except (OverflowError, ValueError):
@@ -471,7 +496,11 @@ class GbfsFeedHandle:
         catalog lookup is needed — its feed list becomes the same endpoint
         table :meth:`create` builds from catalog version metadata.
         ``headers`` apply to the discovery fetch and every subsequent
-        document fetch made through this handle.
+        document fetch made through this handle -- except that Authorization,
+        Cookie and Proxy-Authorization go only to endpoints at the discovery
+        URL's own origin: the endpoint URLs are the producer's data, and a
+        credential addressed to one origin isn't sent to another (as on a
+        redirect, RFC 9110 section 15.4).
         """
         handle = cls(client, None, {}, headers=headers, discovery_url=discovery_url)
         await handle._endpoint_table()  # fetched now: a bad URL fails here
@@ -512,59 +541,60 @@ class GbfsFeedHandle:
         _require_http_url(url, context)
         session = client._get_session()  # deliberate friend access
         requested_at = datetime.now(UTC)
+        shown = redact(url)
+        async with get_withholding(
+            session,
+            url,
+            params={},
+            headers=dict(headers) if headers else {},
+            total=client.timeout_seconds,
+            secret=None,
+            conditional=None if validators is None else validators.request_headers(),
+            conditional_url=None if validators is None else validators.url,
+        ) as (resp, history):
+            received_at = datetime.now(UTC)
+            fields = header_fields(resp.headers)
+            if resp.status == HTTPStatus.NOT_MODIFIED:
+                if validators is None:
+                    raise SourceConnectionError(
+                        "GBFS endpoint answered 304 to an unconditional request",
+                        status=int(HTTPStatus.NOT_MODIFIED),
+                        url=shown,
+                    )
+                return Response(
+                    value=None,
+                    fields=fields,
+                    requested_at=requested_at,
+                    received_at=received_at,
+                    hops=_hops(resp, history),
+                    url=str(resp.url),
+                )
+            if resp.status >= HTTPStatus.BAD_REQUEST:
+                raise SourceConnectionError(
+                    f"GBFS endpoint error {resp.status}", status=resp.status, url=shown
+                )
+            if resp.status not in (
+                HTTPStatus.OK,
+                HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
+            ):
+                raise SourceConnectionError(
+                    f"GBFS endpoint answered {resp.status} without a document",
+                    status=resp.status,
+                    url=shown,
+                )
+            raw = await network(resp.read(), url)
+            hops = _hops(resp, history)
+            answered = str(resp.url)
         try:
-            async with get_withholding(
-                session,
-                url,
-                params={},
-                headers=dict(headers) if headers else {},
-                total=client.timeout_seconds,
-                secret=None,
-                conditional=(
-                    None if validators is None else validators.request_headers()
-                ),
-                conditional_url=None if validators is None else validators.url,
-            ) as (resp, history):
-                received_at = datetime.now(UTC)
-                fields = header_fields(resp.headers)
-                if resp.status == HTTPStatus.NOT_MODIFIED:
-                    if validators is None:
-                        raise SourceConnectionError(
-                            f"GBFS endpoint answered 304 to an unconditional "
-                            f"request: {url}",
-                            status=int(HTTPStatus.NOT_MODIFIED),
-                        )
-                    return Response(
-                        value=None,
-                        fields=fields,
-                        requested_at=requested_at,
-                        received_at=received_at,
-                        hops=_hops(resp, history),
-                        url=str(resp.url),
-                    )
-                if resp.status >= HTTPStatus.BAD_REQUEST:
-                    raise SourceConnectionError(
-                        f"GBFS endpoint error {resp.status}: {url}", status=resp.status
-                    )
-                if resp.status not in (
-                    HTTPStatus.OK,
-                    HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
-                ):
-                    raise SourceConnectionError(
-                        f"GBFS endpoint answered {resp.status} without a document: "
-                        f"{url}",
-                        status=resp.status,
-                    )
-                try:
-                    document = await resp.json(content_type=None)
-                except ValueError as err:
-                    raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
-                hops = _hops(resp, history)
-                answered = str(resp.url)
-        except (TimeoutError, aiohttp.ClientError) as err:
-            raise SourceConnectionError(f"Error fetching {url}: {err}") from err
+            document = json_loads(raw)
+        except ValueError:
+            # Raised below, outside the except: a JSONDecodeError holds the
+            # whole body (.doc), and would ride along as the context.
+            document = _MALFORMED
+        if document is _MALFORMED:
+            raise FeedParseError("Malformed GBFS JSON", url=shown)
         if not isinstance(document, dict) or "data" not in document:
-            raise FeedParseError(f"GBFS document missing data envelope: {url}")
+            raise FeedParseError("GBFS document missing data envelope", url=shown)
         return Response(
             value=document,
             fields=fields,
@@ -585,17 +615,34 @@ class GbfsFeedHandle:
             raise SourceConnectionError(f"GBFS endpoint not published: {name}")
         return await self._fetch_cached(url, f"GBFS {name} endpoint URL")
 
+    def _headers_for(self, url: str) -> dict[str, str]:
+        """Return the caller's headers for ``url``.
+
+        Credentials only within the discovery URL's origin (see
+        :meth:`create_from_url`).
+        """
+        headers = dict(self._headers or {})
+        if self._discovery_url is not None and not same_origin(
+            url, self._discovery_url
+        ):
+            headers = {
+                name: value
+                for name, value in headers.items()
+                if name.lower() not in CREDENTIAL_HEADERS
+            }
+        return headers
+
     async def _fetch_cached(self, url: str, context: str) -> dict[str, Any]:
         """One GBFS document, reused as long as the producer allows."""
+        _require_http_url(url, context)  # before request_fields parses it
+        headers = self._headers_for(url)
         return await self._docs.get(
             url,
-            partial(
-                self._fetch_json_document, self._client, url, self._headers, context
-            ),
+            partial(self._fetch_json_document, self._client, url, headers, context),
             request_fields=request_fields(
                 self._client._get_session(),  # deliberate friend access
                 url,
-                self._headers or {},
+                headers,
             ),
         )
 

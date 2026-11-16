@@ -12,15 +12,12 @@ import csv
 import heapq
 import io
 import json
-import math
 import os
-import re
 import sqlite3
 import tempfile
 import zipfile
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
@@ -29,7 +26,9 @@ from typing import IO, Any, NamedTuple
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .._json import loads as json_loads
 from ._booking import booking_window
+from ._numbers import ascii_number
 from .exceptions import FeedParseError
 from .geo import polygon_is_valid
 from .models import (
@@ -258,12 +257,8 @@ _WEEKDAY_COLUMNS = (
 )
 
 
-# A GTFS Float written in ASCII: a sign, digits with an optional fraction (or
-# a bare fraction), an optional exponent. float() also reads other scripts'
-# digits, PEP 515 grouping ("1_0"), "inf" and "nan".
-_ASCII_DECIMAL = re.compile(
-    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
-)
+class _RefusedError(ValueError):
+    """A cell or row the library refused, in the library's own words."""
 
 
 def _coordinate(value: str, field: str, limit: float) -> float | None:
@@ -275,13 +270,13 @@ def _coordinate(value: str, field: str, limit: float) -> float | None:
     always has: a spelling float() alone would accept is no more a
     coordinate than ``abc``, nor is latitude 200 a place.
     """
-    if not (text := value.strip()):
+    if not value.strip():
         return None
-    parsed = float(text) if _ASCII_DECIMAL.fullmatch(text) else math.nan
-    if not math.isfinite(parsed):
-        raise ValueError(f"{field} is not a finite decimal number: {value!r}")
+    parsed = ascii_number(value)  # spaces and tabs only: no Unicode strip
+    if parsed is None:
+        raise _RefusedError(f"{field} is not a finite decimal number: {value!r}")
     if not -limit <= parsed <= limit:
-        raise ValueError(f"{field} is outside -{limit} to {limit}: {value!r}")
+        raise _RefusedError(f"{field} is outside -{limit} to {limit}: {value!r}")
     return parsed
 
 
@@ -532,60 +527,89 @@ class _FullRowReader(csv.DictReader[str]):
     def __next__(self) -> dict[str, str]:
         row = super().__next__()
         if None in row.values():
-            raise csv.Error(f"line {self.line_num} has fewer fields than the header")
+            raise _RefusedError(
+                f"line {self.line_num} has fewer fields than the header"
+            )
         # DictReader keeps a long row's extra cells as a list under restkey.
         extras: list[str] = row.pop(self.restkey, [])  # type: ignore[assignment]
         if any(cell.strip() for cell in extras):
-            raise csv.Error(f"line {self.line_num} has more fields than the header")
+            raise _RefusedError(f"line {self.line_num} has more fields than the header")
         return row
 
 
-@contextmanager
-def _open_csv(
-    archive: zipfile.ZipFile, filename: str
-) -> Iterator[tuple[IO[bytes], csv.DictReader[str]]]:
-    """Open one dataset file as CSV; anything wrong with it is FeedParseError."""
-    try:
-        fp = archive.open(filename)
-    except _OPEN_ERRORS as err:
-        raise FeedParseError(f"Unreadable {filename}: {err}") from err
+def _reason(err: BaseException) -> str:
+    """Why a file is malformed: the library's own text, else the error's type.
+
+    (A cell the dataset published may be quoted there.) Another library's
+    text (zipfile, csv, codecs, json) isn't passed on, nor
+    the error itself (raised outside the except): its text and attributes
+    carry the file's bytes, and messages are the library's alone.
+    """
+    return str(err) if isinstance(err, _RefusedError) else type(err).__name__
+
+
+def _read_csv[T](
+    archive: zipfile.ZipFile,
+    filename: str,
+    read: Callable[[IO[bytes], csv.DictReader[str]], T],
+) -> T:
+    """Read one dataset file as CSV through ``read``.
+
+    Anything wrong with the file, or refused while reading it, is
+    FeedParseError. Converted here, in a plain function after the
+    ``except`` block ends -- not in a context manager's exit, where the
+    error being handled would become the new one's ``__context__``, and
+    contextlib's frame, kept on the traceback, would still hold it as a
+    local (a codec error carries the file's bytes).
+    """
+    fp = _open_member(archive, filename)
     with fp:
         try:
-            yield fp, _FullRowReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
+            return read(fp, _FullRowReader(io.TextIOWrapper(fp, encoding="utf-8-sig")))
         except _READ_ERRORS as err:
-            raise FeedParseError(f"Malformed {filename}: {err}") from err
+            reason = _reason(err)
+    raise FeedParseError(f"Malformed {filename}: {reason}")
 
 
-def _reject_constant(name: str) -> None:
-    """Refuse ``NaN``/``Infinity``: Python's json accepts them, JSON does not."""
-    raise ValueError(f"{name} is not valid JSON")
+def _open_zip(zip_path: Path) -> zipfile.ZipFile:
+    """Open the dataset; one that isn't a readable zip is FeedParseError."""
+    try:
+        return zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError) as err:
+        reason = _reason(err)
+    raise FeedParseError(f"Unreadable GTFS zip: {reason}")  # outside: see _reason
+
+
+def _open_member(archive: zipfile.ZipFile, filename: str) -> IO[bytes]:
+    """Open one dataset file; one that can't be opened is FeedParseError."""
+    try:
+        return archive.open(filename)
+    except _OPEN_ERRORS as err:
+        reason = _reason(err)
+    raise FeedParseError(f"Unreadable {filename}: {reason}")
 
 
 def _json_member(archive: zipfile.ZipFile, filename: str) -> object:
     """Parse one dataset file as JSON; anything wrong with it is FeedParseError.
 
-    Decoded as strict UTF-8 first, as the CSV files are: ``json.loads`` on
-    bytes would also take UTF-16/32 and let an encoded surrogate through.
-    Integers parse as floats: every number here is a coordinate, and
+    Through the shared strict decoder (:func:`.._json.loads`: strict UTF-8,
+    unique names, no ``NaN``), keeping a string with a lone surrogate for the
+    Feature it sits in to be judged (skipped, or the name None) rather than
+    the whole file. Integers parse as floats:
+    every number here is a coordinate, and
     ``int`` refuses a digit string past CPython's length limit, which would
     fail the whole file over one Feature's value (it is out of range, and
     the Feature is skipped). RecursionError too: json raises it for arrays
     nested deeper than the interpreter's stack, which a hostile file can do
     in a few kilobytes.
     """
-    try:
-        fp = archive.open(filename)
-    except _OPEN_ERRORS as err:
-        raise FeedParseError(f"Unreadable {filename}: {err}") from err
+    fp = _open_member(archive, filename)
     with fp:
         try:
-            return json.loads(
-                fp.read().decode("utf-8-sig"),
-                parse_int=float,
-                parse_constant=_reject_constant,
-            )
-        except (*_READ_ERRORS, RecursionError) as err:
-            raise FeedParseError(f"Malformed {filename}: {err}") from err
+            return json_loads(fp.read(), parse_int=float, lone_surrogates=True)
+        except _READ_ERRORS as err:
+            reason = _reason(err)
+    raise FeedParseError(f"Malformed {filename}: {reason}")
 
 
 # A GeoJSON linear ring "is a closed LineString with four or more positions".
@@ -1176,11 +1200,7 @@ class StaticIndex:
         catalog's ``timezone_name`` is used only when agency.txt names no
         valid zone (absent file, blank cell, unknown name).
         """
-        try:
-            archive = zipfile.ZipFile(zip_path)
-        except (zipfile.BadZipFile, OSError) as err:
-            raise FeedParseError(f"Unreadable GTFS zip: {err}") from err
-        with archive:
+        with _open_zip(zip_path) as archive:
             names = set(archive.namelist())
             # Before the timezone: a zip whose files sit in a subfolder has
             # no agency.txt either, and should say what is actually wrong.
@@ -1314,12 +1334,15 @@ class StaticIndex:
         """
         if "agency.txt" not in names:
             return None
-        with _open_csv(archive, "agency.txt") as (_fp, reader):
+
+        def first_zone(_fp: IO[bytes], reader: csv.DictReader[str]) -> str | None:
             for row in reader:
                 tz_name = (row.get("agency_timezone") or "").strip()
                 if tz_name:
                     return tz_name
-        return None
+            return None
+
+        return _read_csv(archive, "agency.txt", first_zone)
 
     @classmethod
     def _load_all(
@@ -1353,8 +1376,16 @@ class StaticIndex:
         for filename, loader in files:
             if filename not in names:
                 continue  # build() has already rejected a missing required file
-            with _open_csv(archive, filename) as (fp, reader):
-                loader(conn, reader, _reporter(progress, fp, completed, total))
+
+            def read(
+                fp: IO[bytes],
+                reader: csv.DictReader[str],
+                loader: Callable[..., None] = loader,
+                done: int = completed,
+            ) -> None:
+                loader(conn, reader, _reporter(progress, fp, done, total))
+
+            _read_csv(archive, filename, read)
             completed += archive.getinfo(filename).file_size
             if progress is not None:
                 progress(completed, total)
@@ -1728,7 +1759,7 @@ class StaticIndex:
                 )
                 continue
             if anchor is None:
-                raise ValueError(
+                raise _RefusedError(
                     f"frequency trip {trip_id!r} has an untimed first or last "
                     "stop, and no time to anchor repetition offsets"
                 )
@@ -1818,12 +1849,12 @@ class StaticIndex:
             start_secs = parse_gtfs_time(row.get("start_time", ""))
             end_secs = parse_gtfs_time(row.get("end_time", ""))
             if start_secs is None or end_secs is None:
-                raise ValueError(
+                raise _RefusedError(
                     f"frequencies row for trip {trip_id!r} lacks a start/end time"
                 )
             headway_secs = _strict_int(row["headway_secs"], "headway_secs")
             if headway_secs <= 0:
-                raise ValueError(
+                raise _RefusedError(
                     f"non-positive headway_secs for trip {trip_id!r}: {headway_secs}"
                 )
             exact_times = _defaulted_int(row.get("exact_times"), 0)

@@ -3,7 +3,9 @@
 import io
 import os
 import sqlite3
+import traceback
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -374,7 +376,9 @@ def test_lenient_int_contract(value: str | None, expected: int | None) -> None:
     assert _lenient_int(value) == expected
 
 
-def _zip_from_files(tmp_path: Path, files: dict[str, str], name: str) -> Path:
+def _zip_from_files(
+    tmp_path: Path, files: Mapping[str, str | bytes], name: str
+) -> Path:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for member, content in files.items():
@@ -1191,3 +1195,54 @@ def _dump(index: StaticIndex) -> dict[str, list[tuple[object, ...]]]:
         }
     finally:
         index.close()
+
+
+def test_an_unreadable_zip_names_the_problem_in_the_librarys_words(
+    tmp_path: Path,
+) -> None:
+    """zipfile's own text isn't passed on, nor the error itself."""
+    bad = tmp_path / "feed.zip"
+    bad.write_bytes(b"PK\x03\x04 not really a zip")
+    with pytest.raises(FeedParseError) as caught:
+        StaticIndex.build(bad, ":memory:", DATASET, TZ)
+    assert str(caught.value) == "Unreadable GTFS zip: BadZipFile"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "reason"),
+    [
+        ("stops.txt", b"\xff\xfeSECRETBYTES", "UnicodeDecodeError"),
+        (
+            "stops.txt",
+            b"stop_id,stop_name\nS1\n",
+            "line 2 has fewer fields than the header",
+        ),
+        # Read first, for the timezone, by its own path.
+        ("agency.txt", b"\xff\xfeSECRETBYTES", "UnicodeDecodeError"),
+    ],
+)
+def test_a_malformed_file_carries_nothing_of_the_error_behind_it(
+    tmp_path: Path, filename: str, content: bytes, reason: str
+) -> None:
+    """A codec error holds the file's bytes: the FeedParseError has nothing
+    chained, and no frame on its traceback keeps the original (as a context
+    manager's exit would, the conversion happening there)."""
+    files: dict[str, str | bytes] = {**_FILES, filename: content}
+    zip_path = _zip_from_files(tmp_path, files, "malformed.zip")
+    with pytest.raises(FeedParseError) as caught:
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+    assert str(caught.value) == f"Malformed {filename}: {reason}"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    # Nor on the traceback: no frame below this test's (contextlib's exit,
+    # say) keeps the original or the bytes as a local -- error reporters
+    # capture frame locals.
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_code.co_filename == __file__:
+            continue
+        for name, value in frame.f_locals.items():
+            shown = repr(value)
+            assert "SECRETBYTES" not in shown, (frame.f_code.co_name, name)
+            assert not isinstance(value, UnicodeError), (frame.f_code.co_name, name)

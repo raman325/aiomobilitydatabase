@@ -15,6 +15,7 @@ import aiohttp
 from ..client import MobilityDatabaseClient
 from ..exceptions import MobilityDatabaseError
 from ._extra import load_transit_handle
+from ._urls import require_caller_inputs
 from .const import DEFAULT_TIMEOUT_SECONDS
 from .gbfs import GbfsFeedHandle
 from .models import StaticBuildProgress
@@ -170,6 +171,8 @@ class MobilityFeedsClient:
                     "it does not name a direct child"
                 )
             targets = [target]
+        elif not self._cache_dir.exists():
+            return  # nothing cached yet: the directory is made on first build
         else:
             targets = [path for path in self._cache_dir.iterdir() if path.is_dir()]
         for target in targets:
@@ -208,6 +211,7 @@ class MobilityFeedsClient:
         callback's own scheduling, so it cannot abort a build already in
         progress.
         """
+        require_caller_inputs(self._get_session(), api_key=api_key)
         return await load_transit_handle().create(
             self,
             feed_id,
@@ -249,6 +253,16 @@ class MobilityFeedsClient:
         :meth:`purge_cache`). ``on_progress`` and ``rt_min_interval``
         follow the same contracts as :meth:`get_transit_feed`.
         """
+        require_caller_inputs(
+            self._get_session(),
+            [
+                static_url,
+                *(trip_updates_urls or ()),
+                *(vehicle_positions_urls or ()),
+                *(service_alerts_urls or ()),
+            ],
+            headers,
+        )
         return await load_transit_handle().create_from_urls(
             self,
             static_url,
@@ -262,6 +276,7 @@ class MobilityFeedsClient:
 
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeedHandle:
         """Resolve a GBFS feed ID into a GbfsFeedHandle."""
+        require_caller_inputs(self._get_session())
         return await GbfsFeedHandle.create(self, feed_id)
 
     async def get_gbfs_feed_from_url(
@@ -276,8 +291,10 @@ class MobilityFeedsClient:
         point; its published feed list replaces catalog endpoint
         resolution. Returns the same handle type as :meth:`get_gbfs_feed`.
         ``headers`` apply to the discovery fetch and every document fetch
-        for the handle. Like any aiohttp request headers they follow
-        redirects, to another origin too: aiohttp drops only
+        for the handle (a name that isn't an HTTP token, or a value with a
+        control character, raises ``ValueError``). Like any aiohttp request
+        headers they follow redirects, to another origin too: aiohttp drops only
         Authorization, Cookie and Proxy-Authorization there.
         """
+        require_caller_inputs(self._get_session(), [discovery_url], headers)
         return await GbfsFeedHandle.create_from_url(self, discovery_url, headers)

@@ -2606,3 +2606,156 @@ async def test_a_full_response_always_replaces_the_stored_one() -> None:
     assert await cache.get("u", producer) == "newer"
     assert await cache.get("u", producer) == "older"
     assert cache._entries["u"].value == "older"
+
+
+# -- Unicode case folding never reads a date --------------------------------------
+
+# Python's re folds case over Unicode: these match an ASCII letter under
+# IGNORECASE (enumerated over every code point for the letters of the day and
+# month names and GMT).
+_LONG_S, _DOTTED_I, _DOTLESS_I = chr(0x17F), chr(0x130), chr(0x131)
+_CASE_VARIANTS = {"s": _LONG_S, "S": _LONG_S, "i": _DOTTED_I + _DOTLESS_I}
+_DATED = [
+    "Sat, 01 Aug 2026 13:00:00 GMT",
+    "Fri, 31 Jul 2026 13:00:00 GMT",
+    "Saturday, 01-Aug-26 13:00:00 GMT",
+    "Wednesday, 29-Jul-26 13:00:00 GMT",
+    "Sat Aug  1 13:00:00 2026",
+    "Tue, 01 Sep 2026 13:00:00 GMT",
+]
+
+
+@given(data=st.data())
+def test_a_unicode_case_variant_of_a_name_is_no_http_date(data: st.DataObject) -> None:
+    """RFC 9110 section 5.6.7: the names are ASCII ("case-sensitive" in
+    the grammar, case-insensitive in practice): U+017F, a long s, is no
+    "s", so a long-s "Sat" is no Sat and the Expires is invalid -- in the
+    past (RFC 9111 section 5.3)."""
+    date_text = data.draw(st.sampled_from(_DATED))
+    positions = [i for i, char in enumerate(date_text) if char in _CASE_VARIANTS]
+    position = data.draw(st.sampled_from(positions))
+    variant = data.draw(st.sampled_from(_CASE_VARIANTS[date_text[position]]))
+    spoofed = date_text[:position] + variant + date_text[position + 1 :]
+    assert freshness_module._http_date(spoofed, T0) is None
+    assert freshness_module._http_date(date_text, T0) is not None
+    assert _fresh({"Date": _http(T0), "Expires": spoofed}) == Freshness(0.0)
+
+
+# -- quoted-string: read left to right ---------------------------------------------
+
+
+def _reference_quoted_string(text: str) -> bool:
+    """RFC 9110 section 5.6.4, scanned a character at a time."""
+    if len(text) < 2 or text[0] != '"':
+        return False
+
+    def visible(char: str) -> bool:
+        return char == "\t" or not (char < " " or char == "\x7f")
+
+    index = 1
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            return index == len(text) - 1
+        if char == "\\":
+            if index + 1 >= len(text) or not visible(text[index + 1]):
+                return False
+            index += 2
+            continue
+        if not visible(char):
+            return False
+        index += 1
+    return False
+
+
+@given(
+    st.lists(
+        # Each edge of the excluded control ranges, and its neighbours.
+        st.sampled_from(
+            [*'"\\a =!#[]~', "\xe9", "\x80", *"\x00\x01\x08\t\n\x0b\x1f\x7f"]
+        ),
+        max_size=8,
+    ).map(lambda chars: '"' + "".join(chars))
+)
+def test_a_directive_argument_is_a_quoted_string_exactly_by_the_grammar(
+    arg: str,
+) -> None:
+    parsed = freshness_module._directive(f"ext={arg}")
+    is_token = freshness_module._TOKEN.fullmatch(arg) is not None
+    assert (parsed is not None) == (is_token or _reference_quoted_string(arg))
+
+
+@pytest.mark.parametrize(
+    "glued",
+    [
+        r'ext="a\\"x\\""',  # the pair ends the backslash; x is outside
+        r'ext="a\\"x',
+        r'ext="\\"\\""',
+    ],
+)
+def test_text_glued_after_a_closing_quote_makes_the_field_malformed(glued: str) -> None:
+    """``"a\\"`` closes after its escaped backslash: what follows is outside
+    any quoted-string, so the element breaks the grammar and the freshness
+    is invalid -- stale now, the max-age beside it notwithstanding."""
+    assert _fresh({"Cache-Control": f"max-age=60, {glued}"}) == Freshness(0.0)
+
+
+def test_an_escaped_backslash_inside_a_quoted_string_is_fine() -> None:
+    assert _fresh({"Cache-Control": r'ext="a\\b\"c", max-age=60'}) == Freshness(60.0)
+
+
+@given(
+    st.lists(st.sampled_from([*'"\\a 6', *"\t\n\x0b\x1f\x7f"]), max_size=8).map(
+        lambda chars: '"' + "".join(chars)
+    )
+)
+def test_a_max_age_counts_only_beside_a_well_formed_quoted_argument(arg: str) -> None:
+    """The whole path, split then each directive: a max-age beside an
+    extension argument counts exactly when the argument is a quoted-string;
+    a malformed element makes the response stale (RFC 9111 section 4.2.1).
+    Whitespace around an element is OWS, not part of it."""
+    well_formed = _reference_quoted_string(arg.strip(" \t"))
+    expected = Freshness(60.0) if well_formed else Freshness(0.0)
+    assert _fresh({"Cache-Control": f"max-age=60, ext={arg}"}) == expected
+
+
+@pytest.mark.parametrize(
+    ("argument", "lifetime"),
+    [('"60"', 60.0), (r'"6\0"', 60.0), (r'"\6\0"', 60.0), (r'"6\"', None)],
+)
+def test_a_quoted_max_age_reads_its_quoted_pairs(
+    argument: str, lifetime: float | None
+) -> None:
+    """RFC 9111 section 5.2: a recipient reads max-age="60" as 60; a
+    quoted-pair stands for its character, so "6\\0" is 60 too."""
+    freshness = _fresh({"Cache-Control": f"max-age={argument}"})
+    assert freshness == (
+        Freshness(lifetime) if lifetime is not None else Freshness(0.0)
+    )
+
+
+@pytest.mark.parametrize("code", [*range(0x00, 0x22), 0x5C, *range(0x7E, 0x82), 0xFF])
+@pytest.mark.parametrize("form", ['"{}"', '"\\{}"'], ids=["qdtext", "quoted-pair"])
+def test_each_character_is_qdtext_or_quotable_by_the_grammar(
+    code: int, form: str
+) -> None:
+    """Every control character, the edges around them, and backslash and
+    DQUOTE themselves -- alone, and after a backslash."""
+    arg = form.format(chr(code))
+    parsed = freshness_module._directive(f"ext={arg}")
+    assert (parsed is not None) == _reference_quoted_string(arg)
+
+
+@pytest.mark.parametrize("etag", ['"v\udcff1"', 'W/"\udc80"', '"ok\udcc3\udca9"'])
+def test_an_etag_holding_bytes_that_werent_utf8_validates_nothing(etag: str) -> None:
+    """aiohttp decodes such bytes as lone surrogates and drops them when it
+    sends the header, so If-None-Match would name another entity-tag -- one
+    a 304 could answer for a representation never stored."""
+    assert _validators({"ETag": etag}) is None
+
+
+def test_an_etag_holding_utf8_text_still_validates() -> None:
+    """Decoded UTF-8 goes back out as the same bytes."""
+    validators = _validators({"ETag": '"caf\u00e9"'})
+    assert validators is not None
+    assert validators.request_headers()["If-None-Match"] == '"caf\u00e9"'
