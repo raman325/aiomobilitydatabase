@@ -584,7 +584,10 @@ class _ShiftingNew(datetime):
 
 
 def test_a_datetime_subclass_constructor_doesnt_run_while_encoding() -> None:
-    value = datetime.__new__(_ShiftingNew, 2024, 1, 1, tzinfo=UTC)
+    # Not already UTC: converting it builds a new instance.
+    value = datetime.__new__(
+        _ShiftingNew, 2024, 1, 1, tzinfo=timezone(timedelta(hours=5))
+    )
     assert encode_params({"downloaded_after": value}) == {
-        "downloaded_after": "2024-01-01T00:00:00+00:00"
+        "downloaded_after": "2023-12-31T19:00:00+00:00"
     }
