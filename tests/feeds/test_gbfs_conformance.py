@@ -355,10 +355,12 @@ _DEEP = b"[" * 100_000 + b"]" * 100_000
 async def test_a_deeply_nested_discovery_document_is_a_parse_error(
     mock_api: MockApi, direct_client: MobilityFeedsClient
 ) -> None:
-    """json raises RecursionError for nesting past the interpreter's stack:
-    a malformed document, never a bare RecursionError."""
+    """Before 3.14, json raises RecursionError for nesting past the
+    interpreter's stack ("Malformed GBFS JSON"); 3.14 parses it, and the
+    array is no envelope. Either way a FeedParseError, never a bare
+    RecursionError."""
     mock_api.get("/gbfs/gbfs.json", body=_DEEP, content_type="application/json")
-    with pytest.raises(FeedParseError, match="Malformed GBFS JSON"):
+    with pytest.raises(FeedParseError):
         await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
 
 
@@ -369,7 +371,7 @@ async def test_a_deeply_nested_endpoint_document_is_a_parse_error(
     mock_api.get("/gbfs/gbfs.json", payload=_doc({"feeds": feeds}))
     mock_api.get("/gbfs/si.json", body=_DEEP, content_type="application/json")
     handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
-    with pytest.raises(FeedParseError, match="Malformed GBFS JSON"):
+    with pytest.raises(FeedParseError):
         await handle.get_system_info()
 
 
