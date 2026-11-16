@@ -2606,3 +2606,96 @@ async def test_a_full_response_always_replaces_the_stored_one() -> None:
     assert await cache.get("u", producer) == "newer"
     assert await cache.get("u", producer) == "older"
     assert cache._entries["u"].value == "older"
+
+
+# -- Unicode case folding never reads a date --------------------------------------
+
+# Python's re folds case over Unicode: these match an ASCII letter under
+# IGNORECASE (enumerated over every code point for the letters of the day and
+# month names and GMT).
+_LONG_S, _DOTTED_I, _DOTLESS_I = chr(0x17F), chr(0x130), chr(0x131)
+_CASE_VARIANTS = {"s": _LONG_S, "S": _LONG_S, "i": _DOTTED_I + _DOTLESS_I}
+_DATED = [
+    "Sat, 01 Aug 2026 13:00:00 GMT",
+    "Fri, 31 Jul 2026 13:00:00 GMT",
+    "Saturday, 01-Aug-26 13:00:00 GMT",
+    "Wednesday, 29-Jul-26 13:00:00 GMT",
+    "Sat Aug  1 13:00:00 2026",
+    "Tue, 01 Sep 2026 13:00:00 GMT",
+]
+
+
+@given(data=st.data())
+def test_a_unicode_case_variant_of_a_name_is_no_http_date(data: st.DataObject) -> None:
+    """RFC 9110 section 5.6.7: the names are ASCII ("case-sensitive" in
+    the grammar, case-insensitive in practice): U+017F, a long s, is no
+    "s", so a long-s "Sat" is no Sat and the Expires is invalid -- in the
+    past (RFC 9111 section 5.3)."""
+    date_text = data.draw(st.sampled_from(_DATED))
+    positions = [i for i, char in enumerate(date_text) if char in _CASE_VARIANTS]
+    position = data.draw(st.sampled_from(positions))
+    variant = data.draw(st.sampled_from(_CASE_VARIANTS[date_text[position]]))
+    spoofed = date_text[:position] + variant + date_text[position + 1 :]
+    assert freshness_module._http_date(spoofed, T0) is None
+    assert freshness_module._http_date(date_text, T0) is not None
+    assert _fresh({"Date": _http(T0), "Expires": spoofed}) == Freshness(0.0)
+
+
+# -- quoted-string: read left to right ---------------------------------------------
+
+
+def _reference_quoted_string(text: str) -> bool:
+    """RFC 9110 section 5.6.4, scanned a character at a time."""
+    if len(text) < 2 or text[0] != '"':
+        return False
+
+    def visible(char: str) -> bool:
+        return char == "\t" or not (char < " " or char == "\x7f")
+
+    index = 1
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            return index == len(text) - 1
+        if char == "\\":
+            if index + 1 >= len(text) or not visible(text[index + 1]):
+                return False
+            index += 2
+            continue
+        if not visible(char):
+            return False
+        index += 1
+    return False
+
+
+@given(
+    st.lists(
+        st.sampled_from(['"', "\\", "a", " ", "\t", "\x01", "\x7f", "\xe9", "="]),
+        max_size=8,
+    ).map(lambda chars: '"' + "".join(chars))
+)
+def test_a_directive_argument_is_a_quoted_string_exactly_by_the_grammar(
+    arg: str,
+) -> None:
+    parsed = freshness_module._directive(f"ext={arg}")
+    is_token = freshness_module._TOKEN.fullmatch(arg) is not None
+    assert (parsed is not None) == (is_token or _reference_quoted_string(arg))
+
+
+@pytest.mark.parametrize(
+    "glued",
+    [
+        r'ext="a\\"x\\""',  # the pair ends the backslash; x is outside
+        r'ext="a\\"x',
+        r'ext="\\"\\""',
+    ],
+)
+def test_text_glued_after_a_closing_quote_makes_the_field_malformed(glued: str) -> None:
+    """``"a\\"`` closes after its escaped backslash: what follows is outside
+    any quoted-string, so the element breaks the grammar and the freshness
+    is invalid -- stale now, the max-age beside it notwithstanding."""
+    assert _fresh({"Cache-Control": f"max-age=60, {glued}"}) == Freshness(0.0)
+
+
+def test_an_escaped_backslash_inside_a_quoted_string_is_fine() -> None:
+    assert _fresh({"Cache-Control": r'ext="a\\b\"c", max-age=60'}) == Freshness(60.0)

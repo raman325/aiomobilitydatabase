@@ -141,6 +141,7 @@ def feed_request_fields(
     Unconditional: what a stored response's Vary is matched against (see
     :func:`~._freshness.request_fields`; None when they can't be known).
     """
+    _require_http_url(url, "GTFS-RT producer URL")  # request_fields parses it
     _params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)
     return request_fields(session, url, req_headers)
 

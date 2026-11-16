@@ -321,3 +321,84 @@ async def test_a_document_that_isnt_json_is_a_parse_error(
     handle = await feeds_client.get_gbfs_feed("gbfs-300")
     with pytest.raises(FeedParseError, match="Malformed GBFS JSON"):
         await handle.get_system_info()
+
+
+@given(
+    when=st.datetimes(min_value=datetime(1, 1, 2), max_value=datetime(9999, 12, 30)),
+    offset=st.integers(-(23 * 60 + 59), 23 * 60 + 59),
+)
+def test_an_rfc3339_timestamp_reads_as_utc(when: datetime, offset: int) -> None:
+    """Every feeds-layer timestamp is tz-aware UTC (README): a 3.0
+    last_reported keeps its instant but not its offset."""
+    aware = when.replace(tzinfo=timezone(timedelta(minutes=offset)))
+    reported = _reported_at(aware.isoformat())
+    assert reported is not None
+    assert reported.tzinfo is UTC
+    assert reported == aware
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["0001-01-01T00:30:00+01:00", "9999-12-31T23:30:00-01:00"],
+)
+def test_an_rfc3339_timestamp_utc_cannot_hold_is_none(value: str) -> None:
+    """Year 1 ahead of UTC and 9999 behind it name instants before year 1
+    or after 9999 in UTC: no datetime holds them."""
+    assert _reported_at(value) is None
+
+
+# -- Robustness: deep nesting and unparseable endpoint URLs ----------------------
+
+_DEEP = b"[" * 100_000 + b"]" * 100_000
+
+
+async def test_a_deeply_nested_discovery_document_is_a_parse_error(
+    mock_api: MockApi, direct_client: MobilityFeedsClient
+) -> None:
+    """json raises RecursionError for nesting past the interpreter's stack:
+    a malformed document, never a bare RecursionError."""
+    mock_api.get("/gbfs/gbfs.json", body=_DEEP, content_type="application/json")
+    with pytest.raises(FeedParseError, match="Malformed GBFS JSON"):
+        await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+
+
+async def test_a_deeply_nested_endpoint_document_is_a_parse_error(
+    mock_api: MockApi, direct_client: MobilityFeedsClient
+) -> None:
+    feeds = [{"name": "system_information", "url": mock_api.url("/gbfs/si.json")}]
+    mock_api.get("/gbfs/gbfs.json", payload=_doc({"feeds": feeds}))
+    mock_api.get("/gbfs/si.json", body=_DEEP, content_type="application/json")
+    handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+    with pytest.raises(FeedParseError, match="Malformed GBFS JSON"):
+        await handle.get_system_info()
+
+
+_UNPARSEABLE_URLS = [
+    "http://127.0.0.1:99999/station_information.json",  # port past 65535
+    "http://[::1/station_information.json",  # unclosed IPv6 bracket
+    "http://[::1]:70000/station_information.json",
+]
+
+
+@pytest.mark.parametrize("url", _UNPARSEABLE_URLS)
+async def test_an_endpoint_url_aiohttp_cannot_parse_is_a_connection_error(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, url: str
+) -> None:
+    """A discovery document is producer data: an endpoint URL in it that no
+    request can be made to is a source problem, like an unsupported scheme."""
+    feeds = [
+        {"name": "station_information", "url": url},
+        {"name": "station_status", "url": mock_api.url("/gbfs/ss.json")},
+    ]
+    mock_api.get("/gbfs/gbfs.json", payload=_doc({"feeds": feeds}))
+    handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+    with pytest.raises(SourceConnectionError, match="malformed URL"):
+        await handle.get_stations()
+
+
+@pytest.mark.parametrize("url", _UNPARSEABLE_URLS)
+async def test_a_discovery_url_aiohttp_cannot_parse_is_a_connection_error(
+    direct_client: MobilityFeedsClient, url: str
+) -> None:
+    with pytest.raises(SourceConnectionError, match="malformed URL"):
+        await direct_client.get_gbfs_feed_from_url(url)

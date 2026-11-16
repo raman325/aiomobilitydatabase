@@ -32,6 +32,14 @@ _DELTA_SECONDS_MAX = 2_147_483_648
 _DELTA_SECONDS_DIGITS = len(str(_DELTA_SECONDS_MAX))
 # RFC 9110 section 5.6.2 token, and section 8.8.3 entity-tag.
 _TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+# RFC 9110 section 5.6.4: DQUOTE *( qdtext / quoted-pair ) DQUOTE, where
+# qdtext is any text but a control, DQUOTE or backslash (obs-text kept), and
+# a quoted-pair is a backslash and any such character, DQUOTE and backslash
+# included. Read left to right, so an escaped backslash ends its pair:
+# "a\\"x" closes after the second backslash and leaves x outside.
+_QUOTED_STRING = re.compile(
+    r'"(?:[^\x00-\x08\x0a-\x1f\x7f"\\]|\\[^\x00-\x08\x0a-\x1f\x7f])*"'
+)
 # etagc is any visible character but DQUOTE, plus obs-text -- which arrives
 # decoded (aiohttp: UTF-8 with surrogateescape), so anything non-ASCII.
 _ENTITY_TAG = re.compile(r'(W/)?"[^\x00-\x20"\x7f]*"')
@@ -49,14 +57,17 @@ _DAY = "(Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
 _LONG_DAY = "(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
 _MONTH = "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 _CLOCK = "([0-9]{2}):([0-9]{2}):([0-9]{2})"
+# Day and month names match in any ASCII case only: Unicode case folding
+# would also take U+017F (long s) for "s", so "\u017fat" for "Sat".
+_NAMES_ANY_CASE = re.IGNORECASE | re.ASCII
 _IMF_FIXDATE = re.compile(
-    rf"{_DAY}, ([0-9]{{2}}) {_MONTH} ([0-9]{{4}}) {_CLOCK} GMT", re.IGNORECASE
+    rf"{_DAY}, ([0-9]{{2}}) {_MONTH} ([0-9]{{4}}) {_CLOCK} GMT", _NAMES_ANY_CASE
 )
 _RFC850_DATE = re.compile(
-    rf"{_LONG_DAY}, ([0-9]{{2}})-{_MONTH}-([0-9]{{2}}) {_CLOCK} GMT", re.IGNORECASE
+    rf"{_LONG_DAY}, ([0-9]{{2}})-{_MONTH}-([0-9]{{2}}) {_CLOCK} GMT", _NAMES_ANY_CASE
 )
 _ASCTIME_DATE = re.compile(
-    rf"{_DAY} {_MONTH} ([ 0-9][0-9]) {_CLOCK} ([0-9]{{4}})", re.IGNORECASE
+    rf"{_DAY} {_MONTH} ([ 0-9][0-9]) {_CLOCK} ([0-9]{{4}})", _NAMES_ANY_CASE
 )
 
 
@@ -317,12 +328,7 @@ def _directive(part: str) -> tuple[str, str | None] | None:
         return None
     if not sep:
         return name.lower(), None
-    quoted = (
-        len(arg) > 1
-        and arg[0] == arg[-1] == '"'
-        and '"' not in arg[1:-1].replace('\\"', "")
-    )
-    if not (quoted or _TOKEN.fullmatch(arg)):
+    if not (_QUOTED_STRING.fullmatch(arg) or _TOKEN.fullmatch(arg)):
         return None
     return name.lower(), arg
 

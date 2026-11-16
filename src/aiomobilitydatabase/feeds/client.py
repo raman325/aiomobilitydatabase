@@ -170,6 +170,8 @@ class MobilityFeedsClient:
                     "it does not name a direct child"
                 )
             targets = [target]
+        elif not self._cache_dir.is_dir():
+            return  # nothing cached yet: the directory is made on first build
         else:
             targets = [path for path in self._cache_dir.iterdir() if path.is_dir()]
         for target in targets:

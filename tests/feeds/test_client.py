@@ -244,3 +244,18 @@ async def test_purge_cache_rejects_root_like_feed_ids(
         await client.purge_cache(feed_id)
     assert not removed
     await client.close()
+
+
+async def test_purge_cache_before_the_cache_dir_exists(
+    mock_api: MockApi, tmp_path: Path
+) -> None:
+    """The directory is made on the first build: purging before one is a
+    no-op, as purging a feed with nothing cached is."""
+    root = tmp_path / "never-built"
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    await client.purge_cache()
+    await client.purge_cache("mdb-100")
+    assert not root.exists()
+    await client.close()

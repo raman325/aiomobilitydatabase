@@ -177,8 +177,11 @@ def _reported_at(value: Any) -> datetime | None:
     is REQUIRED (section 5.6): one without (``2026-07-31T12:13:20``), a
     bare date, or another ISO 8601 form names no instant, so None -- GBFS
     defines no default zone. A leap second (``:60``) reads as the second
-    before it. Anything else -- including a bool, which is an int in Python
-    -- degrades to None like every other malformed scalar at this boundary.
+    before it. The instant is returned in UTC, as every feeds-layer
+    timestamp is; one UTC can't hold (year 1 ahead of UTC, 9999 behind
+    it) is None. Anything else -- including a bool, which is an int in
+    Python -- degrades to None like every other malformed scalar at this
+    boundary.
     """
     if isinstance(value, bool):
         return None
@@ -193,8 +196,10 @@ def _reported_at(value: Any) -> datetime | None:
             clock = clock[:-2] + "59"
         offset = "+00:00" if offset in ("Z", "z") else offset
         try:
-            return datetime.fromisoformat(f"{day}T{clock}{fraction or ''}{offset}")
-        except ValueError:
+            return datetime.fromisoformat(
+                f"{day}T{clock}{fraction or ''}{offset}"
+            ).astimezone(UTC)
+        except (OverflowError, ValueError):
             return None
     return None
 
@@ -557,7 +562,9 @@ class GbfsFeedHandle:
                     )
                 try:
                     document = await resp.json(content_type=None)
-                except ValueError as err:
+                except (ValueError, RecursionError) as err:
+                    # RecursionError: json raises it for nesting deeper than
+                    # the interpreter's stack, a few kilobytes of brackets.
                     raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
                 hops = _hops(resp, history)
                 answered = str(resp.url)
@@ -587,6 +594,7 @@ class GbfsFeedHandle:
 
     async def _fetch_cached(self, url: str, context: str) -> dict[str, Any]:
         """One GBFS document, reused as long as the producer allows."""
+        _require_http_url(url, context)  # before request_fields parses it
         return await self._docs.get(
             url,
             partial(
