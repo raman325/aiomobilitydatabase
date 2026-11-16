@@ -584,3 +584,19 @@ def _utf8(text: str) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+async def test_an_error_page_in_no_text_encoding_is_an_api_error(
+    mock_api: MockApi, client: MobilityDatabaseClient
+) -> None:
+    """charset=rot13 is no text encoding: the page is read as UTF-8."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get(
+        "/v1/metadata",
+        status=503,
+        body=b"Unavailable",
+        headers={"Content-Type": "text/plain; charset=rot13"},
+    )
+    with pytest.raises(MobilityDatabaseApiError) as caught:
+        await client.get_metadata()
+    assert caught.value.body == "Unavailable"
