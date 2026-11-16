@@ -2730,3 +2730,15 @@ def test_a_quoted_max_age_reads_its_quoted_pairs(
     assert freshness == (
         Freshness(lifetime) if lifetime is not None else Freshness(0.0)
     )
+
+
+@pytest.mark.parametrize("code", [*range(0x00, 0x22), 0x5C, *range(0x7E, 0x82), 0xFF])
+@pytest.mark.parametrize("form", ['"{}"', '"\\{}"'], ids=["qdtext", "quoted-pair"])
+def test_each_character_is_qdtext_or_quotable_by_the_grammar(
+    code: int, form: str
+) -> None:
+    """Every control character, the edges around them, and backslash and
+    DQUOTE themselves -- alone, and after a backslash."""
+    arg = form.format(chr(code))
+    parsed = freshness_module._directive(f"ext={arg}")
+    assert (parsed is not None) == _reference_quoted_string(arg)
