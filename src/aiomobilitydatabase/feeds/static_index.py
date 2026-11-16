@@ -11,6 +11,7 @@ import bisect
 import csv
 import heapq
 import io
+import itertools
 import json
 import lzma
 import os
@@ -208,8 +209,21 @@ _LONG_REACH = 4 * 86_400
 _EXCEPTION_SERVICE_REMOVED = 2
 # GTFS-RT requires start_date for a trip lasting longer than this.
 _ONE_DAY = 86_400
-# Ids bound per statement: under SQLite's lowest default variable limit (999).
-_ID_SLICE = 500
+# The SQL stand-in for an id list's place in an ``IN`` clause (``IN _IDS``),
+# replaced by one slice's marks (see StaticIndex._select).
+_IDS = "(??)"
+
+
+class _Ids(NamedTuple):
+    """A caller- or data-sized list of ids, bound to one ``IN _IDS``."""
+
+    values: tuple[str, ...]
+
+
+def _ids(values: Iterable[str]) -> _Ids:
+    """Collect ``values`` as ids, each once: a repeat matches nothing more."""
+    return _Ids(tuple(sorted(set(values))))
+
 
 # A journey needs a time at both ends, a pickup at the origin and a drop-off
 # at the destination: pickup_type/drop_off_type 1 is "No pickup available" /
@@ -2181,6 +2195,59 @@ class StaticIndex:
 
     # -- queries -----------------------------------------------------------
 
+    def _select(self, sql: str, params: Sequence[object]) -> list[tuple[Any, ...]]:
+        """Run ``sql``, binding each :class:`_Ids` in ``params`` to its ``IN _IDS``.
+
+        The one way an id list reaches SQL: SQLite caps the variables one
+        statement binds (the connection's own limit: 32766 by default since
+        3.32, 999 before), and a list can be any length. Each list (every
+        ``IN _IDS`` a conjunct, in ``params`` order among the scalars) is
+        bound in slices -- whole when it fits, shorter lists first -- the
+        statement run once per combination of slices, and every
+        combination's rows returned. The slices of a list are
+        disjoint (its ids appear once), so each row the whole statement
+        would return comes back exactly once -- for a statement whose rows
+        are each decided by the row alone, or by a group no slice splits.
+        An aggregate or LIMIT reaching across slices is combined by the
+        caller. A list with no ids matches nothing, as ``IN ()`` does.
+        """
+        lists = [param for param in params if isinstance(param, _Ids)]
+        assert sql.count(_IDS) == len(lists)
+        if any(not ids.values for ids in lists):
+            return []
+        budget = self._conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - (
+            len(params) - len(lists)
+        )
+        widths: dict[int, int] = {}
+        for left, at in enumerate(
+            sorted(range(len(lists)), key=lambda at: len(lists[at].values)), 1
+        ):
+            share = max(1, budget // (len(lists) - left + 1))
+            widths[at] = min(len(lists[at].values), share)
+            budget -= widths[at]
+        rows: list[tuple[Any, ...]] = []
+        for combination in itertools.product(
+            *(
+                [
+                    ids.values[start : start + widths[at]]
+                    for start in range(0, len(ids.values), widths[at])
+                ]
+                for at, ids in enumerate(lists)
+            )
+        ):
+            text = sql
+            for chunk in combination:
+                text = text.replace(_IDS, f"({','.join('?' * len(chunk))})", 1)
+            slices = iter(combination)
+            bound: list[object] = []
+            for param in params:
+                if isinstance(param, _Ids):
+                    bound.extend(next(slices))
+                else:
+                    bound.append(param)
+            rows.extend(self._conn.execute(text, bound).fetchall())
+        return rows
+
     def stops(self) -> list[Stop]:
         """All stops (for pickers), with GTFS's parent inheritance applied.
 
@@ -2378,41 +2445,34 @@ class StaticIndex:
 
     def routes_for_trips(self, trip_ids: list[str]) -> dict[str, str]:
         """Map trip_id -> route_id for the given trips."""
-        if not trip_ids:
-            return {}
-        marks = ",".join("?" * len(trip_ids))
         return dict(
-            self._conn.execute(
-                f"SELECT id, route_id FROM trips WHERE id IN ({marks})",
-                trip_ids,
+            self._select(
+                f"SELECT id, route_id FROM trips WHERE id IN {_IDS}", [_ids(trip_ids)]
             )
         )
 
     def trip_summaries(self, trip_ids: Sequence[str]) -> dict[str, TripSummary]:
         """Map each trip to its :class:`TripSummary`."""
         found: dict[str, TripSummary] = {}
-        for offset in range(0, len(trip_ids), _ID_SLICE):
-            chunk = list(trip_ids[offset : offset + _ID_SLICE])
-            for (
-                trip_id,
+        for (
+            trip_id,
+            route_id,
+            headsign,
+            direction_id,
+            short,
+            wheelchair,
+        ) in self._select(
+            "SELECT id, route_id, headsign, direction_id, short_name, "
+            f"wheelchair_accessible FROM trips WHERE id IN {_IDS}",
+            [_ids(trip_ids)],
+        ):
+            found[trip_id] = TripSummary(
                 route_id,
                 headsign,
                 direction_id,
                 short,
-                wheelchair,
-            ) in self._conn.execute(
-                "SELECT id, route_id, headsign, direction_id, short_name, "
-                "wheelchair_accessible FROM trips "
-                f"WHERE id IN ({','.join('?' * len(chunk))})",
-                chunk,
-            ):
-                found[trip_id] = TripSummary(
-                    route_id,
-                    headsign,
-                    direction_id,
-                    short,
-                    _enum_or_none(WheelchairAccess, wheelchair),
-                )
+                _enum_or_none(WheelchairAccess, wheelchair),
+            )
         return found
 
     def copied_run(
@@ -2489,20 +2549,16 @@ class StaticIndex:
         nothing here.
         """
         keys = [key for key in keys if key[1] is not None and key[2] is not None]
-        sources = sorted({source for source, _day, _secs in keys})
         # Every repetition, in order: a slot ends at the next one.
         repetitions: dict[str, list[tuple[int, int | None, str]]] = {}
-        # In slices: realtime can name more trips than SQLite allows bound
-        # variables in one statement.
-        for offset in range(0, len(sources), _ID_SLICE):
-            chunk = sources[offset : offset + _ID_SLICE]
-            for trip_id, source, start, width in self._conn.execute(
-                "SELECT id, source_trip_id, start_secs, slot_secs FROM trips "
-                f"WHERE source_trip_id IN ({','.join('?' * len(chunk))}) "
-                "AND start_secs IS NOT NULL ORDER BY source_trip_id, start_secs",
-                chunk,
-            ):
-                repetitions.setdefault(source, []).append((start, width, trip_id))
+        for trip_id, source, start, width in self._select(
+            "SELECT id, source_trip_id, start_secs, slot_secs FROM trips "
+            f"WHERE source_trip_id IN {_IDS} AND start_secs IS NOT NULL",
+            [_ids(source for source, _day, _secs in keys)],
+        ):
+            repetitions.setdefault(source, []).append((start, width, trip_id))
+        for runs_of in repetitions.values():
+            runs_of.sort()  # start_secs are unique per template (see loader)
         taken: dict[K, tuple[int, str, date]] = {}
         for key in keys:
             source, day, secs = key
@@ -2585,15 +2641,12 @@ class StaticIndex:
         self, source_trip_ids: Sequence[str], stop_ids: Sequence[str]
     ) -> set[str]:
         """Return the producer-facing trips (of those given) calling at a stop."""
-        if not source_trip_ids or not stop_ids:
-            return set()
-        rows = self._conn.execute(
+        rows = self._select(
             "SELECT DISTINCT t.source_trip_id FROM trips t "
             "JOIN stop_times st ON st.trip_id = t.id "
-            f"WHERE t.source_trip_id IN ({','.join('?' * len(source_trip_ids))}) "
-            f"AND st.stop_id IN ({','.join('?' * len(stop_ids))})",
-            [*source_trip_ids, *stop_ids],
-        ).fetchall()
+            f"WHERE t.source_trip_id IN {_IDS} AND st.stop_id IN {_IDS}",
+            [_ids(source_trip_ids), _ids(stop_ids)],
+        )
         return {source for (source,) in rows}
 
     def run_days(
@@ -2612,11 +2665,10 @@ class StaticIndex:
         if not trip_ids:
             return []
         service_of = dict(
-            self._conn.execute(
-                "SELECT id, service_id FROM trips "
-                f"WHERE id IN ({','.join('?' * len(trip_ids))})",
-                trip_ids,
-            ).fetchall()
+            self._select(
+                f"SELECT id, service_id FROM trips WHERE id IN {_IDS}",
+                [_ids(trip_ids)],
+            )
         )
         found: list[tuple[str, date, datetime]] = []
         for service_date in sorted(by_day):
@@ -2639,10 +2691,8 @@ class StaticIndex:
         trip_ids: list[str],
         active: set[str],
     ) -> list[TripInstanceCalls]:
-        marks = ",".join("?" * len(trip_ids))
         instances: list[TripInstanceCalls] = []
-        service_marks = ",".join("?" * len(active))
-        rows = self._conn.execute(
+        rows = self._select(
             "SELECT t.id, t.source_trip_id, t.start_secs, t.route_id, "
             "t.service_id, t.headsign, t.wheelchair_accessible, "
             "t.bikes_allowed, t.direction_id, t.short_name, t.block_id, "
@@ -2650,11 +2700,12 @@ class StaticIndex:
             "st.departure_secs, st.pickup_type, st.drop_off_type, "
             "st.timepoint, st.stop_headsign "
             "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
-            f"WHERE t.id IN ({marks}) "
-            f"AND t.service_id IN ({service_marks}) "
-            "ORDER BY t.id, st.stop_sequence",
-            [*trip_ids, *sorted(active)],
-        ).fetchall()
+            f"WHERE t.id IN {_IDS} AND t.service_id IN {_IDS}",
+            [_ids(trip_ids), _ids(active)],
+        )
+        # By trip, then stop_sequence (unique within a trip): Python orders
+        # str as SQLite's BINARY collation does.
+        rows.sort(key=lambda row: (row[0], row[11]))
         by_trip: dict[str, list[Any]] = {}
         for row in rows:
             by_trip.setdefault(row[0], []).append(row)
@@ -2714,16 +2765,14 @@ class StaticIndex:
     def _on_demand_calls(self, trip_ids: list[str]) -> dict[str, list[TripCall]]:
         """Return each trip's GTFS-Flex calls, untimed, by stop_sequence."""
         found: dict[str, list[TripCall]] = {}
-        if not trip_ids:
-            return found
-        marks = ",".join("?" * len(trip_ids))
-        for row in self._conn.execute(
+        rows = self._select(
             "SELECT trip_id, stop_sequence, "
             "COALESCE(stop_id, location_id, location_group_id), "
             "pickup_type, drop_off_type, stop_headsign FROM flex_stop_times "
-            f"WHERE trip_id IN ({marks}) ORDER BY trip_id, stop_sequence",
-            trip_ids,
-        ):
+            f"WHERE trip_id IN {_IDS}",
+            [_ids(trip_ids)],
+        )
+        for row in sorted(rows, key=lambda row: (row[0], row[1])):
             found.setdefault(row[0], []).append(
                 TripCall(
                     stop_sequence=row[1],
@@ -2753,69 +2802,65 @@ class StaticIndex:
         """
         found: dict[int, OnDemandRow] = {}
         for column, ids in (
-            ("location_id", sorted(set(location_ids))),
-            ("location_group_id", sorted(set(location_group_ids))),
-            ("stop_id", sorted(set(stop_ids))),
+            ("location_id", location_ids),
+            ("location_group_id", location_group_ids),
+            ("stop_id", stop_ids),
         ):
-            for offset in range(0, len(ids), _ID_SLICE):
-                chunk = ids[offset : offset + _ID_SLICE]
-                for (
-                    rowid,
-                    trip_id,
-                    route_id,
-                    service_id,
-                    headsign,
-                    stop_headsign,
-                    stop_sequence,
-                    start_window,
-                    end_window,
-                    location_id,
-                    location_group_id,
-                    stop_id,
-                    pickup_type,
-                    drop_off_type,
-                    pickup_rule,
-                    drop_off_rule,
-                    wheelchair,
-                    exact_times,
-                    start_secs,
-                ) in self._conn.execute(
-                    "SELECT f.rowid, f.trip_id, t.route_id, t.service_id, "
-                    "t.headsign, f.stop_headsign, f.stop_sequence, "
-                    "f.start_window_secs, f.end_window_secs, f.location_id, "
-                    "f.location_group_id, f.stop_id, f.pickup_type, "
-                    "f.drop_off_type, f.pickup_booking_rule_id, "
-                    "f.drop_off_booking_rule_id, t.wheelchair_accessible, "
-                    "t.exact_times, t.start_secs "
-                    "FROM flex_stop_times f JOIN trips t ON t.id = f.trip_id "
-                    f"WHERE f.{column} IN ({','.join('?' * len(chunk))})",
-                    chunk,
-                ):
-                    # A frequencies.txt trip the loader could not repeat
-                    # (exactness unknown on a trip that is no repetition):
-                    # its windows are the template's, no run's.
-                    unrepeated = exact_times is None and start_secs is None
-                    found[rowid] = OnDemandRow(
-                        trip_id=trip_id,
-                        route_id=route_id,
-                        service_id=service_id,
-                        headsign=headsign,
-                        stop_headsign=stop_headsign,
-                        stop_sequence=stop_sequence,
-                        start_window_secs=None if unrepeated else start_window,
-                        end_window_secs=None if unrepeated else end_window,
-                        location_id=location_id,
-                        location_group_id=location_group_id,
-                        stop_id=stop_id,
-                        pickup_type=_enum_or_none(PickupDropOffType, pickup_type),
-                        drop_off_type=_enum_or_none(PickupDropOffType, drop_off_type),
-                        pickup_booking_rule_id=pickup_rule,
-                        drop_off_booking_rule_id=drop_off_rule,
-                        wheelchair_accessible=_enum_or_none(
-                            WheelchairAccess, wheelchair
-                        ),
-                        exact_times={0: False, 1: True}.get(exact_times),
-                    )
+            for (
+                rowid,
+                trip_id,
+                route_id,
+                service_id,
+                headsign,
+                stop_headsign,
+                stop_sequence,
+                start_window,
+                end_window,
+                location_id,
+                location_group_id,
+                stop_id,
+                pickup_type,
+                drop_off_type,
+                pickup_rule,
+                drop_off_rule,
+                wheelchair,
+                exact_times,
+                start_secs,
+            ) in self._select(
+                "SELECT f.rowid, f.trip_id, t.route_id, t.service_id, "
+                "t.headsign, f.stop_headsign, f.stop_sequence, "
+                "f.start_window_secs, f.end_window_secs, f.location_id, "
+                "f.location_group_id, f.stop_id, f.pickup_type, "
+                "f.drop_off_type, f.pickup_booking_rule_id, "
+                "f.drop_off_booking_rule_id, t.wheelchair_accessible, "
+                "t.exact_times, t.start_secs "
+                "FROM flex_stop_times f JOIN trips t ON t.id = f.trip_id "
+                f"WHERE f.{column} IN {_IDS}",
+                [_ids(ids)],
+            ):
+                # A frequencies.txt trip the loader could not repeat
+                # (exactness unknown on a trip that is no repetition):
+                # its windows are the template's, no run's.
+                unrepeated = exact_times is None and start_secs is None
+                found[rowid] = OnDemandRow(
+                    trip_id=trip_id,
+                    route_id=route_id,
+                    service_id=service_id,
+                    headsign=headsign,
+                    stop_headsign=stop_headsign,
+                    stop_sequence=stop_sequence,
+                    start_window_secs=None if unrepeated else start_window,
+                    end_window_secs=None if unrepeated else end_window,
+                    location_id=location_id,
+                    location_group_id=location_group_id,
+                    stop_id=stop_id,
+                    pickup_type=_enum_or_none(PickupDropOffType, pickup_type),
+                    drop_off_type=_enum_or_none(PickupDropOffType, drop_off_type),
+                    pickup_booking_rule_id=pickup_rule,
+                    drop_off_booking_rule_id=drop_off_rule,
+                    wheelchair_accessible=_enum_or_none(WheelchairAccess, wheelchair),
+                    exact_times={0: False, 1: True}.get(exact_times),
+                )
         return list(found.values())
 
     def on_demand_windows(
@@ -2945,15 +2990,13 @@ class StaticIndex:
         services never holds a large calendar_dates.txt, though one over
         thousands holds theirs.
         """
-        missing = sorted(set(service_ids) - self._patterns.keys())
-        for offset in range(0, len(missing), _ID_SLICE):
-            chunk = missing[offset : offset + _ID_SLICE]
-            marks = ",".join("?" * len(chunk))
-            patterns: dict[str, _ServicePattern | None] = dict.fromkeys(chunk)
-            for service_id, *days, raw_start, raw_end in self._conn.execute(
+        missing = _ids(set(service_ids) - self._patterns.keys())
+        if missing.values:
+            patterns: dict[str, _ServicePattern | None] = dict.fromkeys(missing.values)
+            for service_id, *days, raw_start, raw_end in self._select(
                 f"SELECT service_id, {', '.join(_WEEKDAY_COLUMNS)}, start_date, "
-                f"end_date FROM calendar WHERE service_id IN ({marks})",
-                chunk,
+                f"end_date FROM calendar WHERE service_id IN {_IDS}",
+                [missing],
             ):
                 lo, hi = _lenient_date(raw_start), _lenient_date(raw_end)
                 weekdays = tuple(day == 1 for day in days)
@@ -2961,10 +3004,10 @@ class StaticIndex:
                     patterns[service_id] = _ServicePattern(
                         (weekdays, lo, hi), [], set()
                     )
-            for service_id, raw, kind in self._conn.execute(
+            for service_id, raw, kind in self._select(
                 "SELECT service_id, date, exception_type FROM calendar_dates "
-                f"WHERE service_id IN ({marks}) AND exception_type IN (?, ?)",
-                [*chunk, _EXCEPTION_SERVICE_ADDED, _EXCEPTION_SERVICE_REMOVED],
+                f"WHERE service_id IN {_IDS} AND exception_type IN (?, ?)",
+                [missing, _EXCEPTION_SERVICE_ADDED, _EXCEPTION_SERVICE_REMOVED],
             ):
                 if (day := _lenient_date(raw)) is None:
                     continue
@@ -3047,14 +3090,12 @@ class StaticIndex:
         producer's id, so applying one means finding the repetitions it
         covers.
         """
-        if not source_trip_ids:
-            return {}
-        marks = ",".join("?" * len(source_trip_ids))
         found: dict[str, list[str]] = {}
-        for source_trip_id, trip_id in self._conn.execute(
-            "SELECT source_trip_id, id FROM trips "
-            f"WHERE source_trip_id IN ({marks}) ORDER BY source_trip_id, id",
-            source_trip_ids,
+        for source_trip_id, trip_id in sorted(
+            self._select(
+                f"SELECT source_trip_id, id FROM trips WHERE source_trip_id IN {_IDS}",
+                [_ids(source_trip_ids)],
+            )
         ):
             found.setdefault(source_trip_id, []).append(trip_id)
         return found
@@ -3329,23 +3370,21 @@ class StaticIndex:
         service running to a far year with almost no active days, which
         scans day by day to its end -- rare enough to accept.
         """
-        if not stop_ids:
-            return None
         sql = (
             "SELECT t.service_id, MAX(st.departure_secs) "
             "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
-            f"WHERE st.stop_id IN ({','.join('?' * len(stop_ids))}) "
-            "AND st.departure_secs IS NOT NULL"
+            f"WHERE st.stop_id IN {_IDS} AND st.departure_secs IS NOT NULL"
         )
-        params: list[object] = list(stop_ids)
+        params: list[object] = [_ids(stop_ids)]
         if route_ids:
-            sql += f" AND t.route_id IN ({','.join('?' * len(route_ids))})"
-            params.extend(route_ids)
+            sql += f" AND t.route_id IN {_IDS}"
+            params.append(_ids(route_ids))
         if headsigns:
-            sql += f" AND {_HEADSIGN_SQL} IN ({','.join('?' * len(headsigns))})"
-            params.extend(headsigns)
+            sql += f" AND {_HEADSIGN_SQL} IN {_IDS}"
+            params.append(_ids(headsigns))
         sql += " GROUP BY t.service_id"
-        return self._ceiling_from(self._conn.execute(sql, params))
+        # A service's group may span slices: _ceiling_from keeps the latest.
+        return self._ceiling_from(self._select(sql, params))
 
     def journeys_ceiling(
         self, origin_stop_id: str, destination_stop_id: str
@@ -3385,16 +3424,15 @@ class StaticIndex:
         keys = [key for key in keys if key[1] is not None]
         if not keys:
             return []
-        sources = sorted({source for source, _day, _secs in keys})
         # Only trips with calls: a frequency template keeps its trips row
         # after its calls move to the materialized repetitions, and a run
         # with no calls is not a run any row could come from.
-        trips = self._conn.execute(
+        trips = self._select(
             "SELECT id, source_trip_id, start_secs, service_id FROM trips t "
-            f"WHERE source_trip_id IN ({','.join('?' * len(sources))}) "
+            f"WHERE source_trip_id IN {_IDS} "
             "AND EXISTS (SELECT 1 FROM stop_times st WHERE st.trip_id = t.id)",
-            sources,
-        ).fetchall()
+            [_ids(source for source, _day, _secs in keys)],
+        )
         by_identity = {(source, secs): trip_id for trip_id, source, secs, _ in trips}
         service_of = {trip_id: service for trip_id, _, _, service in trips}
         active: dict[date, set[str]] = {}
@@ -3520,22 +3558,14 @@ class StaticIndex:
         templates (whose calls moved to their repetitions) and trips with
         no timed call are left out.
         """
-        ids = sorted(set(trip_ids))
-        starts: dict[str, int] = {}
-        # In slices: realtime can name more trips than SQLite allows bound
-        # variables in one statement.
-        for offset in range(0, len(ids), _ID_SLICE):
-            chunk = ids[offset : offset + _ID_SLICE]
-            starts.update(
-                self._conn.execute(
-                    "SELECT id, first_secs FROM trips "
-                    f"WHERE id IN ({','.join('?' * len(chunk))}) "
-                    "AND start_secs IS NULL AND source_trip_id = id "
-                    "AND first_secs IS NOT NULL",
-                    chunk,
-                ).fetchall()
+        return dict(
+            self._select(
+                f"SELECT id, first_secs FROM trips WHERE id IN {_IDS} "
+                "AND start_secs IS NULL AND source_trip_id = id "
+                "AND first_secs IS NOT NULL",
+                [_ids(trip_ids)],
             )
-        return starts
+        )
 
     def _trip_spans(
         self, trip_ids: Sequence[str]
@@ -3548,17 +3578,16 @@ class StaticIndex:
         first departure). A trip of one call lasts that call's own dwell,
         arrival to departure. No timed call: first and last are None.
         """
-        marks = ",".join("?" * len(trip_ids))
-        trips = self._conn.execute(
-            f"SELECT id, service_id, start_secs FROM trips WHERE id IN ({marks})",
-            list(trip_ids),
-        ).fetchall()
+        ids = _ids(trip_ids)
+        trips = self._select(
+            f"SELECT id, service_id, start_secs FROM trips WHERE id IN {_IDS}", [ids]
+        )
         calls: dict[str, list[tuple[int, int, int]]] = {}
-        for trip_id, sequence, arrival, departure in self._conn.execute(
+        for trip_id, sequence, arrival, departure in self._select(
             "SELECT trip_id, stop_sequence, arrival_secs, departure_secs "
-            f"FROM stop_times WHERE trip_id IN ({marks}) "
+            f"FROM stop_times WHERE trip_id IN {_IDS} "
             "AND (arrival_secs IS NOT NULL OR departure_secs IS NOT NULL)",
-            list(trip_ids),
+            [ids],
         ):
             arrives = arrival if arrival is not None else departure
             departs = departure if departure is not None else arrival
@@ -3850,8 +3879,6 @@ class StaticIndex:
     ) -> list[ScheduledDeparture]:
         """One service day's timed departures at ``stop_ids`` (see callers)."""
         rows: list[ScheduledDeparture] = []
-        stop_marks = ",".join("?" * len(stop_ids))
-        service_marks = ",".join("?" * len(active))
         sql = (
             "SELECT st.trip_id, t.route_id, t.service_id, t.headsign, st.stop_id, "
             "st.stop_sequence, "
@@ -3860,20 +3887,17 @@ class StaticIndex:
             "st.pickup_type, st.drop_off_type, st.timepoint, st.stop_headsign, "
             "t.short_name, t.block_id "
             "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
-            f"WHERE st.stop_id IN ({stop_marks}) "
-            f"AND t.service_id IN ({service_marks}) "
+            f"WHERE st.stop_id IN {_IDS} AND t.service_id IN {_IDS} "
             "AND st.departure_secs IS NOT NULL "
             f"{window_sql}"
         )
-        params: list[object] = [*stop_ids, *sorted(active), *window_params]
+        params: list[object] = [_ids(stop_ids), _ids(active), *window_params]
         if route_ids:
-            route_marks = ",".join("?" * len(route_ids))
-            sql += f" AND t.route_id IN ({route_marks})"
-            params.extend(route_ids)
+            sql += f" AND t.route_id IN {_IDS}"
+            params.append(_ids(route_ids))
         if headsigns:
-            headsign_marks = ",".join("?" * len(headsigns))
-            sql += f" AND {_HEADSIGN_SQL} IN ({headsign_marks})"
-            params.extend(headsigns)
+            sql += f" AND {_HEADSIGN_SQL} IN {_IDS}"
+            params.append(_ids(headsigns))
         for (
             trip_id,
             route_id,
@@ -3894,7 +3918,7 @@ class StaticIndex:
             stop_headsign,
             trip_short_name,
             block_id,
-        ) in self._conn.execute(sql, params):
+        ) in self._select(sql, params):
             try:
                 departure = day_start_utc + timedelta(seconds=dep_secs)
                 arrival = (
@@ -3967,8 +3991,8 @@ class StaticIndex:
                     stop_ids=stop_ids,
                     route_ids=route_ids,
                     headsigns=headsigns,
-                    window_sql=f"AND st.trip_id IN ({','.join('?' * len(trip_ids))})",
-                    window_params=trip_ids,
+                    window_sql=f"AND st.trip_id IN {_IDS}",
+                    window_params=[_ids(trip_ids)],
                 )
             )
         rows.sort(key=lambda dep: (dep.departure, dep.trip_id, dep.stop_id))
@@ -3986,7 +4010,7 @@ class StaticIndex:
         "WHERE o.stop_id = ? AND d.stop_id = ? "
         "AND o.stop_sequence < d.stop_sequence "
         f"{_USABLE_PAIR_SQL} "
-        "AND t.service_id IN ({service_marks})"
+        f"AND t.service_id IN {_IDS}"
     )
 
     def _pair_day_extremes(
@@ -4007,21 +4031,21 @@ class StaticIndex:
         exactly one journey is the first and exactly one is the last even
         when departures tie. Callers
         only invoke this for days that produced candidate rows, so both
-        LIMIT-1 queries always find a row.
+        LIMIT-1 queries always find a row. Each slice of the active services
+        gives its own extreme (see :meth:`_select`); the day's is the
+        extreme of those, under the same order.
         """
-        service_marks = ",".join("?" * len(active))
-        candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
-        params = [origin_stop_id, destination_stop_id, *sorted(active)]
+        params = [origin_stop_id, destination_stop_id, _ids(active)]
         extremes: list[tuple[str, int]] = []
-        for direction in ("ASC", "DESC"):
+        for direction, pick in (("ASC", min), ("DESC", max)):
             sql = (
-                "SELECT o.trip_id, o.stop_sequence "
-                f"{candidates} "
+                "SELECT o.departure_secs, o.trip_id, o.stop_sequence "
+                f"{self._PAIR_CANDIDATES_SQL} "
                 f"ORDER BY o.departure_secs {direction}, o.trip_id {direction}, "
                 f"o.stop_sequence {direction} LIMIT 1"
             )
-            row = self._conn.execute(sql, params).fetchone()
-            extremes.append((row[0], row[1]))
+            _secs, trip_id, sequence = pick(self._select(sql, params))
+            extremes.append((trip_id, sequence))
         return extremes[0], extremes[1]
 
     def _trips_on(
@@ -4037,8 +4061,6 @@ class StaticIndex:
     ) -> list[ScheduledTrip]:
         """One service day's origin->destination journeys (see callers)."""
         found: list[ScheduledTrip] = []
-        service_marks = ",".join("?" * len(active))
-        candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
         # The IS NOT NULL clauses (in the shared candidate predicate)
         # guarantee ScheduledTrip's non-optional datetimes: a stop_time
         # without a departure at the origin (or an arrival at the
@@ -4055,19 +4077,20 @@ class StaticIndex:
             "o.pickup_type, o.drop_off_type, o.timepoint, o.stop_headsign, "
             "d.pickup_type, d.drop_off_type, d.timepoint, d.stop_headsign, "
             "o.stop_sequence, d.stop_sequence, t.short_name, t.block_id "
-            f"{candidates} "
+            f"{self._PAIR_CANDIDATES_SQL} "
             f"{window_sql} "
             # One journey per origin call, which its trip and stop_sequence
-            # name (a loop trip leaving the origin twice has two).
+            # name (a loop trip leaving the origin twice has two). A trip
+            # has one service, so no slice of either id list splits a group.
             "GROUP BY o.trip_id, o.stop_sequence"
         )
         params: list[object] = [
             origin_stop_id,
             destination_stop_id,
-            *sorted(active),
+            _ids(active),
             *window_params,
         ]
-        rows = self._conn.execute(sql, params).fetchall()
+        rows = self._select(sql, params)
         if not rows:
             return []
         first_key, last_key = self._pair_day_extremes(
@@ -4171,8 +4194,8 @@ class StaticIndex:
                     active,
                     origin_stop_id=origin_stop_id,
                     destination_stop_id=destination_stop_id,
-                    window_sql=f"AND o.trip_id IN ({','.join('?' * len(trip_ids))})",
-                    window_params=trip_ids,
+                    window_sql=f"AND o.trip_id IN {_IDS}",
+                    window_params=[_ids(trip_ids)],
                 )
             )
         rows.sort(key=lambda trip: (trip.departure, trip.trip_id, trip.arrival))
