@@ -1,5 +1,6 @@
 """GBFS conformance: the spec's MUST/SHOULD clauses the handle honours."""
 
+import json
 from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
@@ -422,3 +423,40 @@ def test_a_version_that_isnt_ascii_dotted_digits_sorts_lowest(version: str) -> N
 
 def test_dotted_versions_sort_numerically() -> None:
     assert _version_key("2.3") < _version_key("3.0") < _version_key("3.10")
+
+
+@pytest.mark.parametrize("charset", ["iso-8859-1", "base64", "rot13", "utf-16"])
+async def test_a_gbfs_document_is_utf_8_whatever_its_charset_says(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, charset: str
+) -> None:
+    """RFC 8259 sections 8.1 and 11: JSON between systems is UTF-8, and a
+    charset parameter has no effect on a compliant recipient -- read by it,
+    "Caf\u00e9" became mojibake, and base64 raised a bare LookupError."""
+    feeds = [{"name": "system_information", "url": mock_api.url("/gbfs/si.json")}]
+    mock_api.get("/gbfs/gbfs.json", payload=_doc({"feeds": feeds}))
+    body = json.dumps(_doc({"system_id": "s", "name": "Caf\u00e9"}), ensure_ascii=False)
+    mock_api.get(
+        "/gbfs/si.json",
+        body=body.encode("utf-8"),
+        headers={"Content-Type": f"application/json; charset={charset}"},
+    )
+    handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+    assert (await handle.get_system_info()).name == "Caf\u00e9"
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+async def test_a_gbfs_document_with_a_non_json_number_is_a_parse_error(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, constant: str
+) -> None:
+    """Python's json reads NaN and Infinity; JSON has neither."""
+    feeds = [{"name": "system_information", "url": mock_api.url("/gbfs/si.json")}]
+    mock_api.get("/gbfs/gbfs.json", payload=_doc({"feeds": feeds}))
+    body = (
+        '{"ttl": 0, "last_updated": 0, "data": {"system_id": "s", "x": '
+        + constant
+        + "}}"
+    )
+    mock_api.get("/gbfs/si.json", body=body.encode(), content_type="application/json")
+    handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+    with pytest.raises(FeedParseError, match="Malformed GBFS JSON"):
+        await handle.get_system_info()

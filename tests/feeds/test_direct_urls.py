@@ -1,5 +1,6 @@
 """Tests for direct-URL mode: transit and GBFS handles without the catalog."""
 
+import asyncio
 import io
 import zipfile
 from collections.abc import AsyncGenerator
@@ -505,8 +506,8 @@ def test_the_url_guard_passes_only_urls_a_request_can_be_made_to(url: str) -> No
         return
     parsed = URL(url)
     assert parsed.scheme in ("http", "https")
-    if parsed.raw_host:
-        parsed.raw_host.encode("idna")  # what the resolver will do
+    assert parsed.raw_host  # RFC 9110 section 4.2.1: never an empty host
+    parsed.raw_host.encode("idna")  # what the resolver will do
 
 
 @pytest.mark.parametrize(
@@ -554,6 +555,12 @@ _BAD_LOCATIONS = [
     "http://a..b/x",  # the resolver raises UnicodeError
     "http://[::1/x",
     "http://127.0.0.1:99999/x",
+    # No host (RFC 9110 section 4.2.1): from an http:// page these keep
+    # their scheme and resolve to no host at all.
+    "https:",
+    "https://",
+    "https:///x",
+    "https:x",
 ]
 
 
@@ -645,4 +652,98 @@ async def test_a_punycode_label_that_wont_decode_is_still_fetched_by_hand(
                 api_key_name="X-Key",
                 api_key="secret",
                 timeout_seconds=5,
+            )
+
+
+@pytest.mark.parametrize(
+    "url", ["http:", "https://", "http:x", "http:/x", "http:?q", "https:///x"]
+)
+def test_a_url_with_no_host_is_refused(url: str) -> None:
+    """RFC 9110 section 4.2.1: a recipient MUST reject an http(s) URI with
+    an empty host as invalid."""
+    with pytest.raises(SourceConnectionError, match="malformed URL"):
+        _require_http_url(url, "test URL")
+
+
+@pytest.mark.parametrize("url", ["https://", "http:x", "http:/x"])
+async def test_an_rt_url_with_no_host_is_refused_with_a_header_key(url: str) -> None:
+    """With a header key the library follows redirects by hand, whose URL
+    arithmetic raised a bare ValueError on a host-less URL."""
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError, match="malformed URL"):
+            await fetch_feed_message(
+                session, url, auth_type=2, api_key_name="X-Key", api_key="k"
+            )
+
+
+class _OfflineResolver(aiohttp.abc.AbstractResolver):
+    """Encode the host as getaddrinfo does, then fail: no network in tests."""
+
+    async def resolve(self, host: str, port: int = 0, family: int = 0) -> list[Any]:
+        host.encode("idna")
+        raise OSError(f"offline: {host}")
+
+    async def close(self) -> None:
+        pass
+
+
+_LOCATION_TEXT = st.tuples(
+    st.sampled_from(
+        ["http://", "https://", "http:", "https:", "//", "/", "", "ftp://"]
+    ),
+    st.lists(
+        st.sampled_from(
+            [*"ab1:[]@/.%?#-", "::1", "xn--", "..", "99999", chr(0xE9), chr(0x3002)]
+        ),
+        max_size=8,
+    ).map("".join),
+).map("".join)
+
+
+@given(location=_LOCATION_TEXT, by_hand=st.booleans())
+@settings(max_examples=300, deadline=None)
+def test_any_redirect_ends_in_a_library_exception(location: str, by_hand: bool) -> None:
+    """Whatever Location a producer answers with, followed by aiohttp or by
+    hand (a header key), only SourceConnectionError comes out (the mock
+    serves no feed, so no fetch succeeds)."""
+
+    async def scenario() -> None:
+        api = MockApi()
+        await api.start()
+        try:
+            for _ in range(12):  # enough for a Location that loops back
+                api.get("/rt.pb", status=302, headers={"Location": location})
+            connector = aiohttp.TCPConnector(resolver=_OfflineResolver())
+            async with aiohttp.ClientSession(connector=connector) as session:
+                with pytest.raises(SourceConnectionError):
+                    await fetch_feed_message(
+                        session,
+                        api.url("/rt.pb"),
+                        auth_type=2 if by_hand else None,
+                        api_key_name="X-Key" if by_hand else None,
+                        api_key="k" if by_hand else None,
+                        timeout_seconds=5,
+                    )
+        finally:
+            await api.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("name", ["X-Key\r\nX-Evil", "X Key", "X-Key:", "", "Kl\u00e9"])
+async def test_an_api_key_header_name_that_is_no_field_name_is_refused(
+    name: str,
+) -> None:
+    """api_key_parameter_name is catalog data: a CR LF in it raised a bare
+    ValueError from aiohttp mid-request."""
+    async with aiohttp.ClientSession() as session:
+        if not name:  # an empty name sends no key at all
+            return
+        with pytest.raises(SourceConnectionError, match="no HTTP header field name"):
+            await fetch_feed_message(
+                session,
+                "http://127.0.0.1:1/rt.pb",
+                auth_type=2,
+                api_key_name=name,
+                api_key="k",
             )

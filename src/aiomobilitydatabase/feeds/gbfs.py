@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping
@@ -50,6 +51,27 @@ _RFC3339 = re.compile(
     r"((?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60))(\.[0-9]+)?"
     r"([Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
 )
+
+
+def _reject_constant(name: str) -> None:
+    """Refuse ``NaN``/``Infinity``: Python's json accepts them, JSON does not."""
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def _decode_json(body: bytes) -> object:
+    """Parse a GBFS document's bytes as JSON.
+
+    From the bytes, never the response's ``charset``: RFC 8259 section 8.1
+    has JSON exchanged between systems be UTF-8, and its section 11 gives a
+    charset parameter no effect on a compliant recipient. Decoding by it
+    would read a UTF-8 "Caf\u00e9" sent as ``charset=iso-8859-1`` as
+    mojibake, and raise LookupError for one that is no text encoding
+    (``charset=base64``). ``json.loads`` detects UTF-8 (a BOM ignored, as
+    RFC 8259 allows), and UTF-16/32, from the bytes themselves.
+    """
+    return json.loads(body, parse_constant=_reject_constant)
+
+
 # GBFS Date: "ISO 8601 Complete Date Extended Format: YYYY-MM-DD".
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
@@ -569,7 +591,7 @@ class GbfsFeedHandle:
                         status=resp.status,
                     )
                 try:
-                    document = await resp.json(content_type=None)
+                    document = _decode_json(await resp.read())
                 except (ValueError, RecursionError) as err:
                     # RecursionError: json raises it for nesting deeper than
                     # the interpreter's stack, a few kilobytes of brackets.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -47,6 +48,8 @@ _AUTH_STATUSES = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
 
 _AUTH_TYPE_QUERY_PARAM = 1
 _AUTH_TYPE_HEADER = 2
+# RFC 9110 section 5.1: a field name is a token.
+_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
 # The RT identity a TripDescriptor addresses: (trip_id, start_date,
 # start_secs). start_date pins ONE service day's instance of the trip
@@ -123,6 +126,13 @@ def _feed_request(
         if auth_type == _AUTH_TYPE_QUERY_PARAM:
             params[api_key_name] = api_key
         elif auth_type == _AUTH_TYPE_HEADER:
+            if not _FIELD_NAME.fullmatch(api_key_name):
+                # The name is catalog data; aiohttp would raise a bare
+                # ValueError for a CR or LF in it, mid-request.
+                raise SourceConnectionError(
+                    f"The feed's api_key_parameter_name {api_key_name!r} is no "
+                    "HTTP header field name"
+                )
             req_headers[api_key_name] = api_key
     return params, req_headers
 

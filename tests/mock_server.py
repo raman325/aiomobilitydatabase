@@ -127,10 +127,13 @@ class MockApi:
         body = scripted.body or b""
         if isinstance(body, str):
             body = body.encode()
+        # A Content-Type among the headers is sent verbatim (a charset
+        # aiohttp's content_type argument would refuse, for instance).
+        verbatim = any(k.lower() == "content-type" for k in scripted.headers or {})
         return web.Response(
             status=scripted.status,
             body=body,
-            content_type=scripted.content_type,
+            content_type=None if verbatim else scripted.content_type,
             headers=scripted.headers,
         )
 
