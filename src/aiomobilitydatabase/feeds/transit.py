@@ -36,6 +36,7 @@ from ..models import (
     SourceInfo,
 )
 from ._freshness import FreshnessCache, _etag, header_fields
+from ._redirects import open_response
 from ._urls import (
     _require_http_url,  # deliberate friend access: shared data-origin URL guard
 )
@@ -1919,12 +1920,16 @@ class TransitFeedHandle:
         """
         session = client._get_session()  # deliberate friend access
         try:
-            async with session.head(
+            resp = await open_response(
+                session.head(
+                    direct.static_url,
+                    headers=dict(direct.headers) if direct.headers else None,
+                    allow_redirects=True,  # match GET: probe the final URL
+                    timeout=aiohttp.ClientTimeout(total=client.timeout_seconds),
+                ),
                 direct.static_url,
-                headers=dict(direct.headers) if direct.headers else None,
-                allow_redirects=True,  # match GET semantics: probe the final URL
-                timeout=aiohttp.ClientTimeout(total=client.timeout_seconds),
-            ) as resp:
+            )
+            async with resp:
                 if resp.status in _DATASET_STATUSES and (
                     etag := _strong_etag(resp.headers)
                 ):
@@ -2048,13 +2053,17 @@ class TransitFeedHandle:
         """
         session = client._get_session()  # deliberate friend access
         try:
-            async with session.get(
-                source.url,
-                headers=dict(source.headers) if source.headers else None,
-                timeout=aiohttp.ClientTimeout(
-                    total=None, sock_read=client.timeout_seconds
+            resp = await open_response(
+                session.get(
+                    source.url,
+                    headers=dict(source.headers) if source.headers else None,
+                    timeout=aiohttp.ClientTimeout(
+                        total=None, sock_read=client.timeout_seconds
+                    ),
                 ),
-            ) as resp:
+                source.url,
+            )
+            async with resp:
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
                         f"Dataset fetch failed ({resp.status}) for {source.url}",

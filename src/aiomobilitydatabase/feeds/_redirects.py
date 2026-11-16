@@ -10,13 +10,14 @@ request carrying either is fetched through here.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from time import monotonic
 
 import aiohttp
 from yarl import URL
 
+from ._urls import URL_ERRORS, require_resolvable_host
 from .exceptions import SourceConnectionError
 
 # aiohttp's own redirect limit: the tenth redirect raises.
@@ -24,15 +25,38 @@ _MAX_REDIRECTS = 10
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 # Credentials aiohttp itself drops when a redirect leaves the origin.
 _ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization"})
+# What a request can raise mid-flight, unwrapped, for a URL it reaches by a
+# redirect aiohttp follows itself: aiohttp wraps only a ValueError from the
+# Location, not yarl's IndexError, nor the resolver's UnicodeError for a
+# host it can't IDNA-encode.
+_UNREQUESTABLE = (IndexError, UnicodeError)
+
+
+async def open_response(
+    request: Awaitable[aiohttp.ClientResponse], url: str
+) -> aiohttp.ClientResponse:
+    """Await a request; a URL it can't be made to is SourceConnectionError.
+
+    The caller releases the response (``async with``). Only the request
+    itself is covered, never the caller's handling of the response.
+    """
+    try:
+        return await request
+    except _UNREQUESTABLE as err:
+        raise SourceConnectionError(
+            f"Could not request {url} or a URL it redirected to: {err!r}"
+        ) from err
 
 
 def _origin(url: URL) -> tuple[str, str | None, int | None]:
     """RFC 6454 origin: an explicit default port names the same origin.
 
     (yarl's ``URL.origin()`` keeps an explicit ``:443``, so it can't be
-    compared directly.)
+    compared directly.) The host in its ASCII form, as RFC 6454 compares
+    it: decoding punycode (``url.host``) raises for a label such as
+    ``xn--`` that a request can still be made to.
     """
-    return url.scheme, url.host, url.port
+    return url.scheme, url.raw_host, url.port
 
 
 def _remaining(deadline: float | None) -> float | None:
@@ -65,7 +89,8 @@ def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str)
     try:
         following = base.join(URL(location, encoded=not session.requote_redirect_url))
         _origin(following)
-    except ValueError as err:
+        require_resolvable_host(following)
+    except URL_ERRORS as err:
         raise SourceConnectionError(
             f"Producer redirected to an invalid URL ({location!r}): {url}"
         ) from err
@@ -118,12 +143,16 @@ async def get_withholding(
     no bound).
     """
     if secret is None and not conditional:
-        async with session.get(
+        response = await open_response(
+            session.get(
+                url,
+                params=params or None,
+                headers=headers or None,
+                timeout=aiohttp.ClientTimeout(total=total),
+            ),
             url,
-            params=params or None,
-            headers=headers or None,
-            timeout=aiohttp.ClientTimeout(total=total),
-        ) as response:
+        )
+        async with response:
             yield response, response.history
         return
     deadline = monotonic() + total if total is not None and total > 0 else None
@@ -142,12 +171,15 @@ async def get_withholding(
         # The validators go to the resource they came from, and only to it.
         asked = _same_resource(target, query, validated)
         hop_headers = {**sent, **conditional} if conditional and asked else sent
-        response = await session.get(
-            target,
-            params=query,
-            headers=hop_headers or None,
-            timeout=aiohttp.ClientTimeout(total=remaining),
-            allow_redirects=False,
+        response = await open_response(
+            session.get(
+                target,
+                params=query,
+                headers=hop_headers or None,
+                timeout=aiohttp.ClientTimeout(total=remaining),
+                allow_redirects=False,
+            ),
+            url,
         )
         location = response.headers.get("Location")
         if response.status not in _REDIRECT_STATUSES or location is None:
@@ -182,10 +214,14 @@ async def get_withholding(
             following = following.with_user(userinfo[0]).with_password(userinfo[1])
         target, query = following, None
     remaining = _remaining(deadline)
-    async with session.get(
+    response = await open_response(
+        session.get(
+            url,
+            params=params or None,
+            headers=headers or None,
+            timeout=aiohttp.ClientTimeout(total=remaining),
+        ),
         url,
-        params=params or None,
-        headers=headers or None,
-        timeout=aiohttp.ClientTimeout(total=remaining),
-    ) as response:
+    )
+    async with response:
         yield response, response.history

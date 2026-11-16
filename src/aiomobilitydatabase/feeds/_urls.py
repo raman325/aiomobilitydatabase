@@ -7,6 +7,21 @@ from yarl import URL
 from .exceptions import SourceConnectionError
 
 _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
+# What parsing a URL with yarl can raise: ValueError (UnicodeError among
+# them, for IDNA), and IndexError for some malformed authorities, such as
+# ``http://[::1]:@``.
+URL_ERRORS = (ValueError, IndexError)
+
+
+def require_resolvable_host(parsed: URL) -> None:
+    """Raise UnicodeError when the resolver can't IDNA-encode the host.
+
+    An empty label (``a..b``) or one past 63 octets fails there, which
+    aiohttp raises mid-request as a bare UnicodeError. yarl has already
+    punycoded any non-ASCII name, so only those limits are left to check.
+    """
+    if parsed.raw_host:
+        parsed.raw_host.encode("idna")  # as socket.getaddrinfo encodes it
 
 
 def _require_http_url(url: str, context: str) -> None:
@@ -30,10 +45,9 @@ def _require_http_url(url: str, context: str) -> None:
     """
     try:
         parsed = URL(url)
-        if parsed.raw_host:
-            parsed.raw_host.encode("idna")  # as the resolver encodes it
+        require_resolvable_host(parsed)
         scheme = parsed.scheme.lower()
-    except (ValueError, IndexError) as err:  # UnicodeError is a ValueError
+    except URL_ERRORS as err:
         raise SourceConnectionError(
             f"Refusing to fetch {context}: malformed URL ({url!r}): {err}"
         ) from err

@@ -13,6 +13,7 @@ from aiomobilitydatabase.feeds.gbfs import (
     _iso_date,
     _localized,
     _reported_at,
+    _version_key,
 )
 from aiomobilitydatabase.feeds.geo import Circle
 
@@ -407,3 +408,17 @@ async def test_a_discovery_url_aiohttp_cannot_parse_is_a_connection_error(
 ) -> None:
     with pytest.raises(SourceConnectionError, match="malformed URL"):
         await direct_client.get_gbfs_feed_from_url(url)
+
+
+@pytest.mark.parametrize(
+    "version",
+    [chr(0xFF13) + ".0", "٣.0", "3_0.1", " 3.0", "3.0 ", "3..0", "", "v3"],
+)
+def test_a_version_that_isnt_ascii_dotted_digits_sorts_lowest(version: str) -> None:
+    """int() also reads other scripts' digits, spaces and _ grouping: a
+    corrupt catalog version must not sort as the version it resembles."""
+    assert _version_key(version) == (0,)
+
+
+def test_dotted_versions_sort_numerically() -> None:
+    assert _version_key("2.3") < _version_key("3.0") < _version_key("3.10")

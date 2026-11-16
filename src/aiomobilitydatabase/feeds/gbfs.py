@@ -107,9 +107,17 @@ def _localized(value: Any) -> str | None:
 
 
 def _version_key(version: str | None) -> tuple[int, ...]:
+    """Sort key of a GBFS version ("2.3", "3.0"); (0,) when it isn't one.
+
+    ASCII digits only: ``int()`` also reads other scripts' digits, spaces
+    and ``_`` grouping, so a corrupt "\uff13.0" would sort as 3.0.
+    """
+    parts = (version or "0").split(".")
+    if not all(part.isascii() and part.isdigit() for part in parts):
+        return (0,)
     try:
-        return tuple(int(part) for part in (version or "0").split("."))
-    except ValueError:
+        return tuple(int(part) for part in parts)
+    except ValueError:  # past CPython's int-string digit limit
         return (0,)
 
 

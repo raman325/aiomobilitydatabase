@@ -22,7 +22,7 @@ from aiomobilitydatabase.feeds.exceptions import (
     SourceConnectionError,
 )
 from aiomobilitydatabase.feeds.models import ArrivalsQuery, StaticBuildProgress
-from aiomobilitydatabase.feeds.rt import feed_request_fields
+from aiomobilitydatabase.feeds.rt import feed_request_fields, fetch_feed_message
 
 from tests.feeds.fixtures import (
     _FILES,
@@ -545,3 +545,104 @@ async def test_predicting_an_rt_request_refuses_an_unparseable_url(url: str) -> 
     async with aiohttp.ClientSession() as session:
         with pytest.raises(SourceConnectionError, match="malformed URL"):
             feed_request_fields(session, url)
+
+
+# -- A redirect to a URL no request can be made to ------------------------------
+
+_BAD_LOCATIONS = [
+    "http://[::1]:@/x",  # yarl raises IndexError
+    "http://a..b/x",  # the resolver raises UnicodeError
+    "http://[::1/x",
+    "http://127.0.0.1:99999/x",
+]
+
+
+@pytest.mark.parametrize("location", _BAD_LOCATIONS)
+async def test_a_gbfs_redirect_to_an_unusable_url_is_a_connection_error(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, location: str
+) -> None:
+    """Where a redirect leads is as producer-controlled as the first URL:
+    aiohttp following it must not let a bare exception out."""
+    mock_api.get("/gbfs/gbfs.json", status=302, headers={"Location": location})
+    with pytest.raises(SourceConnectionError):
+        await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+
+
+@pytest.mark.parametrize("location", _BAD_LOCATIONS)
+async def test_a_revalidation_redirect_to_an_unusable_url_is_a_connection_error(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, location: str
+) -> None:
+    """A conditional request follows redirects by hand (to withhold its
+    validators): the Location gets the URL guard's checks there too."""
+    feeds = [{"name": "system_information", "url": mock_api.url("/gbfs/si.json")}]
+    discovery = {"ttl": 3600, "last_updated": 0, "data": {"feeds": feeds}}
+    mock_api.get(
+        "/gbfs/gbfs.json", payload=discovery, headers={"Cache-Control": "max-age=3600"}
+    )
+    info = {"ttl": 0, "last_updated": 0, "data": {"system_id": "s", "name": "Bikes"}}
+    mock_api.get("/gbfs/si.json", payload=info, headers={"ETag": '"v1"'})
+    mock_api.get("/gbfs/si.json", status=302, headers={"Location": location})
+    handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+    assert (await handle.get_system_info()).name == "Bikes"
+    with pytest.raises(SourceConnectionError):
+        await handle.get_system_info()
+    revalidation = [r for r in mock_api.requests if r.path == "/gbfs/si.json"][-1]
+    assert revalidation.headers.get("If-None-Match") == '"v1"'
+
+
+@pytest.mark.parametrize("location", _BAD_LOCATIONS)
+@pytest.mark.parametrize(
+    "api_key", [None, "secret"], ids=["aiohttp-follows", "by-hand"]
+)
+async def test_an_rt_redirect_to_an_unusable_url_is_a_connection_error(
+    mock_api: MockApi, location: str, api_key: str | None
+) -> None:
+    """A header API key makes the library follow redirects by hand; without
+    one aiohttp does. Neither lets a bare exception out."""
+    mock_api.get("/rt.pb", status=302, headers={"Location": location})
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError):
+            await fetch_feed_message(
+                session,
+                mock_api.url("/rt.pb"),
+                auth_type=2 if api_key else None,
+                api_key_name="X-Key" if api_key else None,
+                api_key=api_key,
+            )
+
+
+@pytest.mark.parametrize("location", _BAD_LOCATIONS)
+async def test_a_static_download_redirect_to_an_unusable_url_is_a_connection_error(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, location: str
+) -> None:
+    mock_api.head(STATIC_PATH, status=405)
+    mock_api.get(STATIC_PATH, status=302, headers={"Location": location})
+    with pytest.raises(SourceConnectionError):
+        await direct_client.get_transit_feed_from_urls(mock_api.url(STATIC_PATH))
+
+
+@pytest.mark.parametrize("location", _BAD_LOCATIONS)
+async def test_a_static_probe_redirect_to_an_unusable_url_is_a_connection_error(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, location: str
+) -> None:
+    mock_api.head(STATIC_PATH, status=302, headers={"Location": location})
+    with pytest.raises(SourceConnectionError):
+        await direct_client.get_transit_feed_from_urls(mock_api.url(STATIC_PATH))
+
+
+async def test_a_punycode_label_that_wont_decode_is_still_fetched_by_hand(
+    mock_api: MockApi,
+) -> None:
+    """``xn--`` is no IDNA name, yet aiohttp requests it (and fails DNS).
+    The hand-followed path compares origins by the ASCII host, as RFC 6454
+    does, rather than decoding it -- which raised a bare UnicodeError."""
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError):
+            await fetch_feed_message(
+                session,
+                "http://xn--.invalid/rt.pb",
+                auth_type=2,
+                api_key_name="X-Key",
+                api_key="secret",
+                timeout_seconds=5,
+            )

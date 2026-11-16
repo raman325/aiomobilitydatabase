@@ -259,3 +259,18 @@ async def test_purge_cache_before_the_cache_dir_exists(
     await client.purge_cache("mdb-100")
     assert not root.exists()
     await client.close()
+
+
+async def test_purge_cache_of_a_cache_dir_that_is_a_file_still_raises(
+    mock_api: MockApi, tmp_path: Path
+) -> None:
+    """Only a missing directory is "nothing cached yet": a file in its place
+    is a misconfiguration, and the filesystem error propagates."""
+    root = tmp_path / "a-file"
+    root.write_text("x")
+    client = MobilityFeedsClient(
+        "test-refresh-token", base_url=mock_api.url(), cache_dir=root
+    )
+    with pytest.raises(NotADirectoryError):
+        await client.purge_cache()
+    await client.close()

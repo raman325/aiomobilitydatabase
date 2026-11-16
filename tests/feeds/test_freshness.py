@@ -2670,7 +2670,10 @@ def _reference_quoted_string(text: str) -> bool:
 
 @given(
     st.lists(
-        st.sampled_from(['"', "\\", "a", " ", "\t", "\x01", "\x7f", "\xe9", "="]),
+        # Each edge of the excluded control ranges, and its neighbours.
+        st.sampled_from(
+            [*'"\\a =!#[]~', "\xe9", "\x80", *"\x00\x01\x08\t\n\x0b\x1f\x7f"]
+        ),
         max_size=8,
     ).map(lambda chars: '"' + "".join(chars))
 )
@@ -2699,3 +2702,31 @@ def test_text_glued_after_a_closing_quote_makes_the_field_malformed(glued: str) 
 
 def test_an_escaped_backslash_inside_a_quoted_string_is_fine() -> None:
     assert _fresh({"Cache-Control": r'ext="a\\b\"c", max-age=60'}) == Freshness(60.0)
+
+
+@given(
+    st.lists(st.sampled_from([*'"\\a 6', *"\t\n\x0b\x1f\x7f"]), max_size=8).map(
+        lambda chars: '"' + "".join(chars)
+    )
+)
+def test_a_max_age_counts_only_beside_a_well_formed_quoted_argument(arg: str) -> None:
+    """The whole path, split then each directive: a max-age beside an
+    extension argument counts exactly when the argument is a quoted-string;
+    a malformed element makes the response stale (RFC 9111 section 4.2.1)."""
+    expected = Freshness(60.0) if _reference_quoted_string(arg) else Freshness(0.0)
+    assert _fresh({"Cache-Control": f"max-age=60, ext={arg}"}) == expected
+
+
+@pytest.mark.parametrize(
+    ("argument", "lifetime"),
+    [('"60"', 60.0), (r'"6\0"', 60.0), (r'"\6\0"', 60.0), (r'"6\"', None)],
+)
+def test_a_quoted_max_age_reads_its_quoted_pairs(
+    argument: str, lifetime: float | None
+) -> None:
+    """RFC 9111 section 5.2: a recipient reads max-age="60" as 60; a
+    quoted-pair stands for its character, so "6\\0" is 60 too."""
+    freshness = _fresh({"Cache-Control": f"max-age={argument}"})
+    assert freshness == (
+        Freshness(lifetime) if lifetime is not None else Freshness(0.0)
+    )
