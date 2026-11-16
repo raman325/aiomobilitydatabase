@@ -719,7 +719,7 @@ each define their own subtree beneath it, so you can catch broadly
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
 | `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
-| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), or a malformed scalar in a structural GTFS column (stop coordinates included) |
+| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180) |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
 
 The GBFS and GTFS-RT parse paths are **total** with respect to this table:
