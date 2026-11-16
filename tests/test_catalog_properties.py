@@ -9,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
-from datetime import datetime
+import math
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -196,15 +197,19 @@ _scalars = (
     | st.just("")
     | _COMMA_TEXT
     | st.sampled_from(_ENUM_VALUES)
-    | st.datetimes(min_value=datetime(2000, 1, 1), max_value=datetime(2035, 1, 1))
+    | st.datetimes(
+        min_value=datetime(2000, 1, 1),
+        max_value=datetime(2035, 1, 1),
+        timezones=st.sampled_from([UTC, timezone(timedelta(hours=-5, minutes=-30))]),
+    )
+    | st.floats(allow_nan=False, allow_infinity=False)
 )
-_containers = st.lists(_scalars, max_size=4).flatmap(
-    lambda items: st.sampled_from([items, tuple(items)])
-)
-# Nested containers are not reachable through any public client signature, but
-# _encode_value recurses, so pin the flattening it produces today.
-_nested_containers = st.lists(_containers, max_size=3)
-_values = st.none() | _scalars | _containers | _nested_containers
+# A list item can't hold the comma the items are joined on (refused above).
+_containers = st.lists(
+    _scalars.filter(lambda item: not (isinstance(item, str) and "," in item)),
+    max_size=4,
+).flatmap(lambda items: st.sampled_from([items, tuple(items)]))
+_values = st.none() | _scalars | _containers
 _param_keys = st.text(
     alphabet=st.characters(whitelist_categories=("Ll", "Lu")), min_size=1, max_size=10
 )
@@ -219,25 +224,19 @@ def _expected_scalar(value: Any) -> str:
     if isinstance(value, StrEnum):
         return value.value
     if isinstance(value, datetime):
-        # ISO 8601, i.e. "T"-separated -- not str(datetime)'s space.
-        return value.isoformat()
-    if isinstance(value, int):
+        # ISO 8601 ("T"-separated, not str(datetime)'s space), in UTC.
+        return value.astimezone(UTC).isoformat()
+    if isinstance(value, int | float):
+        # repr: the shortest text that reads back as the same double.
         return repr(value)
     assert isinstance(value, str)
     return value
 
 
 def _expected_encoded(value: Any) -> str:
-    """Expected encoding of a (possibly nested) value: containers comma-join
-    their items' encodings, recursively.
-
-    Note this is NOT a flatten: an empty inner container encodes to "", so
-    [[], []] encodes to "," rather than "". Only a TOP-level empty container
-    is dropped. Nested containers are unreachable through the public client
-    signatures; this pins the behavior rather than endorsing it.
-    """
+    """Expected encoding of a value: a container comma-joins its items'."""
     if isinstance(value, list | tuple):
-        return ",".join(_expected_encoded(item) for item in value)
+        return ",".join(_expected_scalar(item) for item in value)
     return _expected_scalar(value)
 
 
@@ -276,16 +275,33 @@ def test_encode_params_keeps_empty_string_but_drops_empty_container() -> None:
     assert encode_params({"provider": "", "features": []}) == {"provider": ""}
 
 
-def test_encode_params_comma_join_is_ambiguous_for_commas_in_values() -> None:
-    """KNOWN GAP, pinned rather than fixed: the API's multi-value convention
-    is a comma-joined string with no escape, so a single value containing a
-    comma is indistinguishable on the wire from two values. Reachable today
-    via the list[str] filters (license_tags, features, license_ids). Fixing
-    it needs an escaping convention the API does not document.
-    """
-    assert encode_params({"license_tags": ["a,b"]}) == encode_params(
-        {"license_tags": ["a", "b"]}
-    )
+@pytest.mark.parametrize("items", [["a,b"], ["a", ","], ("trailing,",)])
+def test_a_list_item_holding_a_comma_is_refused(items: Any) -> None:
+    """The API's multi-value convention is a comma-joined string with no
+    escape: ["a,b"] would have filtered on "a" and "b". A single string
+    value keeps its commas (it is no list)."""
+    with pytest.raises(ValueError, match="comma"):
+        encode_params({"license_tags": items})
+    assert encode_params({"search_query": "a,b"}) == {"search_query": "a,b"}
+
+
+def test_a_naive_query_datetime_is_refused() -> None:
+    """RFC 3339 section 5.6: a date-time carries an offset; a naive one
+    names no instant."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        encode_params({"downloaded_after": datetime(2024, 1, 1)})
+    aware = datetime(2024, 1, 1, tzinfo=timezone(timedelta(hours=-5)))
+    assert encode_params({"downloaded_after": aware}) == {
+        "downloaded_after": "2024-01-01T05:00:00+00:00"
+    }
+
+
+def test_a_query_offset_with_seconds_is_sent_as_the_same_instant_in_utc() -> None:
+    """Python allows an offset of seconds; RFC 3339 writes hours and minutes."""
+    odd = datetime(2024, 1, 1, tzinfo=timezone(timedelta(minutes=19, seconds=32)))
+    encoded = encode_params({"downloaded_after": odd})["downloaded_after"]
+    assert encoded == "2023-12-31T23:40:28+00:00"
+    assert datetime.fromisoformat(encoded) == odd
 
 
 # --- Task 15R-b item 2: path-interpolated ids must be quoted ---------------
@@ -381,3 +397,107 @@ def test_every_quoted_call_site_is_covered() -> None:
     """
     source = Path(client_module.__file__).read_text(encoding="utf-8")
     assert source.count("{_quote_segment(") == len(_PATH_METHODS)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [b"MTA", bytearray(b"x"), object(), {"a": 1}, {1}, [[1]], ("a", None), 1j],
+)
+def test_a_query_value_of_another_type_is_the_callers_type_error(value: Any) -> None:
+    """str() would have filtered on b'MTA' or an object's repr: wrong data."""
+    with pytest.raises(TypeError, match="query parameter"):
+        encode_params({"provider": value})
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, (1.0, math.nan)])
+def test_a_query_number_that_is_not_finite_is_refused(value: Any) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        encode_params({"dataset_latitudes": value})
+
+
+async def test_a_bad_query_value_fails_before_any_request() -> None:
+    """Not even the token request: the caller's mistake is found first."""
+    client = MobilityDatabaseClient("t", base_url="http://127.0.0.1:9")
+    try:
+        with pytest.raises(TypeError):
+            await client.get_feeds(provider=b"MTA")  # type: ignore[arg-type]
+    finally:
+        await client.close()
+
+
+async def test_an_id_holding_a_lone_surrogate_is_refused_in_the_librarys_words() -> (
+    None
+):
+    """No text a URL can carry; the codec's own error (which quotes the id)
+    isn't what the caller gets."""
+    client = MobilityDatabaseClient("t", base_url="http://127.0.0.1:9")
+    try:
+        with pytest.raises(ValueError, match="lone surrogate") as caught:
+            await client.get_feed("mdb-\ud800")
+    finally:
+        await client.close()
+    assert not isinstance(caught.value, UnicodeError)
+
+
+@pytest.mark.parametrize("url", [None, b"https://x", 1])
+async def test_a_license_url_that_isnt_text_is_a_type_error(url: Any) -> None:
+    client = MobilityDatabaseClient("t", base_url="http://127.0.0.1:9")
+    try:
+        with pytest.raises(TypeError, match="license_url"):
+            await client.get_matching_licenses(url)
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5))),
+        datetime.max.replace(tzinfo=timezone(timedelta(hours=-1))),
+    ],
+)
+def test_a_query_datetime_with_no_utc_time_is_refused(value: datetime) -> None:
+    """Its UTC time falls outside what datetime holds: the caller's
+    ValueError, not an OverflowError."""
+    with pytest.raises(ValueError, match="UTC"):
+        encode_params({"downloaded_after": value})
+
+
+class _ShownInt(int):
+    def __repr__(self) -> str:
+        return "nope"
+
+    __str__ = __repr__
+
+
+class _ShownFloat(float):
+    def __repr__(self) -> str:
+        return "np.float64(2.5)"  # numpy 2's spelling
+
+    __str__ = __repr__
+
+
+class _ShownStr(str):
+    def __str__(self) -> str:
+        return "other"
+
+
+def test_a_number_or_text_subclass_is_sent_as_its_value() -> None:
+    """Its own repr or str would be sent as the value: the base spelling is."""
+    assert encode_params(
+        {"limit": _ShownInt(3), "lat": _ShownFloat(2.5), "q": _ShownStr("x")}
+    ) == {"limit": "3", "lat": "2.5", "q": "x"}
+
+
+class _BrokenZone(tzinfo):
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        return timedelta(days=2)  # past the +-24h datetime allows
+
+    def dst(self, dt: datetime | None) -> None:
+        return None
+
+
+def test_a_datetime_whose_tzinfo_is_broken_is_refused_in_the_librarys_words() -> None:
+    with pytest.raises(ValueError, match="no usable offset") as caught:
+        encode_params({"downloaded_after": datetime(2024, 1, 1, tzinfo=_BrokenZone())})
+    assert caught.value.__context__ is None

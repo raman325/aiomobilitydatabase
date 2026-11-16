@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import math
+import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from http import HTTPStatus
@@ -12,7 +15,12 @@ from urllib.parse import quote
 
 import aiohttp
 from mashumaro import DataClassDictMixin
+from yarl import URL
 
+from ._http import URL_ERRORS, require_session, require_text
+from ._json import loads as json_loads
+from ._payload import mismatch
+from ._transport import Answer, exchange
 from .const import (
     DEFAULT_TIMEOUT_SECONDS,
     PROD_BASE_URL,
@@ -23,7 +31,6 @@ from .exceptions import (
     MobilityDatabaseApiError,
     MobilityDatabaseAuthenticationError,
     MobilityDatabaseConnectionError,
-    MobilityDatabaseError,
     MobilityDatabaseNotFoundError,
     MobilityDatabaseRateLimitError,
 )
@@ -50,17 +57,143 @@ from .models import (
 )
 
 
+def _require_catalog_session(session: aiohttp.ClientSession) -> None:
+    """Raise ValueError for an injected session the client can't use.
+
+    The shared policy (:func:`._http.require_session`: no credential
+    defaults, sendable headers), and no ``base_url``: aiohttp before 3.14
+    then refuses the absolute URLs the client requests.
+    """
+    require_session(session)
+    if getattr(session, "_base_url", None) is not None:
+        raise ValueError("the session has a base_url; pass base_url= instead")
+
+
+def _require_base_url(base_url: str) -> str:
+    """Return ``base_url`` without a trailing slash; ValueError if unusable.
+
+    An http(s) URL with a host and nothing a request path can't follow
+    (credentials would be sent as Basic auth beside the Bearer token; a
+    query or fragment would swallow every path). RFC 6750 section 5.3: a
+    bearer token travels over TLS only, so plain http is for loopback.
+    """
+    try:
+        parsed = URL(base_url)
+        host = parsed.host
+    except URL_ERRORS:
+        parsed = None
+    if parsed is None:  # outside the except, quoting nothing: it may hold a password
+        raise ValueError("base_url is no URL")
+    if parsed.scheme not in ("http", "https") or not host:
+        raise ValueError("base_url must be an http(s) URL with a host")
+    if parsed.user is not None or parsed.raw_password is not None:
+        raise ValueError("base_url must not hold credentials")
+    if (
+        parsed.raw_query_string
+        or parsed.raw_fragment
+        or "?" in base_url
+        or "#" in base_url
+    ):
+        raise ValueError("base_url must not hold a query or fragment")
+    if parsed.scheme == "http" and not _is_loopback(host):
+        raise ValueError("base_url must be https: bearer tokens travel over TLS only")
+    return base_url.rstrip("/")
+
+
+def _timeout_seconds(request_timeout: object) -> float:
+    """Return ``request_timeout`` as float seconds; ValueError if unusable.
+
+    A positive number a deadline can be scheduled with: asyncio can't
+    schedule an infinite one (nor an int past float's range, which compares
+    below infinity), so every request would fail with OverflowError as the
+    API's fault.
+    """
+    seconds = math.nan
+    if isinstance(request_timeout, bool) or not isinstance(
+        request_timeout, int | float
+    ):
+        raise TypeError("request_timeout must be a number of seconds")
+    try:
+        seconds = float(request_timeout)
+    except OverflowError:
+        seconds = math.inf
+    if not 0 < seconds < math.inf:
+        raise ValueError("request_timeout must be a finite positive number of seconds")
+    return seconds
+
+
+def _is_loopback(host: str) -> bool:
+    """Whether a host names this machine (where plain http stays local)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _encode_value(value: Any) -> str:
-    """Encode a single query parameter value as a string."""
+    """Encode one query parameter value: a scalar, or a list or tuple of them.
+
+    A list is the API's comma-separated multi-value filter, so an item that
+    holds a comma itself would be read as two: the caller's ValueError.
+    """
+    if not isinstance(value, list | tuple):
+        return _encode_scalar(value)
+    items = [_encode_scalar(item) for item in value]
+    if any("," in item for item in items):
+        raise ValueError("a query list item holds a comma, which separates items")
+    return ",".join(items)
+
+
+def _encode_scalar(value: Any) -> str:
+    """Encode one scalar, from an allowlist of the types the methods take.
+
+    Anything else is the caller's TypeError (``str()`` of bytes or an object
+    filtered on its repr), and a float that's no number the API can read
+    (NaN, infinity) a ValueError -- raised before any request is made.
+    """
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, Enum):
-        return str(value.value)
+        return _encode_scalar(value.value)
     if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, list | tuple):
-        return ",".join(_encode_value(item) for item in value)
-    return str(value)
+        return _encode_datetime(value)
+    # The base types' own spellings: a subclass's (numpy 2's np.float64
+    # repr is "np.float64(2.5)") would be sent as the value.
+    if isinstance(value, int):
+        return int.__repr__(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("a query parameter is no finite number")
+        return float.__repr__(value)
+    if isinstance(value, str):
+        return require_text(str.__str__(value), "a query parameter")
+    raise TypeError(f"a query parameter can't be a {type(value).__name__}")
+
+
+def _encode_datetime(value: datetime) -> str:
+    """Encode an aware datetime as RFC 3339, in UTC; ValueError otherwise.
+
+    RFC 3339 section 5.6 requires an offset: a naive time names no instant,
+    and the API would have to guess the zone. Sent in UTC: the same instant,
+    and an offset RFC 3339 can write (hours and minutes; Python allows
+    seconds, and isoformat writes "+00:19:32"). Errors are raised after the
+    except block, in the library's words: a tzinfo's own (a broken one) or
+    an OverflowError (no UTC time datetime can hold) aren't passed on.
+    """
+    try:
+        aware = value.utcoffset() is not None
+        encoded = value.astimezone(UTC).isoformat() if aware else None
+    except (ValueError, TypeError):
+        failure = "a query datetime's tzinfo gives no usable offset"
+    except OverflowError:
+        failure = "a query datetime has no UTC time datetime can hold"
+    else:
+        if encoded is not None:
+            return encoded
+        failure = "a query datetime must be timezone-aware"
+    raise ValueError(failure)
 
 
 def _quote_segment(segment: str) -> str:
@@ -78,36 +211,79 @@ def _quote_segment(segment: str) -> str:
     makes them one segment. Empty, the path names the collection instead;
     the dot segments are removed when the URL is resolved (RFC 3986
     section 5.2.4), and percent-encoding them changes nothing, since
-    ``%2E`` is the same unreserved ``.`` (section 2.3).
+    ``%2E`` is the same unreserved ``.`` (section 2.3). ``TypeError`` for
+    an id that isn't a ``str`` (``b".."`` would slip past that check).
+
+    aiohttp's URL handling may send some sub-delimiters ``quote`` encoded
+    (``;``, ``,``, ``@``, ``:``, ``=``...) as the characters themselves.
+    That is still one segment, which the API decodes to the same id.
     """
+    if not isinstance(segment, str):
+        raise TypeError(f"an id must be a str, not {type(segment).__name__}")
     if segment in ("", ".", ".."):
         raise ValueError(f"{segment!r} cannot be sent as an id: it is no path segment")
-    return quote(segment, safe="")
+    return quote(require_text(segment, "an id"), safe="")
 
 
-# What decoding a JSON value into a model can raise: mashumaro's MissingField
-# (a LookupError) and InvalidFieldValue (a ValueError), TypeError or
-# AttributeError for a value of the wrong JSON type, and RecursionError for
-# nesting deeper than the interpreter's stack.
-_DECODE_ERRORS = (LookupError, ValueError, TypeError, AttributeError, RecursionError)
+# What decoding a type-checked JSON value into a model can still raise:
+# mashumaro's MissingField (a LookupError) and InvalidFieldValue (a
+# ValueError: an unknown enum value, an unparseable datetime).
+_DECODE_ERRORS = (LookupError, ValueError)
+# RFC 6750 section 2.1's b64token: all a Bearer credential may hold. Anything
+# else (a CR or LF above all) can't go in an Authorization header.
+_B64TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+
+
+def _decode(answer: Answer) -> Any:
+    """Return an answer's JSON, or raise MobilityDatabaseConnectionError.
+
+    The media type must be ``application/json`` itself (``problem+json`` and
+    the like aren't the documented answer), and the body JSON text by
+    :func:`._json.loads`: strict UTF-8, unique names, no ``NaN``.
+    """
+    if answer.media_type != "application/json":
+        # The media type stays out of the message: it is server text.
+        raise MobilityDatabaseConnectionError(
+            "API answered other than application/json"
+        )
+    if answer.body is None:
+        raise MobilityDatabaseConnectionError("API answer's body couldn't be read")
+    try:
+        return json_loads(answer.body)
+    except ValueError:
+        pass
+    # Raised outside the except: a JSONDecodeError holds the whole body (.doc),
+    # and from None would only hide it, still attached as the context.
+    raise MobilityDatabaseConnectionError("API returned invalid JSON")
+
+
+def _text(answer: Answer) -> str:
+    """Return an error answer's body as text, for the exception's ``body``."""
+    return (answer.body or b"").decode("utf-8", "replace")
 
 
 def _one[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> ModelT:
     """Decode one API object, or raise MobilityDatabaseConnectionError.
 
     The body of a 200 is the server's data, so anything it holds that is not
-    the documented object is an invalid payload, never a bare decoding error.
+    the documented object is an invalid payload, never a bare decoding error
+    -- nor wrong data: every value's JSON type is checked against the model
+    first (see :mod:`._payload`), since mashumaro would convert it.
     """
-    if not isinstance(data, dict):
+    if (problem := mismatch(model, data)) is not None:
+        # The problem names a path of model fields and indices: no value.
         raise MobilityDatabaseConnectionError(
-            f"API returned {type(data).__name__}, not a {model.__name__} object"
+            f"API returned an invalid {model.__name__}: {problem}"
         )
     try:
         return model.from_dict(data)
     except _DECODE_ERRORS as err:
-        raise MobilityDatabaseConnectionError(
-            f"API returned an invalid {model.__name__}: {err}"
-        ) from err
+        # mashumaro's own text quotes the value (an echoed token, say): name
+        # the field only, and raise outside the except, attaching nothing.
+        field = getattr(err, "field_name", None) or "a field"
+    raise MobilityDatabaseConnectionError(
+        f"API returned an invalid {model.__name__}: {field} can't be read"
+    )
 
 
 def _many[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> list[ModelT]:
@@ -150,12 +326,26 @@ class MobilityDatabaseClient:
         base_url: str = PROD_BASE_URL,
         request_timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        """Initialize the client. Performs no I/O."""
+        """Initialize the client. Performs no I/O.
+
+        Raises ``ValueError`` for an empty refresh token, or an injected
+        session whose defaults would change what the client sends: an
+        ``auth`` (it would ride to the token endpoint, and clash with the
+        Bearer header), a ``base_url`` (aiohttp then refuses absolute URLs
+        before 3.14), or a default header HTTP can't carry.
+        """
+        if not isinstance(refresh_token, str):
+            raise TypeError("refresh_token must be a str")
+        if not refresh_token:
+            raise ValueError("refresh_token is empty")
+        seconds = _timeout_seconds(request_timeout)
+        if session is not None:
+            _require_catalog_session(session)
         self._refresh_token = refresh_token
         self._session = session
         self._owns_session = session is None
-        self._base_url = base_url.rstrip("/")
-        self._timeout = aiohttp.ClientTimeout(total=request_timeout)
+        self._base_url = _require_base_url(base_url)
+        self._timeout = aiohttp.ClientTimeout(total=seconds)
         self._access_token: str | None = None
         self._token_expiration: datetime | None = None
         self._token_lock = asyncio.Lock()
@@ -194,7 +384,9 @@ class MobilityDatabaseClient:
         if self._access_token is None or self._token_expiration is None:
             return True
         skew = timedelta(seconds=TOKEN_EXPIRY_SKEW_SECONDS)
-        return datetime.now(UTC) >= self._token_expiration - skew
+        # now + skew, never expiration - skew: an expiration in year 1 would
+        # overflow the subtraction.
+        return datetime.now(UTC) + skew >= self._token_expiration
 
     async def _async_ensure_token(
         self, *, force: bool = False, stale_token: str | None = None
@@ -223,29 +415,35 @@ class MobilityDatabaseClient:
                 and self._access_token != stale_token
             ):
                 return self._access_token
-            session = self._get_session()
-            try:
-                async with session.post(
-                    f"{self._base_url}{TOKEN_PATH}",
-                    json={"refresh_token": self._refresh_token},
-                    timeout=self._timeout,
-                ) as resp:
-                    if resp.status != HTTPStatus.OK:
-                        body = await resp.text()
-                        raise MobilityDatabaseAuthenticationError(
-                            f"Unable to obtain access token ({resp.status}): {body}"
-                        )
-                    data = await resp.json()
-            except (
-                TimeoutError,
-                aiohttp.ClientError,
-                ValueError,
-                RecursionError,
-            ) as err:
-                raise MobilityDatabaseConnectionError(
-                    f"Error requesting access token: {err}"
-                ) from err
+            answer = await exchange(
+                self._get_session(),
+                "POST",
+                f"{self._base_url}{TOKEN_PATH}",
+                what="Token request",
+                client_timeout=self._timeout,
+                json={"refresh_token": self._refresh_token},
+            )
+            if answer.status != HTTPStatus.OK:
+                raise MobilityDatabaseAuthenticationError(
+                    f"Unable to obtain access token ({answer.status})",
+                    status=answer.status,
+                    body=_text(answer),
+                )
+            data = _decode(answer)
             token = _one(AccessToken, data)
+            if token.token_type is not None and token.token_type.lower() != "bearer":
+                # RFC 6749 section 7.1: a client MUST NOT use an access token
+                # whose type it doesn't understand; this one sends Bearer.
+                # (The type itself stays out of the message: server text.)
+                raise MobilityDatabaseConnectionError(
+                    "API returned a token that is no Bearer token"
+                )
+            if not _B64TOKEN.fullmatch(token.access_token):
+                # It goes in an Authorization header: a CR, LF or space
+                # there would fail every request, or forge another header.
+                raise MobilityDatabaseConnectionError(
+                    "API returned an access token that is no Bearer credential"
+                )
             expiration = token.expiration_datetime_utc
             if expiration.tzinfo is None:
                 expiration = expiration.replace(tzinfo=UTC)
@@ -262,55 +460,53 @@ class MobilityDatabaseClient:
         json_body: dict[str, Any] | None = None,
         retry_on_auth_fail: bool = True,
     ) -> Any:
-        """Perform an authenticated request and return the decoded JSON body."""
+        """Perform an authenticated request and return the decoded JSON body.
+
+        On a 401 the token is refreshed and the request retried once (the
+        401's connection already released: :func:`._transport.exchange`
+        reads every answer whole).
+        """
+        # Encoded first: a bad value is the caller's error, before any request.
+        encoded = encode_params(params) if params else None
         token = await self._async_ensure_token()
-        session = self._get_session()
-        try:
-            async with session.request(
+        answer = await exchange(
+            self._get_session(),
+            method,
+            f"{self._base_url}{path}",
+            what="API request",
+            client_timeout=self._timeout,
+            params=encoded,
+            json=json_body,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if answer.status == HTTPStatus.UNAUTHORIZED:
+            if not retry_on_auth_fail:
+                raise MobilityDatabaseAuthenticationError(
+                    "Request unauthorized after token refresh",
+                    status=answer.status,
+                    body=_text(answer),
+                )
+            await self._async_ensure_token(force=True, stale_token=token)
+            return await self._request(
                 method,
-                f"{self._base_url}{path}",
-                params=encode_params(params) if params else None,
-                json=json_body,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=self._timeout,
-            ) as resp:
-                if resp.status == HTTPStatus.UNAUTHORIZED:
-                    if retry_on_auth_fail:
-                        await self._async_ensure_token(force=True, stale_token=token)
-                        return await self._request(
-                            method,
-                            path,
-                            params=params,
-                            json_body=json_body,
-                            retry_on_auth_fail=False,
-                        )
-                    raise MobilityDatabaseAuthenticationError(
-                        "Request unauthorized after token refresh"
-                    )
-                if resp.status == HTTPStatus.NOT_FOUND:
-                    raise MobilityDatabaseNotFoundError(f"Not found: {path}")
-                if resp.status == HTTPStatus.TOO_MANY_REQUESTS:
-                    raise MobilityDatabaseRateLimitError("API rate limit exceeded")
-                # Only a 200 or 203 carries the answer (RFC 9110 section
-                # 15.3): a 204 has none, and a 300 or a 3xx left unfollowed
-                # is not the resource asked for.
-                if resp.status not in (
-                    HTTPStatus.OK,
-                    HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
-                ):
-                    raise MobilityDatabaseApiError(resp.status, await resp.text())
-                try:
-                    return await resp.json()
-                except (aiohttp.ContentTypeError, ValueError, RecursionError) as err:
-                    raise MobilityDatabaseConnectionError(
-                        "API returned invalid JSON"
-                    ) from err
-        except MobilityDatabaseError:
-            raise
-        except (TimeoutError, aiohttp.ClientError) as err:
-            raise MobilityDatabaseConnectionError(
-                f"Error communicating with API: {err}"
-            ) from err
+                path,
+                params=params,
+                json_body=json_body,
+                retry_on_auth_fail=False,
+            )
+        if answer.status == HTTPStatus.NOT_FOUND:
+            raise MobilityDatabaseNotFoundError("Not found")
+        if answer.status == HTTPStatus.TOO_MANY_REQUESTS:
+            raise MobilityDatabaseRateLimitError("API rate limit exceeded")
+        # Only a 200 or 203 carries the answer (RFC 9110 section 15.3): a 204
+        # has none, and a 3xx -- never followed -- is not the resource asked
+        # for.
+        if answer.status not in (
+            HTTPStatus.OK,
+            HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
+        ):
+            raise MobilityDatabaseApiError(answer.status, _text(answer))
+        return _decode(answer)
 
     async def get_metadata(self) -> Metadata:
         """Get metadata about the API."""
@@ -601,7 +797,13 @@ class MobilityDatabaseClient:
 
     async def get_matching_licenses(self, license_url: str) -> list[MatchingLicense]:
         """Match a license URL against the license database."""
+        if not isinstance(license_url, str):
+            raise TypeError(
+                f"license_url must be a str, not {type(license_url).__name__}"
+            )
         data = await self._request(
-            "POST", "/v1/licenses:match", json_body={"license_url": license_url}
+            "POST",
+            "/v1/licenses:match",
+            json_body={"license_url": require_text(license_url, "license_url")},
         )
         return _many(MatchingLicense, data)

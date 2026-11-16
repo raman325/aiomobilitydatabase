@@ -60,11 +60,12 @@ async def main() -> None:
         results = await client.search_feeds(
             search_query="new york", data_types=[DataType.GTFS_RT], limit=10
         )
-        for item in results.results:
+        found = results.results or ()  # None when the API sends no list
+        for item in found:
             print(item.id, item.provider, item.status)
 
         # Full detail for one feed, including the producer URL
-        feed = await client.get_gtfs_rt_feed(results.results[0].id)
+        feed = await client.get_gtfs_rt_feed(found[0].id)
         assert feed.source_info is not None
         print(feed.source_info.producer_url)
 
@@ -96,7 +97,7 @@ async def main() -> None:
     ) as client:
         # The full catalog client is available via .catalog:
         results = await client.catalog.search_feeds(search_query="portland", limit=5)
-        for item in results.results:
+        for item in results.results or ():
             print(item.id, item.provider, item.data_type)
 
         # Transit: accepts a GTFS or GTFS-RT feed ID; resolves the sibling.
@@ -726,12 +727,37 @@ The GBFS and GTFS-RT parse paths are **total** with respect to this table:
 any producer document, however malformed, either returns a typed result or
 raises one of the exceptions above — never a bare `KeyError`, `TypeError`,
 `ValueError` or `OverflowError` from inside the library. So is the catalog
-client: a `200` whose body isn't the documented JSON is a
+client: a `200` or `203` whose body isn't the documented JSON -- including a
+value of the wrong JSON type, which is refused rather than converted -- is a
 `MobilityDatabaseConnectionError`. The deliberate exceptions are caller
-mistakes rather than feed problems, and raise the builtin `ValueError`:
-`purge_cache()` for a `feed_id` it will not accept (see above), and a catalog
-method for an id of `""`, `"."` or `".."`, which no URL can carry as one path
-segment.
+mistakes rather than feed problems, and raise builtins: `purge_cache()`
+raises `ValueError` for a `feed_id` it will not accept (see above), and a
+catalog method raises `ValueError` for an id of `""`, `"."` or `".."`, which
+no URL can carry as one path segment (`TypeError` for an id that isn't a
+`str`), or for a query value or `license_url` holding a lone surrogate (no
+text a URL can carry), a float filter that is NaN or infinite, a `datetime`
+filter without a timezone (RFC 3339 requires an offset; a naive time names
+no instant), or a list item holding the comma the API separates items with.
+A query
+value of another type than the method takes (`bytes`, say, which would have
+filtered on `"b'...'"`) is a `TypeError`. Both are raised before any request
+is made. A closed injected session is a `RuntimeError`.
+`get_matching_licenses()` raises `TypeError` for a `license_url` that isn't a
+`str`. `MobilityDatabaseClient(...)` raises `TypeError` for a refresh token that isn't
+a `str`, and `ValueError` for an empty one; a `request_timeout` that isn't a
+finite positive number (`TypeError` if it is no number at all); a `base_url` that isn't https (plain http only on loopback:
+bearer tokens travel over TLS, RFC 6750) or holds credentials, a query or a
+fragment; or an injected session with an `auth`, an `Authorization`, `Cookie`
+or `Proxy-Authorization` default header, or a cookie set without a domain
+(`ClientSession(cookies=...)`) -- any of which would ride on every request,
+to every origin -- a `base_url`, or a default header outside the allowlist
+(token names, visible-ASCII values).
+
+Exception messages are written by the library alone: never a response body,
+a URL's credentials or query, or another library's error text (any of which
+can echo a token). A response's status and body are attributes
+(`MobilityDatabaseApiError.status`/`.body`, and on
+`MobilityDatabaseAuthenticationError` when the API answered) -- yours to log.
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`
