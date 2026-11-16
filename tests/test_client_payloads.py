@@ -567,7 +567,9 @@ async def test_a_200_that_isnt_application_json_is_invalid(
     Metadata."""
     mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
     mock_api.get("/v1/metadata", body=b"{}", headers={"Content-Type": content_type})
-    with pytest.raises(MobilityDatabaseConnectionError, match="not application/json"):
+    with pytest.raises(
+        MobilityDatabaseConnectionError, match="other than application/json"
+    ):
         await client.get_metadata()
 
 
@@ -817,7 +819,7 @@ async def test_a_token_of_another_type_is_refused(
     """RFC 6749 section 7.1: a client MUST NOT use an access token whose
     type it doesn't understand -- this client sends only Bearer."""
     mock_api.post("/v1/tokens", payload={**TOKEN_RESPONSE, "token_type": token_type})
-    with pytest.raises(MobilityDatabaseConnectionError, match="not a Bearer one"):
+    with pytest.raises(MobilityDatabaseConnectionError, match="no Bearer token"):
         await client.get_metadata()
     assert [r.path for r in mock_api.requests] == ["/v1/tokens"]
 
@@ -1513,4 +1515,121 @@ def test_any_answer_gives_a_library_result_and_no_secret_in_any_message(
     while err is not None:
         for secret in _SECRETS:
             assert secret not in str(err), (type(err).__name__, str(err))
+        err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)
+
+
+# -- An echoing server: whatever comes back, no secret leaves in a message ------------
+
+_ECHO_STATUS = st.sampled_from([b"200 OK", b"203 X", b"400 X", b"401 X", b"500 X"])
+_ECHO_HEADERS = st.lists(
+    st.sampled_from(
+        [
+            b"Content-Type: application/json",
+            b"Content-Type: text/{echo}",
+            b"Content-Type: application/{echo}",
+            b"X-Echo: {echo}",
+        ]
+    ),
+    max_size=3,
+)
+_ECHO_BODIES = st.sampled_from(
+    [
+        '{{"version": "{echo}"}}',
+        '{{"id": "x", "data_type": "{echo}"}}',
+        '{{"feed_id": "x", "total": 1, "offset": 0, "limit": 1, "checks": '
+        '[{{"checked_at": "{echo}", "success": true, "request_method": "GET"}}]}}',
+        '{{"access_token": "{echo}", "expiration_datetime_utc": '
+        '"2030-01-01T00:00:00Z", "token_type": "{echo}"}}',
+        '{{"access_token": "Tok", "expiration_datetime_utc": "{echo}"}}',
+        "{echo}",
+    ]
+)
+_ECHO_CALLS = st.sampled_from(
+    ["get_metadata", "get_feed", "get_gtfs_feed_availability"]
+)
+
+
+@given(
+    token_answer=st.tuples(_ECHO_STATUS, _ECHO_HEADERS, _ECHO_BODIES),
+    data_answer=st.tuples(_ECHO_STATUS, _ECHO_HEADERS, _ECHO_BODIES),
+    call=_ECHO_CALLS,
+)
+@settings(max_examples=300, deadline=None)
+def test_an_echoing_server_never_gets_a_secret_into_a_message(
+    token_answer: tuple[bytes, list[bytes], str],
+    data_answer: tuple[bytes, list[bytes], str],
+    call: str,
+) -> None:
+    """The server echoes each request -- the refresh token in the token
+    POST, the access token in the data request's Authorization -- into the
+    Content-Type, a header and JSON values the decoder reads (an enum, a
+    date-time, token_type). Whatever the client then does, no exception
+    message (nor any chained one) holds a token, in any case."""
+    access = "AccessTok123"
+
+    def answer(parts: tuple[bytes, list[bytes], str], request: bytes) -> bytes:
+        status, headers, body = parts
+        echo = request.decode("latin-1").replace("\r", " ").replace("\n", " ")
+        echo_json = json.dumps(echo)[1:-1]
+        lines = [h.replace(b"{echo}", echo.encode("latin-1")) for h in headers]
+        payload = body.format(echo=echo_json).encode("utf-8", "surrogateescape")
+        return (
+            b"HTTP/1.1 "
+            + status
+            + b"\r\n"
+            + b"".join(line + b"\r\n" for line in lines)
+            + b"Content-Length: "
+            + str(len(payload)).encode()
+            + b"\r\n\r\n"
+            + payload
+        )
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            length = 0
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    length = int(line.split(b":", 1)[1])
+            request = head + (await reader.readexactly(length) if length else b"")
+            if request.startswith(b"POST /v1/tokens"):
+                parts = token_answer
+                if parts[0] == b"200 OK" and parts[2].startswith('{{"version"'):
+                    # A usable token, so the data request (and its echo) happens.
+                    parts = (
+                        b"200 OK",
+                        [b"Content-Type: application/json"],
+                        '{{"access_token": "' + access + '", '
+                        '"expiration_datetime_utc": "2030-01-01T00:00:00Z"}}',
+                    )
+            else:
+                parts = data_answer
+            writer.write(answer(parts, request))
+            await writer.drain()
+        finally:
+            writer.close()
+
+    async def scenario() -> BaseException | None:
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+        try:
+            async with MobilityDatabaseClient(
+                "RefreshTokSecret987", base_url=url
+            ) as client:
+                args = () if call == "get_metadata" else ("mdb-1",)
+                try:
+                    await asyncio.wait_for(getattr(client, call)(*args), 10)
+                except MobilityDatabaseError as err:
+                    return err
+            return None
+        finally:
+            server.close()
+
+    err = asyncio.run(scenario())
+    while err is not None:
+        shown = str(err).lower()
+        for secret in ("refreshtoksecret987", access.lower()):
+            assert secret not in shown, (type(err).__name__, str(err))
         err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)

@@ -16,6 +16,7 @@ import aiohttp
 from mashumaro import DataClassDictMixin
 from yarl import URL
 
+from ._http import require_session, require_text
 from ._json import loads as json_loads
 from ._payload import mismatch
 from ._transport import Answer, exchange
@@ -55,40 +56,16 @@ from .models import (
 )
 
 
-def _require_text(text: str, what: str) -> str:
-    """Return ``text``, or raise ValueError when it isn't UTF-8 text.
-
-    A lone surrogate has no bytes: yarl drops it from a query, so a filter
-    would silently become another one -- or none.
-    """
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError as err:
-        raise ValueError(f"{what} holds a lone surrogate, not text") from err
-    return text
-
-
-# Header names are RFC 9110 tokens; default header values the client sends
-# are visible ASCII, space and tab -- an allowlist, not a copy of the rules
-# aiohttp applies mid-request.
-_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-_FIELD_VALUE = re.compile(r"[\t\x20-\x7e]*")
-
-
 def _require_catalog_session(session: aiohttp.ClientSession) -> None:
-    """Raise ValueError for an injected session's default the client can't use."""
-    if getattr(session, "auth", None) is not None:
-        raise ValueError("the session's auth would go to the catalog API")
-    if any(name.lower() == "authorization" for name in session.headers):
-        # It would ride on the token request (data requests replace it).
-        raise ValueError(
-            "the session's Authorization header would go to the catalog API"
-        )
+    """Raise ValueError for an injected session the client can't use.
+
+    The shared policy (:func:`._http.require_session`: no credential
+    defaults, sendable headers), and no ``base_url``: aiohttp before 3.14
+    then refuses the absolute URLs the client requests.
+    """
+    require_session(session)
     if getattr(session, "_base_url", None) is not None:
         raise ValueError("the session has a base_url; pass base_url= instead")
-    for name, value in session.headers.items():
-        if not _FIELD_NAME.fullmatch(name) or not _FIELD_VALUE.fullmatch(value):
-            raise ValueError(f"the session's header {name!r} can't be sent")
 
 
 def _require_base_url(base_url: str) -> str:
@@ -132,7 +109,7 @@ def _is_loopback(host: str) -> bool:
 
 def _encode_value(value: Any) -> str:
     """Encode a single query parameter value as a string (UTF-8 text only)."""
-    return _require_text(_encode_scalar(value), "a query parameter")
+    return require_text(_encode_scalar(value), "a query parameter")
 
 
 def _encode_scalar(value: Any) -> str:
@@ -194,16 +171,17 @@ def _decode(answer: Answer) -> Any:
     :func:`._json.loads`: strict UTF-8, unique names, no ``NaN``.
     """
     if answer.media_type != "application/json":
+        # The media type stays out of the message: it is server text.
         raise MobilityDatabaseConnectionError(
-            f"API answered {answer.media_type or 'no content type'!r}, "
-            "not application/json"
+            "API answered other than application/json"
         )
     if answer.body is None:
         raise MobilityDatabaseConnectionError("API answer's body couldn't be read")
     try:
         return json_loads(answer.body)
-    except ValueError as err:
-        raise MobilityDatabaseConnectionError("API returned invalid JSON") from err
+    except ValueError:
+        # Not from err: a JSONDecodeError holds the whole body (.doc).
+        raise MobilityDatabaseConnectionError("API returned invalid JSON") from None
 
 
 def _text(answer: Answer) -> str:
@@ -220,15 +198,19 @@ def _one[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> ModelT:
     first (see :mod:`._payload`), since mashumaro would convert it.
     """
     if (problem := mismatch(model, data)) is not None:
+        # The problem names a path of model fields and indices: no value.
         raise MobilityDatabaseConnectionError(
             f"API returned an invalid {model.__name__}: {problem}"
         )
     try:
         return model.from_dict(data)
     except _DECODE_ERRORS as err:
+        # mashumaro's own text quotes the value (an echoed token, say): name
+        # the field only, and pass nothing of the error on.
+        field = getattr(err, "field_name", None) or "a field"
         raise MobilityDatabaseConnectionError(
-            f"API returned an invalid {model.__name__}: {err}"
-        ) from err
+            f"API returned an invalid {model.__name__}: {field} can't be read"
+        ) from None
 
 
 def _many[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> list[ModelT]:
@@ -376,8 +358,9 @@ class MobilityDatabaseClient:
             if token.token_type is not None and token.token_type.lower() != "bearer":
                 # RFC 6749 section 7.1: a client MUST NOT use an access token
                 # whose type it doesn't understand; this one sends Bearer.
+                # (The type itself stays out of the message: server text.)
                 raise MobilityDatabaseConnectionError(
-                    f"API returned a {token.token_type!r} token, not a Bearer one"
+                    "API returned a token that is no Bearer token"
                 )
             if not _B64TOKEN.fullmatch(token.access_token):
                 # It goes in an Authorization header: a CR, LF or space
@@ -739,6 +722,6 @@ class MobilityDatabaseClient:
         data = await self._request(
             "POST",
             "/v1/licenses:match",
-            json_body={"license_url": _require_text(license_url, "license_url")},
+            json_body={"license_url": require_text(license_url, "license_url")},
         )
         return _many(MatchingLicense, data)

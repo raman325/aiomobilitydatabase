@@ -17,6 +17,7 @@ from typing import Any
 
 import aiohttp
 
+from ._http import REQUEST_OPTIONS
 from .exceptions import MobilityDatabaseConnectionError
 
 
@@ -56,8 +57,7 @@ async def exchange(
             method,
             url,
             timeout=client_timeout,
-            allow_redirects=False,
-            raise_for_status=False,
+            **REQUEST_OPTIONS,
             **request,
         ) as resp:
             body: bytes | None
