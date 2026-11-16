@@ -725,10 +725,13 @@ each define their own subtree beneath it, so you can catch broadly
 The GBFS and GTFS-RT parse paths are **total** with respect to this table:
 any producer document, however malformed, either returns a typed result or
 raises one of the exceptions above — never a bare `KeyError`, `TypeError`,
-`ValueError` or `OverflowError` from inside the library. The one deliberate
-exception is `purge_cache()`, which raises the builtin `ValueError` for a
-`feed_id` it will not accept (see above), because that is a caller mistake
-rather than a feed problem.
+`ValueError` or `OverflowError` from inside the library. So is the catalog
+client: a `200` whose body isn't the documented JSON is a
+`MobilityDatabaseConnectionError`. The deliberate exceptions are caller
+mistakes rather than feed problems, and raise the builtin `ValueError`:
+`purge_cache()` for a `feed_id` it will not accept (see above), and a catalog
+method for an id of `""`, `"."` or `".."`, which no URL can carry as one path
+segment.
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`
