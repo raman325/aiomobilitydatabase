@@ -60,11 +60,12 @@ async def main() -> None:
         results = await client.search_feeds(
             search_query="new york", data_types=[DataType.GTFS_RT], limit=10
         )
-        for item in results.results:
+        found = results.results or ()  # None when the API sends no list
+        for item in found:
             print(item.id, item.provider, item.status)
 
         # Full detail for one feed, including the producer URL
-        feed = await client.get_gtfs_rt_feed(results.results[0].id)
+        feed = await client.get_gtfs_rt_feed(found[0].id)
         assert feed.source_info is not None
         print(feed.source_info.producer_url)
 
@@ -96,7 +97,7 @@ async def main() -> None:
     ) as client:
         # The full catalog client is available via .catalog:
         results = await client.catalog.search_feeds(search_query="portland", limit=5)
-        for item in results.results:
+        for item in results.results or ():
             print(item.id, item.provider, item.data_type)
 
         # Transit: accepts a GTFS or GTFS-RT feed ID; resolves the sibling.

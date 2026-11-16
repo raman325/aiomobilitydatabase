@@ -106,8 +106,22 @@ def _scalar_fits(annotation: Any, value: Any) -> bool:
     if annotation is datetime:
         return isinstance(value, str) and _DATE_TIME.fullmatch(value) is not None
     if annotation is str or issubclass(annotation, Enum):
-        return isinstance(value, str)
+        return isinstance(value, str) and _is_text(value)
     raise TypeError(f"no JSON type for {annotation!r}")  # pragma: no cover
+
+
+def _is_text(value: str) -> bool:
+    r"""Return whether a string holds no lone surrogate.
+
+    A JSON escape can spell one (``"\ud800"``; RFC 8259 section 8.2 leaves
+    its meaning unpredictable). It is no text: encoding it raises, so an id
+    holding one would fail as the caller's mistake when sent back.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _finite(number: float) -> bool:

@@ -289,7 +289,8 @@ class SearchResults(DataClassDictMixin):
     """Response from the feed search endpoint."""
 
     total: int | None = None
-    results: tuple[SearchFeedItemResult, ...] = ()
+    # Optional in the API spec: absent is None, never an empty result list.
+    results: tuple[SearchFeedItemResult, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -375,7 +376,8 @@ class LocationSearchResults(DataClassDictMixin):
     """Response from the locations search endpoint."""
 
     total: int | None = None
-    results: tuple[LocationSearchResult, ...] = ()
+    # Optional in the API spec: absent is None, never an empty result list.
+    results: tuple[LocationSearchResult, ...] | None = None
 
 
 @dataclass(frozen=True)

@@ -104,6 +104,19 @@ _DECODE_ERRORS = (LookupError, ValueError)
 _B64TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 
 
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object, refusing a name that appears twice."""
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError("a JSON object repeats a name")
+    return obj
+
+
+def _reject_constant(name: str) -> None:
+    """Refuse ``NaN``/``Infinity``: Python's json accepts them, JSON does not."""
+    raise ValueError(f"{name} is not valid JSON")
+
+
 async def _json_body(resp: aiohttp.ClientResponse) -> Any:
     """Return a response's JSON, or raise MobilityDatabaseConnectionError.
 
@@ -113,10 +126,12 @@ async def _json_body(resp: aiohttp.ClientResponse) -> Any:
     response's ``charset``: RFC 8259 section 8.1 has JSON exchanged between
     systems be UTF-8, and its section 11 gives a charset parameter no effect
     on a compliant recipient -- read by it, a UTF-8 "Montr\u00e9al" sent as
-    ``charset=iso-8859-1`` would be mojibake. ``json.loads`` detects UTF-8
-    (a BOM ignored, as RFC 8259 allows) and UTF-16/32 from the bytes; it
-    raises ValueError for anything else, RecursionError for nesting deeper
-    than the interpreter's stack.
+    ``charset=iso-8859-1`` would be mojibake. Decoded as strict UTF-8 (a BOM
+    ignored, as RFC 8259 allows): ``json.loads`` on the bytes would also
+    take UTF-16/32 and let encoded surrogates through. A name repeated in an
+    object (RFC 8259 section 4: unpredictable) and ``NaN``/``Infinity``
+    (no JSON) are refused. Any of these is ValueError; nesting deeper than
+    the interpreter's stack, RecursionError.
     """
     if resp.content_type != "application/json":
         raise MobilityDatabaseConnectionError(
@@ -124,7 +139,11 @@ async def _json_body(resp: aiohttp.ClientResponse) -> Any:
         )
     raw = await resp.read()
     try:
-        return json.loads(raw)
+        return json.loads(
+            raw.decode("utf-8-sig"),
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+        )
     except (ValueError, RecursionError) as err:
         raise MobilityDatabaseConnectionError("API returned invalid JSON") from err
 
@@ -139,7 +158,10 @@ async def _body_text(resp: aiohttp.ClientResponse) -> str:
     an error, so undecodable bytes are replaced, as UTF-8 when the charset
     can't be used.
     """
-    raw = await resp.read()
+    try:
+        raw = await resp.read()
+    except aiohttp.ClientPayloadError:
+        return ""  # unreadable (a Content-Encoding its bytes don't follow)
     try:
         return raw.decode(resp.charset or "utf-8", "replace")
     except (LookupError, UnicodeError):
@@ -287,6 +309,11 @@ class MobilityDatabaseClient:
                     f"{self._base_url}{TOKEN_PATH}",
                     json={"refresh_token": self._refresh_token},
                     timeout=self._timeout,
+                    # RFC 6749 section 10.4: the refresh token goes to the
+                    # authorization server only; a redirect would carry it
+                    # elsewhere. Section 5.1 has the endpoint answer 200, so a
+                    # 3xx is a non-200 like any other: an auth failure.
+                    allow_redirects=False,
                 ) as resp:
                     if resp.status != HTTPStatus.OK:
                         body = await _body_text(resp)

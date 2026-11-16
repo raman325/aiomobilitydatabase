@@ -309,15 +309,22 @@ def _faithful(annotation: Any, raw: Any, decoded: Any) -> bool:  # noqa: PLR0911
         )
     if dataclasses.is_dataclass(annotation):
         hints = typing.get_type_hints(annotation)
+        # A field the JSON leaves out decodes to None (every default is
+        # None): the decoder must invent nothing, such as an empty list.
         return isinstance(raw, dict) and all(
             _faithful(hints[field.name], raw[field.name], getattr(decoded, field.name))
-            for field in dataclasses.fields(annotation)
             if field.name in raw
+            else getattr(decoded, field.name) is None
+            for field in dataclasses.fields(annotation)
         )
     if annotation is datetime:
         return isinstance(raw, str) and decoded == _rfc3339(raw)
     if isinstance(annotation, type) and issubclass(annotation, Enum):
-        return isinstance(raw, str) and decoded == annotation(raw)
+        return (
+            isinstance(raw, str)
+            and type(decoded) is annotation
+            and decoded == annotation(raw)
+        )
     if annotation is float:
         # A JSON number is read as a double (RFC 8259 section 6): an integer
         # past 2**53 rounds, as 0.1 does, so compare against float(raw).
@@ -332,7 +339,7 @@ def _faithful(annotation: Any, raw: Any, decoded: Any) -> bool:  # noqa: PLR0911
 
 _RFC3339 = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt ]([0-9]{2}):([0-9]{2}):([0-9]{2})"
-    r"(?:\.([0-9]+))?(?:([Zz])|([+-])([0-9]{2}):([0-9]{2}))?"
+    r"(?:\.([0-9]+))?(?:(Z)|([+-])([0-9]{2}):([0-9]{2}))?"
 )
 
 
@@ -345,6 +352,8 @@ def _rfc3339(text: str) -> datetime | None:
     year, month, day, hour, minute, second, fraction, zulu, sign, oh, om = (
         match.groups()
     )
+    if int(hour) > 23 or int(minute) > 59 or int(second) > 59 or int(oh or 0) > 23:
+        return None
     zone = None
     if zulu:
         zone = UTC
@@ -352,16 +361,19 @@ def _rfc3339(text: str) -> datetime | None:
         offset = timedelta(hours=int(oh), minutes=int(om))
         zone = timezone(-offset if sign == "-" else offset)
     micro = int((fraction or "0")[:6].ljust(6, "0"))
-    return datetime(
-        int(year),
-        int(month),
-        int(day),
-        int(hour),
-        int(minute),
-        int(second),
-        micro,
-        zone,
-    )
+    try:
+        return datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            int(second),
+            micro,
+            zone,
+        )
+    except ValueError:  # no such day, or year 0
+        return None
 
 
 def _flip(payload: Any, data: st.DataObject) -> Any:
@@ -820,3 +832,154 @@ def test_a_float_field_reads_a_big_integer_as_its_double() -> None:
     )
     feed = _call("get_gtfs_feed", body)
     assert feed.latest_dataset.bounding_box.minimum_latitude == float(2**53 + 1)
+
+
+# -- Bodies json.dumps never writes ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b'{"version": "mdb-\xed\xa0\x80"}', id="encoded-surrogate"),
+        pytest.param(b'{"version": "caf\xe9"}', id="latin-1"),
+        pytest.param('{"version": "x"}'.encode("utf-16-le"), id="utf-16"),
+        pytest.param('{"version": "x"}'.encode("utf-32"), id="utf-32"),
+        pytest.param(b'{"version": "\\ud800"}', id="escaped-lone-surrogate"),
+        pytest.param(b'{"version": 5, "version": "2"}', id="repeated-name"),
+        pytest.param(b'{"version": "2", "x": NaN}', id="nan"),
+        pytest.param(b'{"version": "2", "x": -Infinity}', id="infinity"),
+    ],
+)
+def test_a_body_that_is_no_utf_8_json_text_is_invalid(body: bytes) -> None:
+    """RFC 8259: UTF-8 (section 8.1), unique names (section 4), no NaN.
+    json.loads on bytes took UTF-16/32 and encoded surrogates; an escaped
+    lone surrogate is no text either (an id holding one can't be sent back)."""
+    assert isinstance(_call("get_metadata", body), MobilityDatabaseConnectionError)
+
+
+def test_a_bom_and_an_escaped_pair_are_fine() -> None:
+    body = b'\xef\xbb\xbf{"version": "\\ud83d\\ude8c bus"}'
+    assert _call("get_metadata", body).version == "\U0001f68c bus"
+
+
+def test_a_repeated_name_deep_inside_is_invalid() -> None:
+    body = (
+        json.dumps(GTFS_FEED)
+        .encode()
+        .replace(b'"country_code": "US"', b'"country_code": "US", "country_code": "CA"')
+    )
+    assert b'"CA"' in body
+    assert isinstance(_call("get_gtfs_feed", body), MobilityDatabaseConnectionError)
+
+
+# -- The token request stays with the token endpoint ---------------------------------
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+async def test_the_token_request_follows_no_redirect(
+    mock_api: MockApi, client: MobilityDatabaseClient, status: int
+) -> None:
+    """RFC 6749 section 10.4: the refresh token goes to the authorization
+    server only -- a 307 re-POSTed it to wherever Location said, and the
+    client used the access token that server handed back."""
+    elsewhere = MockApi()
+    await elsewhere.start()
+    try:
+        elsewhere.post("/steal", payload=TOKEN_RESPONSE)
+        mock_api.post(
+            "/v1/tokens", status=status, headers={"Location": elsewhere.url("/steal")}
+        )
+        with pytest.raises(MobilityDatabaseAuthenticationError, match=str(status)):
+            await client.get_metadata()
+        assert elsewhere.requests == []
+    finally:
+        await elsewhere.stop()
+
+
+# -- Absent lists, unreadable error bodies ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("method_name", "path", "payload"),
+    [
+        ("search_feeds", "/v1/search", {"total": 5}),
+        ("get_locations", "/v1/locations", {"total": 5}),
+    ],
+)
+async def test_an_absent_result_list_is_none_not_empty(
+    mock_api: MockApi,
+    client: MobilityDatabaseClient,
+    method_name: str,
+    path: str,
+    payload: dict[str, Any],
+) -> None:
+    """results is optional in the API spec: absent beside total=5, it is
+    unknown, not an empty page."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get(path, payload=payload)
+    mock_api.get(path, payload={**payload, "results": []})
+    assert (await getattr(client, method_name)()).results is None
+    assert (await getattr(client, method_name)()).results == ()
+
+
+async def test_an_unreadable_error_body_keeps_its_status(
+    mock_api: MockApi, client: MobilityDatabaseClient
+) -> None:
+    """The status is known even when the body can't be read."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get(
+        "/v1/metadata",
+        status=500,
+        body=b"not gzip",
+        headers={"Content-Type": "text/plain", "Content-Encoding": "gzip"},
+    )
+    with pytest.raises(MobilityDatabaseApiError) as caught:
+        await client.get_metadata()
+    assert (caught.value.status, caught.value.body) == (500, "")
+
+
+async def test_an_unreadable_token_error_body_is_still_an_auth_error(
+    mock_api: MockApi, client: MobilityDatabaseClient
+) -> None:
+    mock_api.post(
+        "/v1/tokens",
+        status=500,
+        body=b"not gzip",
+        headers={"Content-Type": "text/plain", "Content-Encoding": "gzip"},
+    )
+    with pytest.raises(MobilityDatabaseAuthenticationError):
+        await client.get_metadata()
+
+
+# -- Date-times near the RFC 3339 shape ----------------------------------------------
+
+_DATE_PARTS = st.tuples(
+    st.sampled_from(["2024", "0001", "9999", "0000", "24"]),
+    st.sampled_from(["-01", "-02", "-12", "-13", "01", "-W01"]),
+    st.sampled_from(["-01", "-29", "-30", "-31", "-1", ""]),
+    st.sampled_from(["T", "t", " ", "", "_"]),
+    st.sampled_from(
+        ["00:00:00", "23:59:59", "24:00:00", "12:60:00", "12:00:60", "12:00", "120000"]
+    ),
+    st.sampled_from(["", ".5", ".123456789", "."]),
+    st.sampled_from(["", "Z", "z", "+00:00", "-05:30", "+0100", "+24:00", "+23:59"]),
+)
+
+
+@given(parts=_DATE_PARTS)
+@settings(max_examples=400, deadline=None)
+def test_a_date_time_decodes_exactly_when_rfc_3339_reads_it(
+    parts: tuple[str, ...],
+) -> None:
+    """Accepted iff the independent RFC 3339 reading (offset optional, "Z"
+    upper case only, a real day) gives an instant, and then to that one."""
+    text = "".join(parts)
+    result = _call(
+        "get_gtfs_feed", json.dumps({**GTFS_FEED, "created_at": text}).encode()
+    )
+    expected = _rfc3339(text)
+    if expected is None:
+        assert isinstance(result, MobilityDatabaseConnectionError), text
+    else:
+        assert not isinstance(result, MobilityDatabaseConnectionError), text
+        assert result.created_at == expected
