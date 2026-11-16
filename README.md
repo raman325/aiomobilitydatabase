@@ -733,9 +733,12 @@ mistakes rather than feed problems, and raise the builtin `ValueError`:
 method for an id of `""`, `"."` or `".."`, which no URL can carry as one path
 segment.
 
-So does a feeds handle factory, for a `headers=` entry or an `api_key` that
-HTTP can't carry: a field name that isn't a token, or a value holding a control
-character.
+So does a feeds handle factory, for a caller input HTTP or aiohttp can't
+carry -- in `headers=`, the `api_key`, or an injected session's default headers
+and `auth`: a field name that isn't a token, a value holding a control
+character or no UTF-8 text (a lone surrogate), an `auth` that can't be
+encoded, or an `Authorization` header beside a session `auth` or credentials in
+the URL. Error messages never show a URL's credentials or query.
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`

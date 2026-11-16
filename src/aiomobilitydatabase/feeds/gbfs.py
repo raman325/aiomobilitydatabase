@@ -24,7 +24,11 @@ from ._freshness import hops as _hops
 from ._frozen import FrozenDict
 from ._language import is_preferred_language
 from ._redirects import get_withholding
-from ._urls import _require_http_url  # deliberate friend access: shared URL guard
+from ._urls import (  # deliberate friend access: shared URL guard
+    _require_http_url,
+    describe,
+    redact,
+)
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
 from .models import (
@@ -67,9 +71,10 @@ def _decode_json(body: bytes) -> object:
     would read a UTF-8 "Caf\u00e9" sent as ``charset=iso-8859-1`` as
     mojibake, and raise LookupError for one that is no text encoding
     (``charset=base64``). ``json.loads`` detects UTF-8 (a BOM ignored, as
-    RFC 8259 allows), and UTF-16/32, from the bytes themselves.
+    RFC 8259 allows). Decoded as strict UTF-8 first: ``json.loads`` on the
+    bytes would also take UTF-16/32, and encoded surrogates (surrogatepass).
     """
-    return json.loads(body, parse_constant=_reject_constant)
+    return json.loads(body.decode("utf-8-sig"), parse_constant=_reject_constant)
 
 
 # A number written in ASCII: float() alone also reads other scripts' digits,
@@ -571,7 +576,7 @@ class GbfsFeedHandle:
                     if validators is None:
                         raise SourceConnectionError(
                             f"GBFS endpoint answered 304 to an unconditional "
-                            f"request: {url}",
+                            f"request: {redact(url)}",
                             status=int(HTTPStatus.NOT_MODIFIED),
                         )
                     return Response(
@@ -584,7 +589,8 @@ class GbfsFeedHandle:
                     )
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
-                        f"GBFS endpoint error {resp.status}: {url}", status=resp.status
+                        f"GBFS endpoint error {resp.status}: {redact(url)}",
+                        status=resp.status,
                     )
                 if resp.status not in (
                     HTTPStatus.OK,
@@ -592,7 +598,7 @@ class GbfsFeedHandle:
                 ):
                     raise SourceConnectionError(
                         f"GBFS endpoint answered {resp.status} without a document: "
-                        f"{url}",
+                        f"{redact(url)}",
                         status=resp.status,
                     )
                 try:
@@ -600,13 +606,17 @@ class GbfsFeedHandle:
                 except (ValueError, RecursionError) as err:
                     # RecursionError: json raises it for nesting deeper than
                     # the interpreter's stack, a few kilobytes of brackets.
-                    raise FeedParseError(f"Malformed GBFS JSON from {url}") from err
+                    raise FeedParseError(
+                        f"Malformed GBFS JSON from {redact(url)}"
+                    ) from err
                 hops = _hops(resp, history)
                 answered = str(resp.url)
         except (TimeoutError, aiohttp.ClientError) as err:
-            raise SourceConnectionError(f"Error fetching {url}: {err}") from err
+            raise SourceConnectionError(
+                f"Error fetching {redact(url)}: {describe(err)}"
+            ) from err
         if not isinstance(document, dict) or "data" not in document:
-            raise FeedParseError(f"GBFS document missing data envelope: {url}")
+            raise FeedParseError(f"GBFS document missing data envelope: {redact(url)}")
         return Response(
             value=document,
             fields=fields,

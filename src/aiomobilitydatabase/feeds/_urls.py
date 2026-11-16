@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 
+import aiohttp
 from yarl import URL
 
 from .exceptions import SourceConnectionError
@@ -58,37 +59,83 @@ def _carriable(value: object) -> bool:
 
 
 def _has_credentials(url: str) -> bool:
-    """Return whether a URL carries credentials.
+    """Return whether a URL carries credentials (a user, or a password alone).
 
     False when it doesn't parse: a malformed URL is the guard's to report,
     as SourceConnectionError.
     """
     try:
-        return URL(url).user is not None
+        parsed = URL(url)
     except URL_ERRORS:
         return False
+    return parsed.user is not None or parsed.raw_password is not None
 
 
-def require_compatible_credentials(
-    urls: Iterable[str], headers: Mapping[str, str] | None, session_auth: object
+def require_caller_inputs(
+    session: aiohttp.ClientSession,
+    urls: Iterable[str] = (),
+    headers: Mapping[str, str] | None = None,
+    api_key: str | None = None,
 ) -> None:
-    """Raise ValueError when a caller's credentials can't all be sent.
+    """Raise ValueError for a caller's input aiohttp would refuse mid-request.
 
-    aiohttp sends one Authorization field, so it refuses (mid-request, as a
-    ValueError) an Authorization header beside a session ``auth`` or
-    credentials in the URL, and a session ``auth`` beside URL credentials.
-    Checked for the caller's own URLs when a handle is made, so the mistake
-    is reported as the caller's.
+    Checked when a handle is made, so the mistake is reported as the
+    caller's -- and a ValueError during a request is then the producer's
+    doing (see :func:`._redirects.open_response`):
+
+    - every header, the session's defaults with ``headers``: a name that
+      isn't a token, a value HTTP can't carry (see
+      :func:`require_header_fields`), and the ``api_key``;
+    - a session ``auth`` that can't be encoded (aiohttp encodes it per
+      request);
+    - an Authorization header beside a session ``auth`` or credentials in
+      the caller's URLs: aiohttp sends one Authorization field. (A session
+      ``auth`` beside URL credentials is fine: the URL's are sent.)
     """
-    has_header = any(name.lower() == "authorization" for name in headers or {})
-    in_url = any(_has_credentials(url) for url in urls)
-    if has_header and (in_url or session_auth is not None):
+    require_header_fields(session.headers, None)
+    require_header_fields(headers, api_key)
+    auth = getattr(session, "auth", None)
+    if auth is not None:
+        try:
+            auth.encode()
+        except (UnicodeError, ValueError) as err:
+            raise ValueError("the session's auth can't be encoded") from err
+    has_header = any(
+        name.lower() == "authorization" for name in (*session.headers, *(headers or {}))
+    )
+    if has_header and (auth is not None or any(_has_credentials(url) for url in urls)):
         raise ValueError(
             "an Authorization header can't go with credentials in the URL "
             "or the session's auth"
         )
-    if in_url and session_auth is not None:
-        raise ValueError("credentials in the URL can't go with the session's auth")
+
+
+def redact(url: str) -> str:
+    """Return a URL fit for an error message: no credentials, no query.
+
+    Either can hold a secret (an API key travels in the query). Unparseable,
+    only its scheme is kept.
+    """
+    try:
+        parsed = URL(url)
+        shown = parsed.with_user(None).with_query(None).with_fragment(None)
+        return str(shown) + ("?\u2026" if parsed.query_string else "")
+    except URL_ERRORS:
+        return url.split(":", 1)[0] + ":\u2026"
+
+
+def describe(err: BaseException) -> str:
+    """Name an error for a message without the URLs its text may carry.
+
+    aiohttp's response errors (a redirect loop's among them) print the
+    request's real URL, query parameters and all -- an API key, say. A
+    connection failure's text names only the host and the OS error.
+    """
+    if isinstance(err, aiohttp.ClientConnectorError):
+        return str(err)
+    if isinstance(err, aiohttp.ClientResponseError):
+        return f"{type(err).__name__} ({err.status})"
+    return type(err).__name__
 
 
 def require_requestable(parsed: URL) -> None:
@@ -140,15 +187,16 @@ def _require_http_url(url: str, context: str) -> None:
     UnicodeError mid-request.
     """
     try:
+        url.encode("utf-8")  # yarl drops a lone surrogate: another URL
         parsed = URL(url)
         scheme = parsed.scheme.lower()
         if scheme in _ALLOWED_URL_SCHEMES:  # the scheme refusal comes first
             require_requestable(parsed)
     except URL_ERRORS as err:
         raise SourceConnectionError(
-            f"Refusing to fetch {context}: malformed URL ({url!r}): {err}"
+            f"Refusing to fetch {context}: malformed URL ({redact(url)}): {err}"
         ) from err
     if scheme not in _ALLOWED_URL_SCHEMES:
         raise SourceConnectionError(
-            f"Refusing to fetch {context}: unsupported URL scheme {scheme!r} ({url})"
+            f"Refusing to fetch {context}: unsupported URL scheme {scheme!r}"
         )

@@ -17,7 +17,7 @@ from ._freshness import Response, Validators, header_fields, request_fields
 from ._freshness import hops as _hops
 from ._language import is_preferred_language
 from ._redirects import get_withholding
-from ._urls import FIELD_NAME, _require_http_url
+from ._urls import FIELD_NAME, _require_http_url, describe, redact
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
     AlertCause,
@@ -121,6 +121,14 @@ def _feed_request(
     req_headers: dict[str, str] = dict(headers) if headers else {}
     if api_key is not None and api_key_name:
         if auth_type == _AUTH_TYPE_QUERY_PARAM:
+            try:
+                api_key_name.encode("utf-8")
+            except UnicodeEncodeError as err:
+                # Catalog data: yarl would drop a lone surrogate and send the
+                # key under another name.
+                raise SourceConnectionError(
+                    "The feed's api_key_parameter_name isn't text a query can carry"
+                ) from err
             params[api_key_name] = api_key
         elif auth_type == _AUTH_TYPE_HEADER:
             if not FIELD_NAME.fullmatch(api_key_name):
@@ -200,7 +208,7 @@ async def fetch_feed_message(
             received_at = datetime.now(UTC)
             if resp.status in _AUTH_STATUSES:
                 raise SourceAuthenticationError(
-                    f"Producer rejected credentials ({resp.status}): {url}"
+                    f"Producer rejected credentials ({resp.status}): {redact(url)}"
                 )
             fields = header_fields(resp.headers)
             # 304 is the producer confirming the bytes are unchanged, so
@@ -210,7 +218,8 @@ async def fetch_feed_message(
                     # Unsolicited: there is no previous parse to reuse. A
                     # misbehaving proxy must raise the library's own error.
                     raise SourceConnectionError(
-                        f"Producer answered 304 to an unconditional request: {url}",
+                        "Producer answered 304 to an unconditional request: "
+                        f"{redact(url)}",
                         status=int(HTTPStatus.NOT_MODIFIED),
                     )
                 return Response(
@@ -223,25 +232,29 @@ async def fetch_feed_message(
                 )
             if resp.status >= HTTPStatus.BAD_REQUEST:
                 raise SourceConnectionError(
-                    f"Producer error {resp.status}: {url}", status=resp.status
+                    f"Producer error {resp.status}: {redact(url)}", status=resp.status
                 )
             if resp.status not in _FEED_STATUSES:
                 # A 204, a 300, a 3xx left unfollowed: no feed to parse (an
                 # empty body parses as an empty FeedMessage).
                 raise SourceConnectionError(
-                    f"Producer answered {resp.status} without a feed: {url}",
+                    f"Producer answered {resp.status} without a feed: {redact(url)}",
                     status=resp.status,
                 )
             raw = await resp.read()
             hops = _hops(resp, history)
             answered = str(resp.url)
     except (TimeoutError, aiohttp.ClientError) as err:
-        raise SourceConnectionError(f"Error fetching {url}: {err}") from err
+        raise SourceConnectionError(
+            f"Error fetching {redact(url)}: {describe(err)}"
+        ) from err
     message = gtfs_realtime_pb2.FeedMessage()
     try:
         await asyncio.to_thread(message.ParseFromString, raw)
     except Exception as err:  # DecodeError subclasses Exception, not a shared base
-        raise FeedParseError(f"Undecodable GTFS-RT protobuf from {url}") from err
+        raise FeedParseError(
+            f"Undecodable GTFS-RT protobuf from {redact(url)}"
+        ) from err
     return Response(
         value=message,
         fields=fields,

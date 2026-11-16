@@ -17,7 +17,7 @@ from time import monotonic
 import aiohttp
 from yarl import URL
 
-from ._urls import URL_ERRORS, require_requestable
+from ._urls import URL_ERRORS, redact, require_requestable
 from .exceptions import SourceConnectionError
 
 # aiohttp's own redirect limit: the tenth redirect raises.
@@ -31,8 +31,8 @@ _ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization
 # aiohttp's own, building Basic credentials from a user name holding a colon
 # (a%3Ab@). The caller inputs aiohttp would refuse -- header names and
 # values, an api_key, credentials that can't all be sent -- are checked
-# when a handle is made (_urls.require_header_fields and
-# require_compatible_credentials), so a ValueError here is the producer's.
+# when a handle is made (_urls.require_caller_inputs: the session's defaults
+# included), so a ValueError here is the producer's.
 _UNREQUESTABLE = (IndexError, ValueError)  # UnicodeError is a ValueError
 
 
@@ -50,7 +50,8 @@ async def open_response(
         # The error's own text can echo every request header (aiohttp's
         # pure-Python writer does): name its type only, credentials stay out.
         raise SourceConnectionError(
-            f"Could not request {url} or a URL it redirected to ({type(err).__name__})"
+            f"Could not request {redact(url)} or a URL it redirected to "
+            f"({type(err).__name__})"
         ) from err
 
 
@@ -93,16 +94,18 @@ def _same_resource(target: URL, query: Mapping[str, str] | None, other: URL) -> 
 def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str) -> URL:
     """Resolve a Location as aiohttp does; only an HTTP(S) URL is followed."""
     try:
+        location.encode("utf-8")  # yarl drops a lone surrogate: another URL
         following = base.join(URL(location, encoded=not session.requote_redirect_url))
         _origin(following)
         require_requestable(following)
     except URL_ERRORS as err:
         raise SourceConnectionError(
-            f"Producer redirected to an invalid URL ({location!r}): {url}"
+            f"Producer redirected to an invalid URL ({redact(location)}): {redact(url)}"
         ) from err
     if following.scheme not in ("http", "https"):
         raise SourceConnectionError(
-            f"Producer redirected to a non-HTTP URL ({following}): {url}"
+            f"Producer redirected to a non-HTTP URL ({following.scheme}:): "
+            f"{redact(url)}"
         )
     return following
 
@@ -197,7 +200,7 @@ async def get_withholding(
         response.release()
         history.append(response)
         if len(history) >= _MAX_REDIRECTS:
-            raise SourceConnectionError(f"Too many redirects fetching {url}")
+            raise SourceConnectionError(f"Too many redirects fetching {redact(url)}")
         following = _resolve(response.url, location, session, url)
         origin = _origin(following)
         if origin != _origin(response.url):
@@ -208,7 +211,8 @@ async def get_withholding(
                     break  # only validators made this hand-followed: retry
                 raise SourceConnectionError(
                     f"Producer redirected to another origin ({following.origin()}) "
-                    f"and the session carries credentials that can't be withheld: {url}"
+                    "and the session carries credentials that can't be withheld: "
+                    f"{redact(url)}"
                 )
             sent = {k: v for k, v in sent.items() if k.lower() not in withheld}
             userinfo = None

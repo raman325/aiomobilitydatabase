@@ -475,3 +475,19 @@ def test_a_string_ttl_that_isnt_an_ascii_number_is_unusable(ttl: str) -> None:
 )
 def test_a_string_ttl_in_ascii_reads(ttl: str, seconds: float) -> None:
     assert _ttl_seconds(ttl) == seconds
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"ttl": 0, "last_updated": 0, "data": {"system_id": "a\xed\xa0\x80b"}}',
+        b'{"data": {"x": "\xff"}}',
+    ],
+)
+async def test_a_gbfs_body_that_isnt_utf_8_is_a_parse_error(
+    mock_api: MockApi, direct_client: MobilityFeedsClient, body: bytes
+) -> None:
+    """json.loads on bytes decoded encoded surrogates (surrogatepass)."""
+    mock_api.get("/gbfs/gbfs.json", body=body, content_type="application/json")
+    with pytest.raises(FeedParseError, match="Malformed GBFS JSON"):
+        await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))

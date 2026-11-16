@@ -39,6 +39,8 @@ from ._freshness import FreshnessCache, _etag, header_fields
 from ._redirects import open_response
 from ._urls import (
     _require_http_url,  # deliberate friend access: shared data-origin URL guard
+    describe,
+    redact,
 )
 from .const import STATIC_DB_FILENAME
 from .exceptions import (
@@ -1936,7 +1938,7 @@ class TransitFeedHandle:
                     return f"etag:{etag}"
         except (TimeoutError, aiohttp.ClientError) as err:
             raise SourceConnectionError(
-                f"Error probing {direct.static_url}: {err}"
+                f"Error probing {redact(direct.static_url)}: {describe(err)}"
             ) from err
         return None
 
@@ -2066,13 +2068,14 @@ class TransitFeedHandle:
             async with resp:
                 if resp.status >= HTTPStatus.BAD_REQUEST:
                     raise SourceConnectionError(
-                        f"Dataset fetch failed ({resp.status}) for {source.url}",
+                        f"Dataset fetch failed ({resp.status}) for "
+                        f"{redact(source.url)}",
                         status=resp.status,
                     )
                 if resp.status not in _DATASET_STATUSES:
                     raise SourceConnectionError(
                         f"Dataset URL answered {resp.status} without a dataset: "
-                        f"{source.url}",
+                        f"{redact(source.url)}",
                         status=resp.status,
                     )
                 etag = _strong_etag(resp.headers)
@@ -2112,7 +2115,9 @@ class TransitFeedHandle:
                         )
                     )
         except (TimeoutError, aiohttp.ClientError) as err:
-            raise SourceConnectionError(f"Error downloading dataset: {err}") from err
+            raise SourceConnectionError(
+                f"Error downloading dataset: {describe(err)}"
+            ) from err
         return etag
 
     @staticmethod

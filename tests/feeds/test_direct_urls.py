@@ -896,7 +896,7 @@ def test_a_header_value_is_refused_or_reaches_the_server_as_is(value: str) -> No
     [
         ("http://u:p@127.0.0.1:9/feed", {"Authorization": "Bearer t"}, None),
         ("http://127.0.0.1:9/feed", {"authorization": "Bearer t"}, ("u", "p")),
-        ("http://u:p@127.0.0.1:9/feed", None, ("u", "p")),
+        (":pw@", {"Authorization": "Bearer t"}, None),  # a password alone counts
     ],
 )
 async def test_credentials_that_cant_all_be_sent_are_the_callers_mistake(
@@ -904,6 +904,8 @@ async def test_credentials_that_cant_all_be_sent_are_the_callers_mistake(
 ) -> None:
     """aiohttp sends one Authorization field and raised ValueError
     mid-request -- which open_response would have called the source's."""
+    if url == ":pw@":
+        url = "http://:pw@127.0.0.1:9/feed"
     auth = aiohttp.BasicAuth(*session_auth) if session_auth else None
     async with aiohttp.ClientSession(auth=auth) as session:
         client = MobilityFeedsClient(session=session)
@@ -944,3 +946,132 @@ async def test_a_mid_request_error_echoes_no_request_header(mock_api: MockApi) -
                 session, mock_api.url("/rt.pb"), headers={"X-Secret": "TOPSECRET"}
             )
     assert "TOPSECRET" not in str(caught.value)
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_a_session_auth_beside_url_credentials_sends_the_urls(
+    mock_api: MockApi,
+) -> None:
+    """aiohttp accepts the pair and sends the URL's credentials: no mistake."""
+    mock_api.get("/gbfs/gbfs.json", status=503)
+    url = mock_api.url("/gbfs/gbfs.json").replace("http://", "http://u:p@")
+    async with aiohttp.ClientSession(auth=aiohttp.BasicAuth("sess", "ion")) as session:
+        client = MobilityFeedsClient(session=session)
+        with pytest.raises(SourceConnectionError):
+            await client.get_gbfs_feed_from_url(url)
+    assert mock_api.requests[0].headers["Authorization"] == "Basic dTpw"  # u:p
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize(
+    ("session_headers", "session_auth"),
+    [
+        ({"X-Key": "a\nb"}, None),
+        ({"X-Key": "sec\ud800ret"}, None),  # compiled aiohttp sent "secret"
+        ({"Bad Name": "v"}, None),
+        ({"Authorization": "Bearer t"}, ("u", "p")),
+        ({}, ("u", "p\u20ac")),  # BasicAuth encodes as Latin-1
+    ],
+)
+async def test_a_session_default_aiohttp_would_refuse_is_the_callers_mistake(
+    mock_api: MockApi,
+    session_headers: dict[str, str],
+    session_auth: tuple[str, str] | None,
+) -> None:
+    """A caller-injected session's defaults ride on every request: checked
+    when a handle is made, like headers=, at every factory."""
+    auth = aiohttp.BasicAuth(*session_auth) if session_auth else None
+    async with aiohttp.ClientSession(headers=session_headers, auth=auth) as session:
+        client = MobilityFeedsClient(session=session)
+        for make in (
+            lambda: client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json")),
+            lambda: client.get_transit_feed_from_urls(mock_api.url(STATIC_PATH)),
+            lambda: client.get_transit_feed("mdb-1"),
+            lambda: client.get_gbfs_feed("gbfs-1"),
+        ):
+            with pytest.raises(ValueError):
+                await make()
+    assert mock_api.requests == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:9/a\ud800b",
+        "http://u\ud800:p@127.0.0.1:9/",
+        "http://127.0.0.1:9/?k=\udcff",
+    ],
+)
+def test_a_url_that_isnt_utf_8_text_is_refused(url: str) -> None:
+    """yarl drops a lone surrogate: the request would go to another URL, or
+    with other credentials."""
+    with pytest.raises(SourceConnectionError, match="malformed URL"):
+        _require_http_url(url, "test URL")
+
+
+async def test_a_redirect_to_a_url_that_isnt_utf_8_text_is_refused(
+    mock_api: MockApi,
+) -> None:
+    mock_api.get("/rt.pb", status=302, headers={"Location": "/a\udcffb"})
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError):
+            await fetch_feed_message(
+                session,
+                mock_api.url("/rt.pb"),
+                auth_type=2,
+                api_key_name="X-Key",
+                api_key="k",
+            )
+
+
+async def test_a_query_key_name_that_isnt_text_is_refused() -> None:
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError, match="query can carry"):
+            await fetch_feed_message(
+                session,
+                "http://127.0.0.1:9/rt.pb",
+                auth_type=1,
+                api_key_name="k\ud800",
+                api_key="v",
+            )
+
+
+# -- Secrets stay out of error text --------------------------------------------------
+
+
+def test_a_refused_url_shows_no_credentials() -> None:
+    with pytest.raises(SourceConnectionError) as caught:
+        _require_http_url("https://user:SECRETPW@a..b/x?key=SECRETKEY", "test URL")
+    assert "SECRETPW" not in str(caught.value)
+    assert "SECRETKEY" not in str(caught.value)
+
+
+async def test_a_redirect_loop_shows_no_query_api_key(mock_api: MockApi) -> None:
+    """aiohttp's TooManyRedirects text carries the real URL, ?key= and all."""
+    for _ in range(12):
+        mock_api.get("/loop", status=302, headers={"Location": "/loop"})
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError) as caught:
+            await fetch_feed_message(
+                session,
+                mock_api.url("/loop"),
+                auth_type=1,
+                api_key_name="key",
+                api_key="SECRET123",
+            )
+    assert "SECRET123" not in str(caught.value)
+
+
+async def test_an_unrequestable_url_shows_no_credentials(mock_api: MockApi) -> None:
+    mock_api.get(
+        "/rt.pb",
+        status=302,
+        headers={
+            "Location": mock_api.url("/x").replace("http://", "http://%E2%82%AC@")
+        },
+    )
+    url = mock_api.url("/rt.pb").replace("http://", "http://user:SECRETPW@")
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError) as caught:
+            await fetch_feed_message(session, url)
+    assert "SECRETPW" not in str(caught.value)
