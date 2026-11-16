@@ -498,13 +498,22 @@ def _swept_pairs(
     active: list[int] = []
     for k in sorted(members, key=lambda k: boxes[k][0]):
         x0, y0, _x1, y1 = boxes[k]
+        _r, _i, (ax, ay), (bx, by) = edges[k]
+        dx, dy = bx - ax, by - ay
         active = [g for g in active if boxes[g][2] >= x0]
         steps += len(active) + 1
         for g in active:
-            if boxes[g][1] <= y1 and y0 <= boxes[g][3]:
-                point = _meets(edges, g, k)
-                if point is not None and accept(point):
-                    yield (g, k) if g < k else (k, g)
+            if boxes[g][1] > y1 or y0 > boxes[g][3]:
+                continue
+            # _touch's first test, inline: g wholly to one side of k's line
+            _r, _i, (cx, cy), (ex, ey) = edges[g]
+            o1 = dx * (cy - ay) - dy * (cx - ax)
+            o2 = dx * (ey - ay) - dy * (ex - ax)
+            if (o1 > 0 and o2 > 0) or (o1 < 0 and o2 < 0):
+                continue
+            point = _meets(edges, g, k)
+            if point is not None and accept(point):
+                yield (g, k) if g < k else (k, g)
         active.append(k)
     if budget is not None:
         budget.spend(steps)
