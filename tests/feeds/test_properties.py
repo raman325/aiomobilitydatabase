@@ -911,8 +911,30 @@ def test_version_key_orders_like_its_components(
     """
     key_left = _version_key(".".join(str(part) for part in left))
     key_right = _version_key(".".join(str(part) for part in right))
-    assert key_left == tuple(left)
+    assert key_left[0] == tuple(left)
     assert (key_left < key_right) is (tuple(left) < tuple(right))
+
+
+@given(
+    left=st.lists(st.integers(0, 20), min_size=1, max_size=4),
+    right=st.lists(st.integers(0, 20), min_size=1, max_size=4),
+    label=st.sampled_from(["RC", "rc", "beta", "alpha"]),
+    number=st.sampled_from(["", "1", "2", "10"]),
+)
+def test_a_pre_release_ranks_just_below_its_release_whatever_the_versions(
+    left: list[int], right: list[int], label: str, number: str
+) -> None:
+    """A pre-release (X.Y-RC, X.Y-RC2) ranks by its numeric version, just
+    below that version's release: above every lower release, below every
+    release from its own on."""
+    base = ".".join(str(part) for part in left)
+    other = ".".join(str(part) for part in right)
+    pre = _version_key(f"{base}-{label}{number}")
+    assert pre < _version_key(base)
+    if tuple(right) < tuple(left):
+        assert _version_key(other) < pre
+    else:
+        assert pre < _version_key(other)
 
 
 @given(version=st.text(max_size=12), other=st.text(max_size=12))
@@ -922,7 +944,6 @@ def test_version_key_is_total(version: str, other: str) -> None:
     unparseable entry must not break the sort with a TypeError.
     """
     key, other_key = _version_key(version), _version_key(other)
-    assert all(isinstance(part, int) for part in key)
     assert key < other_key or other_key <= key
 
 
@@ -1714,7 +1735,20 @@ def test_station_bool_coercion_never_lies(raw: object) -> None:
     """
     result = _as_bool(raw)
     assert result in (True, False, None)
-    assert (result is None) is not isinstance(raw, bool | int | float)
+    readable = isinstance(raw, bool) or (isinstance(raw, int | float) and raw in (0, 1))
+    assert (result is None) is not readable
+    if readable:
+        assert result == bool(raw)
+
+
+@given(
+    raw=st.integers().filter(lambda n: n not in (0, 1))
+    | st.floats(allow_nan=True, allow_infinity=True).filter(lambda x: x not in (0, 1))
+)
+def test_a_number_other_than_0_or_1_is_no_gbfs_boolean(raw: float) -> None:
+    """A GBFS Boolean is true/false (0/1 as some producers send them): 0.5,
+    -1, 2 or an overflowed 1e999 (inf) is an unknown, never True."""
+    assert _as_bool(raw) is None
 
 
 @given(raw=st.text())
@@ -5967,15 +6001,23 @@ def _draw_language_blocks(data: st.DataObject) -> dict[str, object]:
     return blocks
 
 
+def _usable(feeds: list[object]) -> dict[str, str]:
+    return {
+        str(feed["name"]): str(feed["url"])
+        for feed in feeds
+        if isinstance(feed, dict) and feed.get("name") and feed.get("url")
+    }
+
+
 def _expected_language_feeds(blocks: dict[str, object]) -> list[object]:
-    """Oracle language preference: "en" when it carries a feeds LIST, else
-    the first block (insertion order) that does, else nothing."""
-    en_block = blocks.get("en")
-    if isinstance(en_block, dict) and isinstance(en_block.get("feeds"), list):
-        return list(en_block["feeds"])
-    for block in blocks.values():
-        if isinstance(block, dict) and isinstance(block.get("feeds"), list):
-            return list(block["feeds"])
+    """Oracle language preference: "en" when its feeds LIST yields a usable
+    pair, else the first block (insertion order) whose list does, else
+    nothing."""
+    ordered = sorted(blocks.items(), key=lambda item: item[0] != "en")
+    for _language, block in ordered:
+        feeds = block.get("feeds") if isinstance(block, dict) else None
+        if isinstance(feeds, list) and _usable(feeds):
+            return list(feeds)
     return []
 
 
@@ -5986,7 +6028,8 @@ def test_endpoints_from_discovery_layouts_oracle(data: st.DataObject) -> None:
     (``data.<lang>.feeds``) discovery layouts -- with invalid entries,
     blank names/urls, garbage language blocks, and feeds-less blocks --
     resolve to exactly the oracle's name->url table (preferred language
-    first, else the first block carrying a feeds list), and FeedParseError
+    first, else the first block whose feeds list yields a usable pair), and
+    FeedParseError
     is raised IFF no usable feeds remain.
     """
     layout = data.draw(st.sampled_from(["3.x", "2.x"]))
@@ -5997,11 +6040,7 @@ def test_endpoints_from_discovery_layouts_oracle(data: st.DataObject) -> None:
         blocks = _draw_language_blocks(data)
         document = {"data": blocks}
         chosen = _expected_language_feeds(blocks)
-    expected = {
-        str(feed["name"]): str(feed["url"])
-        for feed in chosen
-        if isinstance(feed, dict) and feed.get("name") and feed.get("url")
-    }
+    expected = _usable(chosen)
     if expected:
         assert _endpoints_from_discovery(document) == expected
     else:

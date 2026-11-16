@@ -59,6 +59,12 @@ _RFC3339 = re.compile(
 # GBFS Date: "ISO 8601 Complete Date Extended Format: YYYY-MM-DD".
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
+# A GBFS version: dotted ASCII digits ("2.3", "3.0"), optionally a
+# pre-release of it ("3.1-RC", "3.1-RC2": letters, then a number or none).
+_VERSION = re.compile(r"([0-9]+(?:\.[0-9]+)*)(?:-([A-Za-z]+)([0-9]*))?")
+# What no version is: below every one, and comparable with every key.
+_NO_VERSION: tuple[tuple[int, ...], int, str, int] = ((), 0, "", 0)
+
 
 # Every whole number up to here is exactly a float, and back.
 _EXACT_FLOAT = 2**53
@@ -113,19 +119,26 @@ def _localized(value: Any) -> str | None:
     return texts[0][1] if texts else None
 
 
-def _version_key(version: str | None) -> tuple[int, ...]:
-    """Sort key of a GBFS version ("2.3", "3.0"); (0,) when it isn't one.
+def _version_key(version: str | None) -> tuple[tuple[int, ...], int, str, int]:
+    """Sort key of a GBFS version ("2.3", "3.0", "3.1-RC").
 
-    ASCII digits only: ``int()`` also reads other scripts' digits, spaces
-    and ``_`` grouping, so a corrupt "\uff13.0" would sort as 3.0.
+    Ranked by the numeric version, a pre-release just below its release
+    (3.0 < 3.1-RC < 3.1-RC2 < 3.1). Anything else -- None included -- is
+    no version and ranks below every one. ASCII digits only: ``int()``
+    also reads other scripts' digits, spaces and ``_`` grouping, so a
+    corrupt "\uff13.0" would sort as 3.0.
     """
-    parts = (version or "0").split(".")
-    if not all(part.isascii() and part.isdigit() for part in parts):
-        return (0,)
+    match = _VERSION.fullmatch(version) if isinstance(version, str) else None
+    if match is None:
+        return _NO_VERSION
+    numbers, label, number = match.groups()
     try:
-        return tuple(int(part) for part in parts)
+        release = tuple(int(part) for part in numbers.split("."))
+        if label is None:
+            return (release, 1, "", 0)
+        return (release, 0, label.upper(), int(number or "0"))
     except ValueError:  # past CPython's int-string digit limit
-        return (0,)
+        return _NO_VERSION
 
 
 def _rental_uris(value: Any) -> Mapping[str, str] | None:
@@ -317,14 +330,17 @@ def _rows(document: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
 
 
 def _as_bool(value: Any) -> bool | None:
-    """Coerce a GBFS status flag to bool without lying on ambiguous input.
+    """Read a GBFS boolean flag without lying on ambiguous input.
 
-    ``bool("false")`` is ``True`` in Python, so strings (and anything else
-    that isn't already a bool/int/float) are treated as UNKNOWN (``None``)
-    rather than silently coerced.
+    A GBFS Boolean is JSON ``true``/``false``; the numbers ``1`` and ``0``
+    are read as them too, as some producers send. Every other value is
+    UNKNOWN (``None``) rather than coerced: ``bool("false")`` is ``True``
+    in Python, and so would be ``0.5``, ``-1`` or an overflowed ``1e999``.
     """
-    if isinstance(value, bool | int | float):
-        return bool(value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float) and value in (0, 1):
+        return value == 1
     return None
 
 
@@ -385,8 +401,9 @@ def _endpoints_from_discovery(document: Any) -> dict[str, str]:
 
     GBFS 3.x publishes ``data.feeds`` directly; 2.x nests the feed list
     under language codes (``data.en.feeds``) — prefer the library's
-    language preference and otherwise take the first language block that
-    carries feeds, mirroring the fallback order of :func:`_localized`.
+    language preference and otherwise take the first language block whose
+    feeds yield a usable name/url pair, mirroring the fallback order of
+    :func:`_localized`.
     The result feeds the same endpoint table the catalog path builds from
     version metadata, so every handle method works identically after this.
 
@@ -396,39 +413,32 @@ def _endpoints_from_discovery(document: Any) -> dict[str, str]:
     surface as a KeyError/TypeError to a caller.
     """
     data = document.get("data") if isinstance(document, Mapping) else None
-    feeds: Any = None
+    lists: list[list[Any]] = []
     if isinstance(data, Mapping):
         feeds = data.get("feeds")
-        if not isinstance(feeds, list):  # 2.x language-keyed layout
-            candidates = [
-                block
-                for block in data.values()
+        if isinstance(feeds, list):
+            lists = [feeds]
+        else:  # 2.x language-keyed layout: preferred languages first
+            blocks = [
+                (is_preferred_language(tag), block["feeds"])
+                for tag, block in data.items()
                 if isinstance(block, Mapping) and isinstance(block.get("feeds"), list)
             ]
-            preferred = next(
-                (
-                    block
-                    for tag, block in data.items()
-                    if is_preferred_language(tag)
-                    and isinstance(block, Mapping)
-                    and isinstance(block.get("feeds"), list)
-                ),
-                None,
-            )
-            if preferred is not None:
-                candidates.insert(0, preferred)
-            if candidates:
-                feeds = candidates[0]["feeds"]
-    endpoints = {
-        feed["name"]: feed["url"]
-        for feed in (feeds if isinstance(feeds, list) else [])
-        if isinstance(feed, Mapping)
-        and _plain_text(feed.get("name"))
-        and _plain_text(feed.get("url"))
-    }
-    if not endpoints:
-        raise FeedParseError("GBFS discovery document lists no usable feeds")
-    return endpoints
+            lists = [feeds for preferred, feeds in blocks if preferred]
+            lists += [feeds for preferred, feeds in blocks if not preferred]
+    # The first block that yields a usable pair: one listing nothing usable
+    # (an empty "en" beside a full "fr") names no endpoints to prefer.
+    for feeds in lists:
+        endpoints = {
+            feed["name"]: feed["url"]
+            for feed in feeds
+            if isinstance(feed, Mapping)
+            and _plain_text(feed.get("name"))
+            and _plain_text(feed.get("url"))
+        }
+        if endpoints:
+            return endpoints
+    raise FeedParseError("GBFS discovery document lists no usable feeds")
 
 
 class GbfsFeedHandle:

@@ -612,6 +612,8 @@ Notes on direct mode:
   at a station need not report a position: its coordinates are `None`, and
   a zone places it at its station), and a
   `GbfsSystemInfo` with the operator's contact, licensing, and terms URLs.
+  A flag (`is_renting`, `is_installed`, ...) is JSON `true`/`false`, or
+  `1`/`0`; any other value is `None` (unknown), never `True`.
   `last_reported` is exposed on both stations and vehicles so you can tell
   fresh data from stale, and is parsed from either GBFS 2.x POSIX seconds or
   3.0 RFC 3339 (whose offset is required: without one, a timestamp is
