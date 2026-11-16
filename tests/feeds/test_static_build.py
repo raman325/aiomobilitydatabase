@@ -1211,23 +1211,29 @@ def test_an_unreadable_zip_names_the_problem_in_the_librarys_words(
 
 
 @pytest.mark.parametrize(
-    ("stops", "reason"),
+    ("filename", "content", "reason"),
     [
-        (b"\xff\xfeSECRETBYTES", "UnicodeDecodeError"),
-        (b"stop_id,stop_name\nS1\n", "line 2 has fewer fields than the header"),
+        ("stops.txt", b"\xff\xfeSECRETBYTES", "UnicodeDecodeError"),
+        (
+            "stops.txt",
+            b"stop_id,stop_name\nS1\n",
+            "line 2 has fewer fields than the header",
+        ),
+        # Read first, for the timezone, by its own path.
+        ("agency.txt", b"\xff\xfeSECRETBYTES", "UnicodeDecodeError"),
     ],
 )
 def test_a_malformed_file_carries_nothing_of_the_error_behind_it(
-    tmp_path: Path, stops: bytes, reason: str
+    tmp_path: Path, filename: str, content: bytes, reason: str
 ) -> None:
-    """The CSV conversion runs in a context manager's exit, where Python
-    would chain the error being handled -- a codec error holding the file's
-    bytes. Nothing is chained."""
-    files: dict[str, str | bytes] = {**_FILES, "stops.txt": stops}
+    """A codec error holds the file's bytes: the FeedParseError has nothing
+    chained, and no frame on its traceback keeps the original (as a context
+    manager's exit would, the conversion happening there)."""
+    files: dict[str, str | bytes] = {**_FILES, filename: content}
     zip_path = _zip_from_files(tmp_path, files, "malformed.zip")
     with pytest.raises(FeedParseError) as caught:
         StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
-    assert str(caught.value) == f"Malformed stops.txt: {reason}"
+    assert str(caught.value) == f"Malformed {filename}: {reason}"
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     # Nor on the traceback: no frame below this test's (contextlib's exit,
