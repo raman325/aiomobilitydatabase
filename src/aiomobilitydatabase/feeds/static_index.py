@@ -18,12 +18,11 @@ import tempfile
 import zipfile
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
-from typing import IO, Any, NamedTuple, NoReturn
+from typing import IO, Any, NamedTuple
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -549,35 +548,27 @@ def _reason(err: BaseException) -> str:
     return str(err) if isinstance(err, _RefusedError) else type(err).__name__
 
 
-@contextmanager
-def _open_csv(
-    archive: zipfile.ZipFile, filename: str
-) -> Iterator[tuple[IO[bytes], csv.DictReader[str]]]:
-    """Open one dataset file as CSV; anything wrong with it is FeedParseError."""
+def _read_csv[T](
+    archive: zipfile.ZipFile,
+    filename: str,
+    read: Callable[[IO[bytes], csv.DictReader[str]], T],
+) -> T:
+    """Read one dataset file as CSV through ``read``.
+
+    Anything wrong with the file, or refused while reading it, is
+    FeedParseError. Converted here, in a plain function after the
+    ``except`` block ends -- not in a context manager's exit, where the
+    error being handled would become the new one's ``__context__``, and
+    contextlib's frame, kept on the traceback, would still hold it as a
+    local (a codec error carries the file's bytes).
+    """
     fp = _open_member(archive, filename)
     with fp:
         try:
-            yield fp, _FullRowReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
+            return read(fp, _FullRowReader(io.TextIOWrapper(fp, encoding="utf-8-sig")))
         except _READ_ERRORS as err:
             reason = _reason(err)
-        else:
-            return
-    _raise_unchained(FeedParseError(f"Malformed {filename}: {reason}"))
-
-
-def _raise_unchained(error: Exception) -> NoReturn:
-    """Raise ``error`` with no context, even from a context manager's exit.
-
-    Raising after the ``except`` block ends isn't enough here: a
-    ``@contextmanager`` generator runs inside the ``with`` statement's exit,
-    while the error it was handed is still being handled, so Python makes
-    that error the new one's ``__context__`` -- and a codec error carries
-    the file's bytes. The context is cleared as ``error`` leaves.
-    """
-    try:
-        raise error
-    finally:
-        error.__context__ = None
+    raise FeedParseError(f"Malformed {filename}: {reason}")
 
 
 def _open_zip(zip_path: Path) -> zipfile.ZipFile:
@@ -1343,12 +1334,15 @@ class StaticIndex:
         """
         if "agency.txt" not in names:
             return None
-        with _open_csv(archive, "agency.txt") as (_fp, reader):
+
+        def first_zone(_fp: IO[bytes], reader: csv.DictReader[str]) -> str | None:
             for row in reader:
                 tz_name = (row.get("agency_timezone") or "").strip()
                 if tz_name:
                     return tz_name
-        return None
+            return None
+
+        return _read_csv(archive, "agency.txt", first_zone)
 
     @classmethod
     def _load_all(
@@ -1382,8 +1376,13 @@ class StaticIndex:
         for filename, loader in files:
             if filename not in names:
                 continue  # build() has already rejected a missing required file
-            with _open_csv(archive, filename) as (fp, reader):
-                loader(conn, reader, _reporter(progress, fp, completed, total))
+            _read_csv(
+                archive,
+                filename,
+                lambda fp, reader, loader=loader, done=completed: loader(
+                    conn, reader, _reporter(progress, fp, done, total)
+                ),
+            )
             completed += archive.getinfo(filename).file_size
             if progress is not None:
                 progress(completed, total)

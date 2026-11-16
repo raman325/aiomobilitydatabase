@@ -3,6 +3,7 @@
 import io
 import os
 import sqlite3
+import traceback
 import zipfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -1229,3 +1230,13 @@ def test_a_malformed_file_carries_nothing_of_the_error_behind_it(
     assert str(caught.value) == f"Malformed stops.txt: {reason}"
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+    # Nor on the traceback: no frame below this test's (contextlib's exit,
+    # say) keeps the original or the bytes as a local -- error reporters
+    # capture frame locals.
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_code.co_filename == __file__:
+            continue
+        for name, value in frame.f_locals.items():
+            shown = repr(value)
+            assert "SECRETBYTES" not in shown, (frame.f_code.co_name, name)
+            assert not isinstance(value, UnicodeError), (frame.f_code.co_name, name)
