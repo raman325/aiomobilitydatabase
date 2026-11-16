@@ -108,6 +108,35 @@ def _vocab_or_none[StrEnumT: StrEnum](
         return None
 
 
+# Header names catalog data may not use for an API key: each one changes
+# where the request goes, how it is framed, or what is answered (RFC 9110
+# sections 7.2, 7.6.1, 8.6, 13 and 14; RFC 9112 section 6), so a key under
+# it is a different request -- or reaches a proxy instead of the producer.
+_RESERVED_HEADERS = frozenset(
+    {
+        "connection",
+        "content-encoding",
+        "content-length",
+        "content-type",
+        "expect",
+        "host",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "range",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+
 def _feed_request(
     auth_type: int | None,
     api_key_name: str | None,
@@ -136,6 +165,11 @@ def _feed_request(
             if not is_token(api_key_name):
                 raise SourceConnectionError(
                     "The feed's api_key_parameter_name is no header field name"
+                )
+            if api_key_name.lower() in _RESERVED_HEADERS:
+                raise SourceConnectionError(
+                    "The feed's api_key_parameter_name names a header that "
+                    "changes the request, not one an API key can go in"
                 )
             req_headers[api_key_name] = api_key
     return params, req_headers
@@ -250,7 +284,11 @@ async def fetch_feed_message(
     try:
         await asyncio.to_thread(message.ParseFromString, raw)
     except Exception:  # DecodeError subclasses Exception, not a shared base
-        raise FeedParseError("Undecodable GTFS-RT protobuf", url=shown) from None
+        decoded = False
+    else:
+        decoded = True
+    if not decoded:  # outside the except: nothing of the error rides along
+        raise FeedParseError("Undecodable GTFS-RT protobuf", url=shown)
     return Response(
         value=message,
         fields=fields,

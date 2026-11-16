@@ -17,6 +17,7 @@ from yarl import URL
 
 from aiomobilitydatabase import EntityType
 from aiomobilitydatabase.exceptions import MobilityDatabaseError
+from aiomobilitydatabase.feeds._redirects import get_withholding
 from aiomobilitydatabase.feeds._urls import _require_http_url
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import (
@@ -768,6 +769,68 @@ async def test_an_api_key_header_name_that_is_no_field_name_is_refused(
             )
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Host",
+        "content-length",
+        "Transfer-Encoding",
+        "If-None-Match",
+        "Range",
+        "Proxy-Authorization",
+        "Connection",
+        "Expect",
+    ],
+)
+async def test_an_api_key_header_name_that_changes_the_request_is_refused(
+    name: str,
+) -> None:
+    """A key under Host routes the request elsewhere, under Content-Length
+    or Transfer-Encoding reframes it, under a validator or Range changes what
+    is answered, under Proxy-Authorization goes to a proxy: catalog data
+    doesn't get to choose those. Nothing is sent."""
+    sent: list[bytes] = []
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        sent.append(await reader.read(1))
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(
+                SourceConnectionError, match="changes the request"
+            ) as caught:
+                await fetch_feed_message(
+                    session,
+                    f"http://127.0.0.1:{port}/rt.pb",
+                    auth_type=2,
+                    api_key_name=name,
+                    api_key="KeySecret",
+                )
+    finally:
+        server.close()
+    assert sent == []
+    assert name not in str(caught.value)
+    assert "KeySecret" not in str(caught.value)
+
+
+async def test_an_api_key_under_authorization_is_sent(mock_api: MockApi) -> None:
+    """Producers do put keys in Authorization: it stays allowed."""
+    mock_api.get("/rt.pb", body=b"", auth="Key1")
+    async with aiohttp.ClientSession() as session:
+        await fetch_feed_message(
+            session,
+            mock_api.url("/rt.pb"),
+            auth_type=2,
+            api_key_name="Authorization",
+            api_key="Bearer Key1",
+        )
+
+
 _COLON_LOGINS = ["http://a%3Ab@127.0.0.1:9/feed", "http://%3A@127.0.0.1:9/feed"]
 
 
@@ -1168,6 +1231,24 @@ _FEED_RESPONSES = st.builds(
 )
 
 
+def _require_no_secret_in_chain(
+    err: BaseException | None, secrets: tuple[str, ...], path: str
+) -> None:
+    """No secret in the error's message or .url, nor in any error chained to
+    it, hidden from tracebacks or not. A network or decode error is the
+    library's own, with nothing chained at all; only the static path's
+    archive errors keep the zip or CSV error as their cause (local
+    parsing, quoting no request)."""
+    if err is not None and path != "static":
+        assert err.__cause__ is None, repr(err.__cause__)
+        assert err.__context__ is None, repr(err.__context__)
+    while err is not None:
+        shown = (str(err) + " " + str(getattr(err, "url", "") or "")).lower()
+        for secret in secrets:
+            assert secret.lower() not in shown, (type(err).__name__, shown)
+        err = err.__cause__ or err.__context__
+
+
 @given(
     response=_FEED_RESPONSES,
     path=st.sampled_from(["gbfs", "rt-header", "rt-query", "static"]),
@@ -1219,11 +1300,7 @@ def test_any_answer_gives_a_library_result_and_no_secret_in_any_message(
             server.close()
 
     err = asyncio.run(scenario())
-    while err is not None:
-        shown = str(err) + " " + str(getattr(err, "url", "") or "")
-        for secret in _FEED_SECRETS:
-            assert secret not in shown, (type(err).__name__, shown)
-        err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)
+    _require_no_secret_in_chain(err, _FEED_SECRETS, path)
 
 
 @pytest.mark.parametrize("by_hand_key", [False, True])
@@ -1380,15 +1457,20 @@ def test_a_hop_to_another_origin_carries_no_credential_and_no_message_shows_one(
                     elif path == "static":
                         call = client.get_transit_feed_from_urls(url)
                     else:
+                        # An Authorization header, not URL credentials:
+                        # aiohttp refuses the two together.
                         call = fetch_feed_message(
                             client._get_session(),
-                            url,
+                            url.replace(f"user:{password}@", ""),
                             auth_type=2 if path == "rt-header" else 1,
                             api_key_name="X-Key",
                             api_key=header_secret
                             if path == "rt-header"
                             else query_secret,
-                            headers={"X-Trace": "ok"},
+                            headers={
+                                "X-Trace": "ok",
+                                "Authorization": f"Bearer {bearer}",
+                            },
                             timeout_seconds=5,
                         )
                     await asyncio.wait_for(call, 10)
@@ -1402,13 +1484,9 @@ def test_a_hop_to_another_origin_carries_no_credential_and_no_message_shows_one(
     err = asyncio.run(scenario())
     for request in b_requests:
         text = request.decode("latin-1").lower()
-        for secret in (password, header_secret, basic):
+        for secret in (password, header_secret, bearer, basic):
             assert secret.lower() not in text, request
-    while err is not None:
-        shown = (str(err) + " " + str(getattr(err, "url", "") or "")).lower()
-        for secret in secrets:
-            assert secret.lower() not in shown, (type(err).__name__, shown)
-        err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)
+    _require_no_secret_in_chain(err, secrets, path)
 
 
 async def test_a_session_raising_for_status_keeps_the_status_mapping(
@@ -1426,3 +1504,18 @@ async def test_a_session_raising_for_status_keeps_the_status_mapping(
         with pytest.raises(SourceAuthenticationError) as auth:
             await fetch_feed_message(session, mock_api.url("/rt.pb"))
         assert auth.value.status == 401
+
+
+@pytest.mark.parametrize(
+    "url", ["file:///etc/passwd", "http://h\ud800st/feed", "http:///feed", "x"]
+)
+async def test_the_redirect_loop_checks_its_own_url(url: str) -> None:
+    """Callers check first; the one network path checks again, so a new
+    caller can't reach aiohttp with a URL yarl would change or refuse."""
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError, match="Refusing") as caught:
+            async with get_withholding(
+                session, url, params={}, headers={}, total=5, secret=None
+            ):
+                pass
+    assert caught.value.__context__ is None

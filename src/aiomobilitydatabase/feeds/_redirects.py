@@ -6,9 +6,10 @@ or reaching another URL than the producer named:
 - :func:`network` is the only place a network await can fail. Whatever
   aiohttp or yarl raise there -- which exceptions they raise varies by
   version and build -- is a :class:`SourceConnectionError` named by its type
-  alone (``from None``: its text can quote the request, a credential with
-  it). Only network awaits go through it, never a caller's callback or a
-  file write, which keep their own exceptions.
+  alone, raised after the ``except`` so not even its context rides along:
+  its text can quote the request, a credential with it. Only network
+  awaits go through it, never a caller's callback or a file write, which
+  keep their own exceptions.
 - :func:`get_withholding` follows every redirect itself, through one loop:
   each Location is checked like a first URL (:func:`._urls.require_requestable`)
   before anything is sent to it. aiohttp never follows one, so no hop can
@@ -28,8 +29,8 @@ from time import monotonic
 import aiohttp
 from yarl import URL
 
-from .._http import CREDENTIAL_HEADERS, REQUEST_OPTIONS, require_session
-from ._urls import URL_ERRORS, redact, require_requestable
+from .._http import CREDENTIAL_HEADERS, REQUEST_OPTIONS, URL_ERRORS, require_session
+from ._urls import _require_http_url, redact, require_requestable
 from .exceptions import MobilityFeedsError, SourceConnectionError
 
 # aiohttp's own redirect limit: the tenth redirect raises.
@@ -48,9 +49,10 @@ async def network[T](awaitable: Awaitable[T], url: str) -> T:
     except MobilityFeedsError:
         raise
     except Exception as err:
-        raise SourceConnectionError(
-            f"Request failed ({type(err).__name__})", url=redact(url)
-        ) from None
+        failure = type(err).__name__
+    # Outside the except: from None would only hide the original, still
+    # attached as the context.
+    raise SourceConnectionError(f"Request failed ({failure})", url=redact(url))
 
 
 def _origin(url: URL) -> tuple[str, str | None, int | None]:
@@ -101,14 +103,16 @@ def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str)
         following = base.join(URL(location, encoded=not session.requote_redirect_url))
         require_requestable(following)
     except URL_ERRORS:
-        raise SourceConnectionError(
-            "Producer redirected to an invalid URL", url=redact(url)
-        ) from None
-    if following.scheme not in ("http", "https"):
+        pass
+    else:
+        if following.scheme in ("http", "https"):
+            return following
         raise SourceConnectionError(
             "Producer redirected to a non-HTTP URL", url=redact(url)
         )
-    return following
+    raise SourceConnectionError(
+        "Producer redirected to an invalid URL", url=redact(url)
+    )
 
 
 @asynccontextmanager
@@ -151,6 +155,9 @@ async def get_withholding(
     if session.closed:
         raise RuntimeError("the session is closed")  # the caller's, not a source's
     require_session(session)
+    # Callers check first, naming what they fetch; checked here too, so no
+    # path reaches the network with a URL yarl would change or can't send.
+    _require_http_url(url, "a URL")
     deadline = monotonic() + total if total is not None and total > 0 else None
     withheld = CREDENTIAL_HEADERS | ({secret.lower()} if secret else set())
     history: list[aiohttp.ClientResponse] = []

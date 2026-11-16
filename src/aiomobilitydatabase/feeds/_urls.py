@@ -19,16 +19,13 @@ from typing import TYPE_CHECKING
 
 from yarl import URL
 
-from .._http import is_token, is_visible, require_session
+from .._http import URL_ERRORS, is_token, is_visible, require_session
 from .exceptions import SourceConnectionError
 
 if TYPE_CHECKING:
     import aiohttp
 
 _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
-# What parsing a URL with yarl can raise: ValueError (UnicodeError among
-# them), and IndexError for some malformed authorities.
-URL_ERRORS = (ValueError, IndexError)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")  # RFC 5234 CTL
 
 

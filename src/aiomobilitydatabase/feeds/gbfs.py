@@ -61,6 +61,7 @@ _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 # Every whole number up to here is exactly a float, and back.
 _EXACT_FLOAT = 2**53
+_MALFORMED = object()  # json_loads refused the body
 
 
 def _record_id(value: Any) -> str | None:
@@ -582,8 +583,11 @@ class GbfsFeedHandle:
         try:
             document = json_loads(raw)
         except ValueError:
-            # Not from err: a JSONDecodeError holds the whole body (.doc).
-            raise FeedParseError("Malformed GBFS JSON", url=shown) from None
+            # Raised below, outside the except: a JSONDecodeError holds the
+            # whole body (.doc), and would ride along as the context.
+            document = _MALFORMED
+        if document is _MALFORMED:
+            raise FeedParseError("Malformed GBFS JSON", url=shown)
         if not isinstance(document, dict) or "data" not in document:
             raise FeedParseError("GBFS document missing data envelope", url=shown)
         return Response(
