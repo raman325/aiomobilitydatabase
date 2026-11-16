@@ -116,13 +116,15 @@ async def _body_text(resp: aiohttp.ClientResponse) -> str:
 
     ``resp.text()`` raises for bytes its charset (UTF-8 when none is given)
     can't decode -- a Latin-1 gateway page -- or for a charset that isn't a
-    text encoding. The body only explains an error, so undecodable bytes are
-    replaced instead.
+    text encoding (LookupError: ``rot13``) or won't take the "replace"
+    handler (UnicodeError: ``idna``, ``undefined``). The body only explains
+    an error, so undecodable bytes are replaced, as UTF-8 when the charset
+    can't be used.
     """
     raw = await resp.read()
     try:
         return raw.decode(resp.charset or "utf-8", "replace")
-    except LookupError:
+    except (LookupError, UnicodeError):
         return raw.decode("utf-8", "replace")
 
 
@@ -283,6 +285,12 @@ class MobilityDatabaseClient:
                     f"Error requesting access token: {err}"
                 ) from err
             token = _one(AccessToken, data)
+            if token.token_type is not None and token.token_type.lower() != "bearer":
+                # RFC 6749 section 7.1: a client MUST NOT use an access token
+                # whose type it doesn't understand; this one sends Bearer.
+                raise MobilityDatabaseConnectionError(
+                    f"API returned a {token.token_type!r} token, not a Bearer one"
+                )
             if not _B64TOKEN.fullmatch(token.access_token):
                 # It goes in an Authorization header: a CR, LF or space
                 # there would fail every request, or forge another header.

@@ -313,11 +313,18 @@ def _faithful(annotation: Any, raw: Any, decoded: Any) -> bool:  # noqa: PLR0911
             if field.name in raw
         )
     if annotation is datetime:
-        return isinstance(raw, str) and isinstance(decoded, datetime)
+        return isinstance(raw, str) and decoded == datetime.fromisoformat(raw)
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         return isinstance(raw, str) and decoded == annotation(raw)
     if annotation is float:
-        return type(raw) in (int, float) and decoded == raw and math.isfinite(decoded)
+        # A JSON number is read as a double (RFC 8259 section 6): an integer
+        # past 2**53 rounds, as 0.1 does, so compare against float(raw).
+        return (
+            type(raw) in (int, float)
+            and type(decoded) is float
+            and math.isfinite(decoded)
+            and decoded == float(raw)
+        )
     return type(raw) is annotation and type(decoded) is annotation and decoded == raw
 
 
@@ -453,7 +460,8 @@ async def test_a_charset_that_is_no_text_encoding_is_invalid_json(
         await client.get_metadata()
 
 
-@pytest.mark.parametrize("charset", ["rot13", "hex"])
+# (idna decodes an ASCII token body fine; undefined refuses all decoding.)
+@pytest.mark.parametrize("charset", ["rot13", "hex", "undefined"])
 async def test_a_token_body_in_no_text_encoding_is_a_connection_error(
     mock_api: MockApi, client: MobilityDatabaseClient, charset: str
 ) -> None:
@@ -600,3 +608,73 @@ async def test_an_error_page_in_no_text_encoding_is_an_api_error(
     with pytest.raises(MobilityDatabaseApiError) as caught:
         await client.get_metadata()
     assert caught.value.body == "Unavailable"
+
+
+@pytest.mark.parametrize("charset", ["idna", "undefined"])
+async def test_an_error_page_whose_charset_refuses_replace_is_an_api_error(
+    mock_api: MockApi, client: MobilityDatabaseClient, charset: str
+) -> None:
+    """These codecs exist but raise UnicodeError for the "replace" handler
+    (or for any decoding): the page is read as UTF-8 instead."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get(
+        "/v1/metadata",
+        status=502,
+        body=b"Bad Gateway",
+        headers={"Content-Type": f"text/html; charset={charset}"},
+    )
+    with pytest.raises(MobilityDatabaseApiError) as caught:
+        await client.get_metadata()
+    assert caught.value.body == "Bad Gateway"
+
+
+@pytest.mark.parametrize("charset", ["idna", "undefined"])
+async def test_a_token_error_whose_charset_refuses_replace_is_an_auth_error(
+    mock_api: MockApi, client: MobilityDatabaseClient, charset: str
+) -> None:
+    mock_api.post(
+        "/v1/tokens",
+        status=500,
+        body=b"Internal error",
+        headers={"Content-Type": f"text/plain; charset={charset}"},
+    )
+    with pytest.raises(MobilityDatabaseAuthenticationError, match="Internal error"):
+        await client.get_metadata()
+
+
+@pytest.mark.parametrize("token_type", ["mac", "DPoP", "basic", ""])
+async def test_a_token_of_another_type_is_refused(
+    mock_api: MockApi, client: MobilityDatabaseClient, token_type: str
+) -> None:
+    """RFC 6749 section 7.1: a client MUST NOT use an access token whose
+    type it doesn't understand -- this client sends only Bearer."""
+    mock_api.post("/v1/tokens", payload={**TOKEN_RESPONSE, "token_type": token_type})
+    with pytest.raises(MobilityDatabaseConnectionError, match="not a Bearer one"):
+        await client.get_metadata()
+    assert [r.path for r in mock_api.requests] == ["/v1/tokens"]
+
+
+@pytest.mark.parametrize("token_type", ["Bearer", "bearer", "BEARER", None])
+async def test_a_bearer_token_or_an_untyped_one_is_used(
+    mock_api: MockApi, client: MobilityDatabaseClient, token_type: str | None
+) -> None:
+    """The type compares case-insensitively (RFC 6749 section 5.1); a
+    response that states none is taken as the Bearer the API issues."""
+    body = {**TOKEN_RESPONSE, "token_type": token_type}
+    mock_api.post("/v1/tokens", payload=body)
+    mock_api.get("/v1/metadata", payload=METADATA)
+    await client.get_metadata()
+    assert mock_api.requests[-1].headers["Authorization"].startswith("Bearer ")
+
+
+def test_a_float_field_reads_a_big_integer_as_its_double() -> None:
+    """2**53 + 1 has no exact double: it rounds, as any JSON number does."""
+    body = (
+        json.dumps(GTFS_FEED)
+        .encode()
+        .replace(
+            b'"minimum_latitude": 33.721601', b'"minimum_latitude": 9007199254740993'
+        )
+    )
+    feed = _call("get_gtfs_feed", body)
+    assert feed.latest_dataset.bounding_box.minimum_latitude == float(2**53 + 1)
