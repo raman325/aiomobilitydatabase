@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds._numbers import exact_number
@@ -30,7 +30,11 @@ from aiomobilitydatabase.feeds.static_index import (
     parse_gtfs_time,
 )
 
-from tests.feeds.fixtures import _FILES, build_gtfs_zip_bytes
+from tests.feeds.fixtures import (
+    _FILES,
+    build_flex_gtfs_zip_bytes,
+    build_gtfs_zip_bytes,
+)
 
 DATASET = "mdb-100-202607310000"
 TZ = "America/Los_Angeles"
@@ -1790,6 +1794,117 @@ def test_a_damaged_length_that_runs_out_of_memory_is_damage(tmp_path: Path) -> N
         index.close()
 
 
+def test_an_undecodable_schema_is_a_cache_miss(tmp_path: Path) -> None:
+    """Opening a file whose schema SQLite can only describe in bytes that
+    are no UTF-8 raises UnicodeDecodeError at the first statement: a miss,
+    not an error that would fail the feed on every open."""
+    db_path = _built_file(tmp_path)
+    _undecodable_schema_error(db_path)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def _flex_file(tmp_path: Path) -> Path:
+    zip_path = tmp_path / "flex.zip"
+    zip_path.write_bytes(build_flex_gtfs_zip_bytes())
+    db_path = tmp_path / "flex.db"
+    StaticIndex.build(zip_path, str(db_path), DATASET, None).close()
+    return db_path
+
+
+_STORED_DAMAGE = {
+    "polygons no longer JSON": (
+        "UPDATE locations SET polygons = '[[[[41.0, -87.0'",
+        lambda index: index.flex_locations(),
+    ),
+    "polygons of another shape": (
+        "UPDATE locations SET polygons = '[[[[41.0]]]]'",
+        lambda index: index.flex_locations(),
+    ),
+    # Decodes, but no ring the build kept: a ring has four or more positions.
+    "a ring too short": (
+        "UPDATE locations SET polygons = '[[[[41.0, -87.0], [41.0, -87.0]]]]'",
+        lambda index: index.flex_locations(),
+    ),
+    "polygons turned into a number": (
+        "UPDATE locations SET polygons = 7",
+        lambda index: index.flex_locations(),
+    ),
+    "a calendar date no longer canonical": (
+        "UPDATE calendar SET end_date = '2027-12-31'",
+        lambda index: index.departures_ceiling(["H1"]),
+    ),
+    # A BLOB: TEXT affinity would store a number as its text.
+    "a calendar date turned into bytes": (
+        "UPDATE calendar SET end_date = X'3230323731323331'",
+        lambda index: index.departures_ceiling(["S1"]),
+    ),
+    "an exception date no longer canonical": (
+        "INSERT INTO calendar_dates VALUES ('WEEKDAYS', '2026061', 1)",
+        lambda index: index.departures_ceiling(["H1"]),
+    ),
+    "a feed_info date turned into bytes": (
+        "INSERT INTO feed_info (publisher_name, start_date) "
+        "VALUES ('P', X'3230323630313031')",
+        lambda index: index.feed_info(),
+    ),
+    "booking seconds turned into text": (
+        "UPDATE booking_rules SET prior_notice_last_secs = '17:00'",
+        lambda index: index.booking_rules(),
+    ),
+    "unreadable names turned into bytes": (
+        "UPDATE booking_rules SET unreadable = X'05'",
+        lambda index: index.booking_rules(),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_STORED_DAMAGE))
+def test_a_damaged_stored_value_is_feed_parse_error(tmp_path: Path, case: str) -> None:
+    """quick_check reads structure, not cells: a value the build could not
+    have stored -- in pages that stay well formed -- is the index's
+    FeedParseError where a read decodes it, with nothing chained (it was a
+    raw JSONDecodeError, TypeError or AttributeError)."""
+    sql, read = _STORED_DAMAGE[case]
+    db_path = _flex_file(tmp_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(sql)
+        conn.commit()
+    finally:
+        conn.close()
+    index = StaticIndex.open_cached(db_path, DATASET)
+    assert index is not None  # well formed: the check can't see it
+    try:
+        with pytest.raises(FeedParseError) as caught:
+            read(index)
+    finally:
+        index.close()
+    assert str(caught.value) == _DAMAGE_MESSAGE
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_a_build_that_cannot_be_reopened_chains_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reopen after a file build failing is FeedParseError in the
+    library's words, with nothing chained."""
+    real_connect = sqlite3.connect
+
+    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if kwargs.get("uri"):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    db_path = tmp_path / "static.db"
+    with pytest.raises(FeedParseError) as caught:
+        StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ)
+    assert str(caught.value) == f"{db_path} could not be reopened after its build"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
 def test_a_mistaken_statement_on_an_intact_index_is_not_damage(
     tmp_path: Path,
 ) -> None:
@@ -1818,6 +1933,9 @@ def test_a_closed_index_still_raises_programming_error(tmp_path: Path) -> None:
     at=st.integers(0, 4095),
     length=st.integers(1, 4096),
 )
+# Non-UTF-8 bytes in schema text: SQLite's error text no longer decodes, so
+# open_cached's meta read raised a bare UnicodeDecodeError (review, PR #84).
+@example(page=21, fill=b"\x81", at=38, length=1779)
 @settings(max_examples=150, deadline=None)
 def test_any_damage_opens_as_a_miss_or_reads_as_feed_parse_error(
     tmp_path_factory: pytest.TempPathFactory,
@@ -1827,8 +1945,9 @@ def test_any_damage_opens_as_a_miss_or_reads_as_feed_parse_error(
     length: int,
 ) -> None:
     """Bytes overwritten anywhere in any page: open_cached misses or opens
-    an index that answers; read unchecked, every query answers or raises
-    FeedParseError -- never sqlite3.DatabaseError."""
+    an index; either way every query answers or raises the damaged index's
+    FeedParseError (a cell the check can't judge is met by the read that
+    decodes it) -- never sqlite3.DatabaseError or a decoding error."""
     tmp_path = tmp_path_factory.mktemp("damaged-db")
     db_path = _built_file(tmp_path)
     with db_path.open("r+b") as fp:
@@ -1838,18 +1957,14 @@ def test_any_damage_opens_as_a_miss_or_reads_as_feed_parse_error(
         fp.seek((page - 1) * size + at)
         fp.write((fill * length)[: size - at])
     opened = StaticIndex.open_cached(db_path, DATASET)
-    if opened is not None:
+    for index in (opened, _unchecked(db_path)):
+        if index is None:
+            continue
         try:
             for read in _damaged_reads().values():
-                read(opened)
+                try:
+                    read(index)
+                except FeedParseError as err:
+                    assert str(err) == _DAMAGE_MESSAGE
         finally:
-            opened.close()
-    index = _unchecked(db_path)
-    try:
-        for read in _damaged_reads().values():
-            try:
-                read(index)
-            except FeedParseError as err:
-                assert str(err) == _DAMAGE_MESSAGE
-    finally:
-        index.close()
+            index.close()

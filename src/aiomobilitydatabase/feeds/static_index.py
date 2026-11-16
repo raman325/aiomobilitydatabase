@@ -214,6 +214,34 @@ _ONE_DAY = 86_400
 _IDS = "(??)"
 
 
+# What opening or checking a cached index can raise when its file is
+# damaged: SQLite's errors, the OS's, text SQLite returns -- or quotes in
+# its own message -- that no longer decodes, and a damaged length asking
+# for more memory than there is. One definition for every open and check.
+_CACHE_DAMAGE: tuple[type[BaseException], ...] = (
+    sqlite3.Error,
+    OSError,
+    UnicodeDecodeError,
+    MemoryError,
+)
+# ... and what reopening a just-built index can raise besides: an unusable
+# timezone in its meta (see open_cached).
+_REOPEN_ERRORS: tuple[type[BaseException], ...] = (
+    *_CACHE_DAMAGE,
+    ZoneInfoNotFoundError,
+    ValueError,
+    TypeError,
+)
+# What decoding a value the index stored can raise when the value is damaged
+# (see StaticIndex._decoded); RecursionError for JSON nested past the stack.
+_STORED_DAMAGE: tuple[type[BaseException], ...] = (
+    ValueError,
+    TypeError,
+    AttributeError,
+    KeyError,
+    IndexError,
+    RecursionError,
+)
 # SQLite's result codes for a damaged database: a malformed page
 # (SQLITE_CORRUPT), or a file that is not a database (SQLITE_NOTADB).
 _DAMAGE_CODES = frozenset({sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB})
@@ -333,18 +361,37 @@ def _coordinate(value: str, field: str, limit: float) -> float | None:
     raises ValueError, the build's FeedParseError, as an unreadable cell
     always has: a spelling float() alone would accept is no more a
     coordinate than ``abc``, nor is latitude 200 a place. The range is
-    checked on the value as written, before it becomes a double:
-    ``90.000000000000001`` is past the pole, though its double is 90.0.
+    the value as written, not its double: ``90.000000000000001`` is past
+    the pole, though its double is 90.0 (see :func:`_past_limit`).
     """
     if not value.strip():
         return None
     parsed = ascii_number(value)  # spaces and tabs only: no Unicode strip
-    exact = exact_number(value)
-    if parsed is None or exact is None:
+    if parsed is None:
         raise _RefusedError(f"{field} is not a finite decimal number: {value!r}")
-    if not -limit <= exact <= limit:
+    if _past_limit(parsed, limit, lambda: exact_number(value)):
         raise _RefusedError(f"{field} is outside -{limit} to {limit}: {value!r}")
     return parsed
+
+
+def _past_limit(
+    double: float, limit: float, written: Callable[[], Decimal | None]
+) -> bool:
+    """Report whether a number is past ``[-limit, limit]`` as written.
+
+    ``double`` is its nearest double, and ``written()`` its exact value.
+    Rounding to a double never crosses a number a double holds exactly, as
+    the limits are: a double inside the range is a number inside it, and
+    one outside a number outside. Only a double ON a limit can be either
+    (90.000000000000001 and 89.99999999999999999 both round to 90.0), so
+    only then is the exact value read -- a Decimal per number would cost
+    a large zones file several times its parse.
+    """
+    if abs(double) != limit:
+        return not -limit <= double <= limit
+    exact = written()
+    assert exact is not None  # the double came from the same spelling
+    return exact.copy_abs() > limit  # abs() would round to the context
 
 
 def _ascii_digits(value: str) -> bool:
@@ -692,14 +739,14 @@ def _json_member(archive: zipfile.ZipFile, filename: str) -> object:
     Through the shared strict decoder (:func:`.._json.loads`: strict UTF-8,
     unique names, no ``NaN``), keeping a string with a lone surrogate for the
     Feature it sits in to be judged (skipped, or the name None) rather than
-    the whole file. Every number parses as the exact Decimal it spells
-    (see :func:`._numbers.exact_number`): every number here is a
-    coordinate, whose range is checked as written before it becomes a
-    double, and ``int`` refuses a digit string past CPython's length limit,
-    which would fail the whole file over one Feature's value (it is out of
-    range, and the Feature is skipped). RecursionError too: json raises it
-    for arrays nested deeper than the interpreter's stack, which a hostile
-    file can do in a few kilobytes.
+    the whole file. Every number is a coordinate and parses as a float --
+    ``int`` refuses a digit string past CPython's length limit, which
+    would fail the whole file over one Feature's value (it is out of
+    range, and the Feature is skipped) -- except one whose double lands
+    exactly on a WGS84 limit, kept as the exact Decimal it spells: its
+    range is the value as written (see :func:`_past_limit`). RecursionError
+    too: json raises it for arrays nested deeper than the interpreter's
+    stack, which a hostile file can do in a few kilobytes.
     """
     fp = _open_member(archive, filename)
     with fp:
@@ -715,8 +762,11 @@ def _json_member(archive: zipfile.ZipFile, filename: str) -> object:
     raise FeedParseError(f"Malformed {filename}: {reason}")
 
 
-def _json_number(text: str) -> Decimal:
-    """One JSON number token as the exact value it spells."""
+def _json_number(text: str) -> float | Decimal:
+    """One JSON number token: its double, or its exact value on a limit."""
+    double = float(text)
+    if abs(double) not in _LIMITS:
+        return double
     number = exact_number(text)
     assert number is not None  # JSON's number grammar is a subset of ours
     return number
@@ -726,6 +776,8 @@ def _json_number(text: str) -> Decimal:
 _RING_MIN_POSITIONS = 4
 _MAX_LATITUDE = 90
 _MAX_LONGITUDE = 180
+# The doubles a coordinate can round onto a limit at (see _past_limit).
+_LIMITS = frozenset({float(_MAX_LATITUDE), float(_MAX_LONGITUDE)})
 
 type _Ring = list[list[float]]
 
@@ -752,10 +804,11 @@ def _ring(value: object) -> _Ring | None:
         if (
             not isinstance(position, list)
             or len(position) < 2  # noqa: PLR2004
-            or not all(type(number) is Decimal for number in position)
+            or not all(type(number) in (float, Decimal) for number in position)
         ):
-            return None  # see _json_member: every JSON number is a Decimal here
+            return None  # see _json_member: every JSON number is one of these
         lon, lat = position[0], position[1]
+        # A Decimal only on a limit (see _json_number): exact either way.
         if not (-_MAX_LONGITUDE <= lon <= _MAX_LONGITUDE) or not (
             -_MAX_LATITUDE <= lat <= _MAX_LATITUDE
         ):
@@ -879,6 +932,76 @@ def gtfs_time_offset(secs: int | None) -> timedelta | None:
 
 def _flex_ring(ring: list[list[float]]) -> tuple[tuple[float, float], ...]:
     return tuple((lat, lon) for lat, lon in ring)
+
+
+# Decoders of what the index stored, for StaticIndex._decoded: each refuses
+# (ValueError or TypeError) a value the build could not have written.
+
+
+def _stored_date(value: object) -> date | None:
+    """Decode a calendar date as stored: canonical ``YYYYMMDD`` text, or NULL."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or _canonical_date(value) != value:
+        raise ValueError("not a stored date")
+    parsed = _lenient_date(value)
+    assert parsed is not None  # canonical text always parses
+    return parsed
+
+
+def _stored_cell_date(value: object) -> date | None:
+    """Decode a feed_info date: the raw cell, parsed leniently, or NULL."""
+    if value is not None and not isinstance(value, str):
+        raise TypeError("not a stored cell")
+    return _lenient_date(value)
+
+
+def _stored_words(value: object) -> tuple[str, ...]:
+    """Decode space-separated names (booking_rules.unreadable); NULL is none."""
+    if value is None:
+        return ()
+    if not isinstance(value, str):
+        raise TypeError("not stored text")
+    return tuple(value.split())
+
+
+def _stored_offset(value: object) -> timedelta | None:
+    """Decode seconds since the service day's start, or NULL."""
+    if value is not None and type(value) is not int:
+        raise TypeError("not stored seconds")
+    return gtfs_time_offset(value)
+
+
+def _stored_polygons(value: object) -> tuple[FlexPolygon, ...]:
+    """Decode a zone's polygons as stored: JSON lists of rings of [lat, lon]."""
+    if not isinstance(value, str):
+        raise TypeError("not stored JSON")
+    polygons = json.loads(value)
+    if not isinstance(polygons, list) or not polygons:
+        raise ValueError("no polygons")
+    found: list[FlexPolygon] = []
+    for rings in polygons:
+        if not isinstance(rings, list) or not rings:
+            raise ValueError("no rings")
+        for ring in rings:
+            if (
+                not isinstance(ring, list)
+                or len(ring) < _RING_MIN_POSITIONS
+                or not all(
+                    isinstance(position, list)
+                    and len(position) == 2  # noqa: PLR2004
+                    and all(type(number) is float for number in position)
+                    for position in ring
+                )
+            ):
+                raise ValueError("not a ring")
+        found.append(
+            FlexPolygon(
+                exterior=_flex_ring(rings[0]),
+                holes=tuple(_flex_ring(ring) for ring in rings[1:]),
+            )
+        )
+    return tuple(found)
 
 
 type _StopRow = tuple[Any, ...]
@@ -1372,29 +1495,30 @@ class StaticIndex:
         # the file actually holds, so it is never served as another (the
         # caller decides what a different one means). mode=rw: a target
         # purged meanwhile is an error, not a new empty file.
+        # Raised after the except blocks end, so nothing is chained.
+        problem = "could not be reopened after its build"
+        reopened: sqlite3.Connection | None = None
         try:
-            conn = sqlite3.connect(
+            reopened = sqlite3.connect(
                 f"{_file_uri(db_target)}?mode=rw", uri=True, check_same_thread=False
             )
-        except sqlite3.Error as err:
-            raise FeedParseError(
-                f"{db_target} could not be reopened after its build"
-            ) from err
-        try:
-            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            problem = "is not a built static index"
+            meta = dict(reopened.execute("SELECT key, value FROM meta").fetchall())
             if (
-                not isinstance(meta.get("dataset_id"), str)
-                or not isinstance(meta.get("timezone"), str)
-                or meta.get("schema_version") != str(SCHEMA_VERSION)
+                isinstance(meta.get("dataset_id"), str)
+                and isinstance(meta.get("timezone"), str)
+                and meta.get("schema_version") == str(SCHEMA_VERSION)
             ):
-                raise FeedParseError(f"{db_target} is not a built static index")
-            return cls(conn, meta["dataset_id"], meta["timezone"])
-        except (sqlite3.Error, ZoneInfoNotFoundError, ValueError, OSError) as err:
-            conn.close()
-            raise FeedParseError(f"{db_target} is not a built static index") from err
+                return cls(reopened, meta["dataset_id"], meta["timezone"])
+        except _REOPEN_ERRORS:
+            pass
         except BaseException:
-            conn.close()
+            if reopened is not None:
+                reopened.close()
             raise
+        if reopened is not None:
+            reopened.close()
+        raise FeedParseError(f"{db_target} {problem}")
 
     @classmethod
     def open_cached(cls, db_path: Path, dataset_id: str) -> StaticIndex | None:
@@ -1409,18 +1533,22 @@ class StaticIndex:
         A matching file is then checked whole (``PRAGMA quick_check``): a
         damaged page anywhere -- stops and routes the handle reads at once,
         stop_times or an index a later query would meet -- is a miss too, so
-        the entry is rebuilt rather than failing every open or query.
-        Every failure path closes the connection it opened.
+        the entry is rebuilt rather than failing every open or query. The
+        check reads every page: about a second for a 746 MB index whose
+        file is in the OS cache, longer from a cold disk -- once per open,
+        on the caller's worker thread. What a damaged file can raise on the
+        way is one set, ``_CACHE_DAMAGE``. Every failure path closes the
+        connection it opened.
         """
         if not Path(db_path).is_file():
             return None
         try:
             conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        except (sqlite3.Error, OSError):
+        except _CACHE_DAMAGE:
             return None
         try:
             meta = dict(conn.execute("SELECT key, value FROM meta"))
-        except (sqlite3.Error, OSError):
+        except _CACHE_DAMAGE:
             conn.close()
             return None
         if (
@@ -1457,7 +1585,7 @@ class StaticIndex:
                 conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
                 and conn.execute(_SCHEMA_ROWS_SQL).fetchall() == _PRISTINE_SCHEMA
             )
-        except (sqlite3.Error, OSError, UnicodeDecodeError, MemoryError):
+        except _CACHE_DAMAGE:
             return False
 
     @staticmethod
@@ -2293,10 +2421,30 @@ class StaticIndex:
                 _maybe_damaged(err) and not self._intact(self._conn)
             ):
                 raise
-        raise FeedParseError(
+        raise self._damage()
+
+    def _damage(self) -> FeedParseError:
+        """Return the error a damaged index (its file, or a value in it) raises."""
+        return FeedParseError(
             f"The static index of dataset {self.dataset_id!r} is damaged: "
             "SQLite reports a malformed database; purge the cache to rebuild it"
         )
+
+    def _decoded[T](self, decode: Callable[[Any], T], value: object) -> T:
+        """Decode one value the index stored: the one place a read parses one.
+
+        quick_check reads a file's structure, not its cells: a stored value
+        can be damaged in a well-formed page -- JSON that no longer parses,
+        a date that is no longer the canonical text the build wrote, a
+        number turned into text. ``decode`` refuses what the build could
+        not have stored; that is the index's FeedParseError, raised outside
+        the except block so nothing is chained.
+        """
+        try:
+            return decode(value)
+        except _STORED_DAMAGE:
+            pass
+        raise self._damage()
 
     def _select(self, sql: str, params: Sequence[object]) -> list[tuple[Any, ...]]:
         """Run ``sql``, binding each :class:`_Ids` in ``params`` to its ``IN _IDS``.
@@ -2438,8 +2586,8 @@ class StaticIndex:
             publisher_url=row[1],
             lang=row[2],
             version=row[3],
-            start_date=_lenient_date(row[4]),
-            end_date=_lenient_date(row[5]),
+            start_date=self._decoded(_stored_cell_date, row[4]),
+            end_date=self._decoded(_stored_cell_date, row[5]),
             contact_email=row[6],
             contact_url=row[7],
         )
@@ -2470,13 +2618,7 @@ class StaticIndex:
                 id=row[0],
                 name=row[1],
                 description=row[2],
-                polygons=tuple(
-                    FlexPolygon(
-                        exterior=_flex_ring(rings[0]),
-                        holes=tuple(_flex_ring(ring) for ring in rings[1:]),
-                    )
-                    for rings in json.loads(row[3])
-                ),
+                polygons=self._decoded(_stored_polygons, row[3]),
             )
             for row in self._query(
                 "SELECT id, name, description, polygons FROM locations ORDER BY id"
@@ -2512,9 +2654,9 @@ class StaticIndex:
                 prior_notice_duration_min=row[2],
                 prior_notice_duration_max=row[3],
                 prior_notice_last_day=row[4],
-                prior_notice_last_time=gtfs_time_offset(row[5]),
+                prior_notice_last_time=self._decoded(_stored_offset, row[5]),
                 prior_notice_start_day=row[6],
-                prior_notice_start_time=gtfs_time_offset(row[7]),
+                prior_notice_start_time=self._decoded(_stored_offset, row[7]),
                 prior_notice_service_id=row[8],
                 message=row[9],
                 pickup_message=row[10],
@@ -2522,7 +2664,7 @@ class StaticIndex:
                 phone_number=row[12],
                 info_url=row[13],
                 booking_url=row[14],
-                unreadable_fields=tuple(row[15].split()) if row[15] else (),
+                unreadable_fields=self._decoded(_stored_words, row[15]),
             )
             for row in self._query(
                 "SELECT id, booking_type, prior_notice_duration_min, "
@@ -3103,7 +3245,8 @@ class StaticIndex:
                 f"end_date FROM calendar WHERE service_id IN {_IDS}",
                 [missing],
             ):
-                lo, hi = _lenient_date(raw_start), _lenient_date(raw_end)
+                lo = self._decoded(_stored_date, raw_start)
+                hi = self._decoded(_stored_date, raw_end)
                 weekdays = tuple(day == 1 for day in days)
                 if lo is not None and hi is not None and lo <= hi and any(weekdays):
                     patterns[service_id] = _ServicePattern(
@@ -3114,7 +3257,7 @@ class StaticIndex:
                 f"WHERE service_id IN {_IDS} AND exception_type IN (?, ?)",
                 [missing, _EXCEPTION_SERVICE_ADDED, _EXCEPTION_SERVICE_REMOVED],
             ):
-                if (day := _lenient_date(raw)) is None:
+                if (day := self._decoded(_stored_date, raw)) is None:
                     continue
                 pattern = patterns[service_id]
                 if pattern is None:
@@ -3287,7 +3430,7 @@ class StaticIndex:
                 "WHERE exception_type = ?",
                 (_EXCEPTION_SERVICE_ADDED,),
             )
-            dates = [d for (raw,) in rows if (d := _lenient_date(raw)) is not None]
+            dates = [d for (raw,) in rows if (d := self._decoded(_stored_date, raw))]
             self._first_date = min(dates, default=None)
             self._first_date_known = True
         return self._first_date
@@ -3424,7 +3567,7 @@ class StaticIndex:
             (_EXCEPTION_SERVICE_ADDED,),
         )
         for service_id, raw in rows:
-            parsed = _lenient_date(raw)
+            parsed = self._decoded(_stored_date, raw)
             if parsed is not None and (
                 service_id not in last or parsed > last[service_id]
             ):
@@ -3813,7 +3956,7 @@ class StaticIndex:
             (_EXCEPTION_SERVICE_ADDED,),
         )
         for service_id, raw in rows:
-            parsed = _lenient_date(raw)
+            parsed = self._decoded(_stored_date, raw)
             if parsed is not None and (
                 service_id not in first or parsed < first[service_id]
             ):
