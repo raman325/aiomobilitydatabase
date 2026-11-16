@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from http import HTTPStatus
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Final, Self
 from urllib.parse import quote
 
 import aiohttp
@@ -172,6 +172,18 @@ def _encode_scalar(value: Any) -> str:
     raise TypeError(f"a query parameter can't be a {type(value).__name__}")
 
 
+_DATETIME_FIELDS: Final = (
+    "year",
+    "month",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "microsecond",
+    "tzinfo",
+)
+
+
 def _encode_datetime(value: datetime) -> str:
     """Encode an aware datetime as RFC 3339, in UTC; ValueError otherwise.
 
@@ -179,16 +191,27 @@ def _encode_datetime(value: datetime) -> str:
     and the API would have to guess the zone. Sent in UTC: the same instant,
     and an offset RFC 3339 can write (hours and minutes; Python allows
     seconds, and isoformat writes "+00:19:32"). Errors are raised after the
-    except block, in the library's words: a tzinfo's own (a broken one) or
-    an OverflowError (no UTC time datetime can hold) aren't passed on.
+    except block, in the library's words: a tzinfo's own (whatever a broken
+    one raises) or an OverflowError (no UTC time datetime can hold) aren't
+    passed on.
+
+    As a plain ``datetime``, as numbers and text go through their base
+    types: a subclass's ``utcoffset``, ``astimezone``, ``isoformat`` or
+    ``__new__`` (``astimezone`` builds its result through ``type(self)``)
+    would otherwise decide what is sent. Its fields are read through
+    ``datetime``'s own descriptors.
     """
     try:
-        aware = value.utcoffset() is not None
-        encoded = value.astimezone(UTC).isoformat() if aware else None
-    except (ValueError, TypeError):
-        failure = "a query datetime's tzinfo gives no usable offset"
+        plain = datetime(
+            *(getattr(datetime, field).__get__(value) for field in _DATETIME_FIELDS),
+            fold=datetime.fold.__get__(value),
+        )
+        aware = plain.utcoffset() is not None
+        encoded = plain.astimezone(UTC).isoformat() if aware else None
     except OverflowError:
         failure = "a query datetime has no UTC time datetime can hold"
+    except Exception:  # a tzinfo is the caller's code: anything it raises
+        failure = "a query datetime's tzinfo gives no usable offset"
     else:
         if encoded is not None:
             return encoded
@@ -220,6 +243,9 @@ def _quote_segment(segment: str) -> str:
     """
     if not isinstance(segment, str):
         raise TypeError(f"an id must be a str, not {type(segment).__name__}")
+    # Its text, not a subclass's: an __eq__ or encode of its own would slip
+    # ".." past the check below, or send other text.
+    segment = str.__str__(segment)
     if segment in ("", ".", ".."):
         raise ValueError(f"{segment!r} cannot be sent as an id: it is no path segment")
     return quote(require_text(segment, "an id"), safe="")
@@ -804,6 +830,8 @@ class MobilityDatabaseClient:
         data = await self._request(
             "POST",
             "/v1/licenses:match",
-            json_body={"license_url": require_text(license_url, "license_url")},
+            json_body={
+                "license_url": require_text(str.__str__(license_url), "license_url")
+            },
         )
         return _many(MatchingLicense, data)

@@ -22,7 +22,11 @@ from hypothesis import strategies as st
 from mashumaro.exceptions import InvalidFieldValue
 
 from aiomobilitydatabase import client as client_module
-from aiomobilitydatabase.client import MobilityDatabaseClient, encode_params
+from aiomobilitydatabase.client import (
+    MobilityDatabaseClient,
+    _quote_segment,
+    encode_params,
+)
 from aiomobilitydatabase.exceptions import MobilityDatabaseError
 from aiomobilitydatabase.models import (
     BoundingFilterMethod,
@@ -501,3 +505,89 @@ def test_a_datetime_whose_tzinfo_is_broken_is_refused_in_the_librarys_words() ->
     with pytest.raises(ValueError, match="no usable offset") as caught:
         encode_params({"downloaded_after": datetime(2024, 1, 1, tzinfo=_BrokenZone())})
     assert caught.value.__context__ is None
+
+
+class _OwnText(datetime):
+    """A datetime subclass deciding its own text and zone."""
+
+    def isoformat(self, *args: Any, **kwargs: Any) -> str:
+        return "EVIL"
+
+    def astimezone(self, tz: Any = None) -> Any:
+        return "not a datetime"
+
+    def utcoffset(self) -> timedelta:
+        return timedelta(0)  # claims to be aware even when naive
+
+
+def test_a_datetime_subclass_is_sent_as_datetime_writes_it() -> None:
+    aware = _OwnText(2024, 1, 1, tzinfo=timezone(timedelta(hours=5)))
+    assert encode_params({"downloaded_after": aware}) == {
+        "downloaded_after": "2023-12-31T19:00:00+00:00"
+    }
+    with pytest.raises(ValueError, match="timezone-aware"):
+        encode_params({"downloaded_after": _OwnText(2024, 1, 1)})
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError, KeyError, AttributeError, OSError, ZeroDivisionError]
+)
+def test_anything_a_tzinfo_raises_is_the_librarys_value_error(
+    error: type[Exception],
+) -> None:
+    class Raising(tzinfo):
+        def utcoffset(self, dt: datetime | None) -> timedelta:
+            raise error("tzinfo internals")
+
+        def dst(self, dt: datetime | None) -> None:
+            return None
+
+    with pytest.raises(ValueError, match="no usable offset") as caught:
+        encode_params({"downloaded_after": datetime(2024, 1, 1, tzinfo=Raising())})
+    assert "internals" not in str(caught.value)
+    assert caught.value.__context__ is None
+
+
+class _Unequal(str):
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+
+class _Encodes(str):
+    def encode(self, *args: Any, **kwargs: Any) -> bytes:
+        return b".."
+
+
+@pytest.mark.parametrize("segment", [_Unequal(".."), _Unequal("."), _Unequal("")])
+async def test_a_str_subclass_id_is_checked_as_its_text(segment: str) -> None:
+    client = MobilityDatabaseClient("t", base_url="http://127.0.0.1:9")
+    try:
+        with pytest.raises(ValueError, match="no path segment"):
+            await client.get_feed(segment)
+    finally:
+        await client.close()
+
+
+def test_a_str_subclass_id_is_quoted_as_its_text() -> None:
+    assert _quote_segment(_Encodes("mdb-1")) == "mdb-1"
+
+
+class _ShiftingNew(datetime):
+    """A subclass whose constructor moves the time: astimezone built its
+    result through type(self), so this __new__ ran while encoding."""
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> _ShiftingNew:
+        made = super().__new__(cls, *args, **kwargs)
+        return datetime.__add__(made, timedelta(hours=7))  # type: ignore[return-value]
+
+
+def test_a_datetime_subclass_constructor_doesnt_run_while_encoding() -> None:
+    # Not already UTC: converting it builds a new instance.
+    value = datetime.__new__(
+        _ShiftingNew, 2024, 1, 1, tzinfo=timezone(timedelta(hours=5))
+    )
+    assert encode_params({"downloaded_after": value}) == {
+        "downloaded_after": "2023-12-31T19:00:00+00:00"
+    }
