@@ -878,7 +878,10 @@ def test_a_header_value_is_refused_or_reaches_the_server_as_is(value: str) -> No
                     return
                 except SourceConnectionError:
                     pass
-            assert api.requests[0].headers["X-Key"] == value.strip(" \t")
+            # Surrounding whitespace is OWS, no part of the value (servers
+            # differ in stripping it: aiohttp 3.10 keeps a trailing tab).
+            received = api.requests[0].headers["X-Key"]
+            assert received.strip(" \t") == value.strip(" \t")
         finally:
             await api.stop()
 
