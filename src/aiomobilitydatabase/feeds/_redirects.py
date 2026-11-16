@@ -30,7 +30,7 @@ import aiohttp
 from yarl import URL
 
 from .._http import CREDENTIAL_HEADERS, REQUEST_OPTIONS, URL_ERRORS, require_session
-from ._urls import _require_http_url, redact, require_requestable
+from ._urls import _require_http_url, has_credentials, redact, require_requestable
 from .exceptions import MobilityFeedsError, SourceConnectionError
 
 # aiohttp's own redirect limit: the tenth redirect raises.
@@ -99,13 +99,17 @@ def _same_resource(target: URL, query: Mapping[str, str] | None, other: URL) -> 
 def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str) -> URL:
     """Resolve a Location as aiohttp would; refuse what no request can go to.
 
-    The same checks as a first URL: UTF-8 text (yarl drops a lone surrogate,
-    naming another URL), a host the resolver can encode, credentials Basic
-    auth can carry -- and an http(s) scheme.
+    A Location with a scheme of its own is used as it is (RFC 3986 section
+    5.2.2, the strict parser): joined onto the base, ``http:///x`` would
+    borrow the base's host. Then the same checks as a first URL: UTF-8
+    text (yarl drops a lone surrogate, naming another URL), a host the
+    resolver can encode, credentials Basic auth can carry -- and an
+    http(s) scheme.
     """
     try:
         location.encode("utf-8")
-        following = base.join(URL(location, encoded=not session.requote_redirect_url))
+        reference = URL(location, encoded=not session.requote_redirect_url)
+        following = reference if reference.scheme else base.join(reference)
         require_requestable(following)
     except URL_ERRORS:
         pass
@@ -172,7 +176,7 @@ async def get_withholding(
     query = params or None
     # Credentials in the URL: sent for the first hop, and kept while the
     # chain stays in their origin.
-    userinfo = (target.user, target.password) if target.user is not None else None
+    userinfo = (target.user, target.password) if has_credentials(target) else None
     userinfo_origin = _origin(target)
     while True:
         remaining = _remaining(deadline, url)
@@ -206,7 +210,7 @@ async def get_withholding(
         if origin != _origin(response.url):
             sent = {k: v for k, v in sent.items() if k.lower() not in withheld}
             userinfo = None
-        if following.user is not None:
+        if has_credentials(following):
             # Credentials the Location gives are addressed to its origin.
             userinfo = (following.user, following.password)
             userinfo_origin = origin

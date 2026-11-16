@@ -764,7 +764,9 @@ can echo a token). A response's status and body are attributes
 
 So does a feeds handle factory, for a caller input outside its allowlist:
 `headers=` names must be tokens and their values visible ASCII, as must the
-`api_key`; an `Authorization` header can't go beside credentials in the URL.
+`api_key`; credentials in a URL you pass must be ones Basic auth can send
+(Latin-1 without a control character, and no colon in the user-id), and an
+`Authorization` header can't go beside them (a password alone counts).
 An injected session may carry no credential -- no `auth`, no
 `Authorization`, `Cookie` or `Proxy-Authorization` default, no cookie set
 without a domain (`ClientSession(cookies=...)`) -- since it would
@@ -776,7 +778,9 @@ body, or another library's error text, any of which can carry a credential.
 `SourceConnectionError` and `FeedParseError` carry the URL asked for on
 `.url` (without credentials, query or fragment), and the HTTP status on
 `.status`. Every redirect is followed by the library, each target checked
-like the first URL; a hop to another origin sheds the request's credentials.
+like the first URL (a `Location` with a scheme of its own is taken as
+written, RFC 3986 section 5.2.2, so `http:///x` names no host rather than
+the current one); a hop to another origin sheds the request's credentials.
 (Messages from a static build may quote the dataset's own cells: published
 feed data, not anything sent or received over HTTP.)
 

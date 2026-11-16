@@ -235,6 +235,36 @@ async def test_url_credentials_follow_hops_within_their_origin_only(
     ]
 
 
+@pytest.mark.parametrize("auth_type", [None, 2])
+async def test_a_password_alone_follows_hops_within_its_origin_too(
+    mock_api: MockApi, auth_type: int | None
+) -> None:
+    """``http://:pw@host/`` is credentials as much as ``u:pw@`` (yarl reads
+    its user as None): aiohttp sends it as Basic auth on the first hop, so
+    a same-origin hop re-sends it and a hop away sheds it -- a Location's
+    own password alone included."""
+    mock_api.get("/rt", status=302, headers={"Location": "/rt/same"})
+    away = _elsewhere(mock_api.url("/rt/away"))
+    mock_api.get("/rt/same", status=302, headers={"Location": away})
+    mock_api.get("/rt/away", status=302, headers={"Location": mock_api.url("/rt/back")})
+    back = mock_api.url("/rt/next").replace("http://", "http://:w@")
+    mock_api.get("/rt/back", status=302, headers={"Location": back})
+    mock_api.get("/rt/next", body=VEHICLE_POSITIONS, content_type=PB)
+    url = mock_api.url("/rt").replace("http://", "http://:p@")
+    async with aiohttp.ClientSession() as session:
+        await fetch_feed_message(
+            session, url, auth_type=auth_type, api_key_name="K", api_key="k"
+        )
+    sent = [(r.path, r.headers.get("Authorization")) for r in mock_api.requests]
+    assert sent == [
+        ("/rt", "Basic OnA="),  # base64(":p")
+        ("/rt/same", "Basic OnA="),
+        ("/rt/away", None),
+        ("/rt/back", None),
+        ("/rt/next", "Basic Onc="),  # base64(":w")
+    ]
+
+
 @pytest.mark.parametrize("timeout_seconds", [0, -1, None])
 @pytest.mark.parametrize("auth_type", [None, 2])
 async def test_a_timeout_of_none_or_less_is_no_bound_with_or_without_header_auth(
