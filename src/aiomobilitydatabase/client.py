@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from http import HTTPStatus
@@ -13,6 +14,7 @@ from urllib.parse import quote
 import aiohttp
 from mashumaro import DataClassDictMixin
 
+from ._payload import mismatch
 from .const import (
     DEFAULT_TIMEOUT_SECONDS,
     PROD_BASE_URL,
@@ -78,29 +80,63 @@ def _quote_segment(segment: str) -> str:
     makes them one segment. Empty, the path names the collection instead;
     the dot segments are removed when the URL is resolved (RFC 3986
     section 5.2.4), and percent-encoding them changes nothing, since
-    ``%2E`` is the same unreserved ``.`` (section 2.3).
+    ``%2E`` is the same unreserved ``.`` (section 2.3). ``TypeError`` for
+    an id that isn't a ``str`` (``b".."`` would slip past that check).
+
+    aiohttp's URL handling may send some sub-delimiters ``quote`` encoded
+    (``;``, ``,``, ``@``, ``:``, ``=``...) as the characters themselves.
+    That is still one segment, which the API decodes to the same id.
     """
+    if not isinstance(segment, str):
+        raise TypeError(f"an id must be a str, not {type(segment).__name__}")
     if segment in ("", ".", ".."):
         raise ValueError(f"{segment!r} cannot be sent as an id: it is no path segment")
     return quote(segment, safe="")
 
 
-# What decoding a JSON value into a model can raise: mashumaro's MissingField
-# (a LookupError) and InvalidFieldValue (a ValueError), TypeError or
-# AttributeError for a value of the wrong JSON type, and RecursionError for
-# nesting deeper than the interpreter's stack.
-_DECODE_ERRORS = (LookupError, ValueError, TypeError, AttributeError, RecursionError)
+# What decoding a type-checked JSON value into a model can still raise:
+# mashumaro's MissingField (a LookupError) and InvalidFieldValue (a
+# ValueError: an unknown enum value, an unparseable datetime).
+_DECODE_ERRORS = (LookupError, ValueError)
+# RFC 6750 section 2.1's b64token: all a Bearer credential may hold. Anything
+# else (a CR or LF above all) can't go in an Authorization header.
+_B64TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+
+
+# What decoding a response body as JSON can raise: ContentTypeError (a
+# ClientError, for another content type), ValueError (malformed JSON, or bytes
+# its charset can't decode: UnicodeDecodeError), LookupError (a charset that
+# isn't a text encoding, such as rot13), RecursionError (nesting deeper than
+# the interpreter's stack).
+_JSON_ERRORS = (aiohttp.ContentTypeError, ValueError, LookupError, RecursionError)
+
+
+async def _body_text(resp: aiohttp.ClientResponse) -> str:
+    """Return an error response's body as text, whatever bytes it holds.
+
+    ``resp.text()`` raises for bytes its charset (UTF-8 when none is given)
+    can't decode -- a Latin-1 gateway page -- or for a charset that isn't a
+    text encoding. The body only explains an error, so undecodable bytes are
+    replaced instead.
+    """
+    raw = await resp.read()
+    try:
+        return raw.decode(resp.charset or "utf-8", "replace")
+    except LookupError:
+        return raw.decode("utf-8", "replace")
 
 
 def _one[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> ModelT:
     """Decode one API object, or raise MobilityDatabaseConnectionError.
 
     The body of a 200 is the server's data, so anything it holds that is not
-    the documented object is an invalid payload, never a bare decoding error.
+    the documented object is an invalid payload, never a bare decoding error
+    -- nor wrong data: every value's JSON type is checked against the model
+    first (see :mod:`._payload`), since mashumaro would convert it.
     """
-    if not isinstance(data, dict):
+    if (problem := mismatch(model, data)) is not None:
         raise MobilityDatabaseConnectionError(
-            f"API returned {type(data).__name__}, not a {model.__name__} object"
+            f"API returned an invalid {model.__name__}: {problem}"
         )
     try:
         return model.from_dict(data)
@@ -194,7 +230,9 @@ class MobilityDatabaseClient:
         if self._access_token is None or self._token_expiration is None:
             return True
         skew = timedelta(seconds=TOKEN_EXPIRY_SKEW_SECONDS)
-        return datetime.now(UTC) >= self._token_expiration - skew
+        # now + skew, never expiration - skew: an expiration in year 1 would
+        # overflow the subtraction.
+        return datetime.now(UTC) + skew >= self._token_expiration
 
     async def _async_ensure_token(
         self, *, force: bool = False, stale_token: str | None = None
@@ -231,7 +269,7 @@ class MobilityDatabaseClient:
                     timeout=self._timeout,
                 ) as resp:
                     if resp.status != HTTPStatus.OK:
-                        body = await resp.text()
+                        body = await _body_text(resp)
                         raise MobilityDatabaseAuthenticationError(
                             f"Unable to obtain access token ({resp.status}): {body}"
                         )
@@ -239,13 +277,18 @@ class MobilityDatabaseClient:
             except (
                 TimeoutError,
                 aiohttp.ClientError,
-                ValueError,
-                RecursionError,
+                *_JSON_ERRORS,
             ) as err:
                 raise MobilityDatabaseConnectionError(
                     f"Error requesting access token: {err}"
                 ) from err
             token = _one(AccessToken, data)
+            if not _B64TOKEN.fullmatch(token.access_token):
+                # It goes in an Authorization header: a CR, LF or space
+                # there would fail every request, or forge another header.
+                raise MobilityDatabaseConnectionError(
+                    "API returned an access token that is no Bearer credential"
+                )
             expiration = token.expiration_datetime_utc
             if expiration.tzinfo is None:
                 expiration = expiration.replace(tzinfo=UTC)
@@ -298,10 +341,10 @@ class MobilityDatabaseClient:
                     HTTPStatus.OK,
                     HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
                 ):
-                    raise MobilityDatabaseApiError(resp.status, await resp.text())
+                    raise MobilityDatabaseApiError(resp.status, await _body_text(resp))
                 try:
                     return await resp.json()
-                except (aiohttp.ContentTypeError, ValueError, RecursionError) as err:
+                except _JSON_ERRORS as err:
                     raise MobilityDatabaseConnectionError(
                         "API returned invalid JSON"
                     ) from err

@@ -726,12 +726,14 @@ The GBFS and GTFS-RT parse paths are **total** with respect to this table:
 any producer document, however malformed, either returns a typed result or
 raises one of the exceptions above — never a bare `KeyError`, `TypeError`,
 `ValueError` or `OverflowError` from inside the library. So is the catalog
-client: a `200` whose body isn't the documented JSON is a
+client: a `200` or `203` whose body isn't the documented JSON -- including a
+value of the wrong JSON type, which is refused rather than converted -- is a
 `MobilityDatabaseConnectionError`. The deliberate exceptions are caller
-mistakes rather than feed problems, and raise the builtin `ValueError`:
-`purge_cache()` for a `feed_id` it will not accept (see above), and a catalog
-method for an id of `""`, `"."` or `".."`, which no URL can carry as one path
-segment.
+mistakes rather than feed problems, and raise builtins: `purge_cache()`
+raises `ValueError` for a `feed_id` it will not accept (see above), and a
+catalog method raises `ValueError` for an id of `""`, `"."` or `".."`, which
+no URL can carry as one path segment (`TypeError` for an id that isn't a
+`str`).
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`
