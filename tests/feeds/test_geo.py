@@ -10,7 +10,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from hypothesis import assume, given, settings
+from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds import geo
@@ -1148,6 +1148,14 @@ def test_reach_matches_great_circle_distance_within_one_percent(
     size=st.floats(50, 2000),
     shift=st.integers(0, 8),
     circle=st.tuples(_METRES, _METRES, st.floats(0, 3000)),
+)
+# A point within rounding of a vertex: each edge's tests rounded differently
+# with its direction, so the ring's winding changed the answer.
+@example(
+    origin=(0.0, 0.0), count=7, size=60.0, shift=0, circle=(60.0, 1.175494351e-38, 0.0)
+)
+@example(
+    origin=(0.0, 0.0), count=7, size=1801.0, shift=3, circle=(1801.0, 7.68e-185, 0.0)
 )
 def test_the_answer_ignores_the_start_vertex_and_winding(
     origin: tuple[float, float],
