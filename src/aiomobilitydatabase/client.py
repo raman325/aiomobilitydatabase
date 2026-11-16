@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from http import HTTPStatus
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Final, Self
 from urllib.parse import quote
 
 import aiohttp
@@ -172,6 +172,18 @@ def _encode_scalar(value: Any) -> str:
     raise TypeError(f"a query parameter can't be a {type(value).__name__}")
 
 
+_DATETIME_FIELDS: Final = (
+    "year",
+    "month",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "microsecond",
+    "tzinfo",
+)
+
+
 def _encode_datetime(value: datetime) -> str:
     """Encode an aware datetime as RFC 3339, in UTC; ValueError otherwise.
 
@@ -183,13 +195,19 @@ def _encode_datetime(value: datetime) -> str:
     one raises) or an OverflowError (no UTC time datetime can hold) aren't
     passed on.
 
-    Through ``datetime``'s own methods, as numbers and text go through their
-    base types': a subclass's ``utcoffset``, ``astimezone`` or ``isoformat``
-    would otherwise decide what is sent (its own text, its own zone).
+    As a plain ``datetime``, as numbers and text go through their base
+    types: a subclass's ``utcoffset``, ``astimezone``, ``isoformat`` or
+    ``__new__`` (``astimezone`` builds its result through ``type(self)``)
+    would otherwise decide what is sent. Its fields are read through
+    ``datetime``'s own descriptors.
     """
     try:
-        aware = datetime.utcoffset(value) is not None
-        encoded = datetime.isoformat(datetime.astimezone(value, UTC)) if aware else None
+        plain = datetime(
+            *(getattr(datetime, field).__get__(value) for field in _DATETIME_FIELDS),
+            fold=datetime.fold.__get__(value),
+        )
+        aware = plain.utcoffset() is not None
+        encoded = plain.astimezone(UTC).isoformat() if aware else None
     except OverflowError:
         failure = "a query datetime has no UTC time datetime can hold"
     except Exception:  # a tzinfo is the caller's code: anything it raises

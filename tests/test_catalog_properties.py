@@ -572,3 +572,19 @@ async def test_a_str_subclass_id_is_checked_as_its_text(segment: str) -> None:
 
 def test_a_str_subclass_id_is_quoted_as_its_text() -> None:
     assert _quote_segment(_Encodes("mdb-1")) == "mdb-1"
+
+
+class _ShiftingNew(datetime):
+    """A subclass whose constructor moves the time: astimezone built its
+    result through type(self), so this __new__ ran while encoding."""
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> _ShiftingNew:
+        made = super().__new__(cls, *args, **kwargs)
+        return datetime.__add__(made, timedelta(hours=7))  # type: ignore[return-value]
+
+
+def test_a_datetime_subclass_constructor_doesnt_run_while_encoding() -> None:
+    value = datetime.__new__(_ShiftingNew, 2024, 1, 1, tzinfo=UTC)
+    assert encode_params({"downloaded_after": value}) == {
+        "downloaded_after": "2024-01-01T00:00:00+00:00"
+    }
