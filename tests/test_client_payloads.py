@@ -1340,7 +1340,11 @@ async def test_an_undecodable_content_type_is_invalid(content_type: bytes) -> No
 )
 async def test_aiohttps_error_text_never_carries_the_token(header: bytes) -> None:
     """A malformed header echoing the request: aiohttp quotes it in its own
-    error, which went into the message and, as the cause, the traceback."""
+    error, which went into the message and, as the cause, the traceback.
+
+    An aiohttp that accepts the header (3.10.0 takes a NUL in a value)
+    answers with the 400 itself: an API error, which carries no token either.
+    """
     response = (
         b"HTTP/1.1 400 Bad Request\r\n" + header + b"\r\nContent-Length: 0\r\n\r\n"
     )
@@ -1349,7 +1353,9 @@ async def test_aiohttps_error_text_never_carries_the_token(header: bytes) -> Non
         async with MobilityDatabaseClient(
             "RefreshTokSecret987", base_url=url
         ) as client:
-            with pytest.raises(MobilityDatabaseConnectionError) as caught:
+            with pytest.raises(
+                (MobilityDatabaseConnectionError, MobilityDatabaseApiError)
+            ) as caught:
                 await client.get_metadata()
     finally:
         server.close()
