@@ -2712,8 +2712,10 @@ def test_an_escaped_backslash_inside_a_quoted_string_is_fine() -> None:
 def test_a_max_age_counts_only_beside_a_well_formed_quoted_argument(arg: str) -> None:
     """The whole path, split then each directive: a max-age beside an
     extension argument counts exactly when the argument is a quoted-string;
-    a malformed element makes the response stale (RFC 9111 section 4.2.1)."""
-    expected = Freshness(60.0) if _reference_quoted_string(arg) else Freshness(0.0)
+    a malformed element makes the response stale (RFC 9111 section 4.2.1).
+    Whitespace around an element is OWS, not part of it."""
+    well_formed = _reference_quoted_string(arg.strip(" \t"))
+    expected = Freshness(60.0) if well_formed else Freshness(0.0)
     assert _fresh({"Cache-Control": f"max-age=60, ext={arg}"}) == expected
 
 
