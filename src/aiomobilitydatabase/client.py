@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,7 @@ from urllib.parse import quote
 
 import aiohttp
 from mashumaro import DataClassDictMixin
+from yarl import URL
 
 from ._payload import mismatch
 from .const import (
@@ -76,6 +78,11 @@ def _require_catalog_session(session: aiohttp.ClientSession) -> None:
     """Raise ValueError for an injected session's default the client can't use."""
     if getattr(session, "auth", None) is not None:
         raise ValueError("the session's auth would go to the catalog API")
+    if any(name.lower() == "authorization" for name in session.headers):
+        # It would ride on the token request (data requests replace it).
+        raise ValueError(
+            "the session's Authorization header would go to the catalog API"
+        )
     if getattr(session, "_base_url", None) is not None:
         raise ValueError("the session has a base_url; pass base_url= instead")
     for name, value in session.headers.items():
@@ -95,6 +102,58 @@ def _redact(text: str, *secrets: str | None) -> str:
             for form in {secret, secret.replace("/", "\\/")}:
                 text = text.replace(form, "[token]")
     return text
+
+
+def _describe(err: BaseException) -> str:
+    """Name a request error without its text, which may echo a token.
+
+    A response error's message can quote a malformed header the server
+    echoed from the request; a connection failure's names only the host.
+    """
+    if isinstance(err, aiohttp.ClientConnectorError):
+        return str(err)
+    if isinstance(err, aiohttp.ClientResponseError):
+        return f"{type(err).__name__} ({err.status})"
+    return type(err).__name__
+
+
+def _require_base_url(base_url: str) -> str:
+    """Return ``base_url`` without a trailing slash; ValueError if unusable.
+
+    An http(s) URL with a host and nothing a request path can't follow
+    (credentials would be sent as Basic auth beside the Bearer token; a
+    query or fragment would swallow every path). RFC 6750 section 5.3: a
+    bearer token travels over TLS only, so plain http is for loopback.
+    """
+    try:
+        parsed = URL(base_url)
+        host = parsed.host
+    except (ValueError, IndexError) as err:
+        raise ValueError(f"base_url {base_url!r} is no URL") from err
+    if parsed.scheme not in ("http", "https") or not host:
+        raise ValueError("base_url must be an http(s) URL with a host")
+    if parsed.user is not None or parsed.raw_password is not None:
+        raise ValueError("base_url must not hold credentials")
+    if (
+        parsed.raw_query_string
+        or parsed.raw_fragment
+        or "?" in base_url
+        or "#" in base_url
+    ):
+        raise ValueError("base_url must not hold a query or fragment")
+    if parsed.scheme == "http" and not _is_loopback(host):
+        raise ValueError("base_url must be https: bearer tokens travel over TLS only")
+    return base_url.rstrip("/")
+
+
+def _is_loopback(host: str) -> bool:
+    """Whether a host names this machine (where plain http stays local)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _encode_value(value: Any) -> str:
@@ -182,9 +241,18 @@ async def _json_body(resp: aiohttp.ClientResponse) -> Any:
     (no JSON) are refused. Any of these is ValueError; nesting deeper than
     the interpreter's stack, RecursionError.
     """
-    if resp.content_type != "application/json":
+    try:
+        content_type = resp.content_type
+    except ValueError:
+        # aiohttp before 3.14 parses the header with email's parser, which
+        # raises (UnicodeEncodeError) for an undecodable byte beside text --
+        # in a charset, say, which has no effect anyway. Read the media type
+        # itself, as later versions do.
+        header = resp.headers.get("Content-Type", "")
+        content_type = header.split(";", 1)[0].strip(" \t").lower()
+    if content_type != "application/json":
         raise MobilityDatabaseConnectionError(
-            f"API returned {resp.content_type!r}, not application/json"
+            f"API returned {content_type!r}, not application/json"
         )
     raw = await resp.read()
     try:
@@ -197,7 +265,7 @@ async def _json_body(resp: aiohttp.ClientResponse) -> Any:
         raise MobilityDatabaseConnectionError("API returned invalid JSON") from err
 
 
-async def _body_text(resp: aiohttp.ClientResponse) -> str:
+async def _body_text(resp: aiohttp.ClientResponse, secrets: tuple[str, ...]) -> str:
     """Return an error response's body as text, whatever bytes it holds.
 
     ``resp.text()`` raises for bytes its charset (UTF-8 when none is given)
@@ -206,18 +274,26 @@ async def _body_text(resp: aiohttp.ClientResponse) -> str:
     handler (UnicodeError: ``idna``, ``undefined``). The body only explains
     an error, so undecodable bytes are replaced, as UTF-8 when the charset
     can't be used.
+
+    Each secret is hidden in the bytes before decoding, then in the text: a
+    page echoing the request under another charset (``utf-16`` over ASCII)
+    would otherwise decode into text the token is recoverable from.
     """
     try:
         raw = await resp.read()
     except aiohttp.ClientPayloadError:
         return ""  # unreadable (a Content-Encoding its bytes don't follow)
+    for secret in secrets:
+        if secret:
+            raw = raw.replace(secret.encode("utf-8"), b"[token]")
     try:
-        return raw.decode(resp.charset or "utf-8", "replace")
+        text = raw.decode(resp.charset or "utf-8", "replace")
     except (LookupError, ValueError, TypeError):
         # The charset is the server's, after RFC 2231 decoding: it can hold a
         # NUL (ValueError), and aiohttp 3.9 gives a tuple for charset*=
         # (TypeError). UnicodeError is a ValueError.
-        return raw.decode("utf-8", "replace")
+        text = raw.decode("utf-8", "replace")
+    return _redact(text, *secrets)
 
 
 def _one[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> ModelT:
@@ -295,7 +371,7 @@ class MobilityDatabaseClient:
         self._refresh_token = refresh_token
         self._session = session
         self._owns_session = session is None
-        self._base_url = base_url.rstrip("/")
+        self._base_url = _require_base_url(base_url)
         self._timeout = aiohttp.ClientTimeout(total=request_timeout)
         self._access_token: str | None = None
         self._token_expiration: datetime | None = None
@@ -382,15 +458,18 @@ class MobilityDatabaseClient:
                     if resp.status != HTTPStatus.OK:
                         # A page echoing the request must not put the refresh
                         # token into the exception's text (and so logs).
-                        body = _redact(await _body_text(resp), self._refresh_token)
+                        body = await _body_text(resp, (self._refresh_token,))
                         raise MobilityDatabaseAuthenticationError(
                             f"Unable to obtain access token ({resp.status}): {body}"
                         )
                     data = await _json_body(resp)
             except (TimeoutError, aiohttp.ClientError) as err:
+                # Not from err: aiohttp's text can echo a malformed response
+                # header -- the request's token with it -- and a traceback
+                # prints the cause.
                 raise MobilityDatabaseConnectionError(
-                    f"Error requesting access token: {err}"
-                ) from err
+                    f"Error requesting access token: {_describe(err)}"
+                ) from None
             token = _one(AccessToken, data)
             if token.token_type is not None and token.token_type.lower() != "bearer":
                 # RFC 6749 section 7.1: a client MUST NOT use an access token
@@ -453,9 +532,10 @@ class MobilityDatabaseClient:
         except MobilityDatabaseError:
             raise
         except (TimeoutError, aiohttp.ClientError) as err:
+            # Not from err: see _async_ensure_token.
             raise MobilityDatabaseConnectionError(
-                f"Error communicating with API: {err}"
-            ) from err
+                f"Error communicating with API: {_describe(err)}"
+            ) from None
         await self._async_ensure_token(force=True, stale_token=token)
         return await self._request(
             method, path, params=params, json_body=json_body, retry_on_auth_fail=False
@@ -474,7 +554,7 @@ class MobilityDatabaseClient:
         # has none, and a 300 or a 3xx left unfollowed is not the resource
         # asked for.
         if resp.status not in (HTTPStatus.OK, HTTPStatus.NON_AUTHORITATIVE_INFORMATION):
-            body = _redact(await _body_text(resp), *secrets)
+            body = await _body_text(resp, secrets)
             raise MobilityDatabaseApiError(resp.status, body)
         return await _json_body(resp)
 

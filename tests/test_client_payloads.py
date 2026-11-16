@@ -1245,3 +1245,165 @@ def test_an_empty_refresh_token_is_refused() -> None:
     """It would also have made the redaction replace every gap of a page."""
     with pytest.raises(ValueError, match="refresh_token is empty"):
         MobilityDatabaseClient("")
+
+
+# -- Raw responses aiohttp-based mocks can't send ------------------------------------
+
+
+async def _raw_server(data_response: bytes) -> tuple[asyncio.Server, str]:
+    """Serve a real token, then ``data_response`` verbatim to anything else."""
+    token = json.dumps({**TOKEN_RESPONSE, "access_token": "AccessTok123"}).encode()
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        request = await reader.readuntil(b"\r\n\r\n")
+        if request.startswith(b"POST /v1/tokens"):
+            length = int(request.split(b"Content-Length: ")[1].split(b"\r\n")[0])
+            await reader.readexactly(length)
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: " + str(len(token)).encode() + b"\r\n\r\n" + token
+            )
+        else:
+            writer.write(data_response)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    return server, f"http://127.0.0.1:{port}"
+
+
+@pytest.mark.parametrize("content_type", [b"\x80\xc3\xa9", b"text/\x80\xc3\xa9"])
+async def test_an_undecodable_content_type_is_invalid(content_type: bytes) -> None:
+    """aiohttp before 3.14 raised a bare UnicodeEncodeError reading it."""
+    body = b'{"version": "1"}'
+    response = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: " + content_type + b"\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    server, url = await _raw_server(response)
+    try:
+        async with MobilityDatabaseClient(
+            "RefreshTokSecret987", base_url=url
+        ) as client:
+            with pytest.raises(
+                MobilityDatabaseConnectionError, match="not application/json"
+            ):
+                await client.get_metadata()
+    finally:
+        server.close()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        b"X-Echo: Bearer AccessTok123\x00",
+        b"Echo Bearer AccessTok123",
+        b"X-Echo: AccessTok123\rx",
+    ],
+)
+async def test_aiohttps_error_text_never_carries_the_token(header: bytes) -> None:
+    """A malformed header echoing the request: aiohttp quotes it in its own
+    error, which went into the message and, as the cause, the traceback."""
+    response = (
+        b"HTTP/1.1 400 Bad Request\r\n" + header + b"\r\nContent-Length: 0\r\n\r\n"
+    )
+    server, url = await _raw_server(response)
+    try:
+        async with MobilityDatabaseClient(
+            "RefreshTokSecret987", base_url=url
+        ) as client:
+            with pytest.raises(MobilityDatabaseConnectionError) as caught:
+                await client.get_metadata()
+    finally:
+        server.close()
+    assert "AccessTok123" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__
+
+
+async def test_an_echo_under_another_charset_hides_the_tokens(
+    mock_api: MockApi,
+) -> None:
+    """Decoded as UTF-16, an ASCII echo is CJK text the token re-encodes
+    back from: the bytes are redacted before decoding."""
+    mock_api.post(
+        "/v1/tokens", payload={**TOKEN_RESPONSE, "access_token": "AccessTok123"}
+    )
+    mock_api.get(
+        "/v1/metadata",
+        status=500,
+        body=b"Bearer AccessTok123 refresh=RefreshTokSecret987",
+        headers={"Content-Type": "text/plain; charset=utf-16"},
+    )
+    async with MobilityDatabaseClient(
+        "RefreshTokSecret987", base_url=mock_api.url()
+    ) as client:
+        with pytest.raises(MobilityDatabaseApiError) as caught:
+            await client.get_metadata()
+    for form in (
+        str(caught.value),
+        str(caught.value).encode("utf-16", "replace").decode("latin-1"),
+    ):
+        assert "AccessTok123" not in form
+        assert "RefreshTokSecret987" not in form
+
+
+async def test_a_session_authorization_header_is_refused() -> None:
+    """It would ride on the token request, as a session auth would."""
+    async with aiohttp.ClientSession(
+        headers={"Authorization": "Basic dXNlcjpzZWNyZXQ="}
+    ) as session:
+        with pytest.raises(ValueError, match="Authorization header"):
+            MobilityDatabaseClient("t", session)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://user:pw@api.example.com",
+        "https://api.example.com/?x=1",
+        "https://api.example.com/#x",
+        "http://api.example.com",  # RFC 6750 section 5.3: TLS for bearer tokens
+        "ftp://api.example.com",
+        "https://",
+        "not a url",
+    ],
+)
+def test_an_unusable_base_url_is_refused(base_url: str) -> None:
+    with pytest.raises(ValueError, match="base_url"):
+        MobilityDatabaseClient("t", base_url=base_url)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.example.com/",
+        "http://127.0.0.1:8080",
+        "http://localhost",
+        "http://[::1]:9",
+    ],
+)
+def test_https_and_loopback_base_urls_are_fine(base_url: str) -> None:
+    MobilityDatabaseClient("t", base_url=base_url)
+
+
+async def test_an_undecodable_charset_on_json_has_no_effect() -> None:
+    """application/json with an undecodable charset is still JSON (RFC 8259
+    section 11), on every aiohttp: older ones can't parse the header, so the
+    media type is read from it directly."""
+    body = b'{"version": "1"}'
+    response = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=\x80\xc3\xa9\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    server, url = await _raw_server(response)
+    try:
+        async with MobilityDatabaseClient(
+            "RefreshTokSecret987", base_url=url
+        ) as client:
+            assert (await client.get_metadata()).version == "1"
+    finally:
+        server.close()

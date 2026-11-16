@@ -736,8 +736,10 @@ catalog method raises `ValueError` for an id of `""`, `"."` or `".."`, which
 no URL can carry as one path segment (`TypeError` for an id that isn't a
 `str`), or for a query value or `license_url` holding a lone surrogate (no
 text a URL can carry). `MobilityDatabaseClient(...)` raises `ValueError` for an
-empty refresh token, or an injected session with an `auth`, a `base_url` or a
-default header HTTP can't carry. Error pages that echo the request never show
+empty refresh token; a `base_url` that isn't https (plain http only on
+loopback: bearer tokens travel over TLS, RFC 6750) or holds credentials, a
+query or a fragment; or an injected session with an `auth`, an
+`Authorization` header, a `base_url` or a default header HTTP can't carry. Error pages that echo the request never show
 your tokens.
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
