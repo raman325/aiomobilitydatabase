@@ -8,7 +8,8 @@ network boundary's (:func:`._redirects.network`): it needs no list here.
 
 The caller's inputs are checked when a handle is made, against an allowlist
 rather than a copy of aiohttp's rules (:func:`require_caller_inputs`), so a
-caller's mistake is a ValueError up front, never a source error mid-request.
+caller's mistake is a ValueError up front, never a source error mid-request:
+credentials in the caller's own URLs included.
 """
 
 from __future__ import annotations
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
 
 _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")  # RFC 5234 CTL
+# What Basic auth can send of a URL's credentials: Latin-1, the octets
+# aiohttp encodes them to (RFC 7617 section 2 leaves the charset open).
+_LATIN_1 = re.compile(r"[\x00-\xff]*")
 
 
 class UnfetchableURLError(ValueError):
@@ -43,11 +47,20 @@ def require_caller_inputs(
 
     Checked when a handle is made (:mod:`.._http`): the session's defaults
     (sendable, no credential), every ``headers`` entry (a token name, a
-    visible-ASCII value) and the ``api_key`` (visible ASCII). An
-    Authorization header beside credentials in the caller's URLs is refused
-    too: one request carries one Authorization field.
+    visible-ASCII value), the ``api_key`` (visible ASCII), and credentials
+    in the caller's ``urls`` (what :func:`require_requestable` asks of
+    them). An Authorization header beside credentials in the caller's URLs
+    is refused too: one request carries one Authorization field.
     """
     require_session(session)
+    for url in urls:
+        try:
+            parsed = URL(url)
+        except URL_ERRORS:
+            continue  # the guard's to report, naming what it fetches
+        problem = _credentials_problem(parsed)
+        if problem is not None:
+            raise ValueError(problem)
     for name, value in (headers or {}).items():
         if not is_token(name):
             raise ValueError(f"header name {name!r} is no HTTP field name")
@@ -70,7 +83,33 @@ def _has_credentials(url: str) -> bool:
         parsed = URL(url)
     except URL_ERRORS:
         return False
-    return parsed.user is not None or parsed.raw_password is not None
+    return has_credentials(parsed)
+
+
+def has_credentials(parsed: URL) -> bool:
+    """Return whether a parsed URL carries credentials: a user, or a password.
+
+    A password alone counts (``http://:pw@host/``, whose ``user`` yarl
+    reads as None): aiohttp sends it as Basic auth all the same.
+    """
+    return parsed.raw_user is not None or parsed.raw_password is not None
+
+
+def _credentials_problem(parsed: URL) -> str | None:
+    """Why a URL's credentials can't be sent as Basic auth (None: they can).
+
+    RFC 7617 section 2: neither user-id nor password holds a control
+    character, and the user-id no colon (it ends the user-id); and every
+    character must be one the Basic credentials are encoded to (Latin-1).
+    """
+    user, password = parsed.user or "", parsed.password or ""
+    if _CONTROL.search(user) or _CONTROL.search(password):
+        return "the URL's credentials hold a control character"
+    if ":" in user:
+        return "the URL's user-id holds a colon"
+    if not (_LATIN_1.fullmatch(user) and _LATIN_1.fullmatch(password)):
+        return "the URL's credentials hold a character outside Latin-1"
+    return None
 
 
 def redact(url: str) -> str | None:
@@ -93,16 +132,16 @@ def require_requestable(parsed: URL) -> None:
 
     A host is required (RFC 9110 section 4.2.1: a recipient rejects an
     http(s) URI with an empty one, and the redirect loop's URL arithmetic
-    needs it), and credentials hold no control character (RFC 7617 section
-    2), which aiohttp would otherwise send.
+    needs it), and credentials must be ones Basic auth can carry
+    (:func:`_credentials_problem`): aiohttp would send a control character,
+    and fail mid-request on a colon in the user-id or a character Latin-1
+    can't encode.
     """
     if not parsed.raw_host:
         raise UnfetchableURLError("the URL names no host")
-    if any(
-        part is not None and _CONTROL.search(part)
-        for part in (parsed.user, parsed.password)
-    ):
-        raise UnfetchableURLError("the URL's credentials hold a control character")
+    problem = _credentials_problem(parsed)
+    if problem is not None:
+        raise UnfetchableURLError(problem)
 
 
 def _require_http_url(url: str, context: str) -> None:

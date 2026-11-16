@@ -10,6 +10,7 @@ from hypothesis import strategies as st
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import FeedParseError, SourceConnectionError
 from aiomobilitydatabase.feeds.gbfs import (
+    GbfsFeedHandle,
     _document_lifetime,
     _iso_date,
     _localized,
@@ -414,16 +415,74 @@ async def test_a_discovery_url_aiohttp_cannot_parse_is_a_connection_error(
 
 @pytest.mark.parametrize(
     "version",
-    [chr(0xFF13) + ".0", "٣.0", "3_0.1", " 3.0", "3.0 ", "3..0", "", "v3"],
+    [
+        chr(0xFF13) + ".0",
+        "٣.0",
+        "3_0.1",
+        " 3.0",
+        "3.0 ",
+        "3..0",
+        "",
+        "v3",
+        "3.1-",
+        "3.1-RC-2",
+        "3.1-" + chr(0xFF32) + "C",  # a fullwidth letter
+        "3.1-RC" + chr(0xFF12),  # a fullwidth digit
+        "3.1RC",
+    ],
 )
 def test_a_version_that_isnt_ascii_dotted_digits_sorts_lowest(version: str) -> None:
     """int() also reads other scripts' digits, spaces and _ grouping: a
     corrupt catalog version must not sort as the version it resembles."""
-    assert _version_key(version) == (0,)
+    assert _version_key(version) == _version_key(None) < _version_key("0")
 
 
 def test_dotted_versions_sort_numerically() -> None:
     assert _version_key("2.3") < _version_key("3.0") < _version_key("3.10")
+
+
+def test_a_pre_release_ranks_just_below_its_release() -> None:
+    """The catalog lists 3.1-RC: newer than 3.0 and 2.3, older than 3.1."""
+    order = ["1.1", "2.3", "3.0", "3.1-RC", "3.1-RC2", "3.1", "3.1.1-RC", "3.2-RC"]
+    keys = [_version_key(version) for version in order]
+    assert keys == sorted(keys)
+    assert len(set(keys)) == len(keys)
+
+
+def test_trailing_zero_components_name_the_same_version() -> None:
+    assert _version_key("3") == _version_key("3.0") == _version_key("3.0.0")
+    assert _version_key("3.0-RC") < _version_key("3") < _version_key("3.0.1")
+    assert _version_key("3.0-RC") == _version_key("3-RC")
+
+
+async def test_create_resolves_a_pre_release_newer_than_its_predecessors() -> None:
+    """GbfsFeedHandle.create takes the newest version with endpoints: a
+    3.1-RC beside 2.3 is the newer, not junk sorting below it."""
+
+    class _Endpoint:
+        def __init__(self, url: str) -> None:
+            self.name, self.url = "system_information", url
+
+    class _Version:
+        def __init__(self, version: str, url: str) -> None:
+            self.version, self.endpoints = version, [_Endpoint(url)]
+
+    class _Feed:
+        def __init__(self) -> None:
+            self.versions = [
+                _Version("3.1-RC", "https://e.com/31rc"),
+                _Version("2.3", "https://e.com/23"),
+            ]
+
+    class _Catalog:
+        async def get_gbfs_feed(self, feed_id: str) -> object:
+            return _Feed()
+
+    class _Client:
+        catalog = _Catalog()
+
+    handle = await GbfsFeedHandle.create(_Client(), "f")  # type: ignore[arg-type]
+    assert handle._endpoints == {"system_information": "https://e.com/31rc"}
 
 
 @pytest.mark.parametrize("charset", ["iso-8859-1", "base64", "rot13", "utf-16"])

@@ -617,6 +617,8 @@ Notes on direct mode:
   at a station need not report a position: its coordinates are `None`, and
   a zone places it at its station), and a
   `GbfsSystemInfo` with the operator's contact, licensing, and terms URLs.
+  A flag (`is_renting`, `is_installed`, ...) is JSON `true`/`false`, or
+  `1`/`0`; any other value is `None` (unknown), never `True`.
   `last_reported` is exposed on both stations and vehicles so you can tell
   fresh data from stale, and is parsed from either GBFS 2.x POSIX seconds or
   3.0 RFC 3339 (whose offset is required: without one, a timestamp is
@@ -733,7 +735,7 @@ each define their own subtree beneath it, so you can catch broadly
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
 | `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP, `.url`) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
-| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), a trip repeating a `stop_sequence`, a cached static index a query finds damaged, or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
+| `FeedParseError` | feeds | Undecodable protobuf (a string field that isn't UTF-8 included), malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), a trip repeating a `stop_sequence`, a cached static index a query finds damaged, or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
 
 The GBFS and GTFS-RT parse paths are **total** with respect to this table:
@@ -774,7 +776,9 @@ can echo a token). A response's status and body are attributes
 
 So does a feeds handle factory, for a caller input outside its allowlist:
 `headers=` names must be tokens and their values visible ASCII, as must the
-`api_key`; an `Authorization` header can't go beside credentials in the URL.
+`api_key`; credentials in a URL you pass must be ones Basic auth can send
+(Latin-1 without a control character, and no colon in the user-id), and an
+`Authorization` header can't go beside them (a password alone counts).
 An injected session may carry no credential -- no `auth`, no
 `Authorization`, `Cookie` or `Proxy-Authorization` default, no cookie set
 without a domain (`ClientSession(cookies=...)`) -- since it would
@@ -786,7 +790,9 @@ body, or another library's error text, any of which can carry a credential.
 `SourceConnectionError` and `FeedParseError` carry the URL asked for on
 `.url` (without credentials, query or fragment), and the HTTP status on
 `.status`. Every redirect is followed by the library, each target checked
-like the first URL; a hop to another origin sheds the request's credentials.
+like the first URL (a `Location` with a scheme of its own is taken as
+written, RFC 3986 section 5.2.2, so `http:///x` names no host rather than
+the current one); a hop to another origin sheds the request's credentials.
 (Messages from a static build may quote the dataset's own cells: published
 feed data, not anything sent or received over HTTP.)
 

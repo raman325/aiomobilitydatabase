@@ -282,11 +282,9 @@ async def fetch_feed_message(
         answered = str(resp.url)
     message = gtfs_realtime_pb2.FeedMessage()
     try:
-        await asyncio.to_thread(message.ParseFromString, raw)
+        decoded = await asyncio.to_thread(_parse_feed_message, message, raw)
     except Exception:  # DecodeError subclasses Exception, not a shared base
         decoded = False
-    else:
-        decoded = True
     if not decoded:  # outside the except: nothing of the error rides along
         raise FeedParseError("Undecodable GTFS-RT protobuf", url=shown)
     return Response(
@@ -309,6 +307,205 @@ _RT_WHEELCHAIR = {
     "WHEELCHAIR_INACCESSIBLE": WheelchairAccess.NOT_POSSIBLE,
     "UNKNOWN": WheelchairAccess.UNKNOWN,
 }
+
+
+def _parse_feed_message(message: gtfs_realtime_pb2.FeedMessage, raw: bytes) -> bool:
+    """Parse ``raw`` into ``message``; False when a string field isn't text.
+
+    A protobuf ``string`` is UTF-8 text by the language's definition, so a
+    feed carrying other bytes in one is malformed, whichever runtime reads
+    it: the pure-Python one raises while parsing, but upb accepts a proto2
+    string's invalid UTF-8 and hands it back as ``bytes``, which every
+    reader downstream (start_time, ids, translations) would trip on. Every
+    string field is checked once here (:func:`_strings_are_text`) --
+    extensions a loaded module registers included -- so no reader needs to.
+    A ``bytes`` field is bytes by definition, and isn't checked.
+    """
+    message.ParseFromString(raw)
+    return _strings_are_text(message)
+
+
+@dataclass(frozen=True, slots=True)
+class _TextPlan:
+    """Where one message type keeps strings, directly or below it.
+
+    Fields are listed only when they can lead to a string, so a type with
+    none (StopTimeEvent, Position) is never visited.
+    """
+
+    strings: tuple[str, ...]  # singular string fields
+    string_lists: tuple[str, ...]  # repeated string fields
+    messages: tuple[tuple[str, Any], ...]  # singular: (name, its type)
+    message_lists: tuple[tuple[str, Any], ...]  # repeated: (name, its type)
+    maps: tuple[tuple[str, bool, Any], ...]  # (name, string keys?, value field)
+    extensions: tuple[Any, ...]  # registered extensions leading to a string
+
+
+def _repeated(described: Any) -> bool:
+    """Whether a field is repeated (``label`` is gone from protobuf 7)."""
+    is_repeated = getattr(described, "is_repeated", None)
+    if is_repeated is not None:
+        return bool(is_repeated)
+    return bool(described.label == described.LABEL_REPEATED)
+
+
+def _is_message(described: Any) -> bool:
+    return bool(described.type in (described.TYPE_MESSAGE, described.TYPE_GROUP))
+
+
+def _text_plans(root: Any) -> dict[str, _TextPlan | None]:
+    """Every message type reachable from ``root``: its plan, None if stringless.
+
+    Built per parse, from the descriptors and the extensions registered
+    right now (a module loaded later registers more), so it costs one pass
+    over the schema rather than one per message. A type caught in a cycle
+    counts as leading to a string: walking too much is safe, too little
+    isn't.
+    """
+    plans: dict[str, _TextPlan | None] = {}
+    visiting: set[str] = set()
+
+    def fields_of(descriptor: Any) -> list[Any]:
+        pool = descriptor.file.pool
+        return [*descriptor.fields, *pool.FindAllExtensions(descriptor)]
+
+    def leads(described: Any) -> bool:
+        if described.type == described.TYPE_STRING:
+            return True
+        return _is_message(described) and plan(described.message_type) is not None
+
+    def plan(descriptor: Any) -> _TextPlan | None:
+        name = descriptor.full_name
+        if name in plans:
+            return plans[name]
+        if name in visiting:
+            return _CYCLE
+        visiting.add(name)
+        strings: list[str] = []
+        string_lists: list[str] = []
+        messages: list[tuple[str, Any]] = []
+        message_lists: list[tuple[str, Any]] = []
+        maps: list[tuple[str, bool, Any]] = []
+        extensions: list[Any] = []
+        for described in fields_of(descriptor):
+            entry = described.message_type if _is_message(described) else None
+            if entry is not None and entry.GetOptions().map_entry:
+                key, value = entry.fields_by_name["key"], entry.fields_by_name["value"]
+                string_keys = key.type == key.TYPE_STRING
+                if string_keys or leads(value):
+                    maps.append((described.name, string_keys, value))
+            elif not leads(described):
+                continue
+            elif described.is_extension:
+                extensions.append(described)
+            elif entry is None:
+                (string_lists if _repeated(described) else strings).append(
+                    described.name
+                )
+            else:
+                (message_lists if _repeated(described) else messages).append(
+                    (described.name, entry)
+                )
+        visiting.discard(name)
+        found = _TextPlan(
+            tuple(strings),
+            tuple(string_lists),
+            tuple(messages),
+            tuple(message_lists),
+            tuple(maps),
+            tuple(extensions),
+        )
+        result = found if found != _CYCLE else None  # _CYCLE: all empty
+        plans[name] = result
+        return result
+
+    plan(root)
+    return plans
+
+
+# What a type under construction answers when a cycle reaches it again.
+_CYCLE = _TextPlan((), (), (), (), (), ())
+
+
+def _strings_are_text(message: Any) -> bool:
+    """Whether every string field set anywhere in ``message`` holds text.
+
+    Instances are walked a type at a time, each field read through its
+    precomputed plan: no per-message ListFields, and no visit to a type
+    that holds no string.
+    """
+    plans = _text_plans(message.DESCRIPTOR)
+    pending: list[tuple[str, list[Any]]] = [(message.DESCRIPTOR.full_name, [message])]
+    while pending:
+        type_name, instances = pending.pop()
+        plan = plans.get(type_name)
+        if plan is None:
+            continue
+        if not _fields_are_text(plan, instances, pending):
+            return False
+        for name, string_keys, value in plan.maps:
+            if not _map_is_text(instances, name, string_keys, value, pending):
+                return False
+        for extension in plan.extensions:
+            if not _extension_is_text(instances, extension, pending):
+                return False
+    return True
+
+
+def _fields_are_text(
+    plan: _TextPlan, instances: list[Any], pending: list[tuple[str, list[Any]]]
+) -> bool:
+    """Check a type's own string fields; queue its messages that hold some."""
+    for name in plan.strings:
+        if not all(type(getattr(m, name)) is str for m in instances):
+            return False
+    for name in plan.string_lists:
+        if not all(type(v) is str for m in instances for v in getattr(m, name)):
+            return False
+    for name, entry in plan.messages:
+        found = [getattr(m, name) for m in instances if m.HasField(name)]
+        if found:
+            pending.append((entry.full_name, found))
+    for name, entry in plan.message_lists:
+        found = [v for m in instances for v in getattr(m, name)]
+        if found:
+            pending.append((entry.full_name, found))
+    return True
+
+
+def _extension_is_text(
+    instances: list[Any], extension: Any, pending: list[tuple[str, list[Any]]]
+) -> bool:
+    """Check one registered extension's strings; queue its message values."""
+    if _repeated(extension):
+        found = [v for m in instances for v in m.Extensions[extension]]
+    else:
+        found = [
+            m.Extensions[extension] for m in instances if m.HasExtension(extension)
+        ]
+    if extension.type == extension.TYPE_STRING:
+        return all(type(v) is str for v in found)
+    if found:
+        pending.append((extension.message_type.full_name, found))
+    return True
+
+
+def _map_is_text(
+    instances: list[Any],
+    name: str,
+    string_keys: bool,
+    value: Any,
+    pending: list[tuple[str, list[Any]]],
+) -> bool:
+    """Check one map field's string keys and values; queue message values."""
+    entries = [item for m in instances for item in getattr(m, name).items()]
+    if string_keys and not all(type(key) is str for key, _ in entries):
+        return False
+    if value.type == value.TYPE_STRING:
+        return all(type(item) is str for _, item in entries)
+    if _is_message(value) and entries:
+        pending.append((value.message_type.full_name, [item for _, item in entries]))
+    return True
 
 
 def _rt_wheelchair(
