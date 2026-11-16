@@ -640,10 +640,13 @@ Notes on direct mode:
 - **Producer authentication**: pass `api_key=` to `get_transit_feed()`; it is
   applied per the catalog's `authentication_type` (query parameter or header) —
   distinct from the refresh token used to authenticate with the catalog itself.
-  A header key is never sent to another origin: from the first redirect that
-  leaves the producer's origin on, it is left off, along with credentials in
-  the URL. (A session carrying credentials of its own, which couldn't be left
-  off, is refused when the handle is made; see below.)
+  The one key goes to every GTFS-RT feed the catalog links to the handle and
+  marks as needing authentication, at each feed's own origin -- which can be
+  another vendor's than the agency's that issued the key, as the catalog
+  lists them. A redirect never carries a header key to another origin: from
+  the first redirect that leaves the feed's origin on, it is left off, along
+  with credentials in the URL. (A session carrying credentials of its own,
+  which couldn't be left off, is refused when the handle is made; see below.)
 - **Zones are circles** (matching Home Assistant zone entities); GBFS vehicle
   filtering happens client-side because GBFS feeds are full-system dumps by
   design, with no server-side geo-query.
