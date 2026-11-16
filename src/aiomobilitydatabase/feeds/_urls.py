@@ -26,12 +26,10 @@ def _require_http_url(url: str, context: str) -> None:
     65535, an unclosed IPv6 bracket; yarl raises IndexError for some, such
     as ``http://[::1]:@``), and a host the resolver can't IDNA-encode (an
     empty label, ``a..b``, or one past 63 octets), which aiohttp raises as
-    UnicodeError mid-request. The port is read too: some yarl versions
-    check it only then.
+    UnicodeError mid-request.
     """
     try:
         parsed = URL(url)
-        parsed.port  # noqa: B018 -- validated on access by some yarl versions
         if parsed.raw_host:
             parsed.raw_host.encode("idna")  # as the resolver encodes it
         scheme = parsed.scheme.lower()
