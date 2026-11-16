@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import IntEnum
 from pathlib import Path
-from typing import IO, Any, NamedTuple
+from typing import IO, Any, NamedTuple, NoReturn
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -562,7 +562,22 @@ def _open_csv(
             reason = _reason(err)
         else:
             return
-    raise FeedParseError(f"Malformed {filename}: {reason}")
+    _raise_unchained(FeedParseError(f"Malformed {filename}: {reason}"))
+
+
+def _raise_unchained(error: Exception) -> NoReturn:
+    """Raise ``error`` with no context, even from a context manager's exit.
+
+    Raising after the ``except`` block ends isn't enough here: a
+    ``@contextmanager`` generator runs inside the ``with`` statement's exit,
+    while the error it was handed is still being handled, so Python makes
+    that error the new one's ``__context__`` -- and a codec error carries
+    the file's bytes. The context is cleared as ``error`` leaves.
+    """
+    try:
+        raise error
+    finally:
+        error.__context__ = None
 
 
 def _open_zip(zip_path: Path) -> zipfile.ZipFile:

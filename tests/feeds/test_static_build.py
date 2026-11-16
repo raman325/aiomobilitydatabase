@@ -4,6 +4,7 @@ import io
 import os
 import sqlite3
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -374,7 +375,9 @@ def test_lenient_int_contract(value: str | None, expected: int | None) -> None:
     assert _lenient_int(value) == expected
 
 
-def _zip_from_files(tmp_path: Path, files: dict[str, str], name: str) -> Path:
+def _zip_from_files(
+    tmp_path: Path, files: Mapping[str, str | bytes], name: str
+) -> Path:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for member, content in files.items():
@@ -1202,5 +1205,27 @@ def test_an_unreadable_zip_names_the_problem_in_the_librarys_words(
     with pytest.raises(FeedParseError) as caught:
         StaticIndex.build(bad, ":memory:", DATASET, TZ)
     assert str(caught.value) == "Unreadable GTFS zip: BadZipFile"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("stops", "reason"),
+    [
+        (b"\xff\xfeSECRETBYTES", "UnicodeDecodeError"),
+        (b"stop_id,stop_name\nS1\n", "line 2 has fewer fields than the header"),
+    ],
+)
+def test_a_malformed_file_carries_nothing_of_the_error_behind_it(
+    tmp_path: Path, stops: bytes, reason: str
+) -> None:
+    """The CSV conversion runs in a context manager's exit, where Python
+    would chain the error being handled -- a codec error holding the file's
+    bytes. Nothing is chained."""
+    files: dict[str, str | bytes] = {**_FILES, "stops.txt": stops}
+    zip_path = _zip_from_files(tmp_path, files, "malformed.zip")
+    with pytest.raises(FeedParseError) as caught:
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+    assert str(caught.value) == f"Malformed stops.txt: {reason}"
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
