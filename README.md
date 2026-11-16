@@ -739,7 +739,9 @@ text a URL can carry). `MobilityDatabaseClient(...)` raises `ValueError` for an
 empty refresh token; a `base_url` that isn't https (plain http only on
 loopback: bearer tokens travel over TLS, RFC 6750) or holds credentials, a
 query or a fragment; or an injected session with an `auth`, an
-`Authorization` header, a `base_url` or a default header HTTP can't carry.
+`Authorization`, `Cookie` or `Proxy-Authorization` default header (any of
+which would ride on every request, to every origin), a `base_url`, or a
+default header outside the allowlist (token names, visible-ASCII values).
 
 Exception messages are written by the library alone: never a response body,
 a URL's credentials or query, or another library's error text (any of which

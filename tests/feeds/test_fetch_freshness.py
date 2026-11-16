@@ -530,10 +530,8 @@ async def _unsafe_jar_client(mock_api: MockApi, **session: object):  # type: ign
     [
         # Set b, then a: aiohttp sends them sorted, as the cache compares.
         ({}, ["b=1", "a=2"], ["", "b=1", "a=2; b=1"]),
-        # An explicit cookie the jar replaces by name.
-        ({"Cookie": "a=1"}, ["a=2"], ["a=1", "a=2"]),
-        # An explicit cookie merged, sorted, with the jar's.
-        ({"Cookie": "z=1"}, ["a=2"], ["z=1", "a=2; z=1"]),
+        # (A session default Cookie header is refused outright: it would
+        # ride on every request, to every origin -- see the test below.)
     ],
 )
 async def test_vary_cookie_matches_the_cookie_aiohttp_sends(
@@ -816,3 +814,18 @@ async def test_a_header_auth_redirect_to_another_origin_is_cached_without_the_ke
     assert all("If-None-Match" not in hit for hit in _rt_hits(mock_api))
     assert all(hit["X-Api-Key"] == "secret" for hit in _rt_hits(mock_api))
     assert not any("x-api-key" in {k.lower() for k in hit} for hit in away_hits)
+
+
+async def test_a_session_default_cookie_header_is_refused(mock_api: MockApi) -> None:
+    """A Cookie default rides on every request the session makes -- the
+    catalog API's, every producer's -- where no client can withhold it:
+    refused, like an auth or Authorization default. The jar's cookies,
+    scoped by domain, are fine."""
+    async with (
+        aiohttp.ClientSession(headers={"Cookie": "a=1"}) as session,
+        MobilityFeedsClient(
+            "test-refresh-token", session, base_url=mock_api.url()
+        ) as client,
+    ):
+        with pytest.raises(ValueError, match="Cookie header"):
+            await client.get_transit_feed("mdb-100")
