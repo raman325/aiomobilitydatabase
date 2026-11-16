@@ -496,8 +496,8 @@ def _defaulted_text(value: str | None, default: str) -> str:
 # unsupported compression method, a corrupt local header.
 _OPEN_ERRORS = (RuntimeError, NotImplementedError, zipfile.BadZipFile)
 # ... and while it is read and parsed: bad bytes (not UTF-8), a failed CRC
-# or truncated stream, a field past csv's size limit, a ragged or missing
-# column the loaders index.
+# or truncated stream, a field past csv's size limit, a row shorter than the
+# header (see _FullRowReader), a missing column the loaders index.
 _READ_ERRORS = (
     ValueError,
     KeyError,
@@ -508,6 +508,22 @@ _READ_ERRORS = (
     zlib.error,
     EOFError,
 )
+
+
+class _FullRowReader(csv.DictReader[str]):
+    """A DictReader that refuses a row with fewer fields than the header.
+
+    RFC 4180 has each record carry the header's field count; a short one is
+    malformed (maintainer's choice: in every file, rather than reading its
+    missing trailing cells as blank). DictReader fills them with ``restval``
+    (None), which a field the row does carry never is.
+    """
+
+    def __next__(self) -> dict[str, str]:
+        row = super().__next__()
+        if None in row.values():
+            raise csv.Error(f"line {self.line_num} has fewer fields than the header")
+        return row
 
 
 @contextmanager
@@ -521,7 +537,7 @@ def _open_csv(
         raise FeedParseError(f"Unreadable {filename}: {err}") from err
     with fp:
         try:
-            yield fp, csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
+            yield fp, _FullRowReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
         except _READ_ERRORS as err:
             raise FeedParseError(f"Malformed {filename}: {err}") from err
 

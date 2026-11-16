@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from hypothesis import given
+from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
@@ -111,8 +111,8 @@ def test_agency_txt_present_but_blank_timezone_raises(tmp_path: Path) -> None:
 
 def test_ragged_stops_row_raises_feed_parse_error(tmp_path: Path) -> None:
     """A stops.txt data row with fewer columns than the header (a ragged row,
-    which real producers ship) must surface as FeedParseError, not the raw
-    AttributeError from csv.DictReader's restval=None fill-in.
+    which real producers ship) is malformed: FeedParseError, never a bare
+    error from the None csv.DictReader fills the missing cells with.
     """
     header, first_row, *rest = _FILES["stops.txt"].splitlines()
     truncated_first_row = ",".join(first_row.split(",")[:2])  # drop trailing columns
@@ -1001,3 +1001,54 @@ def test_an_ascii_decimal_coordinate_reads_as_written(
 ) -> None:
     text = _SPELLINGS[spelling](value)
     assert _coordinate(text, "stop_lat") == float(text.strip())
+
+
+# -- A row shorter than its header is malformed, in every file --------------------
+
+
+@given(data=st.data())
+@settings(max_examples=150, deadline=None)
+def test_any_short_row_fails_the_build(
+    tmp_path_factory: Any, data: st.DataObject
+) -> None:
+    """RFC 4180: each record carries the header's field count. A short one
+    is malformed in every file (the maintainer's choice over reading its
+    missing trailing cells as blank) -- before, trips.txt raised a bare
+    sqlite3.IntegrityError, stops.txt FeedParseError, and agency.txt loaded.
+    """
+    member = data.draw(st.sampled_from(sorted(_FILES)))
+    header, *rows = _FILES[member].splitlines()
+    assume(rows)
+    index = data.draw(st.integers(0, len(rows) - 1))
+    fields = rows[index].split(",")
+    width = len(header.split(","))
+    keep = data.draw(st.integers(1, width - 1))
+    short = ",".join(fields[:keep])
+    assume(short)  # an empty line is no record: csv skips it
+    files = dict(_FILES)
+    files[member] = "\n".join([header, *rows[:index], short, *rows[index + 1 :]]) + "\n"
+    zip_path = _zip_from_files(tmp_path_factory.mktemp("short"), files, "short.zip")
+    with pytest.raises(FeedParseError, match="fewer fields than the header"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def test_a_short_trips_row_fails_the_build(tmp_path: Path) -> None:
+    """The report's case: trips.txt's NOT NULL service_id met csv's None."""
+    header, first, *rest = _FILES["trips.txt"].splitlines()
+    files = dict(_FILES)
+    files["trips.txt"] = "\n".join([header, first.split(",")[0], *rest]) + "\n"
+    zip_path = _zip_from_files(tmp_path, files, "short_trip.zip")
+    with pytest.raises(FeedParseError, match=r"Malformed trips\.txt: line 2 has fewer"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def test_a_full_row_with_blank_cells_still_loads(tmp_path: Path) -> None:
+    """Only the field count matters: a row carrying every field, its optional
+    ones blank, is well formed."""
+    header, first, *rest = _FILES["agency.txt"].splitlines()
+    width = len(header.split(","))
+    cells = first.split(",") + [""] * (width - len(first.split(",")))
+    files = dict(_FILES)
+    files["agency.txt"] = "\n".join([header, ",".join(cells), *rest]) + "\n"
+    zip_path = _zip_from_files(tmp_path, files, "blank_cells.zip")
+    StaticIndex.build(zip_path, ":memory:", DATASET, TZ).close()
