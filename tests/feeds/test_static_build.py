@@ -1000,8 +1000,8 @@ def test_an_ascii_decimal_coordinate_reads_as_written(
     value: float, spelling: str
 ) -> None:
     text = _SPELLINGS[spelling](value)
-    if abs(float(text.strip())) <= 180:  # "bare-fraction" can spell 10.5 as 1.5
-        assert _coordinate(text, "stop_lon", 180) == float(text.strip())
+    assert abs(float(text.strip())) <= 180  # no spelling grows the value
+    assert _coordinate(text, "stop_lon", 180) == float(text.strip())
 
 
 @pytest.mark.parametrize(
