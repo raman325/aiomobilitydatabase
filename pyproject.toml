@@ -21,7 +21,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-  "aiohttp>=3.9",
+  "aiohttp>=3.10",
   "mashumaro>=3.13",
 ]
 dynamic = ["version"]
