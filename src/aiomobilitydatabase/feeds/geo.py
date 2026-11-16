@@ -136,10 +136,24 @@ def _segment_distance(a: _Plane, b: _Plane) -> float:
     return abs(p[0] * dy - p[1] * dx) / math.hypot(dx, dy)
 
 
+def _edges(ring: Sequence[_Plane]) -> Iterator[tuple[_Plane, _Plane]]:
+    """Yield a closed ring's edges, each with its ends in a fixed order.
+
+    The tests below round differently with an edge's direction (the
+    crossing point ``x1 + (x2 - x1) * ...`` and the nearer-end tie), which
+    matters only for a centre within rounding of the boundary -- but there
+    a ring's start vertex or winding would change the answer. With each
+    edge judged the same way round, the answer depends on the polygon's
+    edges alone, not on how its ring is written.
+    """
+    for a, b in itertools.pairwise(ring):
+        yield (a, b) if a <= b else (b, a)
+
+
 def _encloses_origin(ring: Sequence[_Plane]) -> bool:
     """Return whether the origin is inside a closed planar ring (crossings)."""
     inside = False
-    for (x1, y1), (x2, y2) in itertools.pairwise(ring):
+    for (x1, y1), (x2, y2) in _edges(ring):
         if (y1 > 0) != (y2 > 0) and x1 + (x2 - x1) * (0 - y1) / (y2 - y1) > 0:
             inside = not inside
     return inside
@@ -194,9 +208,7 @@ def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
 
         rings = [plane(polygon.exterior), *(plane(hole) for hole in polygon.holes)]
         if any(
-            _segment_distance(a, b) <= radius
-            for ring in rings
-            for a, b in itertools.pairwise(ring)
+            _segment_distance(a, b) <= radius for ring in rings for a, b in _edges(ring)
         ):
             return True
         return _encloses_origin(rings[0]) and not any(

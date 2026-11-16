@@ -12,7 +12,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from hypothesis import assume, given, settings
+from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds import geo
@@ -1325,6 +1325,14 @@ def test_reach_matches_great_circle_distance_within_one_percent(
     shift=st.integers(0, 8),
     circle=st.tuples(_METRES, _METRES, st.floats(0, 3000)),
 )
+# A point within rounding of a vertex: each edge's tests rounded differently
+# with its direction, so the ring's winding changed the answer.
+@example(
+    origin=(0.0, 0.0), count=7, size=60.0, shift=0, circle=(60.0, 1.175494351e-38, 0.0)
+)
+@example(
+    origin=(0.0, 0.0), count=7, size=1801.0, shift=3, circle=(1801.0, 7.68e-185, 0.0)
+)
 def test_the_answer_ignores_the_start_vertex_and_winding(
     origin: tuple[float, float],
     count: int,
@@ -1359,12 +1367,17 @@ def _rectangle_reach(
 ) -> bool:
     """Whether a longitude/latitude rectangle meets a circle, in the scaled
     plane, over every copy of it within two turns: axis-aligned there, its
-    distance from the centre is a clamp per axis."""
+    distance from the centre is a clamp per axis.
+
+    Each copy's edge (``east + turn``) is formed first, as the library moves
+    the polygon: ``zone.longitude - east - turn`` rounded -179.99999999999997
+    - 180 onto -360, reading a centre 3e-14 degrees outside as on the edge.
+    """
     scale = _M_PER_DEG * math.cos(math.radians(zone.latitude))
     dy = max(south - zone.latitude, 0.0, zone.latitude - north) * _M_PER_DEG
     return any(
         math.hypot(
-            max(west + turn - zone.longitude, 0.0, zone.longitude - east - turn)
+            max((west + turn) - zone.longitude, 0.0, zone.longitude - (east + turn))
             * scale,
             dy,
         )
@@ -1379,6 +1392,7 @@ def _rectangle_reach(
     corner=st.integers(0, 3),
     circle=st.tuples(st.floats(-0.5, 1.5), st.floats(-180, 180), st.floats(0, 100_000)),
 )
+@example(west=0.0, span=180.0, corner=0, circle=(0.0, -179.99999999999997, 0.0))
 def test_a_wide_zone_answers_as_its_nearest_copy_from_every_start(
     west: float, span: float, corner: int, circle: tuple[float, float, float]
 ) -> None:
