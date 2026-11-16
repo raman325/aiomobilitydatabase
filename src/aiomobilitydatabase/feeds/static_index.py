@@ -277,7 +277,7 @@ def _coordinate(value: str, field: str) -> float | None:
         return None
     parsed = float(text) if _ASCII_DECIMAL.fullmatch(text) else math.nan
     if not math.isfinite(parsed):
-        raise ValueError(f"{field} is not a decimal number: {value!r}")
+        raise ValueError(f"{field} is not a finite decimal number: {value!r}")
     return parsed
 
 
@@ -511,18 +511,28 @@ _READ_ERRORS = (
 
 
 class _FullRowReader(csv.DictReader[str]):
-    """A DictReader that refuses a row with fewer fields than the header.
+    """A DictReader that refuses a row whose cells don't fit the header.
 
-    RFC 4180 has each record carry the header's field count; a short one is
-    malformed (maintainer's choice: in every file, rather than reading its
-    missing trailing cells as blank). DictReader fills them with ``restval``
-    (None), which a field the row does carry never is.
+    RFC 4180 has each record carry the header's field count (maintainer's
+    choices, in every file):
+
+    - a short row is malformed, rather than read with its missing trailing
+      cells blank. DictReader fills them with ``restval`` (None), which a
+      field the row does carry never is;
+    - a long row is malformed when a cell past the header holds anything:
+      that cell has no column, and an unquoted comma inside a value is what
+      usually puts it there, moving every later cell one column right.
+      Extra cells that are all blank (``a,b,c,,``) are harmless and dropped.
     """
 
     def __next__(self) -> dict[str, str]:
         row = super().__next__()
         if None in row.values():
             raise csv.Error(f"line {self.line_num} has fewer fields than the header")
+        # DictReader keeps a long row's extra cells as a list under restkey.
+        extras: list[str] = row.pop(self.restkey, [])  # type: ignore[assignment]
+        if any(cell.strip() for cell in extras):
+            raise csv.Error(f"line {self.line_num} has more fields than the header")
         return row
 
 
@@ -1893,10 +1903,12 @@ class StaticIndex:
 
         GTFS defines exactly one record; a producer shipping extras is an
         error the loader resolves by keeping row one and ignoring the rest
-        (documented on :class:`~.models.FeedInfo`). Date cells stay raw
-        text; the model boundary parses them leniently.
+        (documented on :class:`~.models.FeedInfo`) -- each still read, so a
+        malformed one fails the build as in every other file. Date cells
+        stay raw text; the model boundary parses them leniently.
         """
-        for row in reader:
+        rows = iter(reader)
+        for row in rows:
             conn.execute(
                 "INSERT INTO feed_info VALUES (?,?,?,?,?,?,?,?)",
                 (
@@ -1911,6 +1923,8 @@ class StaticIndex:
                 ),
             )
             break
+        for _ in rows:
+            pass  # read, not stored: see above
         if report is not None:
             report()
 
@@ -3877,9 +3891,10 @@ class StaticIndex:
         is one origin call, and a feed repeating an origin stop_sequence
         with another time has two, so the sequence alone names neither.
 
-        Ordered by (departure_secs, trip_id, stop_sequence) — the same
-        total order the row sort uses — so exactly one candidate is the
-        first and exactly one is the last even when departures tie. Callers
+        Ordered by (departure_secs, trip_id, stop_sequence), a total order
+        over these identities -- each one group of the journeys query -- so
+        exactly one journey is the first and exactly one is the last even
+        when departures tie. Callers
         only invoke this for days that produced candidate rows, so both
         LIMIT-1 queries always find a row.
         """

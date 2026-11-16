@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from hypothesis import assume, given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
@@ -1006,29 +1006,108 @@ def test_an_ascii_decimal_coordinate_reads_as_written(
 # -- A row shorter than its header is malformed, in every file --------------------
 
 
-@given(data=st.data())
-@settings(max_examples=150, deadline=None)
+def _short_rows() -> list[Any]:
+    """Every fixture data row cut to each shorter non-empty width."""
+    cases = []
+    for member in sorted(_FILES):
+        header, *rows = _FILES[member].splitlines()
+        width = len(header.split(","))
+        for index, row in enumerate(rows):
+            for keep in range(1, width):
+                short = ",".join(row.split(",")[:keep])
+                if short:  # an empty line is no record: csv skips it
+                    cases.append(
+                        pytest.param(
+                            member, index, short, id=f"{member}-{index}-{keep}"
+                        )
+                    )
+    return cases
+
+
+def _replace_row(member: str, index: int, row: str) -> dict[str, str]:
+    header, *rows = _FILES[member].splitlines()
+    files = dict(_FILES)
+    files[member] = "\n".join([header, *rows[:index], row, *rows[index + 1 :]]) + "\n"
+    return files
+
+
+@pytest.mark.parametrize(("member", "index", "short"), _short_rows())
 def test_any_short_row_fails_the_build(
-    tmp_path_factory: Any, data: st.DataObject
+    tmp_path: Path, member: str, index: int, short: str
 ) -> None:
     """RFC 4180: each record carries the header's field count. A short one
     is malformed in every file (the maintainer's choice over reading its
     missing trailing cells as blank) -- before, trips.txt raised a bare
     sqlite3.IntegrityError, stops.txt FeedParseError, and agency.txt loaded.
     """
-    member = data.draw(st.sampled_from(sorted(_FILES)))
-    header, *rows = _FILES[member].splitlines()
-    assume(rows)
-    index = data.draw(st.integers(0, len(rows) - 1))
-    fields = rows[index].split(",")
-    width = len(header.split(","))
-    keep = data.draw(st.integers(1, width - 1))
-    short = ",".join(fields[:keep])
-    assume(short)  # an empty line is no record: csv skips it
-    files = dict(_FILES)
-    files[member] = "\n".join([header, *rows[:index], short, *rows[index + 1 :]]) + "\n"
-    zip_path = _zip_from_files(tmp_path_factory.mktemp("short"), files, "short.zip")
+    zip_path = _zip_from_files(
+        tmp_path, _replace_row(member, index, short), "short.zip"
+    )
     with pytest.raises(FeedParseError, match="fewer fields than the header"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def _member_rows() -> list[Any]:
+    return [
+        pytest.param(member, index, id=f"{member}-{index}")
+        for member in sorted(_FILES)
+        for index in range(len(_FILES[member].splitlines()) - 1)
+    ]
+
+
+@pytest.mark.parametrize(("member", "index"), _member_rows())
+def test_a_long_row_with_content_past_the_header_fails_the_build(
+    tmp_path: Path, member: str, index: int
+) -> None:
+    """A cell past the header has no column; an unquoted comma inside a value
+    is what usually puts one there, moving every later cell (the maintainer's
+    choice: refused when it holds anything)."""
+    row = _FILES[member].splitlines()[index + 1]
+    zip_path = _zip_from_files(
+        tmp_path, _replace_row(member, index, row + ",x"), "long.zip"
+    )
+    with pytest.raises(FeedParseError, match="more fields than the header"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize(("member", "index"), _member_rows())
+def test_blank_cells_past_the_header_are_dropped(
+    tmp_path: Path, member: str, index: int
+) -> None:
+    """``a,b,c,,``: trailing commas carry nothing, so nothing is misplaced and
+    the index is exactly the one without them."""
+    row = _FILES[member].splitlines()[index + 1]
+    padded = _zip_from_files(
+        tmp_path, _replace_row(member, index, row + ", ,\t"), "pad.zip"
+    )
+    plain = _zip_from_files(tmp_path, dict(_FILES), "plain.zip")
+    assert _dump(StaticIndex.build(padded, ":memory:", DATASET, TZ)) == _dump(
+        StaticIndex.build(plain, ":memory:", DATASET, TZ)
+    )
+
+
+def test_an_unquoted_comma_never_moves_a_cell(tmp_path: Path) -> None:
+    """The review's case: ``Downtown, via Main`` would have loaded
+    trip_short_name ' via Main' and dropped the 10."""
+    files = dict(_FILES)
+    files["trips.txt"] = (
+        "trip_id,route_id,service_id,trip_headsign,trip_short_name\n"
+        "T1,R1,WKDY,Downtown, via Main,10\n"
+    )
+    zip_path = _zip_from_files(tmp_path, files, "comma.zip")
+    with pytest.raises(FeedParseError, match=r"Malformed trips\.txt: line 2 has more"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def test_a_malformed_extra_feed_info_row_fails_the_build(tmp_path: Path) -> None:
+    """feed_info.txt keeps its first record, but every row is still read: a
+    short second one is as malformed as anywhere else."""
+    files = dict(_FILES)
+    files["feed_info.txt"] = (
+        "feed_publisher_name,feed_publisher_url\nPub,https://p.example\nX\n"
+    )
+    zip_path = _zip_from_files(tmp_path, files, "feed_info.zip")
+    with pytest.raises(FeedParseError, match=r"Malformed feed_info\.txt: line 3"):
         StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
 
 
@@ -1052,3 +1131,22 @@ def test_a_full_row_with_blank_cells_still_loads(tmp_path: Path) -> None:
     files["agency.txt"] = "\n".join([header, ",".join(cells), *rest]) + "\n"
     zip_path = _zip_from_files(tmp_path, files, "blank_cells.zip")
     StaticIndex.build(zip_path, ":memory:", DATASET, TZ).close()
+
+
+def _dump(index: StaticIndex) -> dict[str, list[tuple[object, ...]]]:
+    """Every stored row of every table but meta: what any query can read."""
+    try:
+        tables = [
+            name
+            for (name,) in index._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'meta'"
+            )
+        ]
+        return {
+            table: sorted(
+                index._conn.execute(f"SELECT * FROM {table}").fetchall(), key=repr
+            )
+            for table in tables
+        }
+    finally:
+        index.close()

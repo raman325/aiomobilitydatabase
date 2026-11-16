@@ -166,8 +166,8 @@ def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
     a turn either way too.
 
     Meant for circles of up to a few hundred kilometres that do not reach a
-    pole, like :func:`in_circle`; beyond that the plane bends too far from
-    the sphere.
+    pole; beyond that the plane bends too far from the sphere. (Unlike
+    :func:`in_circle`, which measures on the sphere at any radius.)
     """
     radius = zone.radius_m
     dlat = radius * _BBOX_SAFETY / _M_PER_DEG_LAT
