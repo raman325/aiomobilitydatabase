@@ -331,71 +331,198 @@ def _cells(
 
 
 # A cell holding more edges than this is split into a finer grid of its own
-# (each side cut in _SUBDIVISION), down to unit cells: detail clustered in
-# a few cells of an otherwise coarse zone stays near-linear.
+# (each side cut in _SUBDIVISION): detail clustered in a few cells of an
+# otherwise coarse zone stays near-linear. Splitting stops at unit cells,
+# _MAX_DEPTH levels down, or where long edges run together; the edges of a
+# cell not split are box-swept instead. Splitting a crowded cell of the
+# top grid may take _BUDGET steps per pair of its edges, after which the
+# whole cell is box-swept (see _cell_pairs).
 _CROWDED = 64
 _SUBDIVISION = 8
+_MAX_DEPTH = 12
+_BUDGET = 2
 
 
-def _bucket_pairs(
+def _pair_count(count: int) -> int:
+    return count * (count - 1) // 2
+
+
+class _OverBudgetError(Exception):
+    """Splitting a crowded cell took more steps than its budget."""
+
+
+class _Budget:
+    """Steps left to split one crowded cell of the top grid."""
+
+    __slots__ = ("left",)
+
+    def __init__(self, left: int) -> None:
+        self.left = left
+
+    def spend(self, steps: int) -> None:
+        self.left -= steps
+        if self.left < 0:
+            raise _OverBudgetError
+
+
+def _buckets(
     edges: list[_Edge],
     members: Iterable[int],
     origin: _IntPoint,
     size: int,
     limit: int | None,
     *,
-    seen: set[tuple[int, int]] | None = None,
-) -> Iterator[tuple[int, int]]:
-    """Yield pairs of ``members`` sharing a cell of this grid (or a sub-cell).
-
-    A crowded cell is re-bucketed on a finer grid clipped to the cell; two
-    edges meeting in the cell meet in the sub-cell holding that point.
-    Within one crowded cell, a pair is yielded once however many of its
-    sub-cells it shares (nearly parallel edges share hundreds): ``seen``
-    holds that cell's pairs only.
-    """
+    budget: _Budget | None = None,
+) -> dict[tuple[int, int], list[int]]:
+    """Return the ``members`` in each cell they cross (ascending, as given)."""
     buckets: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
     for index in members:
         _r, _i, a, b = edges[index]
-        for cell in _cells(a, b, origin, size, limit):
+        cells = list(_cells(a, b, origin, size, limit))
+        if budget is not None:
+            budget.spend(len(cells))
+        for cell in cells:
             buckets[cell].append(index)
-    for (column, row), inside in buckets.items():
-        if len(inside) > _CROWDED and size > 1:
-            sub = -(-size // _SUBDIVISION)
-            yield from _bucket_pairs(
+    return buckets
+
+
+def _box_pairs(
+    edges: list[_Edge], members: list[int], budget: _Budget | None = None
+) -> Iterator[tuple[int, int]]:
+    """Yield the pairs of ``members`` whose bounding boxes overlap.
+
+    Swept by box, as _holes_overlap: sorted by left side, each edge is
+    compared with those not yet ended to its left. Edges that meet share a
+    point, so their boxes overlap. O(m log m) plus the comparisons, at most
+    one per pair: near-linear for long thin edges side by side (a fine
+    zigzag), quadratic only where the boxes themselves pile up.
+    """
+    boxes = {k: _box(edges[k][2:]) for k in members}
+    if budget is not None:
+        budget.spend(len(members))
+    active: list[int] = []
+    for k in sorted(members, key=lambda k: boxes[k][0]):
+        x0, y0, _x1, y1 = boxes[k]
+        active = [g for g in active if boxes[g][2] >= x0]
+        if budget is not None:
+            budget.spend(len(active))
+        for g in active:
+            if boxes[g][1] <= y1 and y0 <= boxes[g][3]:
+                yield (g, k) if g < k else (k, g)
+        active.append(k)
+
+
+def _unseen(
+    pairs: Iterable[tuple[int, int]], seen: set[tuple[int, int]]
+) -> Iterator[tuple[int, int]]:
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            yield pair
+
+
+def _split_pairs(
+    edges: list[_Edge],
+    members: list[int],
+    corner: _IntPoint,
+    size: int,
+    *,
+    depth: int,
+    budget: _Budget,
+    seen: set[tuple[int, int]],
+) -> Iterator[tuple[int, int]]:
+    """Yield the pairs of a crowded cell's ``members`` sharing a sub-cell.
+
+    The cell (``size`` wide at ``corner``) is re-bucketed on a finer grid
+    clipped to it; two edges meeting in the cell meet in the sub-cell
+    holding that point. A crowded sub-cell is split again, unless it is a
+    unit cell, ``_MAX_DEPTH`` levels down, or one of several sub-cells
+    each holding over half of this cell's edges: long, nearly parallel
+    edges running together through them, which every finer grid would
+    split the same way again, multiplying the work at each level. Its
+    edges are box-swept instead. (One such sub-cell alone is split: edges
+    converging on a point, a sunburst, separate further in.) A pair is
+    yielded once however many sub-cells it shares: ``seen`` holds this
+    top-grid cell's pairs. Every step is charged to ``budget``.
+    """
+    sub = -(-size // _SUBDIVISION)
+    finer = _buckets(edges, members, corner, sub, -(-size // sub), budget=budget)
+    dominant = sum(1 for inside in finer.values() if 2 * len(inside) > len(members))
+    for (column, row), inside in finer.items():
+        if len(inside) <= _CROWDED:
+            budget.spend(_pair_count(len(inside)))
+            yield from _unseen(itertools.combinations(inside, 2), seen)
+        elif (
+            sub > 1
+            and depth < _MAX_DEPTH
+            and (dominant == 1 or 2 * len(inside) <= len(members))
+        ):
+            yield from _split_pairs(
                 edges,
                 inside,
-                (origin[0] + column * size, origin[1] + row * size),
+                (corner[0] + column * sub, corner[1] + row * sub),
                 sub,
-                -(-size // sub),
-                seen=set() if seen is None else seen,
+                depth=depth + 1,
+                budget=budget,
+                seen=seen,
             )
+        else:
+            yield from _unseen(_box_pairs(edges, inside, budget), seen)
+
+
+def _cell_pairs(
+    edges: list[_Edge],
+    buckets: dict[tuple[int, int], list[int]],
+    origin: _IntPoint,
+    size: int,
+) -> Iterator[tuple[int, int]]:
+    """Yield the pairs of edges sharing a cell of the top grid (or a sub-cell).
+
+    A crowded cell of m edges is split finer (_split_pairs) within a budget
+    of ``_BUDGET * m * (m - 1) / 2`` steps -- cell visits, pairs listed, box
+    comparisons -- and box-swept whole if splitting runs out (pairs already
+    yielded are not yielded again). Its work is so O(m^2) however its
+    edges lie and whatever the coordinates' magnitude or precision; without
+    a bound, edges a split leaves together are split again at every level,
+    and there are as many levels as the coordinates have bits.
+    """
+    for (column, row), inside in buckets.items():
+        if len(inside) <= _CROWDED:
+            yield from itertools.combinations(inside, 2)
             continue
-        for n, first in enumerate(inside):
-            for second in inside[n + 1 :]:
-                pair = (first, second) if first < second else (second, first)
-                if seen is not None:
-                    if pair in seen:
-                        continue
-                    seen.add(pair)
-                yield pair
+        seen: set[tuple[int, int]] = set()
+        if size > 1:
+            corner = (origin[0] + column * size, origin[1] + row * size)
+            budget = _Budget(_BUDGET * _pair_count(len(inside)))
+            try:
+                yield from _split_pairs(
+                    edges, inside, corner, size, depth=1, budget=budget, seen=seen
+                )
+            except _OverBudgetError:
+                pass
+            else:
+                continue
+        yield from (pair for pair in _box_pairs(edges, inside) if pair not in seen)
 
 
 def _candidate_pairs(edges: list[_Edge]) -> Iterator[tuple[int, int]]:
     """Yield index pairs ``(i, j)``, ``i < j``, of edges that may meet.
 
     Edges are bucketed on a grid, each in just the cells its line crosses,
-    crowded cells split finer, and only edges sharing a cell are paired;
-    edges that meet share the cell of their meeting point. A pair sharing
-    several cells is yielded once per cell (checking it twice is harmless;
-    remembering every pair would cost memory quadratic in the worst case).
+    crowded cells split finer or box-swept (_cell_pairs), and only edges
+    sharing a cell are paired; edges that meet share the cell of their
+    meeting point. A pair sharing several cells of the top grid is yielded
+    once per cell (checking it twice is harmless; remembering every pair
+    would cost memory quadratic in the worst case).
 
     Cells are the size of the median edge, coarsened so the edges cover
     about 8n cells in all and so no more than about 4n fit across the zone:
     memory stays linear in the edge count. Time is about the edge count for
     evenly spread vertices, with or without a few long edges or a cluster
     of fine detail; more where many edges converge on one point (a
-    sunburst of spikes), where no grid separates them.
+    sunburst of spikes), where no grid separates them. Never more than
+    O(n^2): a top cell of m edges costs O(m^2) (_cell_pairs), and with
+    O(n) cell memberships in all, the cells' m^2 sum to O(n^2).
     """
     xs = [x for _r, _i, a, b in edges for x in (a[0], b[0])]
     ys = [y for _r, _i, a, b in edges for y in (a[1], b[1])]
@@ -408,7 +535,9 @@ def _candidate_pairs(edges: list[_Edge]) -> Iterator[tuple[int, int]]:
         travel // (6 * len(edges)),
         1,
     )
-    return _bucket_pairs(edges, range(len(edges)), (min(xs), min(ys)), size, None)
+    origin = (min(xs), min(ys))
+    buckets = _buckets(edges, range(len(edges)), origin, size, None)
+    return _cell_pairs(edges, buckets, origin, size)
 
 
 def _position(p: _IntPoint, ring: Sequence[_IntPoint]) -> int:

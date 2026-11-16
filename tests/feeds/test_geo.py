@@ -1,5 +1,6 @@
 """Tests for circular-zone geometry."""
 
+import contextlib
 import decimal
 import itertools
 import math
@@ -607,6 +608,144 @@ def test_split_cells_never_lose_a_touching_pair(
         for j in range(i + 1, len(exact)):
             if _touch(*exact[i], *exact[j]):
                 assert (i, j) in candidates
+
+
+def _zigzag(edges: int, gap: float) -> list[tuple[float, float]]:
+    """Teeth of height 1, ``gap`` apart, closed by a square base below."""
+    points = [(k * gap, float(k % 2)) for k in range(edges - 2)]
+    return _ring(*points, ((edges - 3) * gap, -1.0), (0.0, -1.0))
+
+
+def _star(spikes: int, inner: float) -> list[tuple[float, float]]:
+    """Spikes reaching radius 1, their valleys at radius ``inner``."""
+    points: list[tuple[float, float]] = []
+    for k in range(spikes):
+        tip, valley = 2 * math.pi * k / spikes, 2 * math.pi * (k + 0.5) / spikes
+        points += [
+            (math.cos(tip), math.sin(tip)),
+            (inner * math.cos(valley), inner * math.sin(valley)),
+        ]
+    return _ring(*points)
+
+
+@pytest.mark.parametrize(
+    "ring",
+    [
+        pytest.param(_zigzag(66, 1e-8), id="66-edge zigzag, teeth 1e-8 apart"),
+        pytest.param(_zigzag(68, 1e-8), id="68-edge zigzag, teeth 1e-8 apart"),
+        pytest.param(_zigzag(10_000, 1e-8), id="10,000-edge zigzag"),
+        pytest.param(_star(400, 1e-3), id="400-spike star, valleys at 1e-3"),
+        pytest.param(_star(400, 1e-30), id="400-spike star, valleys at 1e-30"),
+        pytest.param(_star(400, 2.0**-1000), id="400-spike star, valleys at 2**-1000"),
+    ],
+)
+def test_near_degenerate_zones_validate_in_seconds(
+    ring: list[tuple[float, float]],
+) -> None:
+    """Long, nearly parallel edges, or edges converging on a point, are
+    not split ever finer at every level of the coordinates' precision
+    (minutes to hours before): a split that leaves them together is
+    box-swept, and every crowded cell's work is bounded."""
+    started = time.perf_counter()
+    assert polygon_is_valid([ring])
+    assert time.perf_counter() - started < 10
+
+
+_GRID_KNOBS = st.fixed_dictionaries(
+    {
+        "_CROWDED": st.sampled_from([2, 3, 64]),
+        "_SUBDIVISION": st.sampled_from([2, 3, 8]),
+        "_MAX_DEPTH": st.sampled_from([1, 2, 12]),
+        "_BUDGET": st.sampled_from([0, 1, 2]),
+    }
+)
+_TINY = st.integers(0, 1074).map(lambda k: 2.0**-k)
+_NEAR_DEGENERATE_RINGS = st.one_of(
+    st.builds(_zigzag, st.integers(5, 80), _TINY),
+    st.builds(_star, st.integers(3, 50), _TINY),
+    st.builds(_circle, st.integers(3, 120), _TINY),
+)
+
+
+def _grid(knobs: dict[str, int]) -> contextlib.ExitStack:
+    stack = contextlib.ExitStack()
+    for name, value in knobs.items():
+        stack.enter_context(patch.object(geo, name, value))
+    return stack
+
+
+def _touching_pairs_by_brute_force(
+    edges: list[tuple[Any, ...]],
+) -> set[tuple[int, int]]:
+    return {
+        (i, j)
+        for i, j in itertools.combinations(range(len(edges)), 2)
+        if _touch(*edges[i][2:], *edges[j][2:])
+    }
+
+
+@given(
+    ring=_NEAR_DEGENERATE_RINGS,
+    dent=st.none() | st.tuples(st.integers(0, 10**6), st.integers(0, 10**6)),
+    knobs=_GRID_KNOBS,
+)
+@settings(max_examples=300, deadline=None)
+def test_the_answer_equals_checking_every_pair(
+    ring: list[tuple[float, float]],
+    dent: tuple[int, int] | None,
+    knobs: dict[str, int],
+) -> None:
+    """On zigzags, stars and polygons scaled down to the last float bit,
+    one vertex optionally moved onto another (a touch), the check answers
+    exactly as checking every pair of edges does -- whether cells are
+    split, box-swept, cut off by depth or out of budget -- and every pair
+    of edges that meet is a candidate."""
+    if dent is not None:
+        body = ring[:-1]
+        body[dent[0] % len(body)] = body[dent[1] % len(body)]
+        ring = _ring(*body)
+    edges = _edges([ring])
+    with _grid(knobs):
+        candidates = set(_candidate_pairs(edges))
+        answer = polygon_is_valid([ring])
+    touching = _touching_pairs_by_brute_force(edges)
+    assert touching <= candidates
+    with patch.object(
+        geo,
+        "_candidate_pairs",
+        lambda edges: itertools.combinations(range(len(edges)), 2),
+    ):
+        assert answer is polygon_is_valid([ring])
+
+
+@given(
+    offsets=st.lists(
+        st.tuples(st.integers(-3, 3), st.integers(-3, 3)), min_size=2, max_size=40
+    ),
+    tiny=_TINY,
+    knobs=_GRID_KNOBS,
+)
+@settings(max_examples=300, deadline=None)
+def test_nearly_parallel_long_edges_never_lose_a_touching_pair(
+    offsets: list[tuple[int, int]], tiny: float, knobs: dict[str, int]
+) -> None:
+    """A bundle of long edges a few ``tiny`` apart at each end, crossing,
+    touching or overlapping where their offsets cross or tie: the
+    candidates hold exactly the meeting pairs a brute-force check finds."""
+    points = [
+        point
+        for left, right in offsets
+        for point in ((0.0, left * tiny), (1.0, 1.0 + right * tiny))
+    ]
+    [exact] = _exact_rings([points])
+    edges = [
+        (0, i, a, b)
+        for i, (a, b) in enumerate(zip(exact[::2], exact[1::2], strict=True))
+    ]
+    with _grid(knobs):
+        candidates = set(_candidate_pairs(edges))
+    touching = _touching_pairs_by_brute_force(edges)
+    assert touching <= candidates
 
 
 def _position_by_brute_force(p: tuple[int, int], ring: list[tuple[int, int]]) -> int:
