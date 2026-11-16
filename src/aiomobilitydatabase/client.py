@@ -137,10 +137,12 @@ def _encode_scalar(value: Any) -> str:
         return _encode_scalar(value.value)
     if isinstance(value, datetime):
         # RFC 3339 section 5.6 requires an offset; a naive time names no
-        # instant, and the API would have to guess the zone.
+        # instant, and the API would have to guess the zone. Sent in UTC: the
+        # same instant, and an offset RFC 3339 can write (hours and minutes;
+        # Python allows seconds, isoformat writes "+00:19:32").
         if value.utcoffset() is None:
             raise ValueError("a query datetime must be timezone-aware")
-        return value.isoformat()
+        return value.astimezone(UTC).isoformat()
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
@@ -297,9 +299,13 @@ class MobilityDatabaseClient:
         if (
             isinstance(request_timeout, bool)
             or not isinstance(request_timeout, int | float)
-            or not request_timeout > 0
+            or not 0 < request_timeout < math.inf
         ):
-            raise ValueError("request_timeout must be a positive number of seconds")
+            # Finite too: asyncio can't schedule an infinite deadline, so
+            # every request would fail (OverflowError) as the API's fault.
+            raise ValueError(
+                "request_timeout must be a finite positive number of seconds"
+            )
         if session is not None:
             _require_catalog_session(session)
         self._refresh_token = refresh_token
@@ -758,6 +764,10 @@ class MobilityDatabaseClient:
 
     async def get_matching_licenses(self, license_url: str) -> list[MatchingLicense]:
         """Match a license URL against the license database."""
+        if not isinstance(license_url, str):
+            raise TypeError(
+                f"license_url must be a str, not {type(license_url).__name__}"
+            )
         data = await self._request(
             "POST",
             "/v1/licenses:match",

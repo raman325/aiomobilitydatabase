@@ -94,7 +94,9 @@ def test_a_refresh_token_that_isnt_text_is_refused(token: Any) -> None:
         MobilityDatabaseClient(token)
 
 
-@pytest.mark.parametrize("timeout", [0, -1, math.nan, math.inf * 0, True, "5", None])
+@pytest.mark.parametrize(
+    "timeout", [0, -1, math.nan, math.inf, -math.inf, True, "5", None]
+)
 def test_a_request_timeout_that_isnt_a_positive_number_is_refused(
     timeout: Any,
 ) -> None:
@@ -102,6 +104,6 @@ def test_a_request_timeout_that_isnt_a_positive_number_is_refused(
         MobilityDatabaseClient("t", request_timeout=timeout)
 
 
-@pytest.mark.parametrize("timeout", [0.5, 5, math.inf])
+@pytest.mark.parametrize("timeout", [0.5, 5, 1e9])
 def test_a_positive_request_timeout_is_taken(timeout: float) -> None:
     MobilityDatabaseClient("t", request_timeout=timeout)

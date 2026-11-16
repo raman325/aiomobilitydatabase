@@ -224,8 +224,8 @@ def _expected_scalar(value: Any) -> str:
     if isinstance(value, StrEnum):
         return value.value
     if isinstance(value, datetime):
-        # ISO 8601, i.e. "T"-separated -- not str(datetime)'s space.
-        return value.isoformat()
+        # ISO 8601 ("T"-separated, not str(datetime)'s space), in UTC.
+        return value.astimezone(UTC).isoformat()
     if isinstance(value, int | float):
         # repr: the shortest text that reads back as the same double.
         return repr(value)
@@ -292,8 +292,16 @@ def test_a_naive_query_datetime_is_refused() -> None:
         encode_params({"downloaded_after": datetime(2024, 1, 1)})
     aware = datetime(2024, 1, 1, tzinfo=timezone(timedelta(hours=-5)))
     assert encode_params({"downloaded_after": aware}) == {
-        "downloaded_after": "2024-01-01T00:00:00-05:00"
+        "downloaded_after": "2024-01-01T05:00:00+00:00"
     }
+
+
+def test_a_query_offset_with_seconds_is_sent_as_the_same_instant_in_utc() -> None:
+    """Python allows an offset of seconds; RFC 3339 writes hours and minutes."""
+    odd = datetime(2024, 1, 1, tzinfo=timezone(timedelta(minutes=19, seconds=32)))
+    encoded = encode_params({"downloaded_after": odd})["downloaded_after"]
+    assert encoded == "2023-12-31T23:40:28+00:00"
+    assert datetime.fromisoformat(encoded) == odd
 
 
 # --- Task 15R-b item 2: path-interpolated ids must be quoted ---------------
@@ -429,3 +437,13 @@ async def test_an_id_holding_a_lone_surrogate_is_refused_in_the_librarys_words()
     finally:
         await client.close()
     assert not isinstance(caught.value, UnicodeError)
+
+
+@pytest.mark.parametrize("url", [None, b"https://x", 1])
+async def test_a_license_url_that_isnt_text_is_a_type_error(url: Any) -> None:
+    client = MobilityDatabaseClient("t", base_url="http://127.0.0.1:9")
+    try:
+        with pytest.raises(TypeError, match="license_url"):
+            await client.get_matching_licenses(url)
+    finally:
+        await client.close()
