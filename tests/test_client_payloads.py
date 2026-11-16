@@ -1405,11 +1405,17 @@ async def test_a_session_authorization_header_is_refused() -> None:
         "ftp://api.example.com",
         "https://",
         "not a url",
+        "https://user:PwSecret@[::1/",  # doesn't parse
+        "https://user:PwSecret@h\ud800st",
     ],
 )
 def test_an_unusable_base_url_is_refused(base_url: str) -> None:
-    with pytest.raises(ValueError, match="base_url"):
+    with pytest.raises(ValueError, match="base_url") as caught:
         MobilityDatabaseClient("t", base_url=base_url)
+    # The caller's own text, but a password: quoted nowhere, chained to nothing.
+    assert "PwSecret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 @pytest.mark.parametrize(

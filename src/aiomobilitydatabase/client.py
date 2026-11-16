@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import math
 import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -79,8 +80,10 @@ def _require_base_url(base_url: str) -> str:
     try:
         parsed = URL(base_url)
         host = parsed.host
-    except URL_ERRORS as err:
-        raise ValueError(f"base_url {base_url!r} is no URL") from err
+    except URL_ERRORS:
+        parsed = None
+    if parsed is None:  # outside the except, quoting nothing: it may hold a password
+        raise ValueError("base_url is no URL")
     if parsed.scheme not in ("http", "https") or not host:
         raise ValueError("base_url must be an http(s) URL with a host")
     if parsed.user is not None or parsed.raw_password is not None:
@@ -108,21 +111,34 @@ def _is_loopback(host: str) -> bool:
 
 
 def _encode_value(value: Any) -> str:
-    """Encode a single query parameter value as a string (UTF-8 text only)."""
-    return require_text(_encode_scalar(value), "a query parameter")
+    """Encode one query parameter value: a scalar, or a list or tuple of them."""
+    if isinstance(value, list | tuple):
+        return ",".join(_encode_scalar(item) for item in value)
+    return _encode_scalar(value)
 
 
 def _encode_scalar(value: Any) -> str:
-    """Encode a single query parameter value as a string."""
+    """Encode one scalar, from an allowlist of the types the methods take.
+
+    Anything else is the caller's TypeError (``str()`` of bytes or an object
+    filtered on its repr), and a float that's no number the API can read
+    (NaN, infinity) a ValueError -- raised before any request is made.
+    """
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, Enum):
-        return str(value.value)
+        return _encode_scalar(value.value)
     if isinstance(value, datetime):
         return value.isoformat()
-    if isinstance(value, list | tuple):
-        return ",".join(_encode_value(item) for item in value)
-    return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("a query parameter is no finite number")
+        return repr(value)
+    if isinstance(value, str):
+        return require_text(value, "a query parameter")
+    raise TypeError(f"a query parameter can't be a {type(value).__name__}")
 
 
 def _quote_segment(segment: str) -> str:
@@ -400,6 +416,8 @@ class MobilityDatabaseClient:
         401's connection already released: :func:`._transport.exchange`
         reads every answer whole).
         """
+        # Encoded first: a bad value is the caller's error, before any request.
+        encoded = encode_params(params) if params else None
         token = await self._async_ensure_token()
         answer = await exchange(
             self._get_session(),
@@ -407,7 +425,7 @@ class MobilityDatabaseClient:
             f"{self._base_url}{path}",
             what="API request",
             client_timeout=self._timeout,
-            params=encode_params(params) if params else None,
+            params=encoded,
             json=json_body,
             headers={"Authorization": f"Bearer {token}"},
         )
