@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import copy
 import math
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -197,12 +197,18 @@ _scalars = (
     | st.just("")
     | _COMMA_TEXT
     | st.sampled_from(_ENUM_VALUES)
-    | st.datetimes(min_value=datetime(2000, 1, 1), max_value=datetime(2035, 1, 1))
+    | st.datetimes(
+        min_value=datetime(2000, 1, 1),
+        max_value=datetime(2035, 1, 1),
+        timezones=st.sampled_from([UTC, timezone(timedelta(hours=-5, minutes=-30))]),
+    )
     | st.floats(allow_nan=False, allow_infinity=False)
 )
-_containers = st.lists(_scalars, max_size=4).flatmap(
-    lambda items: st.sampled_from([items, tuple(items)])
-)
+# A list item can't hold the comma the items are joined on (refused above).
+_containers = st.lists(
+    _scalars.filter(lambda item: not (isinstance(item, str) and "," in item)),
+    max_size=4,
+).flatmap(lambda items: st.sampled_from([items, tuple(items)]))
 _values = st.none() | _scalars | _containers
 _param_keys = st.text(
     alphabet=st.characters(whitelist_categories=("Ll", "Lu")), min_size=1, max_size=10
@@ -269,16 +275,25 @@ def test_encode_params_keeps_empty_string_but_drops_empty_container() -> None:
     assert encode_params({"provider": "", "features": []}) == {"provider": ""}
 
 
-def test_encode_params_comma_join_is_ambiguous_for_commas_in_values() -> None:
-    """KNOWN GAP, pinned rather than fixed: the API's multi-value convention
-    is a comma-joined string with no escape, so a single value containing a
-    comma is indistinguishable on the wire from two values. Reachable today
-    via the list[str] filters (license_tags, features, license_ids). Fixing
-    it needs an escaping convention the API does not document.
-    """
-    assert encode_params({"license_tags": ["a,b"]}) == encode_params(
-        {"license_tags": ["a", "b"]}
-    )
+@pytest.mark.parametrize("items", [["a,b"], ["a", ","], ("trailing,",)])
+def test_a_list_item_holding_a_comma_is_refused(items: Any) -> None:
+    """The API's multi-value convention is a comma-joined string with no
+    escape: ["a,b"] would have filtered on "a" and "b". A single string
+    value keeps its commas (it is no list)."""
+    with pytest.raises(ValueError, match="comma"):
+        encode_params({"license_tags": items})
+    assert encode_params({"search_query": "a,b"}) == {"search_query": "a,b"}
+
+
+def test_a_naive_query_datetime_is_refused() -> None:
+    """RFC 3339 section 5.6: a date-time carries an offset; a naive one
+    names no instant."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        encode_params({"downloaded_after": datetime(2024, 1, 1)})
+    aware = datetime(2024, 1, 1, tzinfo=timezone(timedelta(hours=-5)))
+    assert encode_params({"downloaded_after": aware}) == {
+        "downloaded_after": "2024-01-01T00:00:00-05:00"
+    }
 
 
 # --- Task 15R-b item 2: path-interpolated ids must be quoted ---------------
@@ -400,3 +415,17 @@ async def test_a_bad_query_value_fails_before_any_request() -> None:
             await client.get_feeds(provider=b"MTA")  # type: ignore[arg-type]
     finally:
         await client.close()
+
+
+async def test_an_id_holding_a_lone_surrogate_is_refused_in_the_librarys_words() -> (
+    None
+):
+    """No text a URL can carry; the codec's own error (which quotes the id)
+    isn't what the caller gets."""
+    client = MobilityDatabaseClient("t", base_url="http://127.0.0.1:9")
+    try:
+        with pytest.raises(ValueError, match="lone surrogate") as caught:
+            await client.get_feed("mdb-\ud800")
+    finally:
+        await client.close()
+    assert not isinstance(caught.value, UnicodeError)

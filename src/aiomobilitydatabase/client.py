@@ -111,10 +111,17 @@ def _is_loopback(host: str) -> bool:
 
 
 def _encode_value(value: Any) -> str:
-    """Encode one query parameter value: a scalar, or a list or tuple of them."""
-    if isinstance(value, list | tuple):
-        return ",".join(_encode_scalar(item) for item in value)
-    return _encode_scalar(value)
+    """Encode one query parameter value: a scalar, or a list or tuple of them.
+
+    A list is the API's comma-separated multi-value filter, so an item that
+    holds a comma itself would be read as two: the caller's ValueError.
+    """
+    if not isinstance(value, list | tuple):
+        return _encode_scalar(value)
+    items = [_encode_scalar(item) for item in value]
+    if any("," in item for item in items):
+        raise ValueError("a query list item holds a comma, which separates items")
+    return ",".join(items)
 
 
 def _encode_scalar(value: Any) -> str:
@@ -129,6 +136,10 @@ def _encode_scalar(value: Any) -> str:
     if isinstance(value, Enum):
         return _encode_scalar(value.value)
     if isinstance(value, datetime):
+        # RFC 3339 section 5.6 requires an offset; a naive time names no
+        # instant, and the API would have to guess the zone.
+        if value.utcoffset() is None:
+            raise ValueError("a query datetime must be timezone-aware")
         return value.isoformat()
     if isinstance(value, int):
         return str(value)
@@ -167,7 +178,7 @@ def _quote_segment(segment: str) -> str:
         raise TypeError(f"an id must be a str, not {type(segment).__name__}")
     if segment in ("", ".", ".."):
         raise ValueError(f"{segment!r} cannot be sent as an id: it is no path segment")
-    return quote(segment, safe="")
+    return quote(require_text(segment, "an id"), safe="")
 
 
 # What decoding a type-checked JSON value into a model can still raise:

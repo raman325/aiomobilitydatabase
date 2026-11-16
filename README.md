@@ -735,7 +735,10 @@ raises `ValueError` for a `feed_id` it will not accept (see above), and a
 catalog method raises `ValueError` for an id of `""`, `"."` or `".."`, which
 no URL can carry as one path segment (`TypeError` for an id that isn't a
 `str`), or for a query value or `license_url` holding a lone surrogate (no
-text a URL can carry), or a float filter that is NaN or infinite. A query
+text a URL can carry), a float filter that is NaN or infinite, a `datetime`
+filter without a timezone (RFC 3339 requires an offset; a naive time names
+no instant), or a list item holding the comma the API separates items with.
+A query
 value of another type than the method takes (`bytes`, say, which would have
 filtered on `"b'...'"`) is a `TypeError`. Both are raised before any request
 is made. A closed injected session is a `RuntimeError`.
