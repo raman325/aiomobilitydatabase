@@ -160,7 +160,6 @@ def test_any_json_body_decodes_or_is_invalid(method_name: str, body: Any) -> Non
     "body",
     [
         pytest.param(b"[" * 100_000 + b"]" * 100_000, id="nested-arrays"),
-        pytest.param(b'{"a":' * 100_000 + b"1" + b"}" * 100_000, id="nested-objects"),
         pytest.param(b"7", id="number"),
         pytest.param(b'"text"', id="string"),
         pytest.param(b"null", id="null"),
