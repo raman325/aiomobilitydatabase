@@ -19,6 +19,10 @@ _M_PER_DEG_LAT = _EARTH_RADIUS_M * math.pi / 180.0
 # only costs a few extra distance calls; a tight box wrongly rejects boundary
 # points (e.g. the cos(lat) linearization under-sizes the box at high latitude).
 _BBOX_SAFETY = 1.01
+# ... and by a metre more, for great_circle_m's own rounding: a zero radius
+# scaled by any factor is still zero, but the distance to a point a few ulps
+# from the centre can round to 0.0.
+_BBOX_PAD_M = 1.0
 _HALF_TURN_DEG = 180.0
 _FULL_TURN_DEG = 360.0
 
@@ -60,25 +64,46 @@ def great_circle_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 def in_circle(zone: Circle, latitude: float, longitude: float) -> bool:
     """Return True if the point lies within the zone.
 
-    A cheap bounding-box prefilter (four float comparisons) rejects most
-    points before the trigonometric haversine runs. The box is padded by
-    ``_BBOX_SAFETY`` so it strictly encloses the circle. The longitude
+    That is, within ``radius_m`` of its centre by :func:`great_circle_m`. A
+    cheap bounding-box prefilter rejects most points before the
+    trigonometry runs; the box is padded (``_BBOX_SAFETY``, ``_BBOX_PAD_M``)
+    so it strictly encloses the circle. Its latitude half-height is the radius along a
+    meridian. Its longitude half-width is the spherical cap's own,
+    ``asin(sin r / cos lat)`` for an angular radius ``r``: wider than the
+    radius over the centre's parallel (``r / cos lat``, which leaves out
+    the cap's poleward bulge) for a large or high-latitude circle, and
+    every longitude once the circle reaches a pole. The longitude
     comparison wraps around the antimeridian: a naive linear delta treats a
     zone near +180 and a point near -180 (or vice versa) as ~360 degrees
     apart, when the true angular separation may be a fraction of a degree.
     """
-    dlat_deg = zone.radius_m * _BBOX_SAFETY / _M_PER_DEG_LAT
+    padded_m = zone.radius_m * _BBOX_SAFETY + _BBOX_PAD_M
+    dlat_deg = padded_m / _M_PER_DEG_LAT
     if latitude < zone.latitude - dlat_deg or latitude > zone.latitude + dlat_deg:
         return False
-    cos_lat = math.cos(math.radians(zone.latitude))
-    dlon_deg = zone.radius_m * _BBOX_SAFETY / (_M_PER_DEG_LAT * max(cos_lat, 1e-6))
-    dlon = abs(longitude - zone.longitude)
-    if dlon > _HALF_TURN_DEG:
-        dlon = _FULL_TURN_DEG - dlon
-    if dlon > dlon_deg:
-        return False
+    dlon_deg = _longitude_half_width(zone.latitude, padded_m)
+    if dlon_deg is not None:
+        dlon = abs(longitude - zone.longitude)
+        if dlon > _HALF_TURN_DEG:
+            dlon = _FULL_TURN_DEG - dlon
+        if dlon > dlon_deg:
+            return False
     distance = great_circle_m(zone.latitude, zone.longitude, latitude, longitude)
     return distance <= zone.radius_m
+
+
+def _longitude_half_width(latitude_deg: float, radius_m: float) -> float | None:
+    """Return a circle's longitude half-width in degrees.
+
+    None when it holds a pole (and so every longitude): its angular radius
+    reaches past the centre's colatitude.
+    """
+    angular = radius_m / _EARTH_RADIUS_M
+    latitude = math.radians(latitude_deg)
+    if angular >= math.pi / 2 - abs(latitude):
+        return None
+    ratio = math.sin(angular) / math.cos(latitude)
+    return None if ratio >= 1 else math.degrees(math.asin(ratio))
 
 
 # -- Circle and polygon overlap ------------------------------------------------
@@ -141,8 +166,8 @@ def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
     a turn either way too.
 
     Meant for circles of up to a few hundred kilometres that do not reach a
-    pole, like :func:`in_circle`; beyond that the plane bends too far from
-    the sphere.
+    pole; beyond that the plane bends too far from the sphere. (Unlike
+    :func:`in_circle`, which measures on the sphere at any radius.)
     """
     radius = zone.radius_m
     dlat = radius * _BBOX_SAFETY / _M_PER_DEG_LAT

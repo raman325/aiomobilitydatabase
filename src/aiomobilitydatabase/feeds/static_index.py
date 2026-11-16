@@ -12,7 +12,9 @@ import csv
 import heapq
 import io
 import json
+import math
 import os
+import re
 import sqlite3
 import tempfile
 import zipfile
@@ -256,6 +258,33 @@ _WEEKDAY_COLUMNS = (
 )
 
 
+# A GTFS Float written in ASCII: a sign, digits with an optional fraction (or
+# a bare fraction), an optional exponent. float() also reads other scripts'
+# digits, PEP 515 grouping ("1_0"), "inf" and "nan".
+_ASCII_DECIMAL = re.compile(
+    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+)
+
+
+def _coordinate(value: str, field: str, limit: float) -> float | None:
+    """Parse a stop_lat/stop_lon cell: None when blank.
+
+    Anything else that is not a finite ASCII decimal within ``[-limit,
+    limit]`` (90 for a latitude, 180 for a longitude: WGS84 has no other)
+    raises ValueError, the build's FeedParseError, as an unreadable cell
+    always has: a spelling float() alone would accept is no more a
+    coordinate than ``abc``, nor is latitude 200 a place.
+    """
+    if not (text := value.strip()):
+        return None
+    parsed = float(text) if _ASCII_DECIMAL.fullmatch(text) else math.nan
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field} is not a finite decimal number: {value!r}")
+    if not -limit <= parsed <= limit:
+        raise ValueError(f"{field} is outside -{limit} to {limit}: {value!r}")
+    return parsed
+
+
 def _ascii_digits(value: str) -> bool:
     """Report whether a cell component is ASCII digits and nothing else.
 
@@ -471,8 +500,8 @@ def _defaulted_text(value: str | None, default: str) -> str:
 # unsupported compression method, a corrupt local header.
 _OPEN_ERRORS = (RuntimeError, NotImplementedError, zipfile.BadZipFile)
 # ... and while it is read and parsed: bad bytes (not UTF-8), a failed CRC
-# or truncated stream, a field past csv's size limit, a ragged or missing
-# column the loaders index.
+# or truncated stream, a field past csv's size limit, a row shorter than the
+# header (see _FullRowReader), a missing column the loaders index.
 _READ_ERRORS = (
     ValueError,
     KeyError,
@@ -483,6 +512,32 @@ _READ_ERRORS = (
     zlib.error,
     EOFError,
 )
+
+
+class _FullRowReader(csv.DictReader[str]):
+    """A DictReader that refuses a row whose cells don't fit the header.
+
+    RFC 4180 has each record carry the header's field count (maintainer's
+    choices, in every file):
+
+    - a short row is malformed, rather than read with its missing trailing
+      cells blank. DictReader fills them with ``restval`` (None), which a
+      field the row does carry never is;
+    - a long row is malformed when a cell past the header holds anything:
+      that cell has no column, and an unquoted comma inside a value is what
+      usually puts it there, moving every later cell one column right.
+      Extra cells that are all blank (``a,b,c,,``) are harmless and dropped.
+    """
+
+    def __next__(self) -> dict[str, str]:
+        row = super().__next__()
+        if None in row.values():
+            raise csv.Error(f"line {self.line_num} has fewer fields than the header")
+        # DictReader keeps a long row's extra cells as a list under restkey.
+        extras: list[str] = row.pop(self.restkey, [])  # type: ignore[assignment]
+        if any(cell.strip() for cell in extras):
+            raise csv.Error(f"line {self.line_num} has more fields than the header")
+        return row
 
 
 @contextmanager
@@ -496,7 +551,7 @@ def _open_csv(
         raise FeedParseError(f"Unreadable {filename}: {err}") from err
     with fp:
         try:
-            yield fp, csv.DictReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
+            yield fp, _FullRowReader(io.TextIOWrapper(fp, encoding="utf-8-sig"))
         except _READ_ERRORS as err:
             raise FeedParseError(f"Malformed {filename}: {err}") from err
 
@@ -1403,8 +1458,8 @@ class StaticIndex:
                 (
                     row["stop_id"],
                     row.get("stop_name") or None,
-                    float(lat) if (lat := row.get("stop_lat", "").strip()) else None,
-                    float(lon) if (lon := row.get("stop_lon", "").strip()) else None,
+                    _coordinate(row.get("stop_lat", ""), "stop_lat", _MAX_LATITUDE),
+                    _coordinate(row.get("stop_lon", ""), "stop_lon", _MAX_LONGITUDE),
                     row.get("parent_station") or None,
                     _defaulted_int(row.get("location_type"), 0),
                     row.get("stop_code") or None,
@@ -1852,10 +1907,12 @@ class StaticIndex:
 
         GTFS defines exactly one record; a producer shipping extras is an
         error the loader resolves by keeping row one and ignoring the rest
-        (documented on :class:`~.models.FeedInfo`). Date cells stay raw
-        text; the model boundary parses them leniently.
+        (documented on :class:`~.models.FeedInfo`) -- each still read, so a
+        malformed one fails the build as in every other file. Date cells
+        stay raw text; the model boundary parses them leniently.
         """
-        for row in reader:
+        rows = iter(reader)
+        for row in rows:
             conn.execute(
                 "INSERT INTO feed_info VALUES (?,?,?,?,?,?,?,?)",
                 (
@@ -1870,6 +1927,8 @@ class StaticIndex:
                 ),
             )
             break
+        for _ in rows:
+            pass  # read, not stored: see above
         if report is not None:
             report()
 
@@ -3828,31 +3887,34 @@ class StaticIndex:
         origin_stop_id: str,
         destination_stop_id: str,
         active: set[str],
-    ) -> tuple[tuple[str, int], tuple[str, int]]:
+    ) -> tuple[tuple[str, int, int], tuple[str, int, int]]:
         """Return one service day's first/last departure identities for the pair.
 
-        The identities are (trip_id, origin stop_sequence) pairs computed
-        over the WHOLE service day, not the query window.
+        The identities are (trip_id, origin stop_sequence, departure_secs)
+        computed over the WHOLE service day, not the query window: a journey
+        is one origin call, and a feed repeating an origin stop_sequence
+        with another time has two, so the sequence alone names neither.
 
-        Ordered by (departure_secs, trip_id, stop_sequence) — the same
-        total order the row sort uses — so exactly one candidate is the
-        first and exactly one is the last even when departures tie. Callers
+        Ordered by (departure_secs, trip_id, stop_sequence), a total order
+        over these identities -- each one group of the journeys query -- so
+        exactly one journey is the first and exactly one is the last even
+        when departures tie. Callers
         only invoke this for days that produced candidate rows, so both
         LIMIT-1 queries always find a row.
         """
         service_marks = ",".join("?" * len(active))
         candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
         params = [origin_stop_id, destination_stop_id, *sorted(active)]
-        extremes: list[tuple[str, int]] = []
+        extremes: list[tuple[str, int, int]] = []
         for direction in ("ASC", "DESC"):
             sql = (
-                "SELECT o.trip_id, o.stop_sequence "
+                "SELECT o.trip_id, o.stop_sequence, o.departure_secs "
                 f"{candidates} "
                 f"ORDER BY o.departure_secs {direction}, o.trip_id {direction}, "
                 f"o.stop_sequence {direction} LIMIT 1"
             )
             row = self._conn.execute(sql, params).fetchone()
-            extremes.append((row[0], row[1]))
+            extremes.append((row[0], row[1], row[2]))
         return extremes[0], extremes[1]
 
     def _trips_on(
@@ -3964,8 +4026,8 @@ class StaticIndex:
                     ),
                     destination_timepoint_exact=_timepoint_exact(d_timepoint),
                     destination_stop_headsign=d_stop_headsign,
-                    is_first=(trip_id, o_sequence) == first_key,
-                    is_last=(trip_id, o_sequence) == last_key,
+                    is_first=(trip_id, o_sequence, dep_secs) == first_key,
+                    is_last=(trip_id, o_sequence, dep_secs) == last_key,
                     trip_short_name=trip_short_name,
                     block_id=block_id,
                 )
