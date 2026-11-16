@@ -651,8 +651,9 @@ async def test_a_token_error_with_an_undecodable_body_is_still_an_auth_error(
         body="Erreur \xe9".encode("latin-1"),
         content_type="text/plain",
     )
-    with pytest.raises(MobilityDatabaseAuthenticationError, match="Erreur �"):
+    with pytest.raises(MobilityDatabaseAuthenticationError) as caught:
         await client.get_metadata()
+    assert (caught.value.status, caught.value.body) == (500, "Erreur �")
 
 
 # -- The token's own content ----------------------------------------------------
@@ -804,8 +805,9 @@ async def test_a_token_error_whose_charset_refuses_replace_is_an_auth_error(
         body=b"Internal error",
         headers={"Content-Type": f"text/plain; charset={charset}"},
     )
-    with pytest.raises(MobilityDatabaseAuthenticationError, match="Internal error"):
+    with pytest.raises(MobilityDatabaseAuthenticationError) as caught:
         await client.get_metadata()
+    assert caught.value.body == "Internal error"
 
 
 @pytest.mark.parametrize("token_type", ["mac", "DPoP", "basic", ""])
@@ -1117,8 +1119,8 @@ async def test_an_echoing_token_error_page_hides_the_refresh_token(
     async with MobilityDatabaseClient("SECRET-RT", base_url=mock_api.url()) as client:
         with pytest.raises(MobilityDatabaseAuthenticationError) as caught:
             await client.get_metadata()
-    assert "SECRET-RT" not in str(caught.value)
-    assert "[token]" in str(caught.value)
+    assert "SECRET-RT" not in str(caught.value)  # the message is the library's
+    assert "SECRET-RT" in caught.value.body  # the page itself: the caller's to log
 
 
 # -- Query values, tokens in error pages, injected sessions ---------------------------
@@ -1250,8 +1252,11 @@ def test_an_empty_refresh_token_is_refused() -> None:
 # -- Raw responses aiohttp-based mocks can't send ------------------------------------
 
 
-async def _raw_server(data_response: bytes) -> tuple[asyncio.Server, str]:
-    """Serve a real token, then ``data_response`` verbatim to anything else."""
+async def _raw_server(
+    data_response: bytes, token_response: bytes | None = None
+) -> tuple[asyncio.Server, str]:
+    """Serve ``token_response`` (default: a real token) to the token request,
+    then ``data_response`` verbatim to anything else."""
     token = json.dumps({**TOKEN_RESPONSE, "access_token": "AccessTok123"}).encode()
 
     async def handle(
@@ -1261,6 +1266,11 @@ async def _raw_server(data_response: bytes) -> tuple[asyncio.Server, str]:
         if request.startswith(b"POST /v1/tokens"):
             length = int(request.split(b"Content-Length: ")[1].split(b"\r\n")[0])
             await reader.readexactly(length)
+            if token_response is not None:
+                writer.write(token_response)
+                await writer.drain()
+                writer.close()
+                return
             writer.write(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                 b"Content-Length: " + str(len(token)).encode() + b"\r\n\r\n" + token
@@ -1407,3 +1417,94 @@ async def test_an_undecodable_charset_on_json_has_no_effect() -> None:
             assert (await client.get_metadata()).version == "1"
     finally:
         server.close()
+
+
+# -- The boundary, as a property: any answer, only library errors, no secrets ----------
+
+_SECRETS = ("RefreshTokSecret987", "AccessTok123")
+_STATUS_LINES = st.sampled_from(
+    [
+        b"HTTP/1.1 200 OK",
+        b"HTTP/1.1 203 X",
+        b"HTTP/1.1 302 Found",
+        b"HTTP/1.1 400 X",
+        b"HTTP/1.1 401 X",
+        b"HTTP/1.1 404 X",
+        b"HTTP/1.1 500 X",
+        b"HTTP/1.1 999 X",
+        b"HTTP/1.0 200 OK",
+        b"HTTP/2 200",
+        b"garbage",
+        b"",
+    ]
+)
+_HEADER_LINES = st.sampled_from(
+    [
+        b"Content-Type: application/json",
+        b"Content-Type: text/plain; charset=utf-16",
+        b"Content-Type: application/json; charset*=utf-8''utf%00",
+        b"Content-Type: \x80\xc3\xa9",
+        b"X-Echo: Bearer AccessTok123\x00",
+        b"Echo Bearer AccessTok123",
+        b"X-Echo: RefreshTokSecret987\rx",
+        b"Location: http://u:p@127.0.0.1:9/x",
+        b"Location: \xff",
+        b"Content-Encoding: gzip",
+        b"Content-Length: 99999",
+        b"Transfer-Encoding: chunked",
+        b"Set-Cookie: a=\x00",
+    ]
+)
+_BODIES = st.sampled_from(
+    [
+        b"",
+        b"{}",
+        b'{"version": "1"}',
+        b"Bearer AccessTok123 RefreshTokSecret987",
+        "RefreshTokSecret987".encode("utf-16"),
+        b"\xed\xa0\x80",
+        b"[" * 5000,
+    ]
+)
+_RAW_RESPONSES = st.builds(
+    lambda status, headers, body: (
+        status + b"\r\n" + b"".join(h + b"\r\n" for h in headers) + b"\r\n" + body
+    ),
+    _STATUS_LINES,
+    st.lists(_HEADER_LINES, max_size=4),
+    _BODIES,
+)
+
+
+@given(response=_RAW_RESPONSES, on_token=st.booleans())
+@settings(max_examples=300, deadline=None)
+def test_any_answer_gives_a_library_result_and_no_secret_in_any_message(
+    response: bytes, on_token: bool
+) -> None:
+    """The transport boundary as a property: whatever bytes the server sends
+    on the token or the data request -- malformed, echoing the tokens, under
+    any charset -- the call returns a model or raises a MobilityDatabaseError,
+    and no exception message (nor any chained one) holds a token."""
+
+    async def scenario() -> BaseException | None:
+        if on_token:
+            server, url = await _raw_server(b"", token_response=response)
+        else:
+            server, url = await _raw_server(response)
+        try:
+            async with MobilityDatabaseClient(
+                "RefreshTokSecret987", base_url=url
+            ) as client:
+                try:
+                    await asyncio.wait_for(client.get_metadata(), 10)
+                except MobilityDatabaseError as err:
+                    return err
+            return None
+        finally:
+            server.close()
+
+    err = asyncio.run(scenario())
+    while err is not None:
+        for secret in _SECRETS:
+            assert secret not in str(err), (type(err).__name__, str(err))
+        err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)

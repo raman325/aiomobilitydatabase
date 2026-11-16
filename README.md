@@ -739,8 +739,13 @@ text a URL can carry). `MobilityDatabaseClient(...)` raises `ValueError` for an
 empty refresh token; a `base_url` that isn't https (plain http only on
 loopback: bearer tokens travel over TLS, RFC 6750) or holds credentials, a
 query or a fragment; or an injected session with an `auth`, an
-`Authorization` header, a `base_url` or a default header HTTP can't carry. Error pages that echo the request never show
-your tokens.
+`Authorization` header, a `base_url` or a default header HTTP can't carry.
+
+Exception messages are written by the library alone: never a response body,
+a URL's credentials or query, or another library's error text (any of which
+can echo a token). A response's status and body are attributes
+(`MobilityDatabaseApiError.status`/`.body`, and on
+`MobilityDatabaseAuthenticationError` when the API answered) -- yours to log.
 
 Note the two independent auth flows: a `MobilityDatabaseAuthenticationError`
 means your **catalog refresh token** is invalid; a `SourceAuthenticationError`

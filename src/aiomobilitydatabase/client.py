@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import json
 import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -17,7 +16,9 @@ import aiohttp
 from mashumaro import DataClassDictMixin
 from yarl import URL
 
+from ._json import loads as json_loads
 from ._payload import mismatch
+from ._transport import Answer, exchange
 from .const import (
     DEFAULT_TIMEOUT_SECONDS,
     PROD_BASE_URL,
@@ -28,7 +29,6 @@ from .exceptions import (
     MobilityDatabaseApiError,
     MobilityDatabaseAuthenticationError,
     MobilityDatabaseConnectionError,
-    MobilityDatabaseError,
     MobilityDatabaseNotFoundError,
     MobilityDatabaseRateLimitError,
 )
@@ -68,10 +68,11 @@ def _require_text(text: str, what: str) -> str:
     return text
 
 
-# RFC 9110 section 5.1 field names; section 5.5 bars control characters but
-# HTAB from values (aiohttp refuses the same ones, mid-request).
+# Header names are RFC 9110 tokens; default header values the client sends
+# are visible ASCII, space and tab -- an allowlist, not a copy of the rules
+# aiohttp applies mid-request.
 _FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-_FIELD_VALUE_FORBIDDEN = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+_FIELD_VALUE = re.compile(r"[\t\x20-\x7e]*")
 
 
 def _require_catalog_session(session: aiohttp.ClientSession) -> None:
@@ -86,35 +87,8 @@ def _require_catalog_session(session: aiohttp.ClientSession) -> None:
     if getattr(session, "_base_url", None) is not None:
         raise ValueError("the session has a base_url; pass base_url= instead")
     for name, value in session.headers.items():
-        if not _FIELD_NAME.fullmatch(name) or _FIELD_VALUE_FORBIDDEN.search(value):
+        if not _FIELD_NAME.fullmatch(name) or not _FIELD_VALUE.fullmatch(value):
             raise ValueError(f"the session's header {name!r} can't be sent")
-        _require_text(value, f"the session's header {name!r}")
-
-
-def _redact(text: str, *secrets: str | None) -> str:
-    """Hide each secret in an error page's text, JSON-escaped form included.
-
-    Pages that echo a request (debug pages, WAFs, gateways) would otherwise
-    put a token into the exception's text, and so into logs.
-    """
-    for secret in secrets:
-        if secret:
-            for form in {secret, secret.replace("/", "\\/")}:
-                text = text.replace(form, "[token]")
-    return text
-
-
-def _describe(err: BaseException) -> str:
-    """Name a request error without its text, which may echo a token.
-
-    A response error's message can quote a malformed header the server
-    echoed from the request; a connection failure's names only the host.
-    """
-    if isinstance(err, aiohttp.ClientConnectorError):
-        return str(err)
-    if isinstance(err, aiohttp.ClientResponseError):
-        return f"{type(err).__name__} ({err.status})"
-    return type(err).__name__
 
 
 def _require_base_url(base_url: str) -> str:
@@ -212,88 +186,29 @@ _DECODE_ERRORS = (LookupError, ValueError)
 _B64TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 
 
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """Build a JSON object, refusing a name that appears twice."""
-    obj = dict(pairs)
-    if len(obj) != len(pairs):
-        raise ValueError("a JSON object repeats a name")
-    return obj
+def _decode(answer: Answer) -> Any:
+    """Return an answer's JSON, or raise MobilityDatabaseConnectionError.
 
-
-def _reject_constant(name: str) -> None:
-    """Refuse ``NaN``/``Infinity``: Python's json accepts them, JSON does not."""
-    raise ValueError(f"{name} is not valid JSON")
-
-
-async def _json_body(resp: aiohttp.ClientResponse) -> Any:
-    """Return a response's JSON, or raise MobilityDatabaseConnectionError.
-
-    The content type must be ``application/json`` itself: aiohttp's own check
-    also takes ``application/problem+json`` and the like, which aren't the
-    documented answer. The body is parsed from its bytes, never by the
-    response's ``charset``: RFC 8259 section 8.1 has JSON exchanged between
-    systems be UTF-8, and its section 11 gives a charset parameter no effect
-    on a compliant recipient -- read by it, a UTF-8 "Montr\u00e9al" sent as
-    ``charset=iso-8859-1`` would be mojibake. Decoded as strict UTF-8 (a BOM
-    ignored, as RFC 8259 allows): ``json.loads`` on the bytes would also
-    take UTF-16/32 and let encoded surrogates through. A name repeated in an
-    object (RFC 8259 section 4: unpredictable) and ``NaN``/``Infinity``
-    (no JSON) are refused. Any of these is ValueError; nesting deeper than
-    the interpreter's stack, RecursionError.
+    The media type must be ``application/json`` itself (``problem+json`` and
+    the like aren't the documented answer), and the body JSON text by
+    :func:`._json.loads`: strict UTF-8, unique names, no ``NaN``.
     """
-    try:
-        content_type = resp.content_type
-    except ValueError:
-        # aiohttp before 3.14 parses the header with email's parser, which
-        # raises (UnicodeEncodeError) for an undecodable byte beside text --
-        # in a charset, say, which has no effect anyway. Read the media type
-        # itself, as later versions do.
-        header = resp.headers.get("Content-Type", "")
-        content_type = header.split(";", 1)[0].strip(" \t").lower()
-    if content_type != "application/json":
+    if answer.media_type != "application/json":
         raise MobilityDatabaseConnectionError(
-            f"API returned {content_type!r}, not application/json"
+            f"API answered {answer.media_type or 'no content type'!r}, "
+            "not application/json"
         )
-    raw = await resp.read()
+    if answer.body is None:
+        raise MobilityDatabaseConnectionError("API answer's body couldn't be read")
     try:
-        return json.loads(
-            raw.decode("utf-8-sig"),
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_constant,
-        )
-    except (ValueError, RecursionError) as err:
+        return json_loads(answer.body)
+    except ValueError as err:
         raise MobilityDatabaseConnectionError("API returned invalid JSON") from err
 
 
-async def _body_text(resp: aiohttp.ClientResponse, secrets: tuple[str, ...]) -> str:
-    """Return an error response's body as text, whatever bytes it holds.
-
-    ``resp.text()`` raises for bytes its charset (UTF-8 when none is given)
-    can't decode -- a Latin-1 gateway page -- or for a charset that isn't a
-    text encoding (LookupError: ``rot13``) or won't take the "replace"
-    handler (UnicodeError: ``idna``, ``undefined``). The body only explains
-    an error, so undecodable bytes are replaced, as UTF-8 when the charset
-    can't be used.
-
-    Each secret is hidden in the bytes before decoding, then in the text: a
-    page echoing the request under another charset (``utf-16`` over ASCII)
-    would otherwise decode into text the token is recoverable from.
-    """
-    try:
-        raw = await resp.read()
-    except aiohttp.ClientPayloadError:
-        return ""  # unreadable (a Content-Encoding its bytes don't follow)
-    for secret in secrets:
-        if secret:
-            raw = raw.replace(secret.encode("utf-8"), b"[token]")
-    try:
-        text = raw.decode(resp.charset or "utf-8", "replace")
-    except (LookupError, ValueError, TypeError):
-        # The charset is the server's, after RFC 2231 decoding: it can hold a
-        # NUL (ValueError), and aiohttp 3.9 gives a tuple for charset*=
-        # (TypeError). UnicodeError is a ValueError.
-        text = raw.decode("utf-8", "replace")
-    return _redact(text, *secrets)
+def _text(answer: Answer) -> str:
+    """Return an error answer's body as text, for the exception's ``body``."""
+    return (answer.body or b"").decode("utf-8", "replace")
 
 
 def _one[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> ModelT:
@@ -442,34 +357,21 @@ class MobilityDatabaseClient:
                 and self._access_token != stale_token
             ):
                 return self._access_token
-            session = self._get_session()
-            try:
-                async with session.post(
-                    f"{self._base_url}{TOKEN_PATH}",
-                    json={"refresh_token": self._refresh_token},
-                    timeout=self._timeout,
-                    # RFC 6749 section 10.4: the refresh token goes to the
-                    # authorization server only; a redirect would carry it
-                    # elsewhere. Section 5.1 has the endpoint answer 200, so a
-                    # 3xx is a non-200 like any other: an auth failure.
-                    allow_redirects=False,
-                    raise_for_status=False,  # whatever the session's default
-                ) as resp:
-                    if resp.status != HTTPStatus.OK:
-                        # A page echoing the request must not put the refresh
-                        # token into the exception's text (and so logs).
-                        body = await _body_text(resp, (self._refresh_token,))
-                        raise MobilityDatabaseAuthenticationError(
-                            f"Unable to obtain access token ({resp.status}): {body}"
-                        )
-                    data = await _json_body(resp)
-            except (TimeoutError, aiohttp.ClientError) as err:
-                # Not from err: aiohttp's text can echo a malformed response
-                # header -- the request's token with it -- and a traceback
-                # prints the cause.
-                raise MobilityDatabaseConnectionError(
-                    f"Error requesting access token: {_describe(err)}"
-                ) from None
+            answer = await exchange(
+                self._get_session(),
+                "POST",
+                f"{self._base_url}{TOKEN_PATH}",
+                what="Token request",
+                client_timeout=self._timeout,
+                json={"refresh_token": self._refresh_token},
+            )
+            if answer.status != HTTPStatus.OK:
+                raise MobilityDatabaseAuthenticationError(
+                    f"Unable to obtain access token ({answer.status})",
+                    status=answer.status,
+                    body=_text(answer),
+                )
+            data = _decode(answer)
             token = _one(AccessToken, data)
             if token.token_type is not None and token.token_type.lower() != "bearer":
                 # RFC 6749 section 7.1: a client MUST NOT use an access token
@@ -501,62 +403,49 @@ class MobilityDatabaseClient:
     ) -> Any:
         """Perform an authenticated request and return the decoded JSON body.
 
-        On a 401 the token is refreshed and the request retried once -- after
-        this response is released, so a pool of one connection doesn't wait
-        on the connection the refresh needs.
+        On a 401 the token is refreshed and the request retried once (the
+        401's connection already released: :func:`._transport.exchange`
+        reads every answer whole).
         """
         token = await self._async_ensure_token()
-        session = self._get_session()
-        try:
-            async with session.request(
-                method,
-                f"{self._base_url}{path}",
-                params=encode_params(params) if params else None,
-                json=json_body,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=self._timeout,
-                # A redirect is answered as the 3xx it is (not the resource
-                # asked for: an API error), never followed: another origin's
-                # body is no catalog data, and a same-origin Location with
-                # credentials makes aiohttp raise a bare ValueError beside
-                # the Bearer header (maintainer's choice).
-                allow_redirects=False,
-                raise_for_status=False,  # the status mapping below is ours
-            ) as resp:
-                if resp.status != HTTPStatus.UNAUTHORIZED:
-                    return await self._answer(resp, path, (token, self._refresh_token))
-                if not retry_on_auth_fail:
-                    raise MobilityDatabaseAuthenticationError(
-                        "Request unauthorized after token refresh"
-                    )
-        except MobilityDatabaseError:
-            raise
-        except (TimeoutError, aiohttp.ClientError) as err:
-            # Not from err: see _async_ensure_token.
-            raise MobilityDatabaseConnectionError(
-                f"Error communicating with API: {_describe(err)}"
-            ) from None
-        await self._async_ensure_token(force=True, stale_token=token)
-        return await self._request(
-            method, path, params=params, json_body=json_body, retry_on_auth_fail=False
+        answer = await exchange(
+            self._get_session(),
+            method,
+            f"{self._base_url}{path}",
+            what="API request",
+            client_timeout=self._timeout,
+            params=encode_params(params) if params else None,
+            json=json_body,
+            headers={"Authorization": f"Bearer {token}"},
         )
-
-    @staticmethod
-    async def _answer(
-        resp: aiohttp.ClientResponse, path: str, secrets: tuple[str, ...]
-    ) -> Any:
-        """Map a non-401 response to its JSON body or the matching error."""
-        if resp.status == HTTPStatus.NOT_FOUND:
+        if answer.status == HTTPStatus.UNAUTHORIZED:
+            if not retry_on_auth_fail:
+                raise MobilityDatabaseAuthenticationError(
+                    "Request unauthorized after token refresh",
+                    status=answer.status,
+                    body=_text(answer),
+                )
+            await self._async_ensure_token(force=True, stale_token=token)
+            return await self._request(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                retry_on_auth_fail=False,
+            )
+        if answer.status == HTTPStatus.NOT_FOUND:
             raise MobilityDatabaseNotFoundError(f"Not found: {path}")
-        if resp.status == HTTPStatus.TOO_MANY_REQUESTS:
+        if answer.status == HTTPStatus.TOO_MANY_REQUESTS:
             raise MobilityDatabaseRateLimitError("API rate limit exceeded")
         # Only a 200 or 203 carries the answer (RFC 9110 section 15.3): a 204
-        # has none, and a 300 or a 3xx left unfollowed is not the resource
-        # asked for.
-        if resp.status not in (HTTPStatus.OK, HTTPStatus.NON_AUTHORITATIVE_INFORMATION):
-            body = await _body_text(resp, secrets)
-            raise MobilityDatabaseApiError(resp.status, body)
-        return await _json_body(resp)
+        # has none, and a 3xx -- never followed -- is not the resource asked
+        # for.
+        if answer.status not in (
+            HTTPStatus.OK,
+            HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
+        ):
+            raise MobilityDatabaseApiError(answer.status, _text(answer))
+        return _decode(answer)
 
     async def get_metadata(self) -> Metadata:
         """Get metadata about the API."""
