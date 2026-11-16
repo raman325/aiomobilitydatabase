@@ -1463,3 +1463,131 @@ def test_a_damaged_archive_builds_or_fails_as_feed_parse_error(
         refused = False
     if refused:  # checked again outside the except: it would chain to this one
         _assert_refused(tmp_path, data)
+
+
+# -- stop_sequence MUST increase along a trip: a repeat fails the build -----------
+
+
+_CALLS_HEADER = (
+    "trip_id,arrival_time,departure_time,stop_id,location_id,"
+    "start_pickup_drop_off_window,end_pickup_drop_off_window,stop_sequence\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("rows", "trip", "sequence"),
+    [
+        pytest.param(
+            "T1,08:00:00,08:00:00,S1,,,,1\nT1,08:10:00,08:10:00,S2,,,,1\n",
+            "'T1'",
+            1,
+            id="two fixed calls",
+        ),
+        pytest.param(
+            "T1,08:00:00,08:00:00,S1,,,,1\nT1,08:10:00,08:10:00,S2,,,,01\n",
+            "'T1'",
+            1,
+            id="one value, spelled two ways",
+        ),
+        pytest.param(
+            "T1,08:00:00,08:00:00,S1,,,,1\nT1,,,,Z,08:05:00,08:25:00,1\n",
+            "'T1'",
+            1,
+            id="a zone call and a fixed call",
+        ),
+        pytest.param(
+            "T1,,,,Z,08:05:00,08:25:00,4\nT1,,,S1,,09:00:00,09:30:00,4\n",
+            "'T1'",
+            4,
+            id="two on-demand calls",
+        ),
+        pytest.param(
+            'T1,08:00:00,08:00:00,S1,,,,1\n"T\'1",,,S1,,,,2\n"T\'1",,,S2,,,,2\n',
+            '"T\'1"',
+            2,
+            id="the trip id quoted as written",
+        ),
+    ],
+)
+def test_a_repeated_stop_sequence_fails_the_build(
+    tmp_path: Path, rows: str, trip: str, sequence: int
+) -> None:
+    """GTFS: stop_sequence "values must increase along the trip" -- a repeat
+    leaves the trip's call order unstated, whatever kind of call each is."""
+    files = {**_FILES, "stop_times.txt": _CALLS_HEADER + rows}
+    zip_path = _zip_from_files(tmp_path, files, "repeat.zip")
+    _assert_refused(
+        tmp_path,
+        zip_path.read_bytes(),
+        f"Malformed stop_times.txt: trip {trip} repeats stop_sequence {sequence}: "
+        "it must increase along the trip",
+    )
+
+
+def test_a_trip_named_like_a_repetition_fails_the_build(tmp_path: Path) -> None:
+    """A real trip whose id is a frequency repetition's (``F#21600``) would
+    share that id's calls with the repetition: refused, not merged."""
+    files = {
+        **_FILES,
+        "trips.txt": _FILES["trips.txt"] + "R1,WKDY,F,A\nR1,WKDY,F#21600,B\n",
+        "stop_times.txt": _FILES["stop_times.txt"]
+        + "F,06:00:00,06:00:00,S1,1\nF,06:10:00,06:10:00,S2,2\n"
+        + "F#21600,09:00:00,09:00:00,S1,1\nF#21600,09:10:00,09:10:00,S2,2\n",
+        "frequencies.txt": "trip_id,start_time,end_time,headway_secs\n"
+        "F,06:00:00,07:00:00,1800\n",
+    }
+    zip_path = _zip_from_files(tmp_path, files, "collide.zip")
+    _assert_refused(
+        tmp_path,
+        zip_path.read_bytes(),
+        "Malformed frequencies.txt: trip 'F#21600' has the id of a repetition "
+        "of frequency trip 'F' (starting at 21600s)",
+    )
+
+
+@given(
+    calls=st.lists(
+        st.tuples(
+            st.sampled_from(["T1", "T2", "T9"]),
+            st.integers(0, 6),
+            st.sampled_from(["fixed", "zone", "window"]),
+        ),
+        min_size=1,
+        max_size=10,
+    )
+)
+@settings(max_examples=150, deadline=None)
+def test_a_build_fails_exactly_when_a_trip_repeats_a_stop_sequence(
+    tmp_path_factory: pytest.TempPathFactory,
+    calls: list[tuple[str, int, str]],
+) -> None:
+    """For any calls of any kinds: the build succeeds iff no trip names one
+    stop_sequence twice, and a failure names a repeated pair."""
+    cells = {
+        "fixed": "08:00:00,08:00:00,S1,,,",
+        "zone": ",,,Z,08:00:00,09:00:00",
+        "window": ",,S1,,08:00:00,09:00:00",
+    }
+    rows = "".join(
+        f"{trip},{cells[kind]},{sequence}\n" for trip, sequence, kind in calls
+    )
+    files = {**_FILES, "stop_times.txt": _CALLS_HEADER + rows}
+    tmp_path = tmp_path_factory.mktemp("sequences")
+    zip_path = _zip_from_files(tmp_path, files, "calls.zip")
+    keys = [(trip, sequence) for trip, sequence, _kind in calls]
+    repeated = {key for key in keys if keys.count(key) > 1}
+    try:
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ).close()
+    except FeedParseError as err:
+        message = str(err)
+    else:
+        message = None
+    if not repeated:
+        assert message is None
+    else:
+        assert message is not None
+        assert any(
+            message == f"Malformed stop_times.txt: trip {trip!r} repeats stop_sequence "
+            f"{sequence}: it must increase along the trip"
+            for trip, sequence in repeated
+        )

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 from google.transit import gtfs_realtime_pb2
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
@@ -316,11 +316,6 @@ def test_the_kept_trip_never_shows_its_untimed_stop(tmp_path: Path) -> None:
             "T,,,,Z,,07:00:00,07:50:00,1,2,1\nT,,,S0,,,,,2,,\n",
             id="untimed last stop",
         ),
-        pytest.param(
-            "T,,,,Z,,07:00:00,07:50:00,1,2,1\nT,,,S0,,,,,1,,\n"
-            "T,,,,Z,,08:10:00,09:00:00,3,1,2\n",
-            id="untimed stop winning its window's sequence",
-        ),
     ],
 )
 def test_an_untimed_first_or_last_stop_still_fails_a_frequency_trip(
@@ -328,8 +323,7 @@ def test_an_untimed_first_or_last_stop_still_fails_a_frequency_trip(
 ) -> None:
     """An untimed fixed call with no window before it is the trip's first
     stop, and with none after it the last: the spec requires both times,
-    so the template is still malformed. A fixed call wins a stop_sequence
-    a window repeats, so that window is not before it."""
+    so the template is still malformed."""
     feed = _feed(
         stop_times=_FLEX_HEADER + stop_times,
         frequencies="trip_id,start_time,end_time,headway_secs\nT,06:00:00,07:00:00,600\n",
@@ -481,28 +475,6 @@ def test_a_detour_may_start_at_a_flex_call() -> None:
         ("S0", _EIGHT),
         ("S1", _EIGHT + timedelta(minutes=35)),
     ]
-
-
-def test_a_fixed_call_wins_a_stop_sequence_a_flex_call_repeats() -> None:
-    """A zone row repeating S1's stop_sequence (Forbidden: the pair is the
-    primary key) does not take S1's update: S1 shows its ten minutes."""
-    feed = _deviation()
-    feed["stop_times.txt"] += "T,,,,Z,,08:05:00,08:25:00,3,2,2\n"
-    message = _deviation_update((3, 600, _STU.SCHEDULED))
-
-    async def body(handle: TransitFeedHandle) -> dict[str, object]:
-        [board] = await handle.get_arrivals(
-            [ArrivalsQuery(["S1"], limit=None)],
-            start=_EIGHT - timedelta(minutes=30),
-            end=_EIGHT + timedelta(hours=2),
-        )
-        return {
-            row.stop_id: (row.predicted_arrival, row.delay_seconds) for row in board
-        }
-
-    assert _run_feeds(feed, body, [message]) == {
-        "S1": (_EIGHT + timedelta(minutes=40), 600)
-    }
 
 
 def test_a_replacement_is_not_timed_from_a_flex_call() -> None:
@@ -713,6 +685,9 @@ def _without_flex(
     return rest, rest.pop("flex_stop_times")
 
 
+_REPEAT = "repeats stop_sequence"
+
+
 @given(base=_random_gtfs_zip(), data=st.data())
 @settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_flex_rows_change_no_fixed_route_answer(
@@ -745,6 +720,16 @@ def test_flex_rows_change_no_fixed_route_answer(
             },
         )
     flex = data.draw(st.lists(_flex_row(trip_ids, stop_ids), min_size=1, max_size=8))
+    if data.draw(st.booleans()):
+        # Half the feeds keep every stop_sequence unique: a Flex row taking
+        # one already used by its trip moves to the next free one.
+        used = {(row["trip_id"], int(row["stop_sequence"])) for row in fixed}
+        for row in flex:
+            sequence = int(row["stop_sequence"])
+            while (row["trip_id"], sequence) in used:
+                sequence += 1
+            used.add((row["trip_id"], sequence))
+            row["stop_sequence"] = str(sequence)
     rows = list(fixed)
     for row in flex:
         rows.insert(data.draw(st.integers(0, len(rows))), row)
@@ -778,15 +763,30 @@ def test_flex_rows_change_no_fixed_route_answer(
             )
         )
     )
+    # stop_sequence MUST increase along a trip: a Flex row repeating a
+    # stored call's sequence (fixed or Flex) fails the build once
+    # stop_times.txt is read -- unless it already failed before then.
+    stored_calls = [
+        (row["trip_id"], int(row["stop_sequence"]))
+        for row in fixed
+        if row["stop_id"].strip()
+    ] + [call[:2] for row in flex if (call := _stored_flex(row)) is not None]
+    repeats = len(stored_calls) != len(set(stored_calls))
+    event(f"a stop_sequence repeats: {repeats}")
+    if repeats:
+        assert isinstance(got, str)
+        assert _REPEAT in got or (isinstance(expected, str) and got == expected)
+        if not isinstance(expected, str):
+            assert _REPEAT in got
     # A frequency template whose first stop is untimed fails to anchor, but
     # with a window ahead of it that stop is not the trip's first: the feed
     # then builds (what it stores: see the template-shape property), or
     # fails as before -- never with another error.
-    if repeated and isinstance(expected, str) and "anchor" in expected:
+    elif repeated and isinstance(expected, str) and "anchor" in expected:
         assert got == expected or not isinstance(got, str)
     else:
         assert got == expected
-    if not repeated and not isinstance(expected, str):
+    if not repeated and not repeats and not isinstance(expected, str):
         assert stored == sorted(
             (record for row in flex if (record := _stored_flex(row)) is not None),
             key=repr,
@@ -807,7 +807,14 @@ def test_flex_rows_change_no_fixed_route_answer(
             )
         )
     )
-    assert (
-        got
-        == _without_flex(_outcome(_rezip(base, **{"stop_times.txt": _FIXED_HEADER})))[0]
-    )
+    baseline = _without_flex(
+        _outcome(_rezip(base, **{"stop_times.txt": _FIXED_HEADER}))
+    )[0]
+    zone_calls = [
+        call[:2] for row in zone_rows if (call := _stored_flex(row)) is not None
+    ]
+    if len(zone_calls) != len(set(zone_calls)):
+        assert isinstance(got, str)
+        assert _REPEAT in got or got == baseline
+    else:
+        assert got == baseline

@@ -482,8 +482,11 @@ Notes on direct mode:
   as a plausible value. A malformed **structural** cell — `stop_times` times,
   `stop_sequence`, `headway_secs`, `exception_type`, calendar weekday flags —
   fails the build, because a wrong departure time or a wrong call order is
-  worse than no feed at all. A malformed **descriptive** cell still degrades
-  to `None`.
+  worse than no feed at all. So does a trip repeating a `stop_sequence`
+  (fixed or GTFS-Flex calls alike), which GTFS requires to increase along
+  the trip, and a trip in `trips.txt` named like one of a frequency trip's
+  `{trip_id}#{start_secs}` repetitions. A malformed **descriptive** cell
+  still degrades to `None`.
 - **Detours are applied, not annotated**: a GTFS-RT `TripModifications`
   entity REPLACES a span of a trip's calls, so a board that ignored it
   would keep showing departures at stops the vehicle no longer serves, and
@@ -725,7 +728,7 @@ each define their own subtree beneath it, so you can catch broadly
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
 | `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP, `.url`) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
-| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
+| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), a trip repeating a `stop_sequence`, or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
 
 The GBFS and GTFS-RT parse paths are **total** with respect to this table:

@@ -1364,31 +1364,19 @@ def _pushdown(
     return stops, routes, headsigns
 
 
-# A scheduled row's identity: one stop_times row of one run. Rows read up
-# front and rows read by the scan are the same row only when all of it
-# matches -- an (invalid) feed repeating a stop_sequence within a trip
-# keeps both rows, whichever path reads them.
-_RowKey = tuple[str, date, int, str, datetime]
+# A scheduled row's identity: one stop_times row of one run, named by its
+# trip, service day and stop_sequence (the build refuses a trip repeating a
+# sequence). Rows read up front and rows read by the scan are the same row
+# exactly when these match.
+_RowKey = tuple[str, date, int]
 
 
 def _departure_key(dep: ScheduledDeparture) -> _RowKey:
-    return (
-        dep.trip_id,
-        dep.service_date,
-        dep.stop_sequence,
-        dep.stop_id,
-        dep.departure,
-    )
+    return (dep.trip_id, dep.service_date, dep.stop_sequence)
 
 
 def _journey_key(trip: ScheduledTrip) -> _RowKey:
-    return (
-        trip.trip_id,
-        trip.service_date,
-        trip.origin_stop_sequence,
-        trip.destination_stop_id,
-        trip.departure,
-    )
+    return (trip.trip_id, trip.service_date, trip.origin_stop_sequence)
 
 
 def _board_settles(

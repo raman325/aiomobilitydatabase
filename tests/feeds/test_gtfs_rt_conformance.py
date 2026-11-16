@@ -979,8 +979,8 @@ def test_an_added_trip_without_a_trip_id_is_shown_on_its_own() -> None:
 
 def test_first_departures_agree_with_trip_spans() -> None:
     """The stored first departure is a trip's start as GTFS-RT reads it --
-    its first timed call's departure, the earliest where that sequence
-    repeats, a one-call trip's arrival -- the same as the span reading; and
+    its first timed call's departure, a one-call trip's arrival -- the
+    same as the span reading; and
     a route/direction/start lookup reads it through its index."""
     index = _build_index_from_files(
         _feed(
@@ -993,8 +993,7 @@ def test_first_departures_agree_with_trip_spans() -> None:
                 "A,07:59:00,08:00:00,S0,1\nA,08:10:00,08:10:00,S1,2\n"
                 "B,08:20:00,08:25:00,S0,1\n"
                 "C,,,S0,1\nC,09:00:00,09:01:00,S1,2\nC,09:10:00,09:10:00,S0,3\n"
-                "D,09:30:00,09:31:00,S0,1\nD,09:20:00,09:29:00,S0,1\n"
-                "D,09:50:00,09:50:00,S1,2\n"
+                "D,09:20:00,09:29:00,S0,1\nD,09:50:00,09:50:00,S1,2\n"
                 "F,10:00:00,10:00:00,S0,1\nF,10:10:00,10:10:00,S1,2\n"
             ),
             frequencies="trip_id,start_time,end_time,headway_secs\nF,10:00:00,10:20:00,600\n",

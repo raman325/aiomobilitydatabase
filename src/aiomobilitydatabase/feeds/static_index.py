@@ -1451,8 +1451,8 @@ class StaticIndex:
 
         GTFS-RT reads a trip's start as its first departure: the departure
         of its first TIMED call by stop_sequence (the loader already lets a
-        lone arrival or departure stand for both), the earliest where that
-        sequence repeats; a trip of one call starts at its arrival. Matches
+        lone arrival or departure stand for both; sequences never repeat
+        within a trip); a trip of one call starts at its arrival. Matches
         :meth:`_trip_spans`. Runs once all stop_times, frequency
         repetitions included, are loaded.
         """
@@ -1466,8 +1466,8 @@ class StaticIndex:
             """
             INSERT INTO first_departures
             SELECT b.trip_id,
-                   CASE WHEN b.first = b.last THEN MIN(st.arrival_secs)
-                        ELSE MIN(st.departure_secs) END
+                   CASE WHEN b.first = b.last THEN st.arrival_secs
+                        ELSE st.departure_secs END
             FROM (
                 SELECT trip_id, MIN(stop_sequence) AS first,
                        MAX(stop_sequence) AS last
@@ -1478,7 +1478,6 @@ class StaticIndex:
             JOIN stop_times st
               ON st.trip_id = b.trip_id AND st.stop_sequence = b.first
              AND (st.arrival_secs IS NOT NULL OR st.departure_secs IS NOT NULL)
-            GROUP BY b.trip_id
             """
         )
         conn.execute(
@@ -1639,6 +1638,10 @@ class StaticIndex:
         place at all is skipped. A Flex call is not a stop the vehicle calls
         at on a schedule, and storing it as an untimed fixed call would
         misplace it in boards, journeys, and a frequency template's anchor.
+
+        stop_sequence values "MUST increase along the trip": a trip
+        repeating one among its calls, fixed or Flex, fails the build (see
+        :meth:`_refuse_repeated_sequences`).
         """
         rows: list[tuple[object, ...]] = []
         flex_rows: list[tuple[object, ...]] = []
@@ -1681,8 +1684,35 @@ class StaticIndex:
                     report()
         cls._batched_insert(conn, sql, rows)
         cls._batched_insert(conn, _FLEX_INSERT_SQL, flex_rows)
+        cls._refuse_repeated_sequences(conn)
         if report is not None:
             report()
+
+    @staticmethod
+    def _refuse_repeated_sequences(conn: sqlite3.Connection) -> None:
+        """Refuse a trip whose stop_times calls repeat a stop_sequence.
+
+        A repeat is no increase, so the trip's call order -- which boards,
+        journeys and realtime's StopTimeUpdates all read by stop_sequence
+        -- is not stated. Checked once every call is stored, a Flex call
+        against fixed ones too (both are stop_times.txt rows), each query
+        walking a (trip_id, stop_sequence) index in order.
+        """
+        for sql in (
+            "SELECT trip_id, stop_sequence FROM stop_times "
+            "GROUP BY trip_id, stop_sequence HAVING COUNT(*) > 1 LIMIT 1",
+            "SELECT trip_id, stop_sequence FROM flex_stop_times "
+            "GROUP BY trip_id, stop_sequence HAVING COUNT(*) > 1 LIMIT 1",
+            "SELECT f.trip_id, f.stop_sequence FROM flex_stop_times f "
+            "WHERE EXISTS (SELECT 1 FROM stop_times s WHERE s.trip_id = f.trip_id "
+            "AND s.stop_sequence = f.stop_sequence) LIMIT 1",
+        ):
+            if (repeat := conn.execute(sql).fetchone()) is not None:
+                trip_id, sequence = repeat
+                raise _RefusedError(
+                    f"trip {trip_id!r} repeats stop_sequence {sequence}: "
+                    "it must increase along the trip"
+                )
 
     @classmethod
     def _load_frequencies(
@@ -1741,11 +1771,10 @@ class StaticIndex:
         may exceed 24:00:00 and flow through the normal service-day
         handling. A row referencing a trip with no stop_times template is
         skipped, matching the loaders' no-referential-checks policy. A
-        real trip id that happens to equal a synthetic one (it would need
-        a literal ``#<secs>`` suffix) has its trips row replaced by the
-        repetition's, its calls then read as the repetition's -- accepted
-        as negligible. Malformed rows (unparseable or missing times,
-        non-positive headway) raise, mirroring stop_times.
+        real trip id that equals a synthetic one (a literal ``#<secs>``
+        suffix) fails the build: the two trips' calls would share one id.
+        Malformed rows (unparseable or missing times, non-positive headway)
+        raise, mirroring stop_times.
         """
         spans = cls._parse_frequency_spans(reader)
         # The INSERT..SELECT and the template copy below must carry EVERY
@@ -1823,6 +1852,14 @@ class StaticIndex:
                     rep_start += headway_secs
             for rep_start, (exact_times, headway_secs) in sorted(starts.items()):
                 synthetic_id = repetition_trip_id(trip_id, rep_start)
+                if conn.execute(
+                    "SELECT 1 FROM trips WHERE id = ? AND source_trip_id = id",
+                    (synthetic_id,),
+                ).fetchone():
+                    raise _RefusedError(
+                        f"trip {synthetic_id!r} has the id of a repetition of "
+                        f"frequency trip {trip_id!r} (starting at {rep_start}s)"
+                    )
                 shift = rep_start - anchor
                 trip_rows.append(
                     (
@@ -2648,19 +2685,10 @@ class StaticIndex:
                 ]
             except OverflowError:
                 continue  # a call past the end of datetime: no run to date
-            # A Flex call repeating a fixed call's stop_sequence (a feed
-            # error: the pair is the primary key) yields to it, so whatever
-            # names that sequence names the fixed call.
-            taken = {call.stop_sequence for call in fixed}
+            # Fixed and Flex calls never share a stop_sequence (the build
+            # refuses a repeat), so the merge is one order.
             calls = sorted(
-                [
-                    *fixed,
-                    *(
-                        call
-                        for call in on_demand.get(trip_id, ())
-                        if call.stop_sequence not in taken
-                    ),
-                ],
+                [*fixed, *on_demand.get(trip_id, ())],
                 key=lambda call: call.stop_sequence,
             )
             instances.append(
@@ -3518,8 +3546,7 @@ class StaticIndex:
         and last TIMED calls by stop_sequence, a departure standing in for a
         missing arrival and vice versa (GTFS-RT reads a trip's start as its
         first departure). A trip of one call lasts that call's own dwell,
-        arrival to departure. Repeated sequences take the earliest departure
-        and the latest arrival. No timed call: first and last are None.
+        arrival to departure. No timed call: first and last are None.
         """
         marks = ",".join("?" * len(trip_ids))
         trips = self._conn.execute(
@@ -3542,14 +3569,13 @@ class StaticIndex:
             if not rows:
                 spans.append((trip_id, service_id, repetition, None, None))
                 continue
-            first = min(sequence for sequence, _, _ in rows)
-            last = max(sequence for sequence, _, _ in rows)
-            if first == last:  # one call: its own dwell, arrival to departure
-                start = min(arrives for seq, arrives, _ in rows if seq == first)
-                end = max(departs for seq, _, departs in rows if seq == last)
+            # Sequences never repeat within a trip (the build refuses it).
+            _, first_arrives, first_departs = min(rows)
+            _, last_arrives, last_departs = max(rows)
+            if len(rows) == 1:  # one call: its own dwell, arrival to departure
+                start, end = first_arrives, last_departs
             else:
-                start = min(departs for seq, _, departs in rows if seq == first)
-                end = max(arrives for seq, arrives, _ in rows if seq == last)
+                start, end = first_departs, last_arrives
             spans.append((trip_id, service_id, repetition, start, end))
         return spans
 
@@ -3968,13 +3994,13 @@ class StaticIndex:
         origin_stop_id: str,
         destination_stop_id: str,
         active: set[str],
-    ) -> tuple[tuple[str, int, int], tuple[str, int, int]]:
+    ) -> tuple[tuple[str, int], tuple[str, int]]:
         """Return one service day's first/last departure identities for the pair.
 
-        The identities are (trip_id, origin stop_sequence, departure_secs)
-        computed over the WHOLE service day, not the query window: a journey
-        is one origin call, and a feed repeating an origin stop_sequence
-        with another time has two, so the sequence alone names neither.
+        The identities are (trip_id, origin stop_sequence) computed over the
+        WHOLE service day, not the query window: a journey is one origin
+        call, which its trip and sequence name (sequences never repeat
+        within a trip).
 
         Ordered by (departure_secs, trip_id, stop_sequence), a total order
         over these identities -- each one group of the journeys query -- so
@@ -3986,16 +4012,16 @@ class StaticIndex:
         service_marks = ",".join("?" * len(active))
         candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
         params = [origin_stop_id, destination_stop_id, *sorted(active)]
-        extremes: list[tuple[str, int, int]] = []
+        extremes: list[tuple[str, int]] = []
         for direction in ("ASC", "DESC"):
             sql = (
-                "SELECT o.trip_id, o.stop_sequence, o.departure_secs "
+                "SELECT o.trip_id, o.stop_sequence "
                 f"{candidates} "
                 f"ORDER BY o.departure_secs {direction}, o.trip_id {direction}, "
                 f"o.stop_sequence {direction} LIMIT 1"
             )
             row = self._conn.execute(sql, params).fetchone()
-            extremes.append((row[0], row[1], row[2]))
+            extremes.append((row[0], row[1]))
         return extremes[0], extremes[1]
 
     def _trips_on(
@@ -4031,11 +4057,9 @@ class StaticIndex:
             "o.stop_sequence, d.stop_sequence, t.short_name, t.block_id "
             f"{candidates} "
             f"{window_sql} "
-            # A feed repeating an origin stop_sequence with another time has
-            # two origin calls: each is its own journey (as each is its own
-            # departure row), so no read -- windowed or not -- picks between
-            # them.
-            "GROUP BY o.trip_id, o.stop_sequence, o.departure_secs"
+            # One journey per origin call, which its trip and stop_sequence
+            # name (a loop trip leaving the origin twice has two).
+            "GROUP BY o.trip_id, o.stop_sequence"
         )
         params: list[object] = [
             origin_stop_id,
@@ -4107,8 +4131,8 @@ class StaticIndex:
                     ),
                     destination_timepoint_exact=_timepoint_exact(d_timepoint),
                     destination_stop_headsign=d_stop_headsign,
-                    is_first=(trip_id, o_sequence, dep_secs) == first_key,
-                    is_last=(trip_id, o_sequence, dep_secs) == last_key,
+                    is_first=(trip_id, o_sequence) == first_key,
+                    is_last=(trip_id, o_sequence) == last_key,
                     trip_short_name=trip_short_name,
                     block_id=block_id,
                 )

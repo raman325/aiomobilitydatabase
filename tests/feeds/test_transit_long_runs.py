@@ -228,13 +228,13 @@ def test_a_detour_is_rebuilt_once_and_only_where_it_can_show() -> None:
     _run(_index_from_zip_bytes(feed), unrelated, other)
 
 
-def test_a_repeated_stop_sequence_keeps_both_rows_on_every_path() -> None:
-    """An (invalid) feed repeating a stop_sequence within a trip keeps both
-    rows -- whether the run is read up front (realtime names it) or by the
-    scan -- so the answer can't depend on which path read it.
+def test_a_loop_trip_keeps_both_calls_at_a_stop_on_every_path() -> None:
+    """A trip calling at A twice keeps both rows -- whether the run is read
+    up front (realtime names it) or by the scan -- so the answer can't
+    depend on which path read it.
     """
     feed = _feed(
-        "T,00:00:00,00:00:00,A,0\nT,08:00:00,08:00:00,A,0\nT,09:00:00,09:00:00,B,1\n"
+        "T,00:00:00,00:00:00,A,0\nT,08:00:00,08:00:00,A,1\nT,09:00:00,09:00:00,B,2\n"
     )
     message = gtfs_realtime_pb2.FeedMessage()
     message.header.gtfs_realtime_version = "2.0"
@@ -1486,29 +1486,6 @@ def test_the_tie_search_reaches_back_a_day_not_across_a_gap() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stop_times", "span"),
-    [
-        # A repeated first sequence: its earliest departure starts the trip.
-        (
-            "T,07:00:00,07:00:00,A,1\nT,08:00:00,08:00:00,A,1\nT,09:00:00,09:00:00,B,2\n",
-            (7 * 3600, 9 * 3600),
-        ),
-        # A repeated last sequence: its latest arrival ends the trip.
-        (
-            "T,08:00:00,08:00:00,A,1\nT,09:00:00,09:00:00,B,2\nT,11:00:00,11:00:00,B,2\n",
-            (8 * 3600, 11 * 3600),
-        ),
-    ],
-)
-def test_repeated_sequences_take_the_widest_span(
-    stop_times: str, span: tuple[int, int]
-) -> None:
-    index = _index_from_zip_bytes(_feed(stop_times))
-    assert tuple(index._trip_spans(["T"])[0][3:]) == span
-    index.close()
-
-
-@pytest.mark.parametrize(
     ("start_time", "start_date", "applies"),
     [
         ("08:00:00", "20260610", True),  # its own start time, dated
@@ -1558,11 +1535,11 @@ def test_a_plain_trip_named_with_its_own_start_time(
     _run(_index_from_zip_bytes(feed), cancelled, cancel)
 
 
-def test_a_repeated_origin_call_is_two_journeys() -> None:
-    """A feed repeating an origin stop_sequence with another time has two
-    origin calls: two journeys, whichever read finds them."""
+def test_a_loop_trips_two_origin_calls_are_two_journeys() -> None:
+    """A trip leaving the origin twice has two origin calls: two journeys,
+    whichever read finds them."""
     feed = _feed(
-        "T,08:00:00,08:00:00,A,1\nT,08:20:00,08:20:00,A,1\nT,09:00:00,09:00:00,B,2\n"
+        "T,08:00:00,08:00:00,A,1\nT,08:20:00,08:20:00,A,2\nT,09:00:00,09:00:00,B,3\n"
     )
     index = _index_from_zip_bytes(feed)
     now = datetime(2026, 6, 10, 7, tzinfo=UTC)

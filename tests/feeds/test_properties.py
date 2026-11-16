@@ -6283,8 +6283,8 @@ def _raw_trip_rows(
     """Stored ``(stop_sequence, stop_id, arrival_secs, departure_secs)`` per trip.
 
     Read straight from the table so the oracles below never route through a
-    query method under test. Rows are deliberately NOT deduplicated: a messy
-    feed can repeat a call, and an oracle has to model what is stored.
+    query method under test. A trip never repeats a stop_sequence (the
+    build refuses it), so each row is one call.
     """
     rows: dict[str, list[tuple[int, str, int | None, int | None]]] = {}
     for trip_id, seq, stop_id, arrival, departure in index._conn.execute(
@@ -6335,9 +6335,7 @@ def _pair_oracle(
 
     A row is expected iff the trip's service is active that day, the origin
     call has a departure inside the window, and SOME later-sequence call at
-    the destination has an arrival. A messy feed storing one origin
-    sequence twice with different times has two origin calls, each its own
-    journey. The value is the departure, the EARLIEST qualifying
+    the destination has an arrival. The value is the departure, the EARLIEST qualifying
     destination arrival, and the destination sequences achieving it.
     """
     services: dict[str, str] = dict(
