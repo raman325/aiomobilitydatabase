@@ -12,12 +12,24 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 import types
 import typing
 from datetime import datetime
 from enum import Enum
 from functools import cache
 from typing import Any
+
+# The API's date-time format (RFC 3339 section 5.6), its offset optional:
+# naive values have been seen from the token endpoint and read as UTC.
+# fromisoformat, which mashumaro parses with, would also take a bare date
+# (midnight, a time never sent), week dates, the basic format and 24:00.
+# A lowercase "z", which RFC 3339 allows, is left out: fromisoformat refuses
+# it, and the API's serializer writes "Z" (or "+00:00").
+_DATE_TIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+    r"(?:\.[0-9]+)?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])?"
+)
 
 
 @cache
@@ -32,11 +44,11 @@ def mismatch(annotation: Any, value: Any, where: str = "$") -> str | None:
     JSON types per annotation: ``str`` a string; ``int`` an integer, never
     a boolean (JSON's ``true`` isn't 1); ``float`` a finite number (a
     ``1e400`` literal decodes to infinity); ``bool`` a boolean; a
-    ``datetime`` or a string enum a string, whose content mashumaro then
-    parses or refuses; ``tuple[X, ...]`` an array of X; a dataclass an
-    object whose present fields conform (a missing required field is
-    mashumaro's to report; keys the model doesn't know are ignored, as the
-    API may add fields); ``X | None`` null or an X.
+    string enum a string, whose value mashumaro then checks; a
+    ``datetime`` an RFC 3339 date-time string; ``tuple[X, ...]`` an array
+    of X; a dataclass an object whose present fields conform (a missing
+    required field is mashumaro's to report; keys the model doesn't know
+    are ignored, as the API may add fields); ``X | None`` null or an X.
     """
     origin = typing.get_origin(annotation)
     if origin in (typing.Union, types.UnionType):
@@ -91,7 +103,9 @@ def _scalar_fits(annotation: Any, value: Any) -> bool:
         return isinstance(value, int)
     if annotation is float:
         return isinstance(value, int | float) and _finite(value)
-    if annotation is str or annotation is datetime or issubclass(annotation, Enum):
+    if annotation is datetime:
+        return isinstance(value, str) and _DATE_TIME.fullmatch(value) is not None
+    if annotation is str or issubclass(annotation, Enum):
         return isinstance(value, str)
     raise TypeError(f"no JSON type for {annotation!r}")  # pragma: no cover
 

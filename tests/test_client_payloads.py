@@ -12,12 +12,14 @@ import dataclasses
 import inspect
 import json
 import math
+import re
 import types
 import typing
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
+import aiohttp
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -313,7 +315,7 @@ def _faithful(annotation: Any, raw: Any, decoded: Any) -> bool:  # noqa: PLR0911
             if field.name in raw
         )
     if annotation is datetime:
-        return isinstance(raw, str) and decoded == datetime.fromisoformat(raw)
+        return isinstance(raw, str) and decoded == _rfc3339(raw)
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         return isinstance(raw, str) and decoded == annotation(raw)
     if annotation is float:
@@ -328,10 +330,46 @@ def _faithful(annotation: Any, raw: Any, decoded: Any) -> bool:  # noqa: PLR0911
     return type(raw) is annotation and type(decoded) is annotation and decoded == raw
 
 
+_RFC3339 = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt ]([0-9]{2}):([0-9]{2}):([0-9]{2})"
+    r"(?:\.([0-9]+))?(?:([Zz])|([+-])([0-9]{2}):([0-9]{2}))?"
+)
+
+
+def _rfc3339(text: str) -> datetime | None:
+    """An independent reading of an RFC 3339 date-time (offset optional):
+    the reference the decoder must agree with, not its own parser."""
+    match = _RFC3339.fullmatch(text)
+    if match is None:
+        return None
+    year, month, day, hour, minute, second, fraction, zulu, sign, oh, om = (
+        match.groups()
+    )
+    zone = None
+    if zulu:
+        zone = UTC
+    elif sign:
+        offset = timedelta(hours=int(oh), minutes=int(om))
+        zone = timezone(-offset if sign == "-" else offset)
+    micro = int((fraction or "0")[:6].ljust(6, "0"))
+    return datetime(
+        int(year),
+        int(month),
+        int(day),
+        int(hour),
+        int(minute),
+        int(second),
+        micro,
+        zone,
+    )
+
+
 def _flip(payload: Any, data: st.DataObject) -> Any:
     """``payload`` with one value, at any depth, replaced by arbitrary JSON."""
     if isinstance(payload, dict) and payload:
         key = data.draw(st.sampled_from(sorted(payload)))
+        if data.draw(st.integers(0, 4)) == 0:  # sometimes the key goes missing
+            return {k: v for k, v in payload.items() if k != key}
         deeper = data.draw(st.booleans())
         replaced = _flip(payload[key], data) if deeper else data.draw(_JSON)
         return {**payload, key: replaced}
@@ -344,7 +382,10 @@ def _flip(payload: Any, data: st.DataObject) -> Any:
 _PAYLOADS = {
     "get_metadata": METADATA,
     "get_feed": GTFS_FEED,
-    "get_gtfs_feed": GTFS_FEED,
+    "get_gtfs_feed": {
+        **GTFS_FEED,
+        "redirects": [{"target_id": "mdb-2", "comment": "moved"}],
+    },
     "get_gtfs_rt_feed": GTFS_RT_FEED,
     "get_gbfs_feed": GBFS_FEED,
     "get_dataset_gtfs": GTFS_DATASET,
@@ -445,24 +486,28 @@ async def test_an_undecodable_error_page_is_an_api_error(
     assert caught.value.body == "Bad Gateway �"
 
 
-# (An unknown charset name is no error: aiohttp falls back to UTF-8.)
-@pytest.mark.parametrize("charset", ["rot13", "base64", "zlib"])
-async def test_a_charset_that_is_no_text_encoding_is_invalid_json(
+_CHARSETS = ["iso-8859-1", "cp037", "rot13", "base64", "zlib", "undefined", "utf-16"]
+
+
+@pytest.mark.parametrize("charset", _CHARSETS)
+async def test_a_json_body_is_utf_8_whatever_its_charset_says(
     mock_api: MockApi, client: MobilityDatabaseClient, charset: str
 ) -> None:
+    """RFC 8259 sections 8.1 and 11: JSON between systems is UTF-8, and a
+    charset parameter has no effect on a compliant recipient -- read by it,
+    "Montr\u00e9al" became mojibake (iso-8859-1) or an error (rot13)."""
     mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    body = json.dumps({**METADATA, "version": "Montr\u00e9al"}, ensure_ascii=False)
     mock_api.get(
         "/v1/metadata",
-        body=json.dumps(METADATA).encode(),
+        body=body.encode("utf-8"),
         headers={"Content-Type": f"application/json; charset={charset}"},
     )
-    with pytest.raises(MobilityDatabaseConnectionError):
-        await client.get_metadata()
+    assert (await client.get_metadata()).version == "Montr\u00e9al"
 
 
-# (idna decodes an ASCII token body fine; undefined refuses all decoding.)
-@pytest.mark.parametrize("charset", ["rot13", "hex", "undefined"])
-async def test_a_token_body_in_no_text_encoding_is_a_connection_error(
+@pytest.mark.parametrize("charset", _CHARSETS)
+async def test_a_token_body_is_utf_8_whatever_its_charset_says(
     mock_api: MockApi, client: MobilityDatabaseClient, charset: str
 ) -> None:
     mock_api.post(
@@ -470,15 +515,112 @@ async def test_a_token_body_in_no_text_encoding_is_a_connection_error(
         body=json.dumps(TOKEN_RESPONSE).encode(),
         headers={"Content-Type": f"application/json; charset={charset}"},
     )
-    with pytest.raises(MobilityDatabaseConnectionError):
+    mock_api.get("/v1/metadata", payload=METADATA)
+    await client.get_metadata()
+
+
+async def test_a_body_that_isnt_utf_8_is_invalid_json(
+    mock_api: MockApi, client: MobilityDatabaseClient
+) -> None:
+    """A Latin-1 body is no JSON text, whatever charset it names."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get(
+        "/v1/metadata",
+        body='{"version": "Montr\u00e9al"}'.encode("latin-1"),
+        headers={"Content-Type": "application/json; charset=iso-8859-1"},
+    )
+    with pytest.raises(MobilityDatabaseConnectionError, match="invalid JSON"):
         await client.get_metadata()
+
+
+@pytest.mark.parametrize(
+    "content_type", ["application/problem+json", "application/json-seq", "text/plain"]
+)
+async def test_a_200_that_isnt_application_json_is_invalid(
+    mock_api: MockApi, client: MobilityDatabaseClient, content_type: str
+) -> None:
+    """aiohttp's own check took problem+json, which decoded as an empty
+    Metadata."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/metadata", body=b"{}", headers={"Content-Type": content_type})
+    with pytest.raises(MobilityDatabaseConnectionError, match="not application/json"):
+        await client.get_metadata()
+
+
+async def test_a_401_releases_its_connection_before_refreshing(
+    mock_api: MockApi,
+) -> None:
+    """With a pool of one connection and a 401 too big to buffer, the token
+    refresh waited for the connection the 401 still held, until timeout."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get(
+        "/v1/metadata", status=401, body=b"x" * 2_000_000, content_type="text/plain"
+    )
+    mock_api.post("/v1/tokens", payload={**TOKEN_RESPONSE, "access_token": "second"})
+    mock_api.get("/v1/metadata", payload=METADATA, auth="second")
+    connector = aiohttp.TCPConnector(limit=1)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        client = MobilityDatabaseClient(
+            "t", session, base_url=mock_api.url(), request_timeout=5
+        )
+        assert await client.get_metadata() == Metadata.from_dict(METADATA)
+
+
+async def test_an_availability_without_its_checks_is_invalid(
+    mock_api: MockApi, client: MobilityDatabaseClient
+) -> None:
+    """The API spec requires checks: absent, it isn't an empty history."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    body = {
+        key: value for key, value in AVAILABILITY_RESPONSE.items() if key != "checks"
+    }
+    mock_api.get("/v1/gtfs_feeds/mdb-1/availability", payload=body)
+    with pytest.raises(MobilityDatabaseConnectionError):
+        await client.get_gtfs_feed_availability("mdb-1")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2024-01-01",  # midnight, a time never sent
+        "2024-01-01T24:00:00Z",
+        "20240101T000000Z",
+        "2024-W01-1T00:00:00Z",
+        "2024-01-01T00:00",
+        "2024-01-01T00:00:00+0100",
+        "2024-01-01T00:00:00z",  # fromisoformat refuses a lowercase z
+    ],
+)
+def test_a_date_time_rfc_3339_lacks_is_an_invalid_payload(value: str) -> None:
+    result = _call(
+        "get_gtfs_feed", json.dumps({**GTFS_FEED, "created_at": value}).encode()
+    )
+    assert isinstance(result, MobilityDatabaseConnectionError)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2024-01-01T00:00:00Z",
+        "2024-01-01t00:00:00.5Z",
+        "2024-01-01 00:00:00-05:00",
+        "2024-01-01T00:00:00",
+    ],
+)
+def test_an_rfc_3339_date_time_decodes(value: str) -> None:
+    result = _call(
+        "get_gtfs_feed", json.dumps({**GTFS_FEED, "created_at": value}).encode()
+    )
+    assert not isinstance(result, MobilityDatabaseConnectionError)
+    assert result.created_at == _rfc3339(value)
 
 
 async def test_a_token_error_with_an_undecodable_body_is_still_an_auth_error(
     mock_api: MockApi, client: MobilityDatabaseClient
 ) -> None:
     """Any non-200 from the token endpoint is an authentication failure,
-    whatever bytes its body holds."""
+    whatever bytes its body holds. (One that can't be read at all -- a
+    Content-Encoding its bytes don't follow -- is a connection error.)"""
     mock_api.post(
         "/v1/tokens",
         status=500,

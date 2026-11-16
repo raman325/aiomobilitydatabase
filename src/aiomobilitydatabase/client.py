@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -103,12 +104,29 @@ _DECODE_ERRORS = (LookupError, ValueError)
 _B64TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 
 
-# What decoding a response body as JSON can raise: ContentTypeError (a
-# ClientError, for another content type), ValueError (malformed JSON, or bytes
-# its charset can't decode: UnicodeDecodeError), LookupError (a charset that
-# isn't a text encoding, such as rot13), RecursionError (nesting deeper than
-# the interpreter's stack).
-_JSON_ERRORS = (aiohttp.ContentTypeError, ValueError, LookupError, RecursionError)
+async def _json_body(resp: aiohttp.ClientResponse) -> Any:
+    """Return a response's JSON, or raise MobilityDatabaseConnectionError.
+
+    The content type must be ``application/json`` itself: aiohttp's own check
+    also takes ``application/problem+json`` and the like, which aren't the
+    documented answer. The body is parsed from its bytes, never by the
+    response's ``charset``: RFC 8259 section 8.1 has JSON exchanged between
+    systems be UTF-8, and its section 11 gives a charset parameter no effect
+    on a compliant recipient -- read by it, a UTF-8 "Montr\u00e9al" sent as
+    ``charset=iso-8859-1`` would be mojibake. ``json.loads`` detects UTF-8
+    (a BOM ignored, as RFC 8259 allows) and UTF-16/32 from the bytes; it
+    raises ValueError for anything else, RecursionError for nesting deeper
+    than the interpreter's stack.
+    """
+    if resp.content_type != "application/json":
+        raise MobilityDatabaseConnectionError(
+            f"API returned {resp.content_type!r}, not application/json"
+        )
+    raw = await resp.read()
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError) as err:
+        raise MobilityDatabaseConnectionError("API returned invalid JSON") from err
 
 
 async def _body_text(resp: aiohttp.ClientResponse) -> str:
@@ -275,12 +293,8 @@ class MobilityDatabaseClient:
                         raise MobilityDatabaseAuthenticationError(
                             f"Unable to obtain access token ({resp.status}): {body}"
                         )
-                    data = await resp.json()
-            except (
-                TimeoutError,
-                aiohttp.ClientError,
-                *_JSON_ERRORS,
-            ) as err:
+                    data = await _json_body(resp)
+            except (TimeoutError, aiohttp.ClientError) as err:
                 raise MobilityDatabaseConnectionError(
                     f"Error requesting access token: {err}"
                 ) from err
@@ -313,7 +327,12 @@ class MobilityDatabaseClient:
         json_body: dict[str, Any] | None = None,
         retry_on_auth_fail: bool = True,
     ) -> Any:
-        """Perform an authenticated request and return the decoded JSON body."""
+        """Perform an authenticated request and return the decoded JSON body.
+
+        On a 401 the token is refreshed and the request retried once -- after
+        this response is released, so a pool of one connection doesn't wait
+        on the connection the refresh needs.
+        """
         token = await self._async_ensure_token()
         session = self._get_session()
         try:
@@ -325,43 +344,36 @@ class MobilityDatabaseClient:
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=self._timeout,
             ) as resp:
-                if resp.status == HTTPStatus.UNAUTHORIZED:
-                    if retry_on_auth_fail:
-                        await self._async_ensure_token(force=True, stale_token=token)
-                        return await self._request(
-                            method,
-                            path,
-                            params=params,
-                            json_body=json_body,
-                            retry_on_auth_fail=False,
-                        )
+                if resp.status != HTTPStatus.UNAUTHORIZED:
+                    return await self._answer(resp, path)
+                if not retry_on_auth_fail:
                     raise MobilityDatabaseAuthenticationError(
                         "Request unauthorized after token refresh"
                     )
-                if resp.status == HTTPStatus.NOT_FOUND:
-                    raise MobilityDatabaseNotFoundError(f"Not found: {path}")
-                if resp.status == HTTPStatus.TOO_MANY_REQUESTS:
-                    raise MobilityDatabaseRateLimitError("API rate limit exceeded")
-                # Only a 200 or 203 carries the answer (RFC 9110 section
-                # 15.3): a 204 has none, and a 300 or a 3xx left unfollowed
-                # is not the resource asked for.
-                if resp.status not in (
-                    HTTPStatus.OK,
-                    HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
-                ):
-                    raise MobilityDatabaseApiError(resp.status, await _body_text(resp))
-                try:
-                    return await resp.json()
-                except _JSON_ERRORS as err:
-                    raise MobilityDatabaseConnectionError(
-                        "API returned invalid JSON"
-                    ) from err
         except MobilityDatabaseError:
             raise
         except (TimeoutError, aiohttp.ClientError) as err:
             raise MobilityDatabaseConnectionError(
                 f"Error communicating with API: {err}"
             ) from err
+        await self._async_ensure_token(force=True, stale_token=token)
+        return await self._request(
+            method, path, params=params, json_body=json_body, retry_on_auth_fail=False
+        )
+
+    @staticmethod
+    async def _answer(resp: aiohttp.ClientResponse, path: str) -> Any:
+        """Map a non-401 response to its JSON body or the matching error."""
+        if resp.status == HTTPStatus.NOT_FOUND:
+            raise MobilityDatabaseNotFoundError(f"Not found: {path}")
+        if resp.status == HTTPStatus.TOO_MANY_REQUESTS:
+            raise MobilityDatabaseRateLimitError("API rate limit exceeded")
+        # Only a 200 or 203 carries the answer (RFC 9110 section 15.3): a 204
+        # has none, and a 300 or a 3xx left unfollowed is not the resource
+        # asked for.
+        if resp.status not in (HTTPStatus.OK, HTTPStatus.NON_AUTHORITATIVE_INFORMATION):
+            raise MobilityDatabaseApiError(resp.status, await _body_text(resp))
+        return await _json_body(resp)
 
     async def get_metadata(self) -> Metadata:
         """Get metadata about the API."""

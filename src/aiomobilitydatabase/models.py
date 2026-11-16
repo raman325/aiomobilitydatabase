@@ -349,7 +349,8 @@ class GtfsFeedAvailability(DataClassDictMixin):
     total: int
     offset: int
     limit: int
-    checks: tuple[GtfsFeedAvailabilityCheck, ...] = ()
+    # Required by the API spec: an absent history is no empty one.
+    checks: tuple[GtfsFeedAvailabilityCheck, ...]
 
 
 @dataclass(frozen=True)
