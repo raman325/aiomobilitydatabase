@@ -283,9 +283,12 @@ def _delta_seconds(value: str | None, *, quoted: bool = False) -> int | None:
         value = re.sub(r"\\(.)", r"\1", value[1:-1])  # quoted-pairs
     if not value or not value.isascii() or not value.isdigit():
         return None
-    if len(value.lstrip("0")) > _DELTA_SECONDS_DIGITS:
+    # Leading zeros carry no value: only the significant digits are counted
+    # and converted (int() refuses a string of more than 4300 digits).
+    significant = value.lstrip("0")
+    if len(significant) > _DELTA_SECONDS_DIGITS:
         return _DELTA_SECONDS_MAX
-    return min(int(value), _DELTA_SECONDS_MAX)
+    return min(int(significant or "0"), _DELTA_SECONDS_MAX)
 
 
 def _split_field(value: str) -> list[str] | None:
