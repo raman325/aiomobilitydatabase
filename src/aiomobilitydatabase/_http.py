@@ -20,8 +20,17 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any, Final
 
+from yarl import URL
+
 if TYPE_CHECKING:
     import aiohttp
+
+# What parsing a URL with yarl can raise: ValueError (UnicodeError among
+# them), and IndexError for some malformed authorities.
+URL_ERRORS: Final = (ValueError, IndexError)
+# A host no cookie is scoped to: a cookie the jar would send here, it sends
+# to every host (aiohttp keeps ClientSession(cookies=...) without a domain).
+_ANY_HOST: Final = URL("https://unscoped.invalid/")
 
 # RFC 9110 section 5.1: a field name is a token.
 _TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
@@ -70,12 +79,16 @@ def require_session(session: aiohttp.ClientSession) -> None:
 
     Its default headers must be token names with visible-ASCII values, and
     it may carry no credential -- no ``auth``, no Authorization, Cookie or
-    Proxy-Authorization default: those ride on every request it makes, to
-    every origin (a producer's redirect target, the catalog API), where no
-    client can withhold them. Pass a credential per request instead.
+    Proxy-Authorization default, and no cookie the jar would send to any host
+    (``ClientSession(cookies=...)`` keeps them without a domain): those ride
+    on every request it makes, to every origin (a producer's redirect target,
+    the catalog API), where no client can withhold them. Pass a credential
+    per request instead. Cookies a server set, scoped to it, are fine.
     """
     if getattr(session, "auth", None) is not None:
         raise ValueError("the session's auth would ride on every request")
+    if session.cookie_jar.filter_cookies(_ANY_HOST):
+        raise ValueError("the session's cookies would ride on every request")
     for name, value in session.headers.items():
         if not is_token(name) or not is_visible(value):
             raise ValueError(f"the session's header {name!r} can't be sent")

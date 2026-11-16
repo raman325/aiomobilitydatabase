@@ -23,8 +23,10 @@ async def test_404_maps_to_not_found(
 ) -> None:
     _mock_token(mock_api)
     mock_api.get("/v1/gtfs_feeds/mdb-9999999", status=404)
-    with pytest.raises(MobilityDatabaseNotFoundError):
+    with pytest.raises(MobilityDatabaseNotFoundError) as caught:
         await client.get_gtfs_feed("mdb-9999999")
+    # The message is the library's own: the path stays out of it.
+    assert str(caught.value) == "Not found"
 
 
 async def test_429_maps_to_rate_limit(

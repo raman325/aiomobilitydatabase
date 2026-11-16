@@ -1245,6 +1245,28 @@ async def test_an_injected_session_default_the_client_cant_use_is_refused(
             MobilityDatabaseClient("t", session)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"version": "\\ud800"}',
+        b'{"version": "1", "\\udfff": 1}',
+        b'{"version": "1", "x": [[{"y": "a\\udc00b"}]]}',
+    ],
+)
+async def test_a_lone_surrogate_in_json_is_invalid(
+    mock_api: MockApi, body: bytes
+) -> None:
+    """An escape can spell one; it is no text, and no model holds it."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/metadata", body=body, content_type="application/json")
+    async with MobilityDatabaseClient("t", base_url=mock_api.url()) as client:
+        with pytest.raises(
+            MobilityDatabaseConnectionError, match="invalid JSON"
+        ) as caught:
+            await client.get_metadata()
+    assert caught.value.__context__ is None
+
+
 def test_an_empty_refresh_token_is_refused() -> None:
     """It would also have made the redaction replace every gap of a page."""
     with pytest.raises(ValueError, match="refresh_token is empty"):
@@ -1332,8 +1354,9 @@ async def test_aiohttps_error_text_never_carries_the_token(header: bytes) -> Non
     finally:
         server.close()
     assert "AccessTok123" not in str(caught.value)
+    # Nothing of aiohttp's error rides along, not even as the context.
     assert caught.value.__cause__ is None
-    assert caught.value.__suppress_context__
+    assert caught.value.__context__ is None
 
 
 async def test_an_echo_under_another_charset_hides_the_tokens(
@@ -1512,10 +1535,12 @@ def test_any_answer_gives_a_library_result_and_no_secret_in_any_message(
             server.close()
 
     err = asyncio.run(scenario())
-    while err is not None:
+    if err is not None:
         for secret in _SECRETS:
             assert secret not in str(err), (type(err).__name__, str(err))
-        err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)
+        # Library-written: nothing else rides along, not even as the context.
+        assert err.__cause__ is None, repr(err.__cause__)
+        assert err.__context__ is None, repr(err.__context__)
 
 
 # -- An echoing server: whatever comes back, no secret leaves in a message ------------
@@ -1628,8 +1653,9 @@ def test_an_echoing_server_never_gets_a_secret_into_a_message(
             server.close()
 
     err = asyncio.run(scenario())
-    while err is not None:
+    if err is not None:
         shown = str(err).lower()
         for secret in ("refreshtoksecret987", access.lower()):
             assert secret not in shown, (type(err).__name__, str(err))
-        err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)
+        assert err.__cause__ is None, repr(err.__cause__)
+        assert err.__context__ is None, repr(err.__context__)

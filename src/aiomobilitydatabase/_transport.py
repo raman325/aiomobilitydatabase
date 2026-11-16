@@ -52,6 +52,8 @@ async def exchange(
     server. The status mapping is the client's, whatever the session's
     ``raise_for_status``.
     """
+    if session.closed:
+        raise RuntimeError("the session is closed")  # the caller's, not the API's
     try:
         async with session.request(
             method,
@@ -69,6 +71,7 @@ async def exchange(
             media_type = header.split(";", 1)[0].strip(" \t").lower()
             return Answer(resp.status, media_type, body)
     except Exception as err:  # the boundary: see the module docstring
-        raise MobilityDatabaseConnectionError(
-            f"{what} failed ({type(err).__name__})"
-        ) from None
+        failure = type(err).__name__
+    # Raised outside the except, so the original isn't even the context:
+    # from None would only hide it from tracebacks, not drop it.
+    raise MobilityDatabaseConnectionError(f"{what} failed ({failure})")

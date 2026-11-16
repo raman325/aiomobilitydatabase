@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ._http import is_text
+
 
 def loads(raw: bytes) -> Any:
-    """Parse JSON text, or raise ValueError when the bytes are none.
+    r"""Parse JSON text, or raise ValueError when the bytes are none.
 
     RFC 8259: JSON exchanged between systems is UTF-8 (section 8.1), so the
     bytes are decoded as strict UTF-8 whatever a response's charset says (a
@@ -16,16 +18,42 @@ def loads(raw: bytes) -> Any:
     bytes themselves would also take UTF-16/32 and, by surrogatepass,
     encoded surrogates. A name repeated in an object (section 4: the result
     is unpredictable) and ``NaN``/``Infinity`` (no JSON) are refused, and so
-    is nesting deeper than the interpreter's stack.
+    is nesting deeper than the interpreter's stack -- and a string (a name or
+    a value) holding a lone surrogate, which an escape can spell
+    (``"\ud800"``; section 8.2 leaves its meaning unpredictable): no text,
+    it can't even be sent back.
     """
     try:
-        return json.loads(
+        value = json.loads(
             raw.decode("utf-8-sig"),
             object_pairs_hook=_unique_object,
             parse_constant=_reject_constant,
         )
-    except RecursionError as err:
-        raise ValueError("JSON nests deeper than can be parsed") from err
+    except RecursionError:
+        failure = "JSON nests deeper than can be parsed"
+    else:
+        _require_text(value)
+        return value
+    raise ValueError(failure)  # outside the except: nothing chained
+
+
+def _require_text(value: Any) -> None:
+    """Raise ValueError for a lone surrogate in any string, at any depth.
+
+    Walked with a stack, not recursion: a document may nest as deep as the
+    parser allowed.
+    """
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if not is_text(item):
+                raise ValueError("a JSON string holds a lone surrogate")
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

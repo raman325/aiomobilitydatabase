@@ -16,7 +16,7 @@ import aiohttp
 from mashumaro import DataClassDictMixin
 from yarl import URL
 
-from ._http import require_session, require_text
+from ._http import URL_ERRORS, require_session, require_text
 from ._json import loads as json_loads
 from ._payload import mismatch
 from ._transport import Answer, exchange
@@ -79,7 +79,7 @@ def _require_base_url(base_url: str) -> str:
     try:
         parsed = URL(base_url)
         host = parsed.host
-    except (ValueError, IndexError) as err:
+    except URL_ERRORS as err:
         raise ValueError(f"base_url {base_url!r} is no URL") from err
     if parsed.scheme not in ("http", "https") or not host:
         raise ValueError("base_url must be an http(s) URL with a host")
@@ -180,8 +180,10 @@ def _decode(answer: Answer) -> Any:
     try:
         return json_loads(answer.body)
     except ValueError:
-        # Not from err: a JSONDecodeError holds the whole body (.doc).
-        raise MobilityDatabaseConnectionError("API returned invalid JSON") from None
+        pass
+    # Raised outside the except: a JSONDecodeError holds the whole body (.doc),
+    # and from None would only hide it, still attached as the context.
+    raise MobilityDatabaseConnectionError("API returned invalid JSON")
 
 
 def _text(answer: Answer) -> str:
@@ -206,11 +208,11 @@ def _one[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> ModelT:
         return model.from_dict(data)
     except _DECODE_ERRORS as err:
         # mashumaro's own text quotes the value (an echoed token, say): name
-        # the field only, and pass nothing of the error on.
+        # the field only, and raise outside the except, attaching nothing.
         field = getattr(err, "field_name", None) or "a field"
-        raise MobilityDatabaseConnectionError(
-            f"API returned an invalid {model.__name__}: {field} can't be read"
-        ) from None
+    raise MobilityDatabaseConnectionError(
+        f"API returned an invalid {model.__name__}: {field} can't be read"
+    )
 
 
 def _many[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> list[ModelT]:
@@ -261,8 +263,16 @@ class MobilityDatabaseClient:
         Bearer header), a ``base_url`` (aiohttp then refuses absolute URLs
         before 3.14), or a default header HTTP can't carry.
         """
+        if not isinstance(refresh_token, str):
+            raise TypeError("refresh_token must be a str")
         if not refresh_token:
             raise ValueError("refresh_token is empty")
+        if (
+            isinstance(request_timeout, bool)
+            or not isinstance(request_timeout, int | float)
+            or not request_timeout > 0
+        ):
+            raise ValueError("request_timeout must be a positive number of seconds")
         if session is not None:
             _require_catalog_session(session)
         self._refresh_token = refresh_token
@@ -417,7 +427,7 @@ class MobilityDatabaseClient:
                 retry_on_auth_fail=False,
             )
         if answer.status == HTTPStatus.NOT_FOUND:
-            raise MobilityDatabaseNotFoundError(f"Not found: {path}")
+            raise MobilityDatabaseNotFoundError("Not found")
         if answer.status == HTTPStatus.TOO_MANY_REQUESTS:
             raise MobilityDatabaseRateLimitError("API rate limit exceeded")
         # Only a 200 or 203 carries the answer (RFC 9110 section 15.3): a 204
