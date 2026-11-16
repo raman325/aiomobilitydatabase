@@ -735,13 +735,19 @@ raises `ValueError` for a `feed_id` it will not accept (see above), and a
 catalog method raises `ValueError` for an id of `""`, `"."` or `".."`, which
 no URL can carry as one path segment (`TypeError` for an id that isn't a
 `str`), or for a query value or `license_url` holding a lone surrogate (no
-text a URL can carry). `MobilityDatabaseClient(...)` raises `ValueError` for an
-empty refresh token; a `base_url` that isn't https (plain http only on
-loopback: bearer tokens travel over TLS, RFC 6750) or holds credentials, a
-query or a fragment; or an injected session with an `auth`, an
-`Authorization`, `Cookie` or `Proxy-Authorization` default header (any of
-which would ride on every request, to every origin), a `base_url`, or a
-default header outside the allowlist (token names, visible-ASCII values).
+text a URL can carry), or a float filter that is NaN or infinite. A query
+value of another type than the method takes (`bytes`, say, which would have
+filtered on `"b'...'"`) is a `TypeError`. Both are raised before any request
+is made. A closed injected session is a `RuntimeError`.
+`MobilityDatabaseClient(...)` raises `TypeError` for a refresh token that isn't
+a `str`, and `ValueError` for an empty one; a `request_timeout` that isn't a
+positive number; a `base_url` that isn't https (plain http only on loopback:
+bearer tokens travel over TLS, RFC 6750) or holds credentials, a query or a
+fragment; or an injected session with an `auth`, an `Authorization`, `Cookie`
+or `Proxy-Authorization` default header, or a cookie set without a domain
+(`ClientSession(cookies=...)`) -- any of which would ride on every request,
+to every origin -- a `base_url`, or a default header outside the allowlist
+(token names, visible-ASCII values).
 
 Exception messages are written by the library alone: never a response body,
 a URL's credentials or query, or another library's error text (any of which
