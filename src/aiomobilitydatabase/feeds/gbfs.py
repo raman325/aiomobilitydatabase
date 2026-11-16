@@ -482,17 +482,21 @@ class GbfsFeedHandle:
     async def create(cls, client: MobilityFeedsClient, feed_id: str) -> GbfsFeedHandle:
         """Resolve endpoint URLs from the newest catalog-listed version."""
         feed = await client.catalog.get_gbfs_feed(feed_id)
-        best: dict[str, str] = {}
-        for version in sorted(
-            feed.versions or [], key=lambda v: _version_key(v.version)
-        ):
+        # The highest version with endpoints wins. Versions that rank the
+        # same ("3.0" and "3.0.0") are told apart by their text, then their
+        # endpoints, so the catalog's listing order never picks the winner.
+        ranked: list[tuple[tuple[Any, ...], dict[str, str]]] = []
+        for version in feed.versions or []:
             endpoints = {
                 endpoint.name: endpoint.url
                 for endpoint in (version.endpoints or [])
                 if endpoint.name and endpoint.url
             }
             if endpoints:
-                best = endpoints  # last (highest) version with endpoints wins
+                text = version.version if isinstance(version.version, str) else ""
+                rank = (_version_key(version.version), text, sorted(endpoints.items()))
+                ranked.append((rank, endpoints))
+        best = max(ranked, key=lambda item: item[0])[1] if ranked else {}
         return cls(client, feed, best)
 
     @classmethod

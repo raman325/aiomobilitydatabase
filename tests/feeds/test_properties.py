@@ -1021,14 +1021,48 @@ def test_create_picks_newest_version_that_has_endpoints(
     client = _StubClient(feed)
     handle = asyncio.run(GbfsFeedHandle.create(client, "f"))  # type: ignore[arg-type]
     usable = [
-        (_trimmed(parts), index)
+        (
+            _trimmed(parts),
+            ".".join(str(part) for part in parts),
+            f"https://e.com/{index}",
+        )
         for index, (parts, has_endpoints) in enumerate(versions)
         if has_endpoints
     ]
-    expected = (
-        {"station_information": f"https://e.com/{max(usable)[1]}"} if usable else {}
-    )
+    # Equal-ranked versions ("1" and "1.0") are told apart by their text.
+    expected = {"station_information": max(usable)[2]} if usable else {}
     assert handle._endpoints == expected
+
+
+@given(
+    versions=st.lists(
+        st.tuples(
+            st.sampled_from(["3", "3.0", "3.0.0", "3.0-RC", "3-RC", "2.3", "junk"]),
+            st.sampled_from(["https://e.com/a", "https://e.com/b", None]),
+        ),
+        min_size=1,
+        max_size=6,
+    ),
+    data=st.data(),
+)
+def test_create_picks_the_same_version_whatever_the_catalog_order(
+    versions: list[tuple[str, str | None]], data: st.DataObject
+) -> None:
+    """Versions that rank the same ("3.0" and "3.0.0"), or that repeat with
+    other endpoints, never leave the choice to the catalog's listing order:
+    every order of the same versions resolves the same endpoints."""
+
+    def resolve(order: list[tuple[str, str | None]]) -> dict[str, str]:
+        feed = _StubVersion("feed", [])
+        feed.versions = [  # type: ignore[attr-defined]
+            _StubVersion(version, [_StubEndpoint("station_information", url)])
+            for version, url in order
+        ]
+        handle = asyncio.run(GbfsFeedHandle.create(_StubClient(feed), "f"))  # type: ignore[arg-type]
+        return handle._endpoints
+
+    shuffled = data.draw(st.permutations(versions))
+    assert resolve(shuffled) == resolve(versions) == resolve(versions[::-1])
 
 
 @given(
