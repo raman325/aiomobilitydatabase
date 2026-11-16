@@ -1714,3 +1714,31 @@ async def test_gbfs_credentials_go_only_to_the_discovery_origin(where: str) -> N
         assert "authorization" not in seen
     else:
         assert seen["authorization"] == "Bearer GbfsSecret"
+
+
+async def test_a_producer_url_with_credentials_beside_an_authorization_header(
+    mock_api: MockApi,
+) -> None:
+    """A discovery document naming an endpoint with credentials, fetched with
+    the caller's Authorization header: which to send isn't the library's to
+    pick, so neither is, and nothing reaches the endpoint."""
+    endpoint = mock_api.url("/si").replace("http://", "http://u:p@")
+    mock_api.get(
+        "/gbfs.json",
+        payload={
+            "last_updated": 0,
+            "ttl": 0,
+            "version": "2.3",
+            "data": {
+                "en": {"feeds": [{"name": "system_information", "url": endpoint}]}
+            },
+        },
+    )
+    async with MobilityFeedsClient() as client:
+        handle = await client.get_gbfs_feed_from_url(
+            mock_api.url("/gbfs.json"), headers={"Authorization": "Bearer Tok"}
+        )
+        with pytest.raises(SourceConnectionError, match="can't both be sent") as caught:
+            await handle.get_system_info()
+    assert caught.value.__context__ is None
+    assert "/si" not in [r.path for r in mock_api.requests]

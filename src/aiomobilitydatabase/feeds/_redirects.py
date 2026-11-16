@@ -21,6 +21,7 @@ or reaching another URL than the producer named:
 
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from http import HTTPStatus
@@ -69,6 +70,16 @@ def _origin(url: URL) -> tuple[str, str | None, int | None]:
 def same_origin(a: str, b: str) -> bool:
     """Return whether two checked URLs share an RFC 6454 origin."""
     return _origin(URL(a)) == _origin(URL(b))
+
+
+def _basic(user: str | None, password: str | None) -> str:
+    """Return the Basic credentials header value (RFC 7617).
+
+    The URL guard has checked them: Latin-1 (aiohttp's encoding), no
+    control character, no colon in the user-id.
+    """
+    pair = f"{user or ''}:{password or ''}".encode("latin-1")
+    return "Basic " + base64.b64encode(pair).decode("ascii")
 
 
 def _remaining(deadline: float | None, url: str) -> float | None:
@@ -175,14 +186,26 @@ async def get_withholding(
     validated = URL(conditional_url) if conditional_url is not None else target
     query = params or None
     # Credentials in the URL: sent for the first hop, and kept while the
-    # chain stays in their origin.
+    # chain stays in their origin. Sent as Basic auth by the library, the URL
+    # stripped of them: whether aiohttp derives auth from a URL (3.10 skips a
+    # password without a user; 3.14 deprecates its auth) no longer decides.
     userinfo = (target.user, target.password) if has_credentials(target) else None
-    userinfo_origin = _origin(target)
+    target = target.with_user(None)
     while True:
         remaining = _remaining(deadline, url)
         # The validators go to the resource they came from, and only to it.
         asked = _same_resource(target, query, validated)
         hop_headers = {**sent, **conditional} if conditional and asked else sent
+        if userinfo is not None:
+            if any(name.lower() == "authorization" for name in hop_headers):
+                # Which would be sent is aiohttp's choice (it refused the
+                # pair): neither is, the request is the source's fault.
+                raise SourceConnectionError(
+                    "The URL's credentials and an Authorization header "
+                    "can't both be sent",
+                    url=redact(url),
+                )
+            hop_headers = {**hop_headers, "Authorization": _basic(*userinfo)}
         response = await network(
             session.request(
                 method,
@@ -213,9 +236,7 @@ async def get_withholding(
         if has_credentials(following):
             # Credentials the Location gives are addressed to its origin.
             userinfo = (following.user, following.password)
-            userinfo_origin = origin
-        elif userinfo is not None and origin == userinfo_origin:
-            following = following.with_user(userinfo[0]).with_password(userinfo[1])
+            following = following.with_user(None)
         if response.status == HTTPStatus.SEE_OTHER and method != "HEAD":
             method = "GET"
         target, query = following, None
