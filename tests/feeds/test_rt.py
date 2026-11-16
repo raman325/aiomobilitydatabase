@@ -1,6 +1,7 @@
 """Tests for GTFS-RT fetching (auth, errors) and protobuf parsing."""
 
 import asyncio
+import functools
 import os
 import subprocess
 import sys
@@ -8,11 +9,13 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from google.protobuf import descriptor_pb2, descriptor_pool
 from google.transit import gtfs_realtime_pb2
 from hypothesis import given
 from hypothesis import strategies as st
@@ -212,18 +215,166 @@ def test_a_feed_parses_exactly_when_its_strings_are_utf_8(
         assert message.entity[0].trip_update.trip.start_time == text
 
 
+@functools.cache
+def _extensions() -> dict[str, Any]:
+    """Register test extensions of TripDescriptor in the default pool, once.
+
+    As a module like an agency's realtime extensions would: a string, a
+    repeated string, a bytes field, and a message holding a string, a
+    string map and bytes of its own (9000-9999 is GTFS-RT's range for
+    experiments).
+    """
+    pool = descriptor_pool.Default()
+    name = "aiomobilitydatabase_test_extensions.proto"
+    try:
+        pool.FindFileByName(name)
+    except KeyError:
+        string, nbytes, message = (
+            descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+            descriptor_pb2.FieldDescriptorProto.TYPE_BYTES,
+            descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        )
+        optional, repeated = (
+            descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+            descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+        )
+        file = descriptor_pb2.FileDescriptorProto(
+            name=name,
+            package="aiomobilitydatabase_test",
+            dependency=["gtfs-realtime.proto"],
+            syntax="proto2",
+        )
+        extra = file.message_type.add(name="Extra")
+        extra.field.add(name="note", number=1, type=string, label=optional)
+        extra.field.add(name="blob", number=3, type=nbytes, label=optional)
+        entry = extra.nested_type.add(name="TagsEntry")
+        entry.options.map_entry = True
+        entry.field.add(name="key", number=1, type=string, label=optional)
+        entry.field.add(name="value", number=2, type=string, label=optional)
+        extra.field.add(
+            name="tags",
+            number=2,
+            type=message,
+            label=repeated,
+            type_name=".aiomobilitydatabase_test.Extra.TagsEntry",
+        )
+        for field_name, number, field_type, label, type_name in (
+            ("ext_note", 9990, string, optional, None),
+            ("ext_notes", 9991, string, repeated, None),
+            ("ext_blob", 9992, nbytes, optional, None),
+            ("ext_extra", 9993, message, optional, ".aiomobilitydatabase_test.Extra"),
+        ):
+            field = file.extension.add(
+                name=field_name,
+                number=number,
+                type=field_type,
+                label=label,
+                extendee=".transit_realtime.TripDescriptor",
+            )
+            if type_name:
+                field.type_name = type_name
+        pool.Add(file)
+    return {
+        short: pool.FindExtensionByName(f"aiomobilitydatabase_test.{short}")
+        for short in ("ext_note", "ext_notes", "ext_blob", "ext_extra")
+    }
+
+
+def _with_extension_bytes(field: str, payload: bytes) -> bytes:
+    """A FeedMessage whose TripDescriptor extension ``field`` holds ``payload``."""
+    extensions = _extensions()
+    placeholder = "~" * len(payload)
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    trip = message.entity.add(id="e1").trip_update.trip
+    trip.trip_id = "T"
+    if field == "ext_note":
+        trip.Extensions[extensions["ext_note"]] = placeholder
+    elif field == "ext_notes":
+        trip.Extensions[extensions["ext_notes"]].extend(["ok", placeholder])
+    elif field == "ext_blob":
+        trip.Extensions[extensions["ext_blob"]] = placeholder.encode()
+    else:
+        extra = trip.Extensions[extensions["ext_extra"]]
+        if field == "ext_extra.note":
+            extra.note = placeholder
+        elif field == "ext_extra.blob":
+            extra.blob = placeholder.encode()
+        elif field == "ext_extra.tags.key":
+            extra.tags[placeholder] = "v"
+        else:
+            extra.tags["k"] = placeholder
+    raw = message.SerializeToString()
+    assert raw.count(placeholder.encode()) == 1
+    return raw.replace(placeholder.encode(), payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "checked"),
+    [
+        ("ext_note", True),
+        ("ext_notes", True),
+        ("ext_extra.note", True),
+        ("ext_extra.tags.key", True),
+        ("ext_extra.tags.value", True),
+        ("ext_blob", False),  # bytes are bytes by definition
+        ("ext_extra.blob", False),
+    ],
+)
+def test_strings_in_registered_extensions_are_checked_and_bytes_are_not(
+    field: str, checked: bool
+) -> None:
+    """A registered extension's strings are the feed's strings: one that
+    isn't UTF-8 refuses the message, however deep (a message extension, a
+    map's keys and values). A bytes field may hold any bytes."""
+    invalid = _with_extension_bytes(field, b"\xff\xfe\xfd")
+    message = gtfs_realtime_pb2.FeedMessage()
+    try:
+        parsed = _parse_feed_message(message, invalid)
+    except Exception:  # the pure-Python runtime refuses while parsing
+        parsed = False
+    assert parsed is not checked
+    valid = _with_extension_bytes(field, "é:0".encode())
+    assert _parse_feed_message(gtfs_realtime_pb2.FeedMessage(), valid) is True
+
+
+def test_a_bytes_extension_reads_back_as_the_bytes_sent() -> None:
+    raw = _with_extension_bytes("ext_blob", b"\xff\xfe\xfd")
+    message = gtfs_realtime_pb2.FeedMessage()
+    assert _parse_feed_message(message, raw) is True
+    trip = message.entity[0].trip_update.trip
+    assert trip.Extensions[_extensions()["ext_blob"]] == b"\xff\xfe\xfd"
+
+
 _PURE_PYTHON_CHECK = """
 from google.protobuf.internal import api_implementation
 from google.transit import gtfs_realtime_pb2
 from aiomobilitydatabase.feeds.rt import _parse_feed_message
-from tests.feeds.test_rt import _STRING_FIELDS, _with_string_bytes
+from tests.feeds.test_rt import (
+    _STRING_FIELDS,
+    _with_extension_bytes,
+    _with_string_bytes,
+)
 
 assert api_implementation.Type() == "python", api_implementation.Type()
-for field in _STRING_FIELDS:
-    for payload, expected in ((b"\\xff\\xfe:00", False), ("é:00".encode(), True)):
+cases = [(_with_string_bytes, field, True) for field in _STRING_FIELDS]
+cases += [
+    (_with_extension_bytes, field, checked)
+    for field, checked in (
+        ("ext_note", True),
+        ("ext_notes", True),
+        ("ext_extra.note", True),
+        ("ext_extra.tags.key", True),
+        ("ext_extra.tags.value", True),
+        ("ext_blob", False),
+        ("ext_extra.blob", False),
+    )
+]
+for build, field, checked in cases:
+    for payload, expected in ((b"\\xff\\xfe:00", not checked), ("é:00".encode(), True)):
         message = gtfs_realtime_pb2.FeedMessage()
         try:
-            parsed = _parse_feed_message(message, _with_string_bytes(field, payload))
+            parsed = _parse_feed_message(message, build(field, payload))
         except Exception:
             parsed = False
         assert parsed is expected, (field, payload)

@@ -449,6 +449,12 @@ def test_a_pre_release_ranks_just_below_its_release() -> None:
     assert len(set(keys)) == len(keys)
 
 
+def test_trailing_zero_components_name_the_same_version() -> None:
+    assert _version_key("3") == _version_key("3.0") == _version_key("3.0.0")
+    assert _version_key("3.0-RC") < _version_key("3") < _version_key("3.0.1")
+    assert _version_key("3.0-RC") == _version_key("3-RC")
+
+
 async def test_create_resolves_a_pre_release_newer_than_its_predecessors() -> None:
     """GbfsFeedHandle.create takes the newest version with endpoints: a
     3.1-RC beside 2.3 is the newer, not junk sorting below it."""

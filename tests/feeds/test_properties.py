@@ -911,8 +911,17 @@ def test_version_key_orders_like_its_components(
     """
     key_left = _version_key(".".join(str(part) for part in left))
     key_right = _version_key(".".join(str(part) for part in right))
-    assert key_left[0] == tuple(left)
-    assert (key_left < key_right) is (tuple(left) < tuple(right))
+    assert key_left[0] == _trimmed(left)
+    assert (key_left < key_right) is (_trimmed(left) < _trimmed(right))
+    assert (key_left == key_right) is (_trimmed(left) == _trimmed(right))
+
+
+def _trimmed(parts: list[int]) -> tuple[int, ...]:
+    """A version's components without trailing zeros: 3 == 3.0 == 3.0.0."""
+    trimmed = list(parts)
+    while len(trimmed) > 1 and trimmed[-1] == 0:
+        trimmed.pop()
+    return tuple(trimmed)
 
 
 @given(
@@ -931,7 +940,7 @@ def test_a_pre_release_ranks_just_below_its_release_whatever_the_versions(
     other = ".".join(str(part) for part in right)
     pre = _version_key(f"{base}-{label}{number}")
     assert pre < _version_key(base)
-    if tuple(right) < tuple(left):
+    if _trimmed(right) < _trimmed(left):
         assert _version_key(other) < pre
     else:
         assert pre < _version_key(other)
@@ -1012,7 +1021,7 @@ def test_create_picks_newest_version_that_has_endpoints(
     client = _StubClient(feed)
     handle = asyncio.run(GbfsFeedHandle.create(client, "f"))  # type: ignore[arg-type]
     usable = [
-        (tuple(parts), index)
+        (_trimmed(parts), index)
         for index, (parts, has_endpoints) in enumerate(versions)
         if has_endpoints
     ]

@@ -123,7 +123,8 @@ def _version_key(version: str | None) -> tuple[tuple[int, ...], int, str, int]:
     """Sort key of a GBFS version ("2.3", "3.0", "3.1-RC").
 
     Ranked by the numeric version, a pre-release just below its release
-    (3.0 < 3.1-RC < 3.1-RC2 < 3.1). Anything else -- None included -- is
+    (3.0 < 3.1-RC < 3.1-RC2 < 3.1); trailing zero components name the same
+    version ("3" == "3.0" == "3.0.0"). Anything else -- None included -- is
     no version and ranks below every one. ASCII digits only: ``int()``
     also reads other scripts' digits, spaces and ``_`` grouping, so a
     corrupt "\uff13.0" would sort as 3.0.
@@ -134,6 +135,8 @@ def _version_key(version: str | None) -> tuple[tuple[int, ...], int, str, int]:
     numbers, label, number = match.groups()
     try:
         release = tuple(int(part) for part in numbers.split("."))
+        while len(release) > 1 and release[-1] == 0:
+            release = release[:-1]
         if label is None:
             return (release, 1, "", 0)
         return (release, 0, label.upper(), int(number or "0"))

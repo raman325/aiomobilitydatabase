@@ -97,14 +97,14 @@ def _same_resource(target: URL, query: Mapping[str, str] | None, other: URL) -> 
 
 
 def _resolve(base: URL, location: str, session: aiohttp.ClientSession, url: str) -> URL:
-    """Resolve a Location as aiohttp would; refuse what no request can go to.
+    """Resolve a Location by RFC 3986; refuse what no request can go to.
 
-    A Location with a scheme of its own is used as it is (RFC 3986 section
-    5.2.2, the strict parser): joined onto the base, ``http:///x`` would
-    borrow the base's host. Then the same checks as a first URL: UTF-8
-    text (yarl drops a lone surrogate, naming another URL), a host the
-    resolver can encode, credentials Basic auth can carry -- and an
-    http(s) scheme.
+    A reference without a scheme is joined onto the base; one with a scheme
+    of its own is used as it is (section 5.2.2, the strict parser), where
+    joining -- as aiohttp would -- gives ``http:///x`` the base's host.
+    Then the same checks as a first URL: UTF-8 text (yarl drops a lone
+    surrogate, naming another URL), a host the resolver can encode,
+    credentials Basic auth can carry -- and an http(s) scheme.
     """
     try:
         location.encode("utf-8")
