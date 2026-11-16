@@ -12,8 +12,10 @@ import csv
 import heapq
 import io
 import json
+import lzma
 import os
 import sqlite3
+import sys
 import tempfile
 import zipfile
 import zlib
@@ -495,21 +497,51 @@ def _defaulted_text(value: str | None, default: str) -> str:
     return value if value is not None and value.strip() else default
 
 
-# What a member of the zip can raise when opened: an encrypted entry, an
-# unsupported compression method, a corrupt local header.
-_OPEN_ERRORS = (RuntimeError, NotImplementedError, zipfile.BadZipFile)
-# ... and while it is read and parsed: bad bytes (not UTF-8), a failed CRC
-# or truncated stream, a field past csv's size limit, a row shorter than the
-# header (see _FullRowReader), a missing column the loaders index.
-_READ_ERRORS = (
+# What a corrupt archive can raise while it, or one of its members, is
+# opened: a damaged central directory or local header (BadZipFile; a seek to
+# an offset before the file's start, OSError on a file and ValueError in
+# memory), a name flagged UTF-8 that is not (UnicodeDecodeError, a
+# ValueError), an unsupported zip version, method or flag
+# (NotImplementedError), an encrypted entry (RuntimeError), a truncated
+# record (EOFError).
+_OPEN_ERRORS = (
+    zipfile.BadZipFile,
+    OSError,
+    ValueError,
+    NotImplementedError,
+    RuntimeError,
+    EOFError,
+)
+# What each compression method raises for bad data as a member is read: a
+# failed CRC or truncated stream (BadZipFile, EOFError), deflate's
+# zlib.error, bzip2's bare OSError, LZMA's LZMAError, Zstandard's ZstdError
+# (zipfile reads method 93 from Python 3.14, when the module is built).
+_ZSTD_ERRORS: tuple[type[Exception], ...] = ()
+if sys.version_info >= (3, 14):
+    try:
+        from compression.zstd import ZstdError
+    except ImportError:  # built without zstd: zipfile refuses method 93 at open
+        pass
+    else:
+        _ZSTD_ERRORS = (ZstdError,)
+_DECOMPRESS_ERRORS: tuple[type[Exception], ...] = (
+    zipfile.BadZipFile,
+    EOFError,
+    zlib.error,
+    OSError,
+    lzma.LZMAError,
+    *_ZSTD_ERRORS,
+)
+# ... and everything a member's bytes can raise while read and parsed: those,
+# bad bytes (not UTF-8), a field past csv's size limit, a row shorter than
+# the header (see _FullRowReader), a missing column the loaders index.
+_READ_ERRORS: tuple[type[Exception], ...] = (
+    *_DECOMPRESS_ERRORS,
     ValueError,
     KeyError,
     AttributeError,
     TypeError,
     csv.Error,
-    zipfile.BadZipFile,
-    zlib.error,
-    EOFError,
 )
 
 
@@ -579,7 +611,7 @@ def _open_zip(zip_path: Path) -> zipfile.ZipFile:
     """Open the dataset; one that isn't a readable zip is FeedParseError."""
     try:
         return zipfile.ZipFile(zip_path)
-    except (zipfile.BadZipFile, OSError) as err:
+    except _OPEN_ERRORS as err:
         reason = _reason(err)
     raise FeedParseError(f"Unreadable GTFS zip: {reason}")  # outside: see _reason
 

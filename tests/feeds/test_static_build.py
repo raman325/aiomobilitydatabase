@@ -3,6 +3,7 @@
 import io
 import os
 import sqlite3
+import struct
 import traceback
 import zipfile
 from collections.abc import Mapping
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds._numbers import exact_number
@@ -1306,3 +1307,159 @@ def test_a_malformed_file_carries_nothing_of_the_error_behind_it(
             shown = repr(value)
             assert "SECRETBYTES" not in shown, (frame.f_code.co_name, name)
             assert not isinstance(value, UnicodeError), (frame.f_code.co_name, name)
+
+
+# -- A corrupt archive is FeedParseError, whatever part of it is damaged ----------
+
+
+_CENTRAL = b"PK\x01\x02"
+_LOCAL = b"PK\x03\x04"
+_END = b"PK\x05\x06"
+
+
+def _archive(method: int = zipfile.ZIP_STORED) -> bytearray:
+    """The fixture feed as zip bytes, every member compressed by ``method``."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", method) as zf:
+        for member, content in _FILES.items():
+            zf.writestr(member, content)
+    return bytearray(buf.getvalue())
+
+
+def _member_data(data: bytearray, member: str) -> int:
+    """Where ``member``'s compressed bytes start."""
+    start = data.index(_LOCAL)  # the first local header
+    while True:
+        name_length, extra_length = struct.unpack_from("<HH", data, start + 26)
+        name = bytes(data[start + 30 : start + 30 + name_length])
+        if name == member.encode():
+            return start + 30 + name_length + extra_length
+        start = data.index(_LOCAL, start + 4)
+
+
+def _build_bytes(tmp_path: Path, data: bytes | bytearray) -> StaticIndex:
+    zip_path = tmp_path / "corrupt.zip"
+    zip_path.write_bytes(bytes(data))
+    return StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def _assert_refused(
+    tmp_path: Path, data: bytes | bytearray, message: str | None = None
+) -> None:
+    """The build fails with FeedParseError alone: nothing chained, and no
+    frame on the traceback keeps another error as a local."""
+    with pytest.raises(FeedParseError) as caught:
+        _build_bytes(tmp_path, data).close()
+    if message is not None:
+        assert str(caught.value) == message
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_code.co_filename == __file__:
+            continue
+        for name, value in frame.f_locals.items():
+            assert not isinstance(value, BaseException) or isinstance(
+                value, FeedParseError
+            ), (frame.f_code.co_name, name)
+
+
+def test_a_name_flagged_utf8_that_is_not_is_an_unreadable_zip(
+    tmp_path: Path,
+) -> None:
+    """ZipFile() decodes a name whose UTF-8 flag is set as UTF-8; bytes that
+    are not were a bare UnicodeDecodeError."""
+    data = _archive()
+    central = data.index(_CENTRAL)
+    flags = struct.unpack_from("<H", data, central + 8)[0]
+    struct.pack_into("<H", data, central + 8, flags | 0x800)
+    data[central + 46] = 0xFF  # the first byte of its name
+    _assert_refused(tmp_path, data, "Unreadable GTFS zip: UnicodeDecodeError")
+
+
+def test_a_central_directory_offset_before_the_file_is_an_unreadable_member(
+    tmp_path: Path,
+) -> None:
+    """The end record placing the central directory further in than it is
+    shifts every member's header to before the file's start: seeking there
+    was a bare OSError (errno 22) from archive.open."""
+    data = _archive()
+    end = data.rindex(_END)
+    offset = struct.unpack_from("<I", data, end + 16)[0]
+    struct.pack_into("<I", data, end + 16, offset + 10_000)
+    _assert_refused(tmp_path, data, "Unreadable agency.txt: OSError")
+
+
+# Each method's stream, and where its data starts: zipfile's LZMA member
+# opens with a 4-byte header and 5 bytes of properties.
+_METHOD_ERRORS = [
+    pytest.param(zipfile.ZIP_DEFLATED, 0, "error", id="deflate"),
+    pytest.param(zipfile.ZIP_BZIP2, 0, "OSError", id="bzip2"),
+    pytest.param(zipfile.ZIP_LZMA, 9, "LZMAError", id="lzma"),
+]
+if hasattr(zipfile, "ZIP_ZSTANDARD"):  # Python 3.14+
+    _METHOD_ERRORS.append(
+        pytest.param(zipfile.ZIP_ZSTANDARD, 0, "ZstdError", id="zstandard")
+    )
+
+
+@pytest.mark.parametrize(("method", "skip", "reason"), _METHOD_ERRORS)
+def test_bad_compressed_data_is_a_malformed_member(
+    tmp_path: Path, method: int, skip: int, reason: str
+) -> None:
+    """Each method raises its own error for data it can't decompress --
+    bzip2 a bare OSError, Zstandard a ZstdError -- and each is the member's
+    FeedParseError, named by type."""
+    try:
+        data = _archive(method)
+    except RuntimeError:  # zstd: this Python was built without the module
+        pytest.skip("compression method unavailable")
+    start = _member_data(data, "stops.txt") + skip
+    data[start : start + 8] = b"\xff" * 8  # no stream starts like this
+    _assert_refused(tmp_path, data, f"Malformed stops.txt: {reason}")
+
+
+_METHODS = [
+    zipfile.ZIP_STORED,
+    zipfile.ZIP_DEFLATED,
+    zipfile.ZIP_BZIP2,
+    zipfile.ZIP_LZMA,
+    *([zipfile.ZIP_ZSTANDARD] if hasattr(zipfile, "ZIP_ZSTANDARD") else []),
+]
+
+
+@given(
+    method=st.sampled_from(_METHODS),
+    edits=st.lists(
+        st.tuples(st.floats(0, 1, exclude_max=True), st.integers(0, 255)),
+        min_size=1,
+        max_size=8,
+    ),
+    cut=st.one_of(st.none(), st.floats(0, 1, exclude_max=True)),
+)
+@settings(max_examples=300, deadline=None)
+def test_a_damaged_archive_builds_or_fails_as_feed_parse_error(
+    tmp_path_factory: pytest.TempPathFactory,
+    method: int,
+    edits: list[tuple[float, int]],
+    cut: float | None,
+) -> None:
+    """Any bytes changed anywhere, maybe cut short, under any method: the
+    build succeeds or raises FeedParseError with nothing chained -- never
+    zipfile's or a decompressor's own error."""
+    try:
+        data = _archive(method)
+    except RuntimeError:  # zstd unavailable
+        return
+    for where, value in edits:
+        data[int(where * len(data))] = value
+    if cut is not None:
+        data = data[: int(cut * len(data))]
+    tmp_path = tmp_path_factory.mktemp("damaged")
+    try:
+        _build_bytes(tmp_path, data).close()
+    except FeedParseError:
+        refused = True
+    else:
+        refused = False
+    if refused:  # checked again outside the except: it would chain to this one
+        _assert_refused(tmp_path, data)
