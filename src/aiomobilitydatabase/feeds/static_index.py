@@ -214,6 +214,53 @@ _ONE_DAY = 86_400
 _IDS = "(??)"
 
 
+# SQLite's result codes for a damaged database: a malformed page
+# (SQLITE_CORRUPT), or a file that is not a database (SQLITE_NOTADB).
+_DAMAGE_CODES = frozenset({sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB})
+# What a built index's sqlite_master holds: _SCHEMA, as SQLite records it.
+_SCHEMA_ROWS_SQL = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY 1, 2"
+
+
+def _schema_rows() -> list[tuple[Any, ...]]:
+    """Return the sqlite_master rows _SCHEMA creates (root pages aside)."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_SCHEMA)
+        return conn.execute(_SCHEMA_ROWS_SQL).fetchall()
+    finally:
+        conn.close()
+
+
+_PRISTINE_SCHEMA = _schema_rows()
+
+
+def _damaged(err: sqlite3.Error) -> bool:
+    """Report whether ``err`` says the database file is damaged.
+
+    SQLite's damage codes, or the module's own OperationalError (no code),
+    which it raises for a stored value that does not decode as UTF-8 --
+    and the build stores nothing else.
+    """
+    code = getattr(err, "sqlite_errorcode", None)
+    if code is None:
+        return isinstance(err, sqlite3.OperationalError)
+    return code & 0xFF in _DAMAGE_CODES
+
+
+def _maybe_damaged(err: sqlite3.Error) -> bool:
+    """Report whether ``err`` may be damage SQLite has no code for.
+
+    A schema whose text still parses but names other columns ("no such
+    column"), a header past what this SQLite reads ("unsupported file
+    format"): SQLITE_ERROR, as a mistaken statement would be. Whether the
+    file still checks out decides which it is (see StaticIndex._query).
+    """
+    return (
+        isinstance(err, sqlite3.OperationalError)
+        and getattr(err, "sqlite_errorcode", None) == sqlite3.SQLITE_ERROR
+    )
+
+
 class _Ids(NamedTuple):
     """A caller- or data-sized list of ids, bound to one ``IN _IDS``."""
 
@@ -1359,6 +1406,10 @@ class StaticIndex:
         a feed instead of letting a corrupt entry self-heal. Non-regular
         files (a directory, a FIFO) are rejected before connecting --
         sqlite3.connect itself raises on those, outside any query guard.
+        A matching file is then checked whole (``PRAGMA quick_check``): a
+        damaged page anywhere -- stops and routes the handle reads at once,
+        stop_times or an index a later query would meet -- is a miss too, so
+        the entry is rebuilt rather than failing every open or query.
         Every failure path closes the connection it opened.
         """
         if not Path(db_path).is_file():
@@ -1376,6 +1427,7 @@ class StaticIndex:
             meta.get("dataset_id") != dataset_id
             or meta.get("schema_version") != str(SCHEMA_VERSION)
             or "timezone" not in meta
+            or not cls._intact(conn)  # last: it reads the whole file
         ):
             conn.close()
             return None
@@ -1388,6 +1440,25 @@ class StaticIndex:
             # __init__, one layer below the guards above.
             conn.close()
             return None
+
+    @staticmethod
+    def _intact(conn: sqlite3.Connection) -> bool:
+        """Report whether the file is well formed and holds the built schema.
+
+        ``PRAGMA quick_check`` answers one row, ``ok``, or the problems it
+        found; it doesn't read the schema's text, which damage can leave
+        parseable but naming other columns, so that is compared with what
+        _SCHEMA creates. A check that itself trips over the damage is no
+        better -- running out of memory included, which a damaged length
+        can cause.
+        """
+        try:
+            return (
+                conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+                and conn.execute(_SCHEMA_ROWS_SQL).fetchall() == _PRISTINE_SCHEMA
+            )
+        except (sqlite3.Error, OSError, UnicodeDecodeError, MemoryError):
+            return False
 
     @staticmethod
     def _timezone_from_agency(archive: zipfile.ZipFile, names: set[str]) -> str | None:
@@ -2195,6 +2266,38 @@ class StaticIndex:
 
     # -- queries -----------------------------------------------------------
 
+    def _query(self, sql: str, params: Sequence[object] = ()) -> list[tuple[Any, ...]]:
+        """Run one read and return its rows: the one place a read meets SQLite.
+
+        A cached index can be damaged after it was opened and checked (see
+        :meth:`open_cached`), or in a cell the check can't judge: a page
+        SQLite finds malformed, a file no longer a database at all, text
+        that no longer decodes, or an error SQLite has no damage code for
+        raised by a file that no longer checks out (a MemoryError too: a
+        damaged length can ask for more than there is) -- the index's problem,
+        not the caller's -- is FeedParseError in the library's words,
+        raised outside the except block so nothing is chained. Every other
+        error passes as SQLite raised it: a closed index's ProgrammingError
+        stays the caller's misuse.
+        """
+        try:
+            return self._conn.execute(sql, params).fetchall()
+        except UnicodeDecodeError:
+            pass  # text the build stored as UTF-8 no longer is
+        except MemoryError:
+            # SQLite's NOMEM: memory, or a damaged length asking for more.
+            if self._intact(self._conn):
+                raise
+        except sqlite3.DatabaseError as err:
+            if not _damaged(err) and not (
+                _maybe_damaged(err) and not self._intact(self._conn)
+            ):
+                raise
+        raise FeedParseError(
+            f"The static index of dataset {self.dataset_id!r} is damaged: "
+            "SQLite reports a malformed database; purge the cache to rebuild it"
+        )
+
     def _select(self, sql: str, params: Sequence[object]) -> list[tuple[Any, ...]]:
         """Run ``sql``, binding each :class:`_Ids` in ``params`` to its ``IN _IDS``.
 
@@ -2245,7 +2348,7 @@ class StaticIndex:
                     bound.extend(next(slices))
                 else:
                     bound.append(param)
-            rows.extend(self._conn.execute(text, bound).fetchall())
+            rows.extend(self._query(text, bound))
         return rows
 
     def stops(self) -> list[Stop]:
@@ -2259,12 +2362,12 @@ class StaticIndex:
         under a platform under a station reads the station's. A parent id
         naming no stop, or a ``parent_station`` cycle, ends the chain there.
         """
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT id, name, lat, lon, parent_station, location_type, "
             "stop_code, platform_code, wheelchair_boarding, "
             "description, url, zone_id, timezone "
             "FROM stops ORDER BY name"
-        ).fetchall()
+        )
         by_id = {row[0]: row for row in rows}
         return [
             Stop(
@@ -2308,7 +2411,7 @@ class StaticIndex:
         """All routes (for pickers)."""
         return [
             self._route_from_row(row)
-            for row in self._conn.execute(
+            for row in self._query(
                 "SELECT id, short_name, long_name, type, "
                 "agency_id, color, text_color, url, description, sort_order "
                 "FROM routes ORDER BY id"
@@ -2322,12 +2425,14 @@ class StaticIndex:
         data row); date columns parse leniently at this boundary, so a
         malformed feed_start_date surfaces as None rather than an error.
         """
-        row = self._conn.execute(
+        rows = self._query(
             "SELECT publisher_name, publisher_url, lang, version, "
-            "start_date, end_date, contact_email, contact_url FROM feed_info"
-        ).fetchone()
-        if row is None:
+            "start_date, end_date, contact_email, contact_url FROM feed_info "
+            "LIMIT 1"
+        )
+        if not rows:
             return None
+        [row] = rows
         return FeedInfo(
             publisher_name=row[0],
             publisher_url=row[1],
@@ -2352,7 +2457,7 @@ class StaticIndex:
                 fare_url=row[6],
                 email=row[7],
             )
-            for row in self._conn.execute(
+            for row in self._query(
                 "SELECT id, name, url, timezone, lang, phone, fare_url, email "
                 "FROM agencies"
             )
@@ -2373,7 +2478,7 @@ class StaticIndex:
                     for rings in json.loads(row[3])
                 ),
             )
-            for row in self._conn.execute(
+            for row in self._query(
                 "SELECT id, name, description, polygons FROM locations ORDER BY id"
             )
         ]
@@ -2385,7 +2490,7 @@ class StaticIndex:
         names is not one (its ``location_group_id`` must reference a group).
         """
         members: dict[str, dict[str, None]] = {}
-        for group_id, stop_id in self._conn.execute(
+        for group_id, stop_id in self._query(
             "SELECT location_group_id, stop_id FROM location_group_stops ORDER BY rowid"
         ):
             members.setdefault(group_id, {})[stop_id] = None
@@ -2393,7 +2498,7 @@ class StaticIndex:
             LocationGroup(
                 id=group_id, name=name, stop_ids=tuple(members.get(group_id, ()))
             )
-            for group_id, name in self._conn.execute(
+            for group_id, name in self._query(
                 "SELECT id, name FROM location_groups ORDER BY id"
             )
         ]
@@ -2419,7 +2524,7 @@ class StaticIndex:
                 booking_url=row[14],
                 unreadable_fields=tuple(row[15].split()) if row[15] else (),
             )
-            for row in self._conn.execute(
+            for row in self._query(
                 "SELECT id, booking_type, prior_notice_duration_min, "
                 "prior_notice_duration_max, prior_notice_last_day, "
                 "prior_notice_last_secs, prior_notice_start_day, "
@@ -2494,12 +2599,12 @@ class StaticIndex:
         for a trip naming no run, one with no timed call, or an
         exact_times=0 repetition: such trips "cannot be duplicated".
         """
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT id, service_id, start_secs, first_secs FROM trips "
             "WHERE source_trip_id = ? AND first_secs IS NOT NULL "
             "AND slot_secs IS NULL",
             (source_trip_id,),
-        ).fetchall()
+        )
         named = [
             (trip_id, service_id, first)
             for trip_id, service_id, repetition, first in rows
@@ -3104,7 +3209,7 @@ class StaticIndex:
         """Routes with at least one scheduled stop_time at the stop."""
         return [
             self._route_from_row(row)
-            for row in self._conn.execute(
+            for row in self._query(
                 "SELECT DISTINCT r.id, r.short_name, r.long_name, r.type, "
                 "r.agency_id, r.color, r.text_color, r.url, "
                 "r.description, r.sort_order "
@@ -3134,7 +3239,7 @@ class StaticIndex:
             sql += " AND t.route_id = ?"
             params.append(route_id)
         sql += " ORDER BY sign"
-        return [row[0] for row in self._conn.execute(sql, params)]
+        return [row[0] for row in self._query(sql, params)]
 
     def active_service_ids(self, service_date: date) -> set[str]:
         """Service IDs active on the given local service date."""
@@ -3142,16 +3247,16 @@ class StaticIndex:
         weekday_col = _WEEKDAY_COLUMNS[service_date.weekday()]
         active = {
             row[0]
-            for row in self._conn.execute(
+            for row in self._query(
                 f"SELECT service_id FROM calendar WHERE {weekday_col} = 1 "
                 "AND start_date <= ? AND end_date >= ?",
                 (datestr, datestr),
             )
         }
-        exceptions = self._conn.execute(
+        exceptions = self._query(
             "SELECT service_id, exception_type FROM calendar_dates WHERE date = ?",
             (datestr,),
-        ).fetchall()
+        )
         # Two passes -- all additions, then all removals -- so a service
         # with BOTH exception types for the same date resolves the same way
         # regardless of which row the source CSV happened to list first.
@@ -3175,7 +3280,7 @@ class StaticIndex:
         """
         if not self._first_date_known:
             weekday_any = " OR ".join(f"{day} = 1" for day in _WEEKDAY_COLUMNS)
-            rows = self._conn.execute(
+            rows = self._query(
                 "SELECT start_date FROM calendar "
                 f"WHERE ({weekday_any}) AND start_date <= end_date "
                 "UNION ALL SELECT MIN(date) FROM calendar_dates "
@@ -3199,15 +3304,15 @@ class StaticIndex:
         row. Computed once.
         """
         if self._reach is None:
-            normal = self._conn.execute(
+            [(normal,)] = self._query(
                 "SELECT MAX(departure_secs) FROM stop_times WHERE departure_secs < ?",
                 (_LONG_REACH,),
-            ).fetchone()[0]
-            long = self._conn.execute(
+            )
+            long = self._query(
                 "SELECT DISTINCT departure_secs FROM stop_times "
                 "WHERE departure_secs >= ? ORDER BY departure_secs",
                 (_LONG_REACH,),
-            ).fetchall()
+            )
             self._reach = (normal or 0, tuple(row[0] for row in long))
         return self._reach
 
@@ -3311,7 +3416,7 @@ class StaticIndex:
             return self._last_dates
         weekday_any = " OR ".join(f"{day} = 1" for day in _WEEKDAY_COLUMNS)
         last: dict[str, date] = {}
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT service_id, end_date FROM calendar "
             f"WHERE ({weekday_any}) AND start_date <= end_date "
             "UNION ALL SELECT service_id, MAX(date) FROM calendar_dates "
@@ -3395,7 +3500,7 @@ class StaticIndex:
         candidate predicate as :meth:`upcoming_trips` (right direction, both
         ends timed). None means no journey between them can ever occur.
         """
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT t.service_id, MAX(o.departure_secs) "
             "FROM stop_times o "
             "JOIN stop_times d ON d.trip_id = o.trip_id "
@@ -3469,12 +3574,12 @@ class StaticIndex:
         found: dict[tuple[str, int, date, int], str] = {}
         for ref in sorted(set(refs)):
             route_id, direction_id, day, secs = ref
-            candidates = self._conn.execute(
+            candidates = self._query(
                 "SELECT id, service_id FROM trips WHERE route_id = ? "
                 "AND direction_id = ? AND first_secs = ? "
                 "AND start_secs IS NULL AND source_trip_id = id",
                 (route_id, direction_id, secs),
-            ).fetchall()
+            )
             if day not in active:
                 active[day] = self.active_service_ids(day)
             running = [
@@ -3700,7 +3805,7 @@ class StaticIndex:
             return self._first_dates
         weekday_any = " OR ".join(f"{day} = 1" for day in _WEEKDAY_COLUMNS)
         first: dict[str, date] = {}
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT service_id, start_date FROM calendar "
             f"WHERE ({weekday_any}) AND start_date <= end_date "
             "UNION ALL SELECT service_id, MIN(date) FROM calendar_dates "

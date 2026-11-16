@@ -6,7 +6,8 @@ import sqlite3
 import struct
 import traceback
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -1591,3 +1592,264 @@ def test_a_build_fails_exactly_when_a_trip_repeats_a_stop_sequence(
             f"{sequence}: it must increase along the trip"
             for trip, sequence in repeated
         )
+
+
+# -- A damaged cached index: a miss when opened, FeedParseError when met later ----
+
+
+def damage_page(db_path: Path, name: str, fill: bytes = b"\xff") -> None:
+    """Overwrite the root page of table or index ``name`` in a closed file."""
+    conn = sqlite3.connect(db_path)
+    try:
+        [(root,)] = conn.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchall()
+        [(size,)] = conn.execute("PRAGMA page_size").fetchall()
+    finally:
+        conn.close()
+    with db_path.open("r+b") as fp:
+        fp.seek((root - 1) * size)
+        fp.write(fill * size)
+
+
+def _built_file(tmp_path: Path) -> Path:
+    db_path = tmp_path / "static.db"
+    StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ).close()
+    return db_path
+
+
+def _unchecked(db_path: Path) -> StaticIndex:
+    """The file as an index, skipping open_cached's check: damage met later."""
+    return StaticIndex(sqlite3.connect(db_path), DATASET, TZ)
+
+
+_NOW_UTC = datetime(2026, 6, 10, 14, tzinfo=UTC)
+_DAMAGE_MESSAGE = (
+    f"The static index of dataset {DATASET!r} is damaged: SQLite reports a "
+    "malformed database; purge the cache to rebuild it"
+)
+
+
+def _damaged_reads() -> dict[str, Callable[[StaticIndex], object]]:
+    return {
+        "stops": lambda index: index.stops(),
+        "routes": lambda index: index.routes(),
+        "trips": lambda index: index.trip_summaries(["T1"]),
+        "stop_times": lambda index: index.upcoming_departures(
+            ["S1"], None, _NOW_UTC, timedelta(hours=4)
+        ),
+        "ix_stop_times_stop_departure": lambda index: index.upcoming_departures(
+            ["S1"], None, _NOW_UTC, timedelta(hours=4)
+        ),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_damaged_reads()))
+def test_a_damaged_page_is_a_cache_miss(tmp_path: Path, name: str) -> None:
+    """Damage anywhere -- stops and routes the handle reads at once, a table
+    or index a later query meets -- and open_cached misses, so the entry is
+    rebuilt (it opened, and every open or query raised DatabaseError)."""
+    db_path = _built_file(tmp_path)
+    damage_page(db_path, name)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+@pytest.mark.parametrize("name", sorted(_damaged_reads()))
+def test_damage_met_by_a_query_is_feed_parse_error(tmp_path: Path, name: str) -> None:
+    """Damage the check never saw (the file changed after it was opened) is
+    the index's FeedParseError, in the library's words with nothing chained
+    -- not sqlite3.DatabaseError."""
+    db_path = _built_file(tmp_path)
+    damage_page(db_path, name)
+    index = _unchecked(db_path)
+    try:
+        with pytest.raises(FeedParseError) as caught:
+            _damaged_reads()[name](index)
+    finally:
+        index.close()
+    assert str(caught.value) == _DAMAGE_MESSAGE
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        for local in frame.f_locals.values():
+            assert not isinstance(local, sqlite3.Error)
+
+
+def _rename_in_schema(db_path: Path) -> None:
+    """Rewrite stops' schema text so it still parses but names another column."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql = replace(sql, 'platform_code', "
+            "'platform_kode') WHERE name = 'stops'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _damage_header(db_path: Path) -> None:
+    """Write past what this SQLite reads into the header's format fields."""
+    with db_path.open("r+b") as fp:
+        fp.seek(31)
+        fp.write(b"\x05" * 17)
+
+
+@pytest.mark.parametrize("damage", [_rename_in_schema, _damage_header])
+def test_damage_sqlite_has_no_code_for(
+    tmp_path: Path, damage: Callable[[Path], None]
+) -> None:
+    """Schema text that parses but names other columns, or a header this
+    SQLite can't read, raise SQLITE_ERROR as a mistaken statement would:
+    the file no longer checks out, so it is a miss when opened and the
+    index's FeedParseError when met by a query."""
+    db_path = _built_file(tmp_path)
+    damage(db_path)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+    index = _unchecked(db_path)
+    try:
+        with pytest.raises(FeedParseError, match="is damaged"):
+            index.stops()
+    finally:
+        index.close()
+
+
+def _undecodable_name(db_path: Path) -> None:
+    """Store bytes that are no UTF-8 as a stop's name: pages stay well formed."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE stops SET name = CAST(X'FF41' AS TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _undecodable_schema_error(db_path: Path) -> None:
+    """Damage stops' schema row so SQLite's own message quotes non-UTF-8 bytes."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute(
+            "UPDATE sqlite_master SET name = CAST(X'FF' AS TEXT), "
+            "sql = sql || ' nonsense' WHERE name = 'stops'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        # sqlite3's own OperationalError, with no SQLite code: quick_check
+        # can't see it, so only the read meets it.
+        _undecodable_name,
+        # A UnicodeDecodeError: SQLite's message can't become a str.
+        _undecodable_schema_error,
+    ],
+)
+def test_text_that_no_longer_decodes_is_damage(
+    tmp_path: Path, damage: Callable[[Path], None]
+) -> None:
+    db_path = _built_file(tmp_path)
+    damage(db_path)
+    index = _unchecked(db_path)
+    try:
+        with pytest.raises(FeedParseError) as caught:
+            index.stops()
+    finally:
+        index.close()
+    assert str(caught.value) == _DAMAGE_MESSAGE
+    assert caught.value.__context__ is None
+
+
+def test_a_damaged_length_that_runs_out_of_memory_is_damage(tmp_path: Path) -> None:
+    """A routes index cell whose damaged length asks SQLite for more memory
+    than there is (SQLITE_NOMEM, sqlite3's bare MemoryError): the file no
+    longer checks out, so it is a miss when opened and the index's
+    FeedParseError when met by a query."""
+    db_path = _built_file(tmp_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        [(root,)] = conn.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = ?",
+            ("sqlite_autoindex_routes_1",),
+        ).fetchall()
+    finally:
+        conn.close()
+    with db_path.open("r+b") as fp:
+        fp.seek((root - 1) * 4096 + 498)
+        fp.write((b"\x88\x80" * 1796)[: 4096 - 498])
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+    index = _unchecked(db_path)
+    try:
+        with pytest.raises(FeedParseError, match="is damaged"):
+            index.routes()
+    finally:
+        index.close()
+
+
+def test_a_mistaken_statement_on_an_intact_index_is_not_damage(
+    tmp_path: Path,
+) -> None:
+    """SQLITE_ERROR from a file that checks out is the statement's own:
+    passed on as SQLite raised it, never blamed on the index."""
+    index = _unchecked(_built_file(tmp_path))
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="no such column"):
+            index._query("SELECT no_such_column FROM stops")
+    finally:
+        index.close()
+
+
+def test_a_closed_index_still_raises_programming_error(tmp_path: Path) -> None:
+    """Querying a closed index is the caller's misuse: it stays sqlite3's
+    ProgrammingError, not a damaged index."""
+    index = _unchecked(_built_file(tmp_path))
+    index.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        index.stops()
+
+
+@given(
+    page=st.integers(1, 40),
+    fill=st.binary(min_size=1, max_size=4),
+    at=st.integers(0, 4095),
+    length=st.integers(1, 4096),
+)
+@settings(max_examples=150, deadline=None)
+def test_any_damage_opens_as_a_miss_or_reads_as_feed_parse_error(
+    tmp_path_factory: pytest.TempPathFactory,
+    page: int,
+    fill: bytes,
+    at: int,
+    length: int,
+) -> None:
+    """Bytes overwritten anywhere in any page: open_cached misses or opens
+    an index that answers; read unchecked, every query answers or raises
+    FeedParseError -- never sqlite3.DatabaseError."""
+    tmp_path = tmp_path_factory.mktemp("damaged-db")
+    db_path = _built_file(tmp_path)
+    with db_path.open("r+b") as fp:
+        size = 4096
+        if (page - 1) * size >= db_path.stat().st_size:
+            return
+        fp.seek((page - 1) * size + at)
+        fp.write((fill * length)[: size - at])
+    opened = StaticIndex.open_cached(db_path, DATASET)
+    if opened is not None:
+        try:
+            for read in _damaged_reads().values():
+                read(opened)
+        finally:
+            opened.close()
+    index = _unchecked(db_path)
+    try:
+        for read in _damaged_reads().values():
+            try:
+                read(index)
+            except FeedParseError as err:
+                assert str(err) == _DAMAGE_MESSAGE
+    finally:
+        index.close()

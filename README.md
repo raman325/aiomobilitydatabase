@@ -629,8 +629,13 @@ Notes on direct mode:
   safe to call while queries are in flight: the swap waits for in-flight reads
   to finish, and two overlapping refreshes run back to back rather than
   double-building). A corrupt or unreadable cache is treated as a cache miss
-  and rebuilt rather than raising. Without a `cache_dir` the index is built in
-  memory on every startup.
+  and rebuilt rather than raising: as a cached index is opened, SQLite checks
+  every page (`PRAGMA quick_check`) and its schema is compared with the
+  library's, so one damaged page anywhere is a miss. Damage that check can't
+  see (a value that no longer decodes, or a file changed after it was
+  opened), met later by a query, is `FeedParseError`; `purge_cache()`
+  rebuilds it. Without a `cache_dir` the index is built in memory on every
+  startup.
 - **Pull, not push**: `TransitFeedHandle`/`GbfsFeedHandle` return snapshots on
   demand — there's no built-in polling loop or scheduler. Bring your own (e.g.
   Home Assistant's `DataUpdateCoordinator`).
@@ -728,7 +733,7 @@ each define their own subtree beneath it, so you can catch broadly
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
 | `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP, `.url`) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
-| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), a trip repeating a `stop_sequence`, or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
+| `FeedParseError` | feeds | Undecodable protobuf, malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), a trip repeating a `stop_sequence`, a cached static index a query finds damaged, or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
 
 The GBFS and GTFS-RT parse paths are **total** with respect to this table:
