@@ -9,7 +9,7 @@ from typing import Any
 
 import aiohttp
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 from yarl import URL
 
@@ -487,13 +487,14 @@ async def test_only_a_200_or_203_is_a_dataset(
 _URL_TEXT = st.tuples(
     st.sampled_from(["http://", "https://", "HTTP://", "ftp://", "", "http:"]),
     st.lists(
-        st.sampled_from([*"ab1:[]@/.%?#-", "99999", "::1", "xn--", chr(0xE9)]),
+        st.sampled_from([*"ab1:[]@/.%?#-", "99999", "::1", "xn--", "..", chr(0xE9)]),
         max_size=8,
     ).map("".join),
 ).map("".join)
 
 
 @given(url=_URL_TEXT)
+@settings(max_examples=500)
 def test_the_url_guard_passes_only_urls_a_request_can_be_made_to(url: str) -> None:
     """_require_http_url either refuses with SourceConnectionError or lets
     through an http(s) URL that aiohttp parses -- never a bare ValueError
@@ -502,12 +503,20 @@ def test_the_url_guard_passes_only_urls_a_request_can_be_made_to(url: str) -> No
         _require_http_url(url, "test URL")
     except SourceConnectionError:
         return
-    assert URL(url).scheme in ("http", "https")
+    parsed = URL(url)
+    assert parsed.scheme in ("http", "https")
+    if parsed.raw_host:
+        parsed.raw_host.encode("idna")  # what the resolver will do
 
 
 @pytest.mark.parametrize(
     "url",
-    ["http://127.0.0.1:99999/rt.pb", "http://[::1/rt.pb"],
+    [
+        "http://127.0.0.1:99999/rt.pb",
+        "http://[::1/rt.pb",
+        "http://[::1]:@/rt.pb",
+        "http://a..b/rt.pb",
+    ],
 )
 async def test_an_rt_url_aiohttp_cannot_parse_is_refused_up_front(
     mock_api: MockApi, direct_client: MobilityFeedsClient, url: str
@@ -523,7 +532,12 @@ async def test_an_rt_url_aiohttp_cannot_parse_is_refused_up_front(
 
 @pytest.mark.parametrize(
     "url",
-    ["http://127.0.0.1:99999/rt.pb", "http://[::1/rt.pb"],
+    [
+        "http://127.0.0.1:99999/rt.pb",
+        "http://[::1/rt.pb",
+        "http://[::1]:@/rt.pb",
+        "http://a..b/rt.pb",
+    ],
 )
 async def test_predicting_an_rt_request_refuses_an_unparseable_url(url: str) -> None:
     """A catalog feed's producer_url never passed the up-front check: the

@@ -377,6 +377,9 @@ _UNPARSEABLE_URLS = [
     "http://127.0.0.1:99999/station_information.json",  # port past 65535
     "http://[::1/station_information.json",  # unclosed IPv6 bracket
     "http://[::1]:70000/station_information.json",
+    "http://[::1]:@/station_information.json",  # yarl raises IndexError
+    "http://a..b/station_information.json",  # an empty label: no IDNA name
+    f"http://{'a' * 64}.com/station_information.json",  # a label past 63
 ]
 
 

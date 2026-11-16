@@ -21,16 +21,21 @@ def _require_http_url(url: str, context: str) -> None:
     so host/IP validation is out of scope; a stricter policy belongs in the
     consuming application (e.g. the HA integration) if needed.
 
-    A URL aiohttp can't parse -- a port past 65535, an unclosed IPv6
-    bracket -- is refused the same way, rather than escaping later as
-    yarl's bare ``ValueError``. The port is read too: some yarl versions
+    A URL no request can be made to is refused the same way, rather than
+    escaping later as a bare exception: one yarl can't parse (a port past
+    65535, an unclosed IPv6 bracket; yarl raises IndexError for some, such
+    as ``http://[::1]:@``), and a host the resolver can't IDNA-encode (an
+    empty label, ``a..b``, or one past 63 octets), which aiohttp raises as
+    UnicodeError mid-request. The port is read too: some yarl versions
     check it only then.
     """
     try:
         parsed = URL(url)
         parsed.port  # noqa: B018 -- validated on access by some yarl versions
+        if parsed.raw_host:
+            parsed.raw_host.encode("idna")  # as the resolver encodes it
         scheme = parsed.scheme.lower()
-    except ValueError as err:
+    except (ValueError, IndexError) as err:  # UnicodeError is a ValueError
         raise SourceConnectionError(
             f"Refusing to fetch {context}: malformed URL ({url!r}): {err}"
         ) from err
