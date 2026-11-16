@@ -30,6 +30,7 @@ from aiomobilitydatabase.exceptions import (
     MobilityDatabaseAuthenticationError,
     MobilityDatabaseConnectionError,
     MobilityDatabaseError,
+    MobilityDatabaseNotFoundError,
 )
 from aiomobilitydatabase.models import (
     Feed,
@@ -1117,4 +1118,130 @@ async def test_an_echoing_token_error_page_hides_the_refresh_token(
         with pytest.raises(MobilityDatabaseAuthenticationError) as caught:
             await client.get_metadata()
     assert "SECRET-RT" not in str(caught.value)
-    assert "[refresh token]" in str(caught.value)
+    assert "[token]" in str(caught.value)
+
+
+# -- Query values, tokens in error pages, injected sessions ---------------------------
+
+
+def _sent_query(value: str) -> str | None:
+    """The search_query the server saw for search_feeds(value); None if refused."""
+
+    async def scenario() -> str | None:
+        api = MockApi()
+        await api.start()
+        try:
+            api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+            api.get("/v1/search", payload={"total": 0, "results": []})
+            async with MobilityDatabaseClient("t", base_url=api.url()) as client:
+                try:
+                    await client.search_feeds(search_query=value)
+                except ValueError:
+                    return None
+            search = next(r for r in api.requests if r.method == "GET")
+            return search.query["search_query"]
+        finally:
+            await api.stop()
+
+    return asyncio.run(scenario())
+
+
+# st.lists, not st.text: st.text never yields a lone surrogate.
+@given(
+    value=st.lists(
+        st.characters(codec="utf-8", exclude_categories=["Cs"])
+        | st.sampled_from(["\ud800", "\udcff", "+", "&", "#", "%41", "\x00"]),
+        min_size=1,
+        max_size=8,
+    ).map("".join)
+)
+@settings(max_examples=200, deadline=None)
+def test_a_query_value_is_refused_or_reaches_the_server_as_itself(value: str) -> None:
+    """yarl drops a lone surrogate: "new\\ud800york" went out as "newyork",
+    and "\\udcff" as no filter at all."""
+    sent = _sent_query(value)
+    if sent is None:
+        assert not _utf8(value)
+    else:
+        assert sent == value
+
+
+async def test_a_license_url_that_isnt_text_is_refused(
+    mock_api: MockApi, client: MobilityDatabaseClient
+) -> None:
+    with pytest.raises(ValueError, match="lone surrogate"):
+        await client.get_matching_licenses("https://x/\ud800")
+    assert mock_api.requests == []
+
+
+async def test_an_echoing_error_page_hides_the_access_token(
+    mock_api: MockApi, client: MobilityDatabaseClient
+) -> None:
+    mock_api.post(
+        "/v1/tokens", payload={**TOKEN_RESPONSE, "access_token": "SECRET/ACCESS"}
+    )
+    mock_api.get(
+        "/v1/metadata",
+        status=400,
+        body=b'you sent "Authorization": "Bearer SECRET\\/ACCESS" (SECRET/ACCESS)',
+        content_type="text/plain",
+    )
+    with pytest.raises(MobilityDatabaseApiError) as caught:
+        await client.get_metadata()
+    assert "SECRET" not in str(caught.value)
+
+
+async def test_a_session_raising_for_status_keeps_the_error_mapping(
+    mock_api: MockApi,
+) -> None:
+    """raise_for_status=True on the session made a 404 a connection error
+    and a 401 skip its refresh: each request opts out."""
+    mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+    mock_api.get("/v1/feeds/mdb-1", status=404)
+    mock_api.get("/v1/metadata", status=401)
+    mock_api.post("/v1/tokens", payload={**TOKEN_RESPONSE, "access_token": "second"})
+    mock_api.get("/v1/metadata", payload=METADATA, auth="second")
+    async with aiohttp.ClientSession(raise_for_status=True) as session:
+        client = MobilityDatabaseClient("t", session, base_url=mock_api.url())
+        with pytest.raises(MobilityDatabaseNotFoundError):
+            await client.get_feed("mdb-1")
+        assert await client.get_metadata() == Metadata.from_dict(METADATA)
+
+
+async def test_a_session_raising_for_status_keeps_token_errors_auth_errors(
+    mock_api: MockApi,
+) -> None:
+    mock_api.post("/v1/tokens", status=500, body=b"x", content_type="text/plain")
+    async with aiohttp.ClientSession(raise_for_status=True) as session:
+        client = MobilityDatabaseClient("t", session, base_url=mock_api.url())
+        with pytest.raises(MobilityDatabaseAuthenticationError):
+            await client.get_metadata()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize(
+    "kind", ["auth", "base_url", "header-lf", "header-surrogate", "header-name"]
+)
+async def test_an_injected_session_default_the_client_cant_use_is_refused(
+    kind: str,
+) -> None:
+    """A session auth would ride to the token endpoint (the caller's
+    credentials, to the catalog API) and clash with the Bearer header; a
+    base_url makes old aiohttp refuse absolute URLs; a bad default header
+    fails every request."""
+    options: dict[str, Any] = {
+        "auth": {"auth": aiohttp.BasicAuth("user", "pw")},
+        "base_url": {"base_url": "http://127.0.0.1:9"},
+        "header-lf": {"headers": {"X-A": "a\nb"}},
+        "header-surrogate": {"headers": {"X-A": "a\ud800"}},
+        "header-name": {"headers": {"X A": "b"}},
+    }[kind]
+    async with aiohttp.ClientSession(**options) as session:
+        with pytest.raises(ValueError):
+            MobilityDatabaseClient("t", session)
+
+
+def test_an_empty_refresh_token_is_refused() -> None:
+    """It would also have made the redaction replace every gap of a page."""
+    with pytest.raises(ValueError, match="refresh_token is empty"):
+        MobilityDatabaseClient("")

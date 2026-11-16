@@ -53,7 +53,56 @@ from .models import (
 )
 
 
+def _require_text(text: str, what: str) -> str:
+    """Return ``text``, or raise ValueError when it isn't UTF-8 text.
+
+    A lone surrogate has no bytes: yarl drops it from a query, so a filter
+    would silently become another one -- or none.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as err:
+        raise ValueError(f"{what} holds a lone surrogate, not text") from err
+    return text
+
+
+# RFC 9110 section 5.1 field names; section 5.5 bars control characters but
+# HTAB from values (aiohttp refuses the same ones, mid-request).
+_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_FIELD_VALUE_FORBIDDEN = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def _require_catalog_session(session: aiohttp.ClientSession) -> None:
+    """Raise ValueError for an injected session's default the client can't use."""
+    if getattr(session, "auth", None) is not None:
+        raise ValueError("the session's auth would go to the catalog API")
+    if getattr(session, "_base_url", None) is not None:
+        raise ValueError("the session has a base_url; pass base_url= instead")
+    for name, value in session.headers.items():
+        if not _FIELD_NAME.fullmatch(name) or _FIELD_VALUE_FORBIDDEN.search(value):
+            raise ValueError(f"the session's header {name!r} can't be sent")
+        _require_text(value, f"the session's header {name!r}")
+
+
+def _redact(text: str, *secrets: str | None) -> str:
+    """Hide each secret in an error page's text, JSON-escaped form included.
+
+    Pages that echo a request (debug pages, WAFs, gateways) would otherwise
+    put a token into the exception's text, and so into logs.
+    """
+    for secret in secrets:
+        if secret:
+            for form in {secret, secret.replace("/", "\\/")}:
+                text = text.replace(form, "[token]")
+    return text
+
+
 def _encode_value(value: Any) -> str:
+    """Encode a single query parameter value as a string (UTF-8 text only)."""
+    return _require_text(_encode_scalar(value), "a query parameter")
+
+
+def _encode_scalar(value: Any) -> str:
     """Encode a single query parameter value as a string."""
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -231,7 +280,18 @@ class MobilityDatabaseClient:
         base_url: str = PROD_BASE_URL,
         request_timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        """Initialize the client. Performs no I/O."""
+        """Initialize the client. Performs no I/O.
+
+        Raises ``ValueError`` for an empty refresh token, or an injected
+        session whose defaults would change what the client sends: an
+        ``auth`` (it would ride to the token endpoint, and clash with the
+        Bearer header), a ``base_url`` (aiohttp then refuses absolute URLs
+        before 3.14), or a default header HTTP can't carry.
+        """
+        if not refresh_token:
+            raise ValueError("refresh_token is empty")
+        if session is not None:
+            _require_catalog_session(session)
         self._refresh_token = refresh_token
         self._session = session
         self._owns_session = session is None
@@ -317,13 +377,12 @@ class MobilityDatabaseClient:
                     # elsewhere. Section 5.1 has the endpoint answer 200, so a
                     # 3xx is a non-200 like any other: an auth failure.
                     allow_redirects=False,
+                    raise_for_status=False,  # whatever the session's default
                 ) as resp:
                     if resp.status != HTTPStatus.OK:
                         # A page echoing the request must not put the refresh
                         # token into the exception's text (and so logs).
-                        body = (await _body_text(resp)).replace(
-                            self._refresh_token, "[refresh token]"
-                        )
+                        body = _redact(await _body_text(resp), self._refresh_token)
                         raise MobilityDatabaseAuthenticationError(
                             f"Unable to obtain access token ({resp.status}): {body}"
                         )
@@ -383,9 +442,10 @@ class MobilityDatabaseClient:
                 # credentials makes aiohttp raise a bare ValueError beside
                 # the Bearer header (maintainer's choice).
                 allow_redirects=False,
+                raise_for_status=False,  # the status mapping below is ours
             ) as resp:
                 if resp.status != HTTPStatus.UNAUTHORIZED:
-                    return await self._answer(resp, path)
+                    return await self._answer(resp, path, (token, self._refresh_token))
                 if not retry_on_auth_fail:
                     raise MobilityDatabaseAuthenticationError(
                         "Request unauthorized after token refresh"
@@ -402,7 +462,9 @@ class MobilityDatabaseClient:
         )
 
     @staticmethod
-    async def _answer(resp: aiohttp.ClientResponse, path: str) -> Any:
+    async def _answer(
+        resp: aiohttp.ClientResponse, path: str, secrets: tuple[str, ...]
+    ) -> Any:
         """Map a non-401 response to its JSON body or the matching error."""
         if resp.status == HTTPStatus.NOT_FOUND:
             raise MobilityDatabaseNotFoundError(f"Not found: {path}")
@@ -412,7 +474,8 @@ class MobilityDatabaseClient:
         # has none, and a 300 or a 3xx left unfollowed is not the resource
         # asked for.
         if resp.status not in (HTTPStatus.OK, HTTPStatus.NON_AUTHORITATIVE_INFORMATION):
-            raise MobilityDatabaseApiError(resp.status, await _body_text(resp))
+            body = _redact(await _body_text(resp), *secrets)
+            raise MobilityDatabaseApiError(resp.status, body)
         return await _json_body(resp)
 
     async def get_metadata(self) -> Metadata:
@@ -705,6 +768,8 @@ class MobilityDatabaseClient:
     async def get_matching_licenses(self, license_url: str) -> list[MatchingLicense]:
         """Match a license URL against the license database."""
         data = await self._request(
-            "POST", "/v1/licenses:match", json_body={"license_url": license_url}
+            "POST",
+            "/v1/licenses:match",
+            json_body={"license_url": _require_text(license_url, "license_url")},
         )
         return _many(MatchingLicense, data)

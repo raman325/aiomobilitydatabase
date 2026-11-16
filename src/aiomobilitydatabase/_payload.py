@@ -25,7 +25,8 @@ from typing import Any
 # fromisoformat, which mashumaro parses with, would also take a bare date
 # (midnight, a time never sent), week dates, the basic format and 24:00.
 # A lowercase "z", which RFC 3339 allows, is left out: fromisoformat refuses
-# it, and the API's serializer writes "Z" (or "+00:00").
+# it, and the API's serializer writes "Z" (or "+00:00"). So is a leap second
+# (":60"): datetime can't hold one, and reading it as ":59" would be wrong.
 _DATE_TIME = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
     r"(?:\.[0-9]+)?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])?"
