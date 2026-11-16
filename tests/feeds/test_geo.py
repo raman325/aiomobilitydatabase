@@ -1218,3 +1218,70 @@ def test_a_wide_zone_answers_as_its_nearest_copy_from_every_start(
     assert polygon_overlaps_circle(polygon, zone) is _rectangle_reach(
         0.0, 1.0, west, east, zone
     )
+
+
+# -- in_circle is great_circle_m within the radius, whatever the zone -----------
+
+
+def _destination(
+    lat: float, lon: float, bearing: float, distance_m: float
+) -> tuple[float, float]:
+    """The point ``distance_m`` from (lat, lon) along ``bearing`` (radians)
+    on the same sphere great_circle_m measures."""
+    delta = distance_m / geo._EARTH_RADIUS_M
+    phi1, lambda1 = math.radians(lat), math.radians(lon)
+    phi2 = math.asin(
+        math.sin(phi1) * math.cos(delta)
+        + math.cos(phi1) * math.sin(delta) * math.cos(bearing)
+    )
+    lambda2 = lambda1 + math.atan2(
+        math.sin(bearing) * math.sin(delta) * math.cos(phi1),
+        math.cos(delta) - math.sin(phi1) * math.sin(phi2),
+    )
+    lon2 = (math.degrees(lambda2) + 180.0) % 360.0 - 180.0
+    return math.degrees(phi2), lon2
+
+
+@given(
+    zone_lat=st.floats(-90, 90),
+    zone_lon=st.floats(-180, 180),
+    radius=st.sampled_from(
+        [1.0, 500.0, 50_000.0, 500_000.0, 3_000_000.0, 1.5e7, 2.1e7]
+    ).flatmap(lambda scale: st.floats(0, scale)),
+    bearing=st.floats(0, 2 * math.pi),
+    reach=st.floats(0, 1.5),
+)
+@settings(max_examples=2000)
+def test_in_circle_is_the_great_circle_distance_within_the_radius(
+    zone_lat: float,
+    zone_lon: float,
+    radius: float,
+    bearing: float,
+    reach: float,
+) -> None:
+    """The prefilter only saves work: it never turns away a point the
+    distance keeps. Points are drawn around the edge in every direction --
+    the poleward bulge of a large or high-latitude circle included, where a
+    box ``radius / cos(lat)`` wide falls short."""
+    zone = Circle(zone_lat, zone_lon, radius)
+    lat, lon = _destination(zone_lat, zone_lon, bearing, radius * reach)
+    expected = great_circle_m(zone_lat, zone_lon, lat, lon) <= radius
+    assert in_circle(zone, lat, lon) is expected
+
+
+@pytest.mark.parametrize(
+    ("zone", "point"),
+    [
+        # 3000 km around 60N reaches 65 degrees of longitude either side,
+        # at 76N; a box r / cos(60N) wide stops at 54.5.
+        (Circle(60.0, 0.0, 3_000_000.0), (76.0, 63.0)),
+        # A circle holding the north pole holds every longitude near it.
+        (Circle(85.0, 0.0, 1_000_000.0), (89.5, 179.0)),
+        (Circle(-85.0, 10.0, 1_000_000.0), (-89.5, -170.0)),
+    ],
+)
+def test_in_circle_keeps_points_past_the_centre_parallel_box(
+    zone: Circle, point: tuple[float, float]
+) -> None:
+    assert great_circle_m(zone.latitude, zone.longitude, *point) <= zone.radius_m
+    assert in_circle(zone, *point)

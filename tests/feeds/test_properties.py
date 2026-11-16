@@ -1763,8 +1763,11 @@ def _random_gtfs_zip(draw: st.DrawFn) -> bytes:
 
     stops_rows = [
         f"{sid},{clean_name()},"
-        f"{draw(st.sampled_from(['34.05', '999', '-999', '']))},"
-        f"{draw(st.sampled_from(['-118.25', '181', '']))},,"
+        # WGS84's edges and blanks: a coordinate past them fails the build
+        # (tested in test_static_build), and this generator wants buildable
+        # feeds that are messy in every other way.
+        f"{draw(st.sampled_from(['34.05', '90', '-90', '']))},"
+        f"{draw(st.sampled_from(['-118.25', '180', '-180', '']))},,"
         for sid in stop_ids
     ]
     if draw(st.booleans()):

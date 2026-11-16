@@ -8,12 +8,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import StopLocationType
 from aiomobilitydatabase.feeds.static_index import (
     SCHEMA_VERSION,
     StaticIndex,
+    _coordinate,
     _lenient_date,
     _lenient_int,
     _strict_int,
@@ -108,8 +111,8 @@ def test_agency_txt_present_but_blank_timezone_raises(tmp_path: Path) -> None:
 
 def test_ragged_stops_row_raises_feed_parse_error(tmp_path: Path) -> None:
     """A stops.txt data row with fewer columns than the header (a ragged row,
-    which real producers ship) must surface as FeedParseError, not the raw
-    AttributeError from csv.DictReader's restval=None fill-in.
+    which real producers ship) is malformed: FeedParseError, never a bare
+    error from the None csv.DictReader fills the missing cells with.
     """
     header, first_row, *rest = _FILES["stops.txt"].splitlines()
     truncated_first_row = ",".join(first_row.split(",")[:2])  # drop trailing columns
@@ -946,3 +949,245 @@ def test_a_scratch_file_is_removed_when_its_connection_fails(
             _write_zip(tmp_path), str(tmp_path / "static.db"), DATASET, TZ
         )
     assert not list(tmp_path.glob("*.building*"))
+
+
+# -- stop_lat/stop_lon: finite ASCII decimals only -------------------------------
+
+_STOP_ROW = "ST1,Depot Station,34.0705,-118.2295,,1"
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        "٣٤.0705",  # Arabic-Indic digits
+        chr(0xFF13) + chr(0xFF14) + ".0705",  # full-width digits
+        "3_4.0705",  # PEP 515 grouping
+        "nan",
+        "inf",
+        "-Infinity",
+        "1e999",  # overflows to inf
+        "34. 0705",
+        "0x22",
+        "abc",
+    ],
+)
+@pytest.mark.parametrize("column", [2, 3], ids=["stop_lat", "stop_lon"])
+def test_a_coordinate_float_alone_would_read_fails_the_build(
+    tmp_path: Path, cell: str, column: int
+) -> None:
+    """GTFS writes a Float in ASCII decimal. float() also reads other
+    scripts' digits, underscores, nan and inf, each turning a corrupt cell
+    into a plausible -- or no -- position; they fail the build as ``abc``
+    always has."""
+    files = dict(_FILES)
+    files["stops.txt"] = _with_cell(_FILES["stops.txt"], _STOP_ROW, column, cell)
+    zip_path = _zip_from_files(tmp_path, files, "coordinate.zip")
+    with pytest.raises(FeedParseError, match=r"Malformed stops\.txt"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+_SPELLINGS = {
+    "repr": repr,
+    "signed": lambda value: f"{value:+}",
+    "exponent": lambda value: f"{value:e}",
+    "padded": lambda value: f" {value!r}\t",
+    "bare-fraction": lambda value: f"{value:f}".replace("0.", ".", 1),
+}
+
+
+@given(value=st.floats(-180, 180), spelling=st.sampled_from(sorted(_SPELLINGS)))
+def test_an_ascii_decimal_coordinate_reads_as_written(
+    value: float, spelling: str
+) -> None:
+    text = _SPELLINGS[spelling](value)
+    assert abs(float(text.strip())) <= 180  # no spelling grows the value
+    assert _coordinate(text, "stop_lon", 180) == float(text.strip())
+
+
+@pytest.mark.parametrize(
+    ("column", "cell"),
+    [
+        (2, "90.000001"),
+        (2, "-90.5"),
+        (2, "200"),
+        (3, "180.0001"),
+        (3, "-181"),
+        (3, "1e300"),
+    ],
+)
+def test_a_coordinate_outside_wgs84_fails_the_build(
+    tmp_path: Path, column: int, cell: str
+) -> None:
+    """Latitude 200 names no place: an impossible coordinate is as malformed
+    as an unreadable one (maintainer's choice), as an out-of-range position
+    in locations.geojson already is."""
+    files = dict(_FILES)
+    files["stops.txt"] = _with_cell(_FILES["stops.txt"], _STOP_ROW, column, cell)
+    zip_path = _zip_from_files(tmp_path, files, "range.zip")
+    with pytest.raises(FeedParseError, match="outside"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize(
+    ("lat", "lon"), [("90", "180"), ("-90", "-180"), ("+90.0", "-180.000")]
+)
+def test_the_wgs84_edges_are_coordinates(tmp_path: Path, lat: str, lon: str) -> None:
+    files = dict(_FILES)
+    row = _with_cell(_FILES["stops.txt"], _STOP_ROW, 2, lat)
+    files["stops.txt"] = _with_cell(row, _STOP_ROW.replace("34.0705", lat), 3, lon)
+    zip_path = _zip_from_files(tmp_path, files, "edges.zip")
+    index = StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+    stored = next(
+        r for r in index._conn.execute("SELECT * FROM stops") if r[0] == "ST1"
+    )
+    assert (stored[2], stored[3]) == (float(lat), float(lon))
+    index.close()
+
+
+# -- A row shorter than its header is malformed, in every file --------------------
+
+
+def _short_rows() -> list[Any]:
+    """Every fixture data row cut to each shorter non-empty width."""
+    cases = []
+    for member in sorted(_FILES):
+        header, *rows = _FILES[member].splitlines()
+        width = len(header.split(","))
+        for index, row in enumerate(rows):
+            for keep in range(1, width):
+                short = ",".join(row.split(",")[:keep])
+                if short:  # an empty line is no record: csv skips it
+                    cases.append(
+                        pytest.param(
+                            member, index, short, id=f"{member}-{index}-{keep}"
+                        )
+                    )
+    return cases
+
+
+def _replace_row(member: str, index: int, row: str) -> dict[str, str]:
+    header, *rows = _FILES[member].splitlines()
+    files = dict(_FILES)
+    files[member] = "\n".join([header, *rows[:index], row, *rows[index + 1 :]]) + "\n"
+    return files
+
+
+@pytest.mark.parametrize(("member", "index", "short"), _short_rows())
+def test_any_short_row_fails_the_build(
+    tmp_path: Path, member: str, index: int, short: str
+) -> None:
+    """RFC 4180: each record carries the header's field count. A short one
+    is malformed in every file (the maintainer's choice over reading its
+    missing trailing cells as blank) -- before, trips.txt raised a bare
+    sqlite3.IntegrityError, stops.txt FeedParseError, and agency.txt loaded.
+    """
+    zip_path = _zip_from_files(
+        tmp_path, _replace_row(member, index, short), "short.zip"
+    )
+    with pytest.raises(FeedParseError, match="fewer fields than the header"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def _member_rows() -> list[Any]:
+    return [
+        pytest.param(member, index, id=f"{member}-{index}")
+        for member in sorted(_FILES)
+        for index in range(len(_FILES[member].splitlines()) - 1)
+    ]
+
+
+@pytest.mark.parametrize(("member", "index"), _member_rows())
+def test_a_long_row_with_content_past_the_header_fails_the_build(
+    tmp_path: Path, member: str, index: int
+) -> None:
+    """A cell past the header has no column; an unquoted comma inside a value
+    is what usually puts one there, moving every later cell (the maintainer's
+    choice: refused when it holds anything)."""
+    row = _FILES[member].splitlines()[index + 1]
+    zip_path = _zip_from_files(
+        tmp_path, _replace_row(member, index, row + ",x"), "long.zip"
+    )
+    with pytest.raises(FeedParseError, match="more fields than the header"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize(("member", "index"), _member_rows())
+def test_blank_cells_past_the_header_are_dropped(
+    tmp_path: Path, member: str, index: int
+) -> None:
+    """``a,b,c,,``: trailing commas carry nothing, so nothing is misplaced and
+    the index is exactly the one without them."""
+    row = _FILES[member].splitlines()[index + 1]
+    padded = _zip_from_files(
+        tmp_path, _replace_row(member, index, row + ", ,\t"), "pad.zip"
+    )
+    plain = _zip_from_files(tmp_path, dict(_FILES), "plain.zip")
+    assert _dump(StaticIndex.build(padded, ":memory:", DATASET, TZ)) == _dump(
+        StaticIndex.build(plain, ":memory:", DATASET, TZ)
+    )
+
+
+def test_an_unquoted_comma_never_moves_a_cell(tmp_path: Path) -> None:
+    """The review's case: ``Downtown, via Main`` would have loaded
+    trip_short_name ' via Main' and dropped the 10."""
+    files = dict(_FILES)
+    files["trips.txt"] = (
+        "trip_id,route_id,service_id,trip_headsign,trip_short_name\n"
+        "T1,R1,WKDY,Downtown, via Main,10\n"
+    )
+    zip_path = _zip_from_files(tmp_path, files, "comma.zip")
+    with pytest.raises(FeedParseError, match=r"Malformed trips\.txt: line 2 has more"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def test_a_malformed_extra_feed_info_row_fails_the_build(tmp_path: Path) -> None:
+    """feed_info.txt keeps its first record, but every row is still read: a
+    short second one is as malformed as anywhere else."""
+    files = dict(_FILES)
+    files["feed_info.txt"] = (
+        "feed_publisher_name,feed_publisher_url\nPub,https://p.example\nX\n"
+    )
+    zip_path = _zip_from_files(tmp_path, files, "feed_info.zip")
+    with pytest.raises(FeedParseError, match=r"Malformed feed_info\.txt: line 3"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def test_a_short_trips_row_fails_the_build(tmp_path: Path) -> None:
+    """The report's case: trips.txt's NOT NULL service_id met csv's None."""
+    header, first, *rest = _FILES["trips.txt"].splitlines()
+    files = dict(_FILES)
+    files["trips.txt"] = "\n".join([header, first.split(",")[0], *rest]) + "\n"
+    zip_path = _zip_from_files(tmp_path, files, "short_trip.zip")
+    with pytest.raises(FeedParseError, match=r"Malformed trips\.txt: line 2 has fewer"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def test_a_full_row_with_blank_cells_still_loads(tmp_path: Path) -> None:
+    """Only the field count matters: a row carrying every field, its optional
+    ones blank, is well formed."""
+    header, first, *rest = _FILES["agency.txt"].splitlines()
+    width = len(header.split(","))
+    cells = first.split(",") + [""] * (width - len(first.split(",")))
+    files = dict(_FILES)
+    files["agency.txt"] = "\n".join([header, ",".join(cells), *rest]) + "\n"
+    zip_path = _zip_from_files(tmp_path, files, "blank_cells.zip")
+    StaticIndex.build(zip_path, ":memory:", DATASET, TZ).close()
+
+
+def _dump(index: StaticIndex) -> dict[str, list[tuple[object, ...]]]:
+    """Every stored row of every table but meta: what any query can read."""
+    try:
+        tables = [
+            name
+            for (name,) in index._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'meta'"
+            )
+        ]
+        return {
+            table: sorted(
+                index._conn.execute(f"SELECT * FROM {table}").fetchall(), key=repr
+            )
+            for table in tables
+        }
+    finally:
+        index.close()
