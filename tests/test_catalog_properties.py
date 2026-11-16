@@ -447,3 +447,17 @@ async def test_a_license_url_that_isnt_text_is_a_type_error(url: Any) -> None:
             await client.get_matching_licenses(url)
     finally:
         await client.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5))),
+        datetime.max.replace(tzinfo=timezone(timedelta(hours=-1))),
+    ],
+)
+def test_a_query_datetime_with_no_utc_time_is_refused(value: datetime) -> None:
+    """Its UTC time falls outside what datetime holds: the caller's
+    ValueError, not an OverflowError."""
+    with pytest.raises(ValueError, match="UTC"):
+        encode_params({"downloaded_after": value})

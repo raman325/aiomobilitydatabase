@@ -100,6 +100,27 @@ def _require_base_url(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
+def _timeout_seconds(request_timeout: object) -> float:
+    """Return ``request_timeout`` as float seconds; ValueError if unusable.
+
+    A positive number a deadline can be scheduled with: asyncio can't
+    schedule an infinite one (nor an int past float's range, which compares
+    below infinity), so every request would fail with OverflowError as the
+    API's fault.
+    """
+    seconds = math.nan
+    if isinstance(request_timeout, int | float) and not isinstance(
+        request_timeout, bool
+    ):
+        try:
+            seconds = float(request_timeout)
+        except OverflowError:
+            seconds = math.inf
+    if not 0 < seconds < math.inf:
+        raise ValueError("request_timeout must be a finite positive number of seconds")
+    return seconds
+
+
 def _is_loopback(host: str) -> bool:
     """Whether a host names this machine (where plain http stays local)."""
     if host == "localhost":
@@ -142,7 +163,11 @@ def _encode_scalar(value: Any) -> str:
         # Python allows seconds, isoformat writes "+00:19:32").
         if value.utcoffset() is None:
             raise ValueError("a query datetime must be timezone-aware")
-        return value.astimezone(UTC).isoformat()
+        try:
+            return value.astimezone(UTC).isoformat()
+        except OverflowError:
+            pass  # raised below, outside the except
+        raise ValueError("a query datetime has no UTC time datetime can hold")
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
@@ -296,23 +321,14 @@ class MobilityDatabaseClient:
             raise TypeError("refresh_token must be a str")
         if not refresh_token:
             raise ValueError("refresh_token is empty")
-        if (
-            isinstance(request_timeout, bool)
-            or not isinstance(request_timeout, int | float)
-            or not 0 < request_timeout < math.inf
-        ):
-            # Finite too: asyncio can't schedule an infinite deadline, so
-            # every request would fail (OverflowError) as the API's fault.
-            raise ValueError(
-                "request_timeout must be a finite positive number of seconds"
-            )
+        seconds = _timeout_seconds(request_timeout)
         if session is not None:
             _require_catalog_session(session)
         self._refresh_token = refresh_token
         self._session = session
         self._owns_session = session is None
         self._base_url = _require_base_url(base_url)
-        self._timeout = aiohttp.ClientTimeout(total=request_timeout)
+        self._timeout = aiohttp.ClientTimeout(total=seconds)
         self._access_token: str | None = None
         self._token_expiration: datetime | None = None
         self._token_lock = asyncio.Lock()

@@ -95,7 +95,7 @@ def test_a_refresh_token_that_isnt_text_is_refused(token: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    "timeout", [0, -1, math.nan, math.inf, -math.inf, True, "5", None]
+    "timeout", [0, -1, math.nan, math.inf, -math.inf, 10**400, True, "5", None]
 )
 def test_a_request_timeout_that_isnt_a_positive_number_is_refused(
     timeout: Any,
