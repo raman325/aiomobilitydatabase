@@ -1219,3 +1219,38 @@ def test_any_answer_gives_a_library_result_and_no_secret_in_any_message(
         for secret in _FEED_SECRETS:
             assert secret not in shown, (type(err).__name__, shown)
         err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)
+
+
+@pytest.mark.parametrize("by_hand_key", [False, True])
+async def test_a_location_that_isnt_utf_8_is_never_followed(by_hand_key: bool) -> None:
+    """A byte that isn't UTF-8 arrives as a lone surrogate; yarl would drop
+    it and request /real.json, another URL than the producer named."""
+    paths: list[bytes] = []
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        request = await reader.readuntil(b"\r\n\r\n")
+        paths.append(request.split(b" ")[1])
+        writer.write(
+            b"HTTP/1.1 302 Found\r\nLocation: /real\xff.json\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/feed"
+    try:
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(SourceConnectionError, match="invalid URL"):
+                await fetch_feed_message(
+                    session,
+                    url,
+                    auth_type=2 if by_hand_key else None,
+                    api_key_name="X-Key" if by_hand_key else None,
+                    api_key="k" if by_hand_key else None,
+                )
+    finally:
+        server.close()
+    assert paths == [b"/feed"]
