@@ -224,10 +224,11 @@ _CACHE_DAMAGE: tuple[type[BaseException], ...] = (
     UnicodeDecodeError,
     MemoryError,
 )
-# ... and what reopening a just-built index can raise besides: an unusable
-# timezone in its meta (see open_cached).
+# What reopening a just-built index can raise when it is no index: those,
+# but MemoryError -- on a file the build just wrote and closed, that is the
+# machine, and propagates -- and an unusable timezone in its meta.
 _REOPEN_ERRORS: tuple[type[BaseException], ...] = (
-    *_CACHE_DAMAGE,
+    *(error for error in _CACHE_DAMAGE if error is not MemoryError),
     ZoneInfoNotFoundError,
     ValueError,
     TypeError,
@@ -260,6 +261,35 @@ def _schema_rows() -> list[tuple[Any, ...]]:
 
 
 _PRISTINE_SCHEMA = _schema_rows()
+
+
+def _column_types() -> dict[str, type]:
+    """Map each column name in _SCHEMA to the Python type it reads back as.
+
+    Every column is declared INTEGER, REAL or TEXT (none BLOB), and a name
+    means one type in every table, so a result column's name -- an
+    expression is aliased to the column it computes -- says what its
+    values must be. ``rowid`` is an integer.
+    """
+    kinds = {"INTEGER": int, "REAL": float, "TEXT": str}
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_SCHEMA)
+        found: dict[str, type] = {"rowid": int}
+        for (table,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall():
+            for _cid, name, declared, *_rest in conn.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall():
+                assert found.setdefault(name, kinds[declared]) is kinds[declared]
+        return found
+    finally:
+        conn.close()
+
+
+_COLUMN_TYPES = _column_types()
+_NONE = type(None)
 
 
 def _damaged(err: sqlite3.Error) -> bool:
@@ -2397,6 +2427,10 @@ class StaticIndex:
     def _query(self, sql: str, params: Sequence[object] = ()) -> list[tuple[Any, ...]]:
         """Run one read and return its rows: the one place a read meets SQLite.
 
+        Each value must be of its column's declared type (see
+        :data:`_COLUMN_TYPES`): one that is not is damage too, so every
+        number a read computes with is a number.
+
         A cached index can be damaged after it was opened and checked (see
         :meth:`open_cached`), or in a cell the check can't judge: a page
         SQLite finds malformed, a file no longer a database at all, text
@@ -2409,7 +2443,9 @@ class StaticIndex:
         stays the caller's misuse.
         """
         try:
-            return self._conn.execute(sql, params).fetchall()
+            cursor = self._conn.execute(sql, params)
+            rows = cursor.fetchall()
+            names = [column[0] for column in cursor.description]
         except UnicodeDecodeError:
             pass  # text the build stored as UTF-8 no longer is
         except MemoryError:
@@ -2421,6 +2457,17 @@ class StaticIndex:
                 _maybe_damaged(err) and not self._intact(self._conn)
             ):
                 raise
+        else:
+            # Every value is of its column's declared type, or NULL: the
+            # build stores nothing else, so another storage class -- text
+            # in a seconds column, bytes anywhere -- is a damaged cell in a
+            # well-formed page, which quick_check can't see.
+            kinds = [_COLUMN_TYPES[name] for name in names]
+            if not rows or all(
+                set(map(type, column)) <= {kind, _NONE}
+                for kind, column in zip(kinds, zip(*rows, strict=True), strict=True)
+            ):
+                return rows
         raise self._damage()
 
     def _damage(self) -> FeedParseError:
@@ -3014,7 +3061,7 @@ class StaticIndex:
         found: dict[str, list[TripCall]] = {}
         rows = self._select(
             "SELECT trip_id, stop_sequence, "
-            "COALESCE(stop_id, location_id, location_group_id), "
+            "COALESCE(stop_id, location_id, location_group_id) AS stop_id, "
             "pickup_type, drop_off_type, stop_headsign FROM flex_stop_times "
             f"WHERE trip_id IN {_IDS}",
             [_ids(trip_ids)],
@@ -3373,7 +3420,7 @@ class StaticIndex:
         match, so picker options and filterable values always agree.
         """
         sql = (
-            f"SELECT DISTINCT {_HEADSIGN_SQL} AS sign FROM stop_times st "
+            f"SELECT DISTINCT {_HEADSIGN_SQL} AS headsign FROM stop_times st "
             "JOIN trips t ON t.id = st.trip_id "
             f"WHERE st.stop_id = ? AND {_HEADSIGN_SQL} IS NOT NULL"
         )
@@ -3381,7 +3428,7 @@ class StaticIndex:
         if route_id is not None:
             sql += " AND t.route_id = ?"
             params.append(route_id)
-        sql += " ORDER BY sign"
+        sql += " ORDER BY 1"
         return [row[0] for row in self._query(sql, params)]
 
     def active_service_ids(self, service_date: date) -> set[str]:
@@ -3448,7 +3495,8 @@ class StaticIndex:
         """
         if self._reach is None:
             [(normal,)] = self._query(
-                "SELECT MAX(departure_secs) FROM stop_times WHERE departure_secs < ?",
+                "SELECT MAX(departure_secs) AS departure_secs FROM stop_times "
+                "WHERE departure_secs < ?",
                 (_LONG_REACH,),
             )
             long = self._query(
@@ -3619,7 +3667,7 @@ class StaticIndex:
         scans day by day to its end -- rare enough to accept.
         """
         sql = (
-            "SELECT t.service_id, MAX(st.departure_secs) "
+            "SELECT t.service_id, MAX(st.departure_secs) AS departure_secs "
             "FROM stop_times st JOIN trips t ON t.id = st.trip_id "
             f"WHERE st.stop_id IN {_IDS} AND st.departure_secs IS NOT NULL"
         )
@@ -3644,7 +3692,7 @@ class StaticIndex:
         ends timed). None means no journey between them can ever occur.
         """
         rows = self._query(
-            "SELECT t.service_id, MAX(o.departure_secs) "
+            "SELECT t.service_id, MAX(o.departure_secs) AS departure_secs "
             "FROM stop_times o "
             "JOIN stop_times d ON d.trip_id = o.trip_id "
             "JOIN trips t ON t.id = o.trip_id "
@@ -4319,7 +4367,7 @@ class StaticIndex:
         # call actually ridden to.
         sql = (
             "SELECT o.trip_id, t.route_id, t.service_id, t.headsign, "
-            "o.departure_secs, MIN(d.arrival_secs), "
+            "o.departure_secs, MIN(d.arrival_secs) AS arrival_secs, "
             "t.source_trip_id, t.start_secs, "
             "t.wheelchair_accessible, t.bikes_allowed, t.direction_id, "
             "o.pickup_type, o.drop_off_type, o.timepoint, o.stop_headsign, "

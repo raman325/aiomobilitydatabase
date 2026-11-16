@@ -7,7 +7,7 @@ import struct
 import traceback
 import zipfile
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -1811,6 +1811,9 @@ def _flex_file(tmp_path: Path) -> Path:
     return db_path
 
 
+_FLEX_DAY = date(2026, 6, 10)  # a Wednesday: WEEKDAYS runs
+_FLEX_MORNING = datetime(2026, 6, 10, 12, tzinfo=UTC)
+
 _STORED_DAMAGE = {
     "polygons no longer JSON": (
         "UPDATE locations SET polygons = '[[[[41.0, -87.0'",
@@ -1821,6 +1824,38 @@ _STORED_DAMAGE = {
         lambda index: index.flex_locations(),
     ),
     # Decodes, but no ring the build kept: a ring has four or more positions.
+    # A number of the wrong storage class, in pages that stay well formed:
+    # it raised TypeError where a read computed with it, or read as None.
+    "stop_times seconds turned into text": (
+        "UPDATE stop_times SET arrival_secs = 'x'",
+        lambda index: index.upcoming_departures(
+            ["S1"], None, _FLEX_MORNING, timedelta(hours=4)
+        ),
+    ),
+    "stop_times seconds turned into bytes": (
+        "UPDATE stop_times SET departure_secs = X'01'",
+        lambda index: index.instance_trip_calls([("DEV1", _FLEX_DAY)]),
+    ),
+    "a pickup type turned into text": (
+        "UPDATE stop_times SET pickup_type = 'x'",
+        lambda index: index.instance_trip_calls([("DEV1", _FLEX_DAY)]),
+    ),
+    "a trip's first departure turned into bytes": (
+        "UPDATE trips SET first_secs = X'01'",
+        lambda index: index.plain_trip_starts(["DEV1"]),
+    ),
+    "a repetition's slot turned into text": (
+        "UPDATE trips SET start_secs = 28800, slot_secs = 'x' WHERE id = 'DEV1'",
+        lambda index: index.slot_runs([("DEV1", _FLEX_DAY, 28800)]),
+    ),
+    "flex window seconds turned into text": (
+        "UPDATE flex_stop_times SET start_window_secs = 'x'",
+        lambda index: index.on_demand_rows(["TOWN"], [], []),
+    ),
+    "a stop latitude turned into text": (
+        "UPDATE stops SET lat = 'north'",
+        lambda index: index.stops(),
+    ),
     "a ring too short": (
         "UPDATE locations SET polygons = '[[[[41.0, -87.0], [41.0, -87.0]]]]'",
         lambda index: index.flex_locations(),
@@ -1903,6 +1938,25 @@ def test_a_build_that_cannot_be_reopened_chains_nothing(
     assert str(caught.value) == f"{db_path} could not be reopened after its build"
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+def test_running_out_of_memory_reopening_a_build_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the file a build just wrote, MemoryError is the machine's: it
+    propagates rather than reading as "not a built static index"."""
+    real_connect = sqlite3.connect
+
+    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if kwargs.get("uri"):
+            raise MemoryError
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    with pytest.raises(MemoryError):
+        StaticIndex.build(
+            _write_zip(tmp_path), str(tmp_path / "static.db"), DATASET, TZ
+        )
 
 
 def test_a_mistaken_statement_on_an_intact_index_is_not_damage(
