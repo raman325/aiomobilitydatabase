@@ -6,6 +6,7 @@ import itertools
 import math
 import sys
 import time
+import tracemalloc
 from fractions import Fraction
 from typing import Any
 from unittest.mock import patch
@@ -645,7 +646,7 @@ def test_near_degenerate_zones_validate_in_seconds(
     """Long, nearly parallel edges, or edges converging on a point, are
     not split ever finer at every level of the coordinates' precision
     (minutes to hours before): a split that leaves them together is
-    box-swept, and every crowded cell's work is bounded."""
+    box-swept, and splitting any crowded cell has a budget."""
     started = time.perf_counter()
     assert polygon_is_valid([ring])
     assert time.perf_counter() - started < 10
@@ -656,7 +657,8 @@ _GRID_KNOBS = st.fixed_dictionaries(
         "_CROWDED": st.sampled_from([2, 3, 64]),
         "_SUBDIVISION": st.sampled_from([2, 3, 8]),
         "_MAX_DEPTH": st.sampled_from([1, 2, 12]),
-        "_BUDGET": st.sampled_from([0, 1, 2]),
+        # Fractions run out part-way through a split, on purpose.
+        "_BUDGET": st.sampled_from([0, 0.001, 0.01, 0.05, 0.2, 1, 4]),
     }
 )
 _TINY = st.integers(0, 1074).map(lambda k: 2.0**-k)
@@ -667,7 +669,7 @@ _NEAR_DEGENERATE_RINGS = st.one_of(
 )
 
 
-def _grid(knobs: dict[str, int]) -> contextlib.ExitStack:
+def _grid(knobs: dict[str, float]) -> contextlib.ExitStack:
     stack = contextlib.ExitStack()
     for name, value in knobs.items():
         stack.enter_context(patch.object(geo, name, value))
@@ -693,23 +695,23 @@ def _touching_pairs_by_brute_force(
 def test_the_answer_equals_checking_every_pair(
     ring: list[tuple[float, float]],
     dent: tuple[int, int] | None,
-    knobs: dict[str, int],
+    knobs: dict[str, float],
 ) -> None:
     """On zigzags, stars and polygons scaled down to the last float bit,
     one vertex optionally moved onto another (a touch), the check answers
     exactly as checking every pair of edges does -- whether cells are
-    split, box-swept, cut off by depth or out of budget -- and every pair
-    of edges that meet is a candidate."""
+    split, box-swept, cut off by depth or out of budget part-way -- and
+    the candidates are exactly the pairs of edges that meet, once each."""
     if dent is not None:
         body = ring[:-1]
         body[dent[0] % len(body)] = body[dent[1] % len(body)]
         ring = _ring(*body)
     edges = _edges([ring])
     with _grid(knobs):
-        candidates = set(_candidate_pairs(edges))
+        candidates = list(_candidate_pairs(edges))
         answer = polygon_is_valid([ring])
-    touching = _touching_pairs_by_brute_force(edges)
-    assert touching <= candidates
+    assert len(set(candidates)) == len(candidates)
+    assert set(candidates) == _touching_pairs_by_brute_force(edges)
     with patch.object(
         geo,
         "_candidate_pairs",
@@ -726,12 +728,13 @@ def test_the_answer_equals_checking_every_pair(
     knobs=_GRID_KNOBS,
 )
 @settings(max_examples=300, deadline=None)
-def test_nearly_parallel_long_edges_never_lose_a_touching_pair(
-    offsets: list[tuple[int, int]], tiny: float, knobs: dict[str, int]
+def test_nearly_parallel_long_edges_yield_exactly_the_meeting_pairs(
+    offsets: list[tuple[int, int]], tiny: float, knobs: dict[str, float]
 ) -> None:
     """A bundle of long edges a few ``tiny`` apart at each end, crossing,
     touching or overlapping where their offsets cross or tie: the
-    candidates hold exactly the meeting pairs a brute-force check finds."""
+    candidates are exactly the meeting pairs a brute-force check finds,
+    once each."""
     points = [
         point
         for left, right in offsets
@@ -743,9 +746,43 @@ def test_nearly_parallel_long_edges_never_lose_a_touching_pair(
         for i, (a, b) in enumerate(zip(exact[::2], exact[1::2], strict=True))
     ]
     with _grid(knobs):
-        candidates = set(_candidate_pairs(edges))
-    touching = _touching_pairs_by_brute_force(edges)
-    assert touching <= candidates
+        candidates = list(_candidate_pairs(edges))
+    assert len(set(candidates)) == len(candidates)
+    assert set(candidates) == _touching_pairs_by_brute_force(edges)
+
+
+def _bundle(edges: int, gap: float) -> list[tuple[float, float]]:
+    """Parallel diagonal edges ``gap`` apart, zigzagging up, closed below."""
+    teeth = [(float(k % 2), k % 2 + k * gap) for k in range(edges - 4 + (edges % 2))]
+    top = teeth[-1][1]
+    return _ring(*teeth, (2.0, top), (2.0, -1.0), (-1.0, -1.0), (-1.0, 0.0))
+
+
+@pytest.mark.parametrize("budget", [4, 0.01])
+def test_a_bundle_yields_each_meeting_pair_once(budget: float) -> None:
+    """Hundreds of long edges 1e-12 apart share every cell they cross: each
+    pair that meets (here only neighbours) is yielded once and nothing
+    else, even when splitting runs out of budget part-way and the cell is
+    finished by a sweep."""
+    ring = _bundle(600, 1e-12)
+    edges = _edges([ring])
+    with patch.object(geo, "_BUDGET", budget):
+        candidates = list(_candidate_pairs(edges))
+    assert len(candidates) == len(edges)
+    assert set(candidates) == _touching_pairs_by_brute_force(edges)
+
+
+def test_a_bundle_validates_in_linear_memory() -> None:
+    """No set of pairs is kept: a thousand edges that all overlap one
+    another's boxes (half a million box pairs) peak at a few megabytes."""
+    ring = _bundle(1000, 1e-12)
+    tracemalloc.start()
+    try:
+        assert polygon_is_valid([ring])
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8_000_000
 
 
 def _position_by_brute_force(p: tuple[int, int], ring: list[tuple[int, int]]) -> int:
