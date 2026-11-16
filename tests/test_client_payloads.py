@@ -352,7 +352,13 @@ def _rfc3339(text: str) -> datetime | None:
     year, month, day, hour, minute, second, fraction, zulu, sign, oh, om = (
         match.groups()
     )
-    if int(hour) > 23 or int(minute) > 59 or int(second) > 59 or int(oh or 0) > 23:
+    if (
+        int(hour) > 23
+        or int(minute) > 59
+        or int(second) > 59
+        or int(oh or 0) > 23
+        or int(om or 0) > 59
+    ):
         return None
     zone = None
     if zulu:
@@ -408,6 +414,11 @@ _PAYLOADS = {
     "get_licenses": [LICENSE],
     "get_matching_licenses": [MATCHING_LICENSE],
     "get_gtfs_feed_datasets": [GTFS_DATASET],
+    "get_feeds": [GTFS_FEED, GTFS_RT_FEED],
+    "get_gtfs_feeds": [GTFS_FEED],
+    "get_gtfs_rt_feeds": [GTFS_RT_FEED],
+    "get_gbfs_feeds": [GBFS_FEED],
+    "get_gtfs_feed_gtfs_rt_feeds": [GTFS_RT_FEED],
 }
 
 
@@ -962,7 +973,9 @@ _DATE_PARTS = st.tuples(
         ["00:00:00", "23:59:59", "24:00:00", "12:60:00", "12:00:60", "12:00", "120000"]
     ),
     st.sampled_from(["", ".5", ".123456789", "."]),
-    st.sampled_from(["", "Z", "z", "+00:00", "-05:30", "+0100", "+24:00", "+23:59"]),
+    st.sampled_from(
+        ["", "Z", "z", "+00:00", "-05:30", "+0100", "+24:00", "+23:59", "+05:60"]
+    ),
 )
 
 
@@ -983,3 +996,125 @@ def test_a_date_time_decodes_exactly_when_rfc_3339_reads_it(
     else:
         assert not isinstance(result, MobilityDatabaseConnectionError), text
         assert result.created_at == expected
+
+
+# -- Redirects on data requests are answered, not followed ---------------------------
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize(
+    "location",
+    ["same-origin-with-credentials", "other-origin", "ftp://x/", "http:/path"],
+)
+async def test_a_data_redirect_is_an_api_error_never_followed(
+    mock_api: MockApi, client: MobilityDatabaseClient, status: int, location: str
+) -> None:
+    """A same-origin Location with credentials made aiohttp raise a bare
+    ValueError beside the Bearer header; another origin's body would have
+    been read as catalog data (maintainer's choice: never follow)."""
+    elsewhere = MockApi()
+    await elsewhere.start()
+    try:
+        target = {
+            "same-origin-with-credentials": mock_api.url("/x").replace(
+                "http://", "http://u:p@"
+            ),
+            "other-origin": elsewhere.url("/v1/metadata"),
+        }.get(location, location)
+        elsewhere.get("/v1/metadata", payload={"version": "elsewhere"})
+        mock_api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+        mock_api.get("/v1/metadata", status=status, headers={"Location": target})
+        with pytest.raises(MobilityDatabaseApiError) as caught:
+            await client.get_metadata()
+        assert caught.value.status == status
+        assert elsewhere.requests == []
+    finally:
+        await elsewhere.stop()
+
+
+# -- Error pages, whatever their Content-Type says -------------------------------------
+
+_PARAM_VALUES = st.sampled_from(
+    [
+        "utf-8",
+        "utf%00",
+        "utf-8''utf%00",
+        "utf-8''utf-8",
+        "rot13",
+        "idna",
+        "undefined",
+        'x"y',
+        "",
+        "%ff",
+    ]
+)
+_CONTENT_TYPES = st.tuples(
+    st.sampled_from(["text/plain", "text/html", "application/json", "x/y"]),
+    st.lists(
+        st.tuples(
+            st.sampled_from(["charset", "charset*", "q", "charset*0*"]), _PARAM_VALUES
+        ),
+        max_size=3,
+    ),
+).map(lambda parts: parts[0] + "".join(f"; {name}={value}" for name, value in parts[1]))
+
+
+@given(
+    status=st.sampled_from([400, 500, 502, 503]),
+    content_type=_CONTENT_TYPES,
+    body=st.binary(max_size=16),
+    on_token=st.booleans(),
+)
+@settings(max_examples=200, deadline=None)
+def test_an_error_page_is_its_status_whatever_its_content_type(
+    status: int, content_type: str, body: bytes, on_token: bool
+) -> None:
+    """The charset is the server's, after RFC 2231 decoding (a NUL, or on
+    aiohttp 3.9 a tuple): the error is still the status's -- an API error,
+    or from the token endpoint an authentication failure."""
+
+    async def scenario() -> Any:
+        api = MockApi()
+        await api.start()
+        try:
+            page = {
+                "status": status,
+                "body": body,
+                "headers": {"Content-Type": content_type},
+            }
+            if on_token:
+                api.post("/v1/tokens", **page)
+            else:
+                api.post("/v1/tokens", payload=TOKEN_RESPONSE)
+                api.get("/v1/metadata", **page)
+            async with MobilityDatabaseClient("t", base_url=api.url()) as client:
+                try:
+                    await client.get_metadata()
+                except MobilityDatabaseError as err:
+                    return err
+        finally:
+            await api.stop()
+
+    result = asyncio.run(scenario())
+    expected = (
+        MobilityDatabaseAuthenticationError if on_token else MobilityDatabaseApiError
+    )
+    assert isinstance(result, expected), result
+
+
+async def test_an_echoing_token_error_page_hides_the_refresh_token(
+    mock_api: MockApi,
+) -> None:
+    """A proxy page echoing the request would have put the refresh token in
+    the exception's text, and so in logs."""
+    mock_api.post(
+        "/v1/tokens",
+        status=403,
+        body=b'echo: {"refresh_token": "SECRET-RT"}',
+        content_type="text/plain",
+    )
+    async with MobilityDatabaseClient("SECRET-RT", base_url=mock_api.url()) as client:
+        with pytest.raises(MobilityDatabaseAuthenticationError) as caught:
+            await client.get_metadata()
+    assert "SECRET-RT" not in str(caught.value)
+    assert "[refresh token]" in str(caught.value)

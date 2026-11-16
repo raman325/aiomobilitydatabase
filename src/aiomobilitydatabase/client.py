@@ -164,7 +164,10 @@ async def _body_text(resp: aiohttp.ClientResponse) -> str:
         return ""  # unreadable (a Content-Encoding its bytes don't follow)
     try:
         return raw.decode(resp.charset or "utf-8", "replace")
-    except (LookupError, UnicodeError):
+    except (LookupError, ValueError, TypeError):
+        # The charset is the server's, after RFC 2231 decoding: it can hold a
+        # NUL (ValueError), and aiohttp 3.9 gives a tuple for charset*=
+        # (TypeError). UnicodeError is a ValueError.
         return raw.decode("utf-8", "replace")
 
 
@@ -316,7 +319,11 @@ class MobilityDatabaseClient:
                     allow_redirects=False,
                 ) as resp:
                     if resp.status != HTTPStatus.OK:
-                        body = await _body_text(resp)
+                        # A page echoing the request must not put the refresh
+                        # token into the exception's text (and so logs).
+                        body = (await _body_text(resp)).replace(
+                            self._refresh_token, "[refresh token]"
+                        )
                         raise MobilityDatabaseAuthenticationError(
                             f"Unable to obtain access token ({resp.status}): {body}"
                         )
@@ -370,6 +377,12 @@ class MobilityDatabaseClient:
                 json=json_body,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=self._timeout,
+                # A redirect is answered as the 3xx it is (not the resource
+                # asked for: an API error), never followed: another origin's
+                # body is no catalog data, and a same-origin Location with
+                # credentials makes aiohttp raise a bare ValueError beside
+                # the Bearer header (maintainer's choice).
+                allow_redirects=False,
             ) as resp:
                 if resp.status != HTTPStatus.UNAUTHORIZED:
                     return await self._answer(resp, path)
