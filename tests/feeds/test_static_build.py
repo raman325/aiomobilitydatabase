@@ -1000,7 +1000,48 @@ def test_an_ascii_decimal_coordinate_reads_as_written(
     value: float, spelling: str
 ) -> None:
     text = _SPELLINGS[spelling](value)
-    assert _coordinate(text, "stop_lat") == float(text.strip())
+    if abs(float(text.strip())) <= 180:  # "bare-fraction" can spell 10.5 as 1.5
+        assert _coordinate(text, "stop_lon", 180) == float(text.strip())
+
+
+@pytest.mark.parametrize(
+    ("column", "cell"),
+    [
+        (2, "90.000001"),
+        (2, "-90.5"),
+        (2, "200"),
+        (3, "180.0001"),
+        (3, "-181"),
+        (3, "1e300"),
+    ],
+)
+def test_a_coordinate_outside_wgs84_fails_the_build(
+    tmp_path: Path, column: int, cell: str
+) -> None:
+    """Latitude 200 names no place: an impossible coordinate is as malformed
+    as an unreadable one (maintainer's choice), as an out-of-range position
+    in locations.geojson already is."""
+    files = dict(_FILES)
+    files["stops.txt"] = _with_cell(_FILES["stops.txt"], _STOP_ROW, column, cell)
+    zip_path = _zip_from_files(tmp_path, files, "range.zip")
+    with pytest.raises(FeedParseError, match="outside"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+@pytest.mark.parametrize(
+    ("lat", "lon"), [("90", "180"), ("-90", "-180"), ("+90.0", "-180.000")]
+)
+def test_the_wgs84_edges_are_coordinates(tmp_path: Path, lat: str, lon: str) -> None:
+    files = dict(_FILES)
+    row = _with_cell(_FILES["stops.txt"], _STOP_ROW, 2, lat)
+    files["stops.txt"] = _with_cell(row, _STOP_ROW.replace("34.0705", lat), 3, lon)
+    zip_path = _zip_from_files(tmp_path, files, "edges.zip")
+    index = StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+    stored = next(
+        r for r in index._conn.execute("SELECT * FROM stops") if r[0] == "ST1"
+    )
+    assert (stored[2], stored[3]) == (float(lat), float(lon))
+    index.close()
 
 
 # -- A row shorter than its header is malformed, in every file --------------------

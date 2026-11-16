@@ -266,18 +266,22 @@ _ASCII_DECIMAL = re.compile(
 )
 
 
-def _coordinate(value: str, field: str) -> float | None:
+def _coordinate(value: str, field: str, limit: float) -> float | None:
     """Parse a stop_lat/stop_lon cell: None when blank.
 
-    Anything else that is not a finite ASCII decimal raises ValueError (the
-    build's FeedParseError), as an unreadable cell always has: a spelling
-    float() alone would accept is no more a coordinate than ``abc``.
+    Anything else that is not a finite ASCII decimal within ``[-limit,
+    limit]`` (90 for a latitude, 180 for a longitude: WGS84 has no other)
+    raises ValueError, the build's FeedParseError, as an unreadable cell
+    always has: a spelling float() alone would accept is no more a
+    coordinate than ``abc``, nor is latitude 200 a place.
     """
     if not (text := value.strip()):
         return None
     parsed = float(text) if _ASCII_DECIMAL.fullmatch(text) else math.nan
     if not math.isfinite(parsed):
         raise ValueError(f"{field} is not a finite decimal number: {value!r}")
+    if not -limit <= parsed <= limit:
+        raise ValueError(f"{field} is outside -{limit} to {limit}: {value!r}")
     return parsed
 
 
@@ -1454,8 +1458,8 @@ class StaticIndex:
                 (
                     row["stop_id"],
                     row.get("stop_name") or None,
-                    _coordinate(row.get("stop_lat", ""), "stop_lat"),
-                    _coordinate(row.get("stop_lon", ""), "stop_lon"),
+                    _coordinate(row.get("stop_lat", ""), "stop_lat", _MAX_LATITUDE),
+                    _coordinate(row.get("stop_lon", ""), "stop_lon", _MAX_LONGITUDE),
                     row.get("parent_station") or None,
                     _defaulted_int(row.get("location_type"), 0),
                     row.get("stop_code") or None,
