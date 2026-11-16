@@ -212,8 +212,9 @@ Notes on direct mode:
   storage; direct mode fetches **your** URL, with the optional `headers`
   applied to the static download and every GTFS-RT/GBFS fetch the handle
   makes. Like any aiohttp request headers they follow redirects, to another
-  origin too (aiohttp drops only `Authorization`, `Cookie` and
-  `Proxy-Authorization` there).
+  origin too, except `Authorization`, `Cookie` and `Proxy-Authorization`,
+  which go to the URL's own origin only -- also when a GBFS discovery
+  document places an endpoint at another origin.
 - RT URLs are declared per layer (`trip_updates_urls`,
   `vehicle_positions_urls`, `service_alerts_urls`), so each operation only
   fetches sources that can serve it. A combined feed listed under several
@@ -641,9 +642,8 @@ Notes on direct mode:
   distinct from the refresh token used to authenticate with the catalog itself.
   A header key is never sent to another origin: from the first redirect that
   leaves the producer's origin on, it is left off, along with credentials in
-  the URL. If your session itself carries `Authorization`, `Cookie` or
-  `Proxy-Authorization` defaults (or `auth`), which can't be left off, such a
-  redirect fails with `SourceConnectionError` instead of being followed.
+  the URL. (A session carrying credentials of its own, which couldn't be left
+  off, is refused when the handle is made; see below.)
 - **Zones are circles** (matching Home Assistant zone entities); GBFS vehicle
   filtering happens client-side because GBFS feeds are full-system dumps by
   design, with no server-side geo-query.
@@ -737,7 +737,8 @@ So does a feeds handle factory, for a caller input outside its allowlist:
 `headers=` names must be tokens and their values visible ASCII, as must the
 `api_key`; an `Authorization` header can't go beside credentials in the URL.
 An injected session may carry no credential -- no `auth`, no
-`Authorization`, `Cookie` or `Proxy-Authorization` default -- since it would
+`Authorization`, `Cookie` or `Proxy-Authorization` default, no cookie set
+without a domain (`ClientSession(cookies=...)`) -- since it would
 ride on every request, to every origin (pass credentials per request instead,
 in `headers=`).
 

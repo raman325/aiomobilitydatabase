@@ -1232,14 +1232,12 @@ _FEED_RESPONSES = st.builds(
 
 
 def _require_no_secret_in_chain(
-    err: BaseException | None, secrets: tuple[str, ...], path: str
+    err: BaseException | None, secrets: tuple[str, ...]
 ) -> None:
     """No secret in the error's message or .url, nor in any error chained to
-    it, hidden from tracebacks or not. A network or decode error is the
-    library's own, with nothing chained at all; only the static path's
-    archive errors keep the zip or CSV error as their cause (local
-    parsing, quoting no request)."""
-    if err is not None and path != "static":
+    it, hidden from tracebacks or not -- and a library error has nothing
+    chained at all, on every path (network, decode, archive)."""
+    if err is not None:
         assert err.__cause__ is None, repr(err.__cause__)
         assert err.__context__ is None, repr(err.__context__)
     while err is not None:
@@ -1300,7 +1298,7 @@ def test_any_answer_gives_a_library_result_and_no_secret_in_any_message(
             server.close()
 
     err = asyncio.run(scenario())
-    _require_no_secret_in_chain(err, _FEED_SECRETS, path)
+    _require_no_secret_in_chain(err, _FEED_SECRETS)
 
 
 @pytest.mark.parametrize("by_hand_key", [False, True])
@@ -1359,8 +1357,21 @@ _A_HEADERS = st.lists(
     ),
     max_size=3,
 )
+# A GBFS discovery document is the producer's data naming further URLs:
+# one at origin B (where the caller's credentials must not go) and one at A.
+_DISCOVERY = (
+    b'{"last_updated": 0, "ttl": 0, "version": "2.3", "data": {"en": {"feeds": '
+    b'[{"name": "system_information", "url": "%s"}]}}}'
+)
 _A_BODIES = st.sampled_from(
-    [b"", b"{echo}", b'{"data": {"x": "{echo}"}}', b"\x08\x96\x01"]
+    [
+        b"",
+        b"{echo}",
+        b'{"data": {"x": "{echo}"}}',
+        b"\x08\x96\x01",
+        _DISCOVERY % b"{B}/si",
+        _DISCOVERY % b"{A}/si",
+    ]
 )
 
 
@@ -1424,6 +1435,7 @@ def test_a_hop_to_another_origin_carries_no_credential_and_no_message_shows_one(
                     b"{B}": f"http://{b_host}".encode(),
                     b"{BHOST}": b_host.encode(),
                     b"{echo}": echo_of(request),
+                    b"{A}": f"http://127.0.0.1:{a_port}".encode(),
                 }
                 lines = []
                 for template in headers:
@@ -1431,7 +1443,9 @@ def test_a_hop_to_another_origin_carries_no_credential_and_no_message_shows_one(
                     for key, value in fill.items():
                         line = line.replace(key, value)
                     lines.append(line)
-                payload = body.replace(b"{echo}", echo_of(request))
+                payload = body
+                for key, value in fill.items():
+                    payload = payload.replace(key, value)
                 writer.write(
                     b"HTTP/1.1 "
                     + status
@@ -1453,7 +1467,20 @@ def test_a_hop_to_another_origin_carries_no_credential_and_no_message_shows_one(
             async with MobilityFeedsClient() as client:
                 try:
                     if path == "gbfs":
-                        call = client.get_gbfs_feed_from_url(url)
+                        # Credentials in a header (not the URL, which
+                        # aiohttp refuses beside one): they go to A only,
+                        # even where A's discovery document names B.
+                        handle = await asyncio.wait_for(
+                            client.get_gbfs_feed_from_url(
+                                url.replace(f"user:{password}@", ""),
+                                headers={
+                                    "X-Trace": "ok",
+                                    "Authorization": f"Bearer {bearer}",
+                                },
+                            ),
+                            10,
+                        )
+                        call = handle.get_system_info()
                     elif path == "static":
                         call = client.get_transit_feed_from_urls(url)
                     else:
@@ -1486,7 +1513,7 @@ def test_a_hop_to_another_origin_carries_no_credential_and_no_message_shows_one(
         text = request.decode("latin-1").lower()
         for secret in (password, header_secret, bearer, basic):
             assert secret.lower() not in text, request
-    _require_no_secret_in_chain(err, secrets, path)
+    _require_no_secret_in_chain(err, secrets)
 
 
 async def test_a_session_raising_for_status_keeps_the_status_mapping(
@@ -1519,3 +1546,64 @@ async def test_the_redirect_loop_checks_its_own_url(url: str) -> None:
             ):
                 pass
     assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("where", ["other-origin", "same-origin"])
+async def test_gbfs_credentials_go_only_to_the_discovery_origin(where: str) -> None:
+    """The endpoint URLs are the producer's data: Authorization goes to an
+    endpoint at the discovery URL's origin, never to another; other caller
+    headers go to both."""
+    received: dict[str, dict[str, str]] = {}
+
+    def serve(name: str, documents: dict[str, bytes]) -> Any:
+        async def handle(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
+            target = head.split(" ")[1]
+            received[f"{name}{target}"] = {
+                line.split(":", 1)[0].lower(): line.split(":", 1)[1].strip()
+                for line in head.split("\r\n")[1:]
+                if ":" in line
+            }
+            body = documents[target]
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            await writer.drain()
+            writer.close()
+
+        return handle
+
+    info = b'{"last_updated": 0, "ttl": 0, "data": {"system_id": "s"}}'
+    docs_b = {"/si": info}
+    server_b = await asyncio.start_server(serve("B", docs_b), "127.0.0.1", 0)
+    b = f"http://127.0.0.1:{server_b.sockets[0].getsockname()[1]}"
+    docs_a: dict[str, bytes] = {"/si": info}
+    server_a = await asyncio.start_server(serve("A", docs_a), "127.0.0.1", 0)
+    a = f"http://127.0.0.1:{server_a.sockets[0].getsockname()[1]}"
+    endpoint = f"{b}/si" if where == "other-origin" else f"{a}/si"
+    docs_a["/gbfs.json"] = (
+        b'{"last_updated": 0, "ttl": 0, "version": "2.3", "data": {"en": '
+        b'{"feeds": [{"name": "system_information", "url": "'
+        + endpoint.encode()
+        + b'"}]}}}'
+    )
+    try:
+        async with MobilityFeedsClient() as client:
+            handle = await client.get_gbfs_feed_from_url(
+                f"{a}/gbfs.json",
+                headers={"Authorization": "Bearer GbfsSecret", "X-Trace": "ok"},
+            )
+            await handle.get_system_info()
+    finally:
+        server_a.close()
+        server_b.close()
+    assert received["A/gbfs.json"]["authorization"] == "Bearer GbfsSecret"
+    seen = received["B/si" if where == "other-origin" else "A/si"]
+    assert seen["x-trace"] == "ok"
+    if where == "other-origin":
+        assert "authorization" not in seen
+    else:
+        assert seen["authorization"] == "Bearer GbfsSecret"

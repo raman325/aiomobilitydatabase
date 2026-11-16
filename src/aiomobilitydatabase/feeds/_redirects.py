@@ -66,6 +66,11 @@ def _origin(url: URL) -> tuple[str, str | None, int | None]:
     return url.scheme, url.raw_host, url.port
 
 
+def same_origin(a: str, b: str) -> bool:
+    """Return whether two checked URLs share an RFC 6454 origin."""
+    return _origin(URL(a)) == _origin(URL(b))
+
+
 def _remaining(deadline: float | None, url: str) -> float | None:
     """Seconds left before ``deadline`` (None: no bound); none left raises."""
     if deadline is None:

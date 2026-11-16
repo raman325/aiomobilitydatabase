@@ -1944,9 +1944,7 @@ class TransitFeedHandle:
         """Catalog strategy: translate latest-dataset metadata to a source."""
         dataset = static_feed.latest_dataset
         if dataset is None or not dataset.id or not dataset.hosted_url:
-            raise StaticDataUnavailableError(
-                f"Feed {static_feed.id} has no hosted static dataset"
-            )
+            raise StaticDataUnavailableError("The feed has no hosted static dataset")
         _require_http_url(dataset.hosted_url, "hosted GTFS dataset URL")
         source = _StaticSource(
             url=dataset.hosted_url,
@@ -1965,8 +1963,8 @@ class TransitFeedHandle:
                 return index
             await asyncio.to_thread(index.close)
         raise StaticDataUnavailableError(
-            f"Feed {static_feed.id}'s index was replaced twice by concurrent "
-            f"builds of dataset {index.dataset_id!r}; try again later"
+            "The feed's index was replaced twice by concurrent builds of "
+            "another dataset; try again later"
         )
 
     @classmethod
@@ -1999,9 +1997,7 @@ class TransitFeedHandle:
             # hashes and can never escape, but they flow through the same
             # guard anyway.)
             if not feed_dir.resolve().is_relative_to(client.cache_dir.resolve()):
-                raise FeedParseError(
-                    f"Feed id {source.cache_key!r} escapes the cache directory"
-                )
+                raise FeedParseError("The feed id escapes the cache directory")
             await asyncio.to_thread(feed_dir.mkdir, parents=True, exist_ok=True)
             db_path = feed_dir / STATIC_DB_FILENAME
             if source.dataset_id is not None:

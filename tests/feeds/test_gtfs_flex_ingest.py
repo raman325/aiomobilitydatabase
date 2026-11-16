@@ -237,6 +237,10 @@ def test_build_progress_counts_the_zones_file(tmp_path: Path) -> None:
             id="features not a list",
         ),
         pytest.param(json.dumps({"features": [_zone()]}), id="no type"),
+        pytest.param(
+            '{"type": "Feature", "type": "FeatureCollection", "features": []}',
+            id="a repeated name (RFC 8259 section 4)",
+        ),
     ],
 )
 def test_a_zones_file_that_is_not_a_feature_collection_fails_the_build(

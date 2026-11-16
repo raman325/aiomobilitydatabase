@@ -1191,3 +1191,16 @@ def _dump(index: StaticIndex) -> dict[str, list[tuple[object, ...]]]:
         }
     finally:
         index.close()
+
+
+def test_an_unreadable_zip_names_the_problem_in_the_librarys_words(
+    tmp_path: Path,
+) -> None:
+    """zipfile's own text isn't passed on, nor the error itself."""
+    bad = tmp_path / "feed.zip"
+    bad.write_bytes(b"PK\x03\x04 not really a zip")
+    with pytest.raises(FeedParseError) as caught:
+        StaticIndex.build(bad, ":memory:", DATASET, TZ)
+    assert str(caught.value) == "Unreadable GTFS zip: BadZipFile"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None

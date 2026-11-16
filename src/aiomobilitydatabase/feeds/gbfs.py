@@ -10,6 +10,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
+from .._http import CREDENTIAL_HEADERS
 from .._json import loads as json_loads
 from ._freshness import (
     FreshnessCache,
@@ -22,7 +23,7 @@ from ._freshness import hops as _hops
 from ._frozen import FrozenDict
 from ._language import is_preferred_language
 from ._numbers import ascii_number
-from ._redirects import get_withholding, network
+from ._redirects import get_withholding, network, same_origin
 from ._urls import (  # deliberate friend access: shared URL guard
     _require_http_url,
     redact,
@@ -495,7 +496,11 @@ class GbfsFeedHandle:
         catalog lookup is needed — its feed list becomes the same endpoint
         table :meth:`create` builds from catalog version metadata.
         ``headers`` apply to the discovery fetch and every subsequent
-        document fetch made through this handle.
+        document fetch made through this handle -- except that Authorization,
+        Cookie and Proxy-Authorization go only to endpoints at the discovery
+        URL's own origin: the endpoint URLs are the producer's data, and a
+        credential addressed to one origin isn't sent to another (as on a
+        redirect, RFC 9110 section 15.4).
         """
         handle = cls(client, None, {}, headers=headers, discovery_url=discovery_url)
         await handle._endpoint_table()  # fetched now: a bad URL fails here
@@ -610,18 +615,34 @@ class GbfsFeedHandle:
             raise SourceConnectionError(f"GBFS endpoint not published: {name}")
         return await self._fetch_cached(url, f"GBFS {name} endpoint URL")
 
+    def _headers_for(self, url: str) -> dict[str, str]:
+        """Return the caller's headers for ``url``.
+
+        Credentials only within the discovery URL's origin (see
+        :meth:`create_from_url`).
+        """
+        headers = dict(self._headers or {})
+        if self._discovery_url is not None and not same_origin(
+            url, self._discovery_url
+        ):
+            headers = {
+                name: value
+                for name, value in headers.items()
+                if name.lower() not in CREDENTIAL_HEADERS
+            }
+        return headers
+
     async def _fetch_cached(self, url: str, context: str) -> dict[str, Any]:
         """One GBFS document, reused as long as the producer allows."""
         _require_http_url(url, context)  # before request_fields parses it
+        headers = self._headers_for(url)
         return await self._docs.get(
             url,
-            partial(
-                self._fetch_json_document, self._client, url, self._headers, context
-            ),
+            partial(self._fetch_json_document, self._client, url, headers, context),
             request_fields=request_fields(
                 self._client._get_session(),  # deliberate friend access
                 url,
-                self._headers or {},
+                headers,
             ),
         )
 

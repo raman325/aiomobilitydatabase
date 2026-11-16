@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 from ._http import is_text
 
 
-def loads(raw: bytes) -> Any:
+def loads(
+    raw: bytes,
+    *,
+    parse_int: Callable[[str], Any] | None = None,
+    lone_surrogates: bool = False,
+) -> Any:
     r"""Parse JSON text, or raise ValueError when the bytes are none.
 
     RFC 8259: JSON exchanged between systems is UTF-8 (section 8.1), so the
@@ -21,18 +27,23 @@ def loads(raw: bytes) -> Any:
     is nesting deeper than the interpreter's stack -- and a string (a name or
     a value) holding a lone surrogate, which an escape can spell
     (``"\ud800"``; section 8.2 leaves its meaning unpredictable): no text,
-    it can't even be sent back.
+    it can't even be sent back. With ``lone_surrogates`` such strings are
+    kept, for a caller that judges each value itself (a GeoJSON Feature
+    with one is skipped, not the whole file). ``parse_int`` is
+    ``json.loads``'s.
     """
     try:
         value = json.loads(
             raw.decode("utf-8-sig"),
             object_pairs_hook=_unique_object,
             parse_constant=_reject_constant,
+            parse_int=parse_int,
         )
     except RecursionError:
         failure = "JSON nests deeper than can be parsed"
     else:
-        _require_text(value)
+        if not lone_surrogates:
+            _require_text(value)
         return value
     raise ValueError(failure)  # outside the except: nothing chained
 
