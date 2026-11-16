@@ -15,7 +15,7 @@ import aiohttp
 from ..client import MobilityDatabaseClient
 from ..exceptions import MobilityDatabaseError
 from ._extra import load_transit_handle
-from ._urls import require_header_fields
+from ._urls import require_compatible_credentials, require_header_fields
 from .const import DEFAULT_TIMEOUT_SECONDS
 from .gbfs import GbfsFeedHandle
 from .models import StaticBuildProgress
@@ -254,6 +254,16 @@ class MobilityFeedsClient:
         follow the same contracts as :meth:`get_transit_feed`.
         """
         require_header_fields(headers)
+        require_compatible_credentials(
+            [
+                static_url,
+                *(trip_updates_urls or ()),
+                *(vehicle_positions_urls or ()),
+                *(service_alerts_urls or ()),
+            ],
+            headers,
+            getattr(self._get_session(), "auth", None),
+        )
         return await load_transit_handle().create_from_urls(
             self,
             static_url,
@@ -287,4 +297,7 @@ class MobilityFeedsClient:
         Authorization, Cookie and Proxy-Authorization there.
         """
         require_header_fields(headers)
+        require_compatible_credentials(
+            [discovery_url], headers, getattr(self._get_session(), "auth", None)
+        )
         return await GbfsFeedHandle.create_from_url(self, discovery_url, headers)

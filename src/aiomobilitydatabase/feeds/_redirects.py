@@ -29,8 +29,10 @@ _ORIGIN_CREDENTIALS = frozenset({"authorization", "cookie", "proxy-authorization
 # redirect aiohttp follows itself: yarl's IndexError for some Locations, the
 # resolver's UnicodeError for a host it can't IDNA-encode, and ValueError --
 # aiohttp's own, building Basic credentials from a user name holding a colon
-# (a%3Ab@). Caller headers are checked when a handle is made
-# (_urls.require_header_fields), so a ValueError here is the producer's.
+# (a%3Ab@). The caller inputs aiohttp would refuse -- header names and
+# values, an api_key, credentials that can't all be sent -- are checked
+# when a handle is made (_urls.require_header_fields and
+# require_compatible_credentials), so a ValueError here is the producer's.
 _UNREQUESTABLE = (IndexError, ValueError)  # UnicodeError is a ValueError
 
 
@@ -45,8 +47,10 @@ async def open_response(
     try:
         return await request
     except _UNREQUESTABLE as err:
+        # The error's own text can echo every request header (aiohttp's
+        # pure-Python writer does): name its type only, credentials stay out.
         raise SourceConnectionError(
-            f"Could not request {url} or a URL it redirected to: {err!r}"
+            f"Could not request {url} or a URL it redirected to ({type(err).__name__})"
         ) from err
 
 

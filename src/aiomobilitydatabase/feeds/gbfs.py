@@ -72,6 +72,9 @@ def _decode_json(body: bytes) -> object:
     return json.loads(body, parse_constant=_reject_constant)
 
 
+# A number written in ASCII: float() alone also reads other scripts' digits,
+# "1_0", "inf" and "nan".
+_ASCII_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 # GBFS Date: "ISO 8601 Complete Date Extended Format: YYYY-MM-DD".
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
@@ -352,6 +355,8 @@ def _ttl_seconds(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         return None
+    if isinstance(value, str) and not _ASCII_NUMBER.fullmatch(value.strip(" \t")):
+        return None  # float() also reads other scripts' digits and 1_0
     try:
         ttl = float(value)
     except (OverflowError, ValueError):

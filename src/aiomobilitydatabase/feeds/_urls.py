@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 from yarl import URL
 
@@ -20,6 +20,7 @@ URL_ERRORS = (ValueError, IndexError)
 # holds no control character but HTAB (aiohttp refuses the same ones).
 FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _FIELD_VALUE_FORBIDDEN = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")  # RFC 5234 CTL
 
 
 def require_header_fields(
@@ -34,14 +35,64 @@ def require_header_fields(
     for name, value in (headers or {}).items():
         if not isinstance(name, str) or not FIELD_NAME.fullmatch(name):
             raise ValueError(f"header name {name!r} is no HTTP field name")
-        if not isinstance(value, str) or _FIELD_VALUE_FORBIDDEN.search(value):
+        if not _carriable(value):
             raise ValueError(f"header {name!r} has a value HTTP can't carry")
-    if api_key is not None and _FIELD_VALUE_FORBIDDEN.search(api_key):
-        raise ValueError("api_key holds a control character HTTP can't carry")
+    if api_key is not None and not _carriable(api_key):
+        raise ValueError("api_key holds a character HTTP can't carry")
+
+
+def _carriable(value: object) -> bool:
+    """Return whether a header value (or API key) reaches the server as is.
+
+    No control character but HTAB, and UTF-8 encodable: a lone surrogate
+    has no bytes, so aiohttp (and yarl, in a query) either drops it --
+    sending another value, another key -- or raises mid-request.
+    """
+    if not isinstance(value, str) or _FIELD_VALUE_FORBIDDEN.search(value):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _has_credentials(url: str) -> bool:
+    """Return whether a URL carries credentials.
+
+    False when it doesn't parse: a malformed URL is the guard's to report,
+    as SourceConnectionError.
+    """
+    try:
+        return URL(url).user is not None
+    except URL_ERRORS:
+        return False
+
+
+def require_compatible_credentials(
+    urls: Iterable[str], headers: Mapping[str, str] | None, session_auth: object
+) -> None:
+    """Raise ValueError when a caller's credentials can't all be sent.
+
+    aiohttp sends one Authorization field, so it refuses (mid-request, as a
+    ValueError) an Authorization header beside a session ``auth`` or
+    credentials in the URL, and a session ``auth`` beside URL credentials.
+    Checked for the caller's own URLs when a handle is made, so the mistake
+    is reported as the caller's.
+    """
+    has_header = any(name.lower() == "authorization" for name in headers or {})
+    in_url = any(_has_credentials(url) for url in urls)
+    if has_header and (in_url or session_auth is not None):
+        raise ValueError(
+            "an Authorization header can't go with credentials in the URL "
+            "or the session's auth"
+        )
+    if in_url and session_auth is not None:
+        raise ValueError("credentials in the URL can't go with the session's auth")
 
 
 def require_requestable(parsed: URL) -> None:
-    """Raise ValueError unless aiohttp can make a request to the URL.
+    """Raise ValueError for a URL these checks find no request can go to.
 
     No host at all (``https:``, ``http:/x``): RFC 9110 section 4.2.1 has a
     recipient reject an http(s) URI with an empty host as invalid -- and
@@ -59,6 +110,14 @@ def require_requestable(parsed: URL) -> None:
     parsed.raw_host.encode("idna")  # as socket.getaddrinfo encodes it
     if parsed.user is not None and ":" in parsed.user:
         raise ValueError("the URL's user name holds a colon")
+    # RFC 7617 section 2: neither user-id nor password holds a control
+    # character. (One that isn't Latin-1 fails in aiohttp as UnicodeError,
+    # which open_response reports as the source's.)
+    if any(
+        part is not None and _CONTROL.search(part)
+        for part in (parsed.user, parsed.password)
+    ):
+        raise ValueError("the URL's credentials hold a control character")
 
 
 def _require_http_url(url: str, context: str) -> None:

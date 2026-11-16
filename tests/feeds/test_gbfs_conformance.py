@@ -14,6 +14,7 @@ from aiomobilitydatabase.feeds.gbfs import (
     _iso_date,
     _localized,
     _reported_at,
+    _ttl_seconds,
     _version_key,
 )
 from aiomobilitydatabase.feeds.geo import Circle
@@ -460,3 +461,17 @@ async def test_a_gbfs_document_with_a_non_json_number_is_a_parse_error(
     handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
     with pytest.raises(FeedParseError, match="Malformed GBFS JSON"):
         await handle.get_system_info()
+
+
+@pytest.mark.parametrize("ttl", ["\u0663\u0660", "1_0", "inf", "nan", "60s", "0x3c"])
+def test_a_string_ttl_that_isnt_an_ascii_number_is_unusable(ttl: str) -> None:
+    """float() also reads other scripts' digits and 1_0: a corrupt ttl must
+    not become a lifetime."""
+    assert _ttl_seconds(ttl) is None
+
+
+@pytest.mark.parametrize(
+    ("ttl", "seconds"), [("60", 60.0), (" 60\t", 60.0), ("1.5", 1.5), ("1e2", 100.0)]
+)
+def test_a_string_ttl_in_ascii_reads(ttl: str, seconds: float) -> None:
+    assert _ttl_seconds(ttl) == seconds

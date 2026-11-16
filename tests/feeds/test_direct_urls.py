@@ -562,6 +562,8 @@ _BAD_LOCATIONS = [
     "https:///x",
     "https:x",
     "http://a%3Ab@127.0.0.1:9/x",  # RFC 7617: no colon in a Basic user-id
+    "http://a%0Ab:p@127.0.0.1:9/x",  # RFC 7617: no control character either
+    "http://a:p%00x@127.0.0.1:9/x",
 ]
 
 
@@ -803,6 +805,8 @@ def test_a_password_may_hold_a_colon() -> None:
         {"X-Key": "a\r\nX-Evil: 1"},
         {"X-Key": "a\x00b"},
         {"X-Key": "a\x7f"},
+        {"X-Key": "sec\ud800ret"},  # aiohttp dropped it: "secret" was sent
+        {"X-Key": "a\udc80"},
     ],
 )
 async def test_a_header_http_cant_carry_is_the_callers_mistake(
@@ -824,8 +828,9 @@ async def test_a_header_http_cant_carry_is_the_callers_mistake(
 async def test_an_api_key_http_cant_carry_is_the_callers_mistake(
     mock_api: MockApi, direct_client: MobilityFeedsClient
 ) -> None:
-    with pytest.raises(ValueError, match="control character"):
-        await direct_client.get_transit_feed("mdb-1", api_key="k\r\nX-Evil: 1")
+    for api_key in ("k\r\nX-Evil: 1", "k\ud800ey", "k\udcffey"):
+        with pytest.raises(ValueError, match="HTTP can't carry"):
+            await direct_client.get_transit_feed("mdb-1", api_key=api_key)
     assert mock_api.requests == []
 
 
@@ -842,3 +847,97 @@ async def test_a_tab_or_text_in_a_header_value_is_fine(
     )
     assert handle is not None
     assert mock_api.requests[0].headers["X-Note"].startswith("a\tb")
+
+
+# st.lists, not st.text: st.text never yields a lone surrogate.
+@given(
+    value=st.lists(
+        st.characters(codec="utf-8", exclude_categories=["Cs"])
+        | st.sampled_from(["\ud800", "\udcff", "\t", "\r", "\x00"]),
+        max_size=12,
+    ).map("".join)
+)
+@settings(max_examples=200, deadline=None)
+def test_a_header_value_is_refused_or_reaches_the_server_as_is(value: str) -> None:
+    """Either the caller's mistake, up front (ValueError), or the producer
+    receives exactly that value -- less the surrounding whitespace, which
+    is no part of an HTTP field value (RFC 9110 section 5.5)."""
+
+    async def scenario() -> None:
+        api = MockApi()
+        await api.start()
+        try:
+            api.get("/gbfs/gbfs.json", status=503)
+            async with MobilityFeedsClient() as client:
+                try:
+                    await client.get_gbfs_feed_from_url(
+                        api.url("/gbfs/gbfs.json"), headers={"X-Key": value}
+                    )
+                except ValueError:
+                    assert api.requests == []
+                    return
+                except SourceConnectionError:
+                    pass
+            assert api.requests[0].headers["X-Key"] == value.strip(" \t")
+        finally:
+            await api.stop()
+
+    asyncio.run(scenario())
+
+
+# BasicAuth and session auth are deprecated in aiohttp 3.14, absent its
+# replacement in 3.10 (the floor): still the case to refuse.
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize(
+    ("url", "headers", "session_auth"),
+    [
+        ("http://u:p@127.0.0.1:9/feed", {"Authorization": "Bearer t"}, None),
+        ("http://127.0.0.1:9/feed", {"authorization": "Bearer t"}, ("u", "p")),
+        ("http://u:p@127.0.0.1:9/feed", None, ("u", "p")),
+    ],
+)
+async def test_credentials_that_cant_all_be_sent_are_the_callers_mistake(
+    url: str, headers: dict[str, str] | None, session_auth: tuple[str, str] | None
+) -> None:
+    """aiohttp sends one Authorization field and raised ValueError
+    mid-request -- which open_response would have called the source's."""
+    auth = aiohttp.BasicAuth(*session_auth) if session_auth else None
+    async with aiohttp.ClientSession(auth=auth) as session:
+        client = MobilityFeedsClient(session=session)
+        with pytest.raises(ValueError, match="can't go with"):
+            await client.get_gbfs_feed_from_url(url, headers=headers)
+        with pytest.raises(ValueError, match="can't go with"):
+            await client.get_transit_feed_from_urls(url, headers=headers)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://a%0Ab:p@127.0.0.1:9/f",
+        "http://a:p%00x@127.0.0.1:9/f",
+        "http://a%09:p@127.0.0.1:9/f",
+    ],
+)
+def test_credentials_with_a_control_character_are_refused(url: str) -> None:
+    """RFC 7617 section 2: neither user-id nor password holds a control
+    character -- aiohttp sent them, newline and NUL included."""
+    with pytest.raises(SourceConnectionError, match="control character"):
+        _require_http_url(url, "test URL")
+
+
+async def test_a_mid_request_error_echoes_no_request_header(mock_api: MockApi) -> None:
+    """An error's own text can carry every request header (aiohttp's
+    pure-Python writer); the SourceConnectionError names its type only."""
+    mock_api.get(
+        "/rt.pb",
+        status=302,
+        headers={
+            "Location": mock_api.url("/x").replace("http://", "http://%E2%82%AC@")
+        },
+    )
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(SourceConnectionError) as caught:
+            await fetch_feed_message(
+                session, mock_api.url("/rt.pb"), headers={"X-Secret": "TOPSECRET"}
+            )
+    assert "TOPSECRET" not in str(caught.value)
