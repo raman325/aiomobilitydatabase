@@ -6,7 +6,7 @@ import bisect
 import itertools
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -263,7 +263,11 @@ def _within_box(p: _IntPoint, a: _IntPoint, b: _IntPoint) -> bool:
 def _touch(a: _IntPoint, b: _IntPoint, c: _IntPoint, d: _IntPoint) -> bool:
     """Return whether the closed segments ab and cd share any point."""
     o1, o2 = _orientation(a, b, c), _orientation(a, b, d)
+    if o1 * o2 > 0:
+        return False  # c and d strictly on one side of ab's line
     o3, o4 = _orientation(c, d, a), _orientation(c, d, b)
+    if o3 * o4 > 0:
+        return False
     if o1 * o2 < 0 and o3 * o4 < 0:
         return True
     return (
@@ -308,106 +312,369 @@ def _cells(
     origin: _IntPoint,
     size: int,
     limit: int | None = None,
-) -> Iterator[tuple[int, int]]:
-    """Yield every grid cell the closed segment ab passes through.
+) -> list[tuple[int, int]]:
+    """Return every grid cell the closed segment ab passes through.
 
     Column by column: the segment's y-range over each column's closed slab,
     computed exactly, gives the rows. A point of the segment lies in the
-    cell of its own floor coordinates, which this always yields. With
+    cell of its own floor coordinates, which this always returns. With
     ``limit``, only cells with both indices in ``[0, limit)`` are walked.
     """
-    (x1, y1), (x2, y2) = sorted((a, b))
+    (x1, y1), (x2, y2) = (a, b) if a <= b else (b, a)
     x0, y0 = origin
-    low, high = (0, limit - 1) if limit is not None else (None, None)
-
-    def clamp(first: int, last: int) -> range:
-        if low is not None and high is not None:
-            first, last = max(first, low), min(last, high)
-        return range(first, last + 1)
-
+    top = None if limit is None else limit - 1
     if x1 == x2:
         column = (x1 - x0) // size
-        if low is not None and high is not None and not low <= column <= high:
-            return
-        for row in clamp((min(y1, y2) - y0) // size, (max(y1, y2) - y0) // size):
-            yield column, row
-        return
+        first, last = (y1 - y0) // size, (y2 - y0) // size
+        if top is not None:
+            if not 0 <= column <= top:
+                return []
+            first, last = max(first, 0), min(last, top)
+        return [(column, row) for row in range(first, last + 1)]
     dx, dy = x2 - x1, y2 - y1
-    for column in clamp((x1 - x0) // size, (x2 - x0) // size):
-        lo = max(x1, x0 + column * size)
-        hi = min(x2, x0 + (column + 1) * size)
-        # floor((y(x) - y0) / size) with y(x) = y1 + dy (x - x1) / dx, exactly
-        rows = [((y1 - y0) * dx + dy * (x - x1)) // (dx * size) for x in (lo, hi)]
-        for row in clamp(min(rows), max(rows)):
-            yield column, row
+    # floor((y(x) - y0) / size) with y(x) = y1 + dy (x - x1) / dx, exactly
+    base, unit = (y1 - y0) * dx, dx * size
+    first, last = (x1 - x0) // size, (x2 - x0) // size
+    if top is not None:
+        first, last = max(first, 0), min(last, top)
+    cells = []
+    for column in range(first, last + 1):
+        left = x0 + column * size
+        low = (base + dy * (max(x1, left) - x1)) // unit
+        high = (base + dy * (min(x2, left + size) - x1)) // unit
+        if low > high:
+            low, high = high, low
+        if top is not None:
+            low, high = max(low, 0), min(high, top)
+        cells += [(column, row) for row in range(low, high + 1)]
+    return cells
 
 
 # A cell holding more edges than this is split into a finer grid of its own
-# (each side cut in _SUBDIVISION), down to unit cells: detail clustered in
-# a few cells of an otherwise coarse zone stays near-linear.
+# (each side cut in _SUBDIVISION): detail clustered in a few cells of an
+# otherwise coarse zone stays near-linear. Splitting stops at unit cells,
+# _MAX_DEPTH levels down, where long edges run together, or once a crowded
+# cell of the top grid has spent _BUDGET steps per pair of its edges; the
+# edges of a cell not split are box-swept instead (see _split_pairs).
 _CROWDED = 64
 _SUBDIVISION = 8
+_MAX_DEPTH = 12
+_BUDGET = 4
+
+type _Cell = tuple[int, int]
+# A half-open box [x0, x1) x [y0, y1): a cell clipped to its ancestors.
+type _Region = tuple[int, int, int, int]
 
 
-def _bucket_pairs(
+def _pair_count(count: int) -> int:
+    return count * (count - 1) // 2
+
+
+class _Budget:
+    """Steps left to split one crowded cell of the top grid."""
+
+    __slots__ = ("left",)
+
+    def __init__(self, left: float) -> None:
+        self.left = left
+
+    def spend(self, steps: int) -> None:
+        self.left -= steps
+
+    @property
+    def spent(self) -> bool:
+        return self.left < 0
+
+
+def _meeting_point(
+    a: _IntPoint, b: _IntPoint, c: _IntPoint, d: _IntPoint
+) -> _IntPoint | None:
+    """Return the floor of the one point where ab and cd meet, if any.
+
+    For segments not parallel, their lines' crossing ``a + (b - a) t``
+    (the only point they can share); along one line, the first (lowest x,
+    then y) point of both, or None if they are apart there; None for
+    parallel lines apart. Floored exactly, the crossing places the pair in
+    the half-open cell holding it. Whether the segments really meet is left
+    to the caller.
+    """
+    dx1, dy1 = b[0] - a[0], b[1] - a[1]
+    dx2, dy2 = d[0] - c[0], d[1] - c[1]
+    den = dx1 * dy2 - dy1 * dx2
+    if den:
+        num = (c[0] - a[0]) * dy2 - (c[1] - a[1]) * dx2
+        return a[0] + dx1 * num // den, a[1] + dy1 * num // den
+    if _orientation(a, b, c) or _orientation(c, d, a):
+        return None
+    first, last = max(min(a, b), min(c, d)), min(max(a, b), max(c, d))
+    return first if first <= last else None
+
+
+def _within(point: _IntPoint, region: _Region) -> bool:
+    return region[0] <= point[0] < region[2] and region[1] <= point[1] < region[3]
+
+
+def _buckets(
     edges: list[_Edge],
     members: Iterable[int],
     origin: _IntPoint,
     size: int,
     limit: int | None,
-    *,
-    seen: set[tuple[int, int]] | None = None,
-) -> Iterator[tuple[int, int]]:
-    """Yield pairs of ``members`` sharing a cell of this grid (or a sub-cell).
-
-    A crowded cell is re-bucketed on a finer grid clipped to the cell; two
-    edges meeting in the cell meet in the sub-cell holding that point.
-    Within one crowded cell, a pair is yielded once however many of its
-    sub-cells it shares (nearly parallel edges share hundreds): ``seen``
-    holds that cell's pairs only.
-    """
-    buckets: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
+) -> tuple[dict[_Cell, list[int]], dict[int, list[_Cell]]]:
+    """Return the ``members`` in each cell they cross, and each one's cells."""
+    buckets: defaultdict[_Cell, list[int]] = defaultdict(list)
+    cells_of: dict[int, list[_Cell]] = {}
     for index in members:
         _r, _i, a, b = edges[index]
-        for cell in _cells(a, b, origin, size, limit):
+        cells_of[index] = cells = _cells(a, b, origin, size, limit)
+        for cell in cells:
             buckets[cell].append(index)
+    return buckets, cells_of
+
+
+def _cell_of(
+    point: _IntPoint, origin: _IntPoint, size: int, clip: _Region | None
+) -> _Cell | None:
+    """Return the cell of this grid holding ``point``, if within ``clip``."""
+    if clip is not None and not _within(point, clip):
+        return None
+    return (point[0] - origin[0]) // size, (point[1] - origin[1]) // size
+
+
+def _meets(edges: list[_Edge], first: int, second: int) -> _IntPoint | None:
+    """Return two edges' meeting point (floored), or None if they do not meet."""
+    _r, _i, a, b = edges[first]
+    _r, _i, c, d = edges[second]
+    return _meeting_point(a, b, c, d) if _touch(a, b, c, d) else None
+
+
+def _leaf_pairs(
+    edges: list[_Edge],
+    buckets: dict[_Cell, list[int]],
+    cells_of: dict[int, list[_Cell]],
+    leaves: set[_Cell],
+    grid: tuple[_IntPoint, int, _Region | None],
+    *,
+    budget: _Budget | None,
+) -> Iterator[tuple[int, int]]:
+    """Yield the pairs meeting in a leaf cell (one not split) of this grid.
+
+    Each edge walks its leaf cells, marking each partner the first time it
+    is met (``partner``, linear in the edges), so a pair sharing many
+    cells is weighed once here.
+    """
+    partner: dict[int, int] = {}
+    steps = 0
+    for i, cells in cells_of.items():
+        _r, _i, (ax, ay), (bx, by) = edges[i]
+        dx, dy = bx - ax, by - ay
+        for cell in cells:
+            if cell not in leaves:
+                continue
+            inside = buckets[cell]  # ascending, as the members
+            later = inside[bisect.bisect_right(inside, i) :]
+            steps += len(later) + 1
+            for j in later:
+                if partner.get(j) == i:
+                    continue
+                partner[j] = i
+                # _touch's first test, inline: j wholly to one side of i's line
+                _r, _i, (cx, cy), (ex, ey) = edges[j]
+                o1 = dx * (cy - ay) - dy * (cx - ax)
+                o2 = dx * (ey - ay) - dy * (ex - ax)
+                if (o1 > 0 and o2 > 0) or (o1 < 0 and o2 < 0):
+                    continue
+                point = _meets(edges, i, j)
+                if point is not None and _cell_of(point, *grid) in leaves:
+                    yield i, j
+    if budget is not None:
+        budget.spend(steps)
+
+
+def _swept_pairs(
+    edges: list[_Edge],
+    boxes: list[_Region],
+    members: Iterable[int],
+    accept: Callable[[_IntPoint], bool],
+    budget: _Budget | None = None,
+) -> Iterator[tuple[int, int]]:
+    """Yield the pairs of ``members`` meeting at a point ``accept`` takes.
+
+    Swept by box, as _holes_overlap: sorted by left side, each edge is
+    compared with those not yet ended to its left. Edges that meet share a
+    point, so their boxes overlap. O(m log m) plus the comparisons, at most
+    one per pair: near-linear for long thin edges side by side (a fine
+    zigzag), quadratic only where the boxes themselves pile up.
+    """
+    steps = 0
+    active: list[int] = []
+    for k in sorted(members, key=lambda k: boxes[k][0]):
+        x0, y0, _x1, y1 = boxes[k]
+        _r, _i, (ax, ay), (bx, by) = edges[k]
+        dx, dy = bx - ax, by - ay
+        active = [g for g in active if boxes[g][2] >= x0]
+        steps += len(active) + 1
+        for g in active:
+            if boxes[g][1] > y1 or y0 > boxes[g][3]:
+                continue
+            # _touch's first test, inline: g wholly to one side of k's line
+            _r, _i, (cx, cy), (ex, ey) = edges[g]
+            o1 = dx * (cy - ay) - dy * (cx - ax)
+            o2 = dx * (ey - ay) - dy * (ex - ax)
+            if (o1 > 0 and o2 > 0) or (o1 < 0 and o2 < 0):
+                continue
+            point = _meets(edges, g, k)
+            if point is not None and accept(point):
+                yield (g, k) if g < k else (k, g)
+        active.append(k)
+    if budget is not None:
+        budget.spend(steps)
+
+
+class _OutOfBudgetError(Exception):
+    """A crowded cell's split ran out of budget (see _split_pairs)."""
+
+
+# One level of a split in progress: its grid, its sub-cells done (meeting
+# points there all yielded), and the sub-cell being split, if any.
+type _Level = tuple[tuple[_IntPoint, int, _Region], set[_Cell], list[_Cell | None]]
+
+
+def _done(point: _IntPoint, path: list[_Level]) -> bool:
+    """Return whether the split had yielded the pairs meeting at ``point``."""
+    for grid, done, current in path:
+        cell = _cell_of(point, *grid)
+        if cell in done:
+            return True
+        if cell != current[0]:
+            return False
+    return False
+
+
+def _split_pairs(  # noqa: PLR0917
+    edges: list[_Edge],
+    boxes: list[_Region],
+    members: list[int],
+    corner: _IntPoint,
+    size: int,
+    clip: _Region,
+    budget: _Budget,
+    path: list[_Level],
+) -> Iterator[tuple[int, int]]:
+    """Yield the pairs of a crowded cell's ``members`` meeting in ``clip``.
+
+    The cell (``size`` wide at ``corner``) is re-bucketed on a finer grid;
+    two edges meeting in the cell meet in the sub-cell holding that point.
+    A crowded sub-cell is split again, unless it is a unit cell,
+    ``_MAX_DEPTH`` levels down, or one of several sub-cells each holding
+    over half of this cell's edges: long, nearly parallel edges running
+    together, which every finer grid would split the same way again,
+    multiplying the work at each level. (One such sub-cell alone is split:
+    edges converging on a point, a sunburst, separate further in.) The
+    sub-cells not split are box-swept together, once.
+
+    Every step is charged to ``budget``; once it is spent, the next split
+    or sweep raises _OutOfBudgetError instead, leaving ``path`` to tell
+    which sub-cells are done.
+    """
+    sub = -(-size // _SUBDIVISION)
+    grid = (corner, sub, clip)
+    buckets, cells_of = _buckets(edges, members, corner, sub, -(-size // sub))
+    budget.spend(sum(len(cells) for cells in cells_of.values()))
+    leaves = {cell for cell, inside in buckets.items() if len(inside) <= _CROWDED}
+    current: list[_Cell | None] = [None]
+    path.append((grid, set(leaves), current))
+    yield from _leaf_pairs(edges, buckets, cells_of, leaves, grid, budget=budget)
+    done = path[-1][1]
+    dominant = sum(1 for inside in buckets.values() if 2 * len(inside) > len(members))
+    swept: set[_Cell] = set()
     for (column, row), inside in buckets.items():
-        if len(inside) > _CROWDED and size > 1:
-            sub = -(-size // _SUBDIVISION)
-            yield from _bucket_pairs(
-                edges,
-                inside,
-                (origin[0] + column * size, origin[1] + row * size),
-                sub,
-                -(-size // sub),
-                seen=set() if seen is None else seen,
-            )
+        x, y = corner[0] + column * sub, corner[1] + row * sub
+        region = (
+            max(clip[0], x),
+            max(clip[1], y),
+            min(clip[2], x + sub),
+            min(clip[3], y + sub),
+        )
+        if (column, row) in leaves or region[0] >= region[2] or region[1] >= region[3]:
             continue
-        for n, first in enumerate(inside):
-            for second in inside[n + 1 :]:
-                pair = (first, second) if first < second else (second, first)
-                if seen is not None:
-                    if pair in seen:
-                        continue
-                    seen.add(pair)
-                yield pair
+        if not (
+            sub > 1
+            and len(path) < _MAX_DEPTH
+            and (dominant == 1 or 2 * len(inside) <= len(members))
+        ):
+            swept.add((column, row))
+            continue
+        if budget.spent:
+            raise _OutOfBudgetError
+        current[0] = column, row
+        yield from _split_pairs(edges, boxes, inside, (x, y), sub, region, budget, path)
+        current[0] = None
+        done.add((column, row))
+    if swept:
+        if budget.spent:
+            raise _OutOfBudgetError
+        members_swept = {k for cell in swept for k in buckets[cell]}
+        yield from _swept_pairs(
+            edges,
+            boxes,
+            members_swept,
+            lambda point: _cell_of(point, *grid) in swept,
+            budget,
+        )
+    path.pop()
+
+
+def _crowded_pairs(
+    edges: list[_Edge], boxes: list[_Region], members: list[int], region: _Region
+) -> Iterator[tuple[int, int]]:
+    """Yield the pairs of a crowded top-grid cell's ``members`` meeting in it.
+
+    Split (_split_pairs) within a budget of ``_BUDGET * m * (m - 1) / 2``
+    steps for m edges -- cell visits, partners weighed, box comparisons --
+    and, if that runs out, finished by one box sweep of the whole cell,
+    which yields only the pairs meeting where the split had not got to.
+    The step that spends the budget overruns it by one sweep at most, so
+    the cell costs O(m^2) in all, whatever the coordinates' magnitude or
+    precision.
+    """
+    budget = _Budget(_BUDGET * _pair_count(len(members)))
+    path: list[_Level] = []
+    size = region[2] - region[0]
+    try:
+        yield from _split_pairs(
+            edges, boxes, members, region[:2], size, region, budget, path
+        )
+    except _OutOfBudgetError:
+        yield from _swept_pairs(
+            edges,
+            boxes,
+            members,
+            lambda point: _within(point, region) and not _done(point, path),
+        )
 
 
 def _candidate_pairs(edges: list[_Edge]) -> Iterator[tuple[int, int]]:
-    """Yield index pairs ``(i, j)``, ``i < j``, of edges that may meet.
+    """Yield index pairs ``(i, j)``, ``i < j``, of the edges that meet.
 
-    Edges are bucketed on a grid, each in just the cells its line crosses,
-    crowded cells split finer, and only edges sharing a cell are paired;
-    edges that meet share the cell of their meeting point. A pair sharing
-    several cells is yielded once per cell (checking it twice is harmless;
-    remembering every pair would cost memory quadratic in the worst case).
+    Each meeting pair exactly once, and no other. Edges are bucketed on a
+    grid, each in just the cells its line crosses; a crowded cell is split
+    finer or box-swept (_split_pairs). Two edges that meet share the cell
+    holding their meeting point (_meeting_point, one per pair) and are
+    yielded from that cell alone, so no set of pairs is kept.
 
     Cells are the size of the median edge, coarsened so the edges cover
     about 8n cells in all and so no more than about 4n fit across the zone:
-    memory stays linear in the edge count. Time is about the edge count for
-    evenly spread vertices, with or without a few long edges or a cluster
-    of fine detail; more where many edges converge on one point (a
-    sunburst of spikes), where no grid separates them.
+    memory stays linear in the edge count (a split holds only the cells of
+    the one cell it splits, at most _MAX_DEPTH deep). Time is about the
+    edge count for evenly spread vertices, with or without a few long
+    edges or a cluster of fine detail. It is more where many edges converge
+    on one point (a sunburst of spikes) or run together (a bundle of
+    nearly parallel edges), which no grid separates: up to quadratic --
+    seconds for a few thousand such edges, minutes for tens of thousands
+    -- but no worse. A crowded cell of m edges costs O(m^2)
+    (_crowded_pairs), and the cells' m^2 sum to O(n^2) over the O(n) cell
+    memberships.
     """
     xs = [x for _r, _i, a, b in edges for x in (a[0], b[0])]
     ys = [y for _r, _i, a, b in edges for y in (a[1], b[1])]
@@ -420,7 +687,29 @@ def _candidate_pairs(edges: list[_Edge]) -> Iterator[tuple[int, int]]:
         travel // (6 * len(edges)),
         1,
     )
-    return _bucket_pairs(edges, range(len(edges)), (min(xs), min(ys)), size, None)
+    origin = (min(xs), min(ys))
+    grid = (origin, size, None)
+    boxes = [_box((a, b)) for *_, a, b in edges]
+    buckets, cells_of = _buckets(edges, range(len(edges)), origin, size, None)
+    leaves = {cell for cell, inside in buckets.items() if len(inside) <= _CROWDED}
+    yield from _leaf_pairs(edges, buckets, cells_of, leaves, grid, budget=None)
+    swept: set[_Cell] = set()
+    for (column, row), inside in buckets.items():
+        if (column, row) in leaves:
+            continue
+        if size == 1:
+            swept.add((column, row))
+            continue
+        x, y = origin[0] + column * size, origin[1] + row * size
+        yield from _crowded_pairs(edges, boxes, inside, (x, y, x + size, y + size))
+    if swept:
+        members = {k for cell in swept for k in buckets[cell]}
+        yield from _swept_pairs(
+            edges,
+            boxes,
+            members,
+            lambda point: _cell_of(point, *grid) in swept,
+        )
 
 
 def _position(p: _IntPoint, ring: Sequence[_IntPoint]) -> int:
