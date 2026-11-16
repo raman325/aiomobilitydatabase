@@ -12,7 +12,9 @@ import csv
 import heapq
 import io
 import json
+import math
 import os
+import re
 import sqlite3
 import tempfile
 import zipfile
@@ -254,6 +256,29 @@ _WEEKDAY_COLUMNS = (
     "saturday",
     "sunday",
 )
+
+
+# A GTFS Float written in ASCII: a sign, digits with an optional fraction (or
+# a bare fraction), an optional exponent. float() also reads other scripts'
+# digits, PEP 515 grouping ("1_0"), "inf" and "nan".
+_ASCII_DECIMAL = re.compile(
+    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+)
+
+
+def _coordinate(value: str, field: str) -> float | None:
+    """Parse a stop_lat/stop_lon cell: None when blank.
+
+    Anything else that is not a finite ASCII decimal raises ValueError (the
+    build's FeedParseError), as an unreadable cell always has: a spelling
+    float() alone would accept is no more a coordinate than ``abc``.
+    """
+    if not (text := value.strip()):
+        return None
+    parsed = float(text) if _ASCII_DECIMAL.fullmatch(text) else math.nan
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field} is not a decimal number: {value!r}")
+    return parsed
 
 
 def _ascii_digits(value: str) -> bool:
@@ -1403,8 +1428,8 @@ class StaticIndex:
                 (
                     row["stop_id"],
                     row.get("stop_name") or None,
-                    float(lat) if (lat := row.get("stop_lat", "").strip()) else None,
-                    float(lon) if (lon := row.get("stop_lon", "").strip()) else None,
+                    _coordinate(row.get("stop_lat", ""), "stop_lat"),
+                    _coordinate(row.get("stop_lon", ""), "stop_lon"),
                     row.get("parent_station") or None,
                     _defaulted_int(row.get("location_type"), 0),
                     row.get("stop_code") or None,
@@ -3828,11 +3853,13 @@ class StaticIndex:
         origin_stop_id: str,
         destination_stop_id: str,
         active: set[str],
-    ) -> tuple[tuple[str, int], tuple[str, int]]:
+    ) -> tuple[tuple[str, int, int], tuple[str, int, int]]:
         """Return one service day's first/last departure identities for the pair.
 
-        The identities are (trip_id, origin stop_sequence) pairs computed
-        over the WHOLE service day, not the query window.
+        The identities are (trip_id, origin stop_sequence, departure_secs)
+        computed over the WHOLE service day, not the query window: a journey
+        is one origin call, and a feed repeating an origin stop_sequence
+        with another time has two, so the sequence alone names neither.
 
         Ordered by (departure_secs, trip_id, stop_sequence) — the same
         total order the row sort uses — so exactly one candidate is the
@@ -3843,16 +3870,16 @@ class StaticIndex:
         service_marks = ",".join("?" * len(active))
         candidates = self._PAIR_CANDIDATES_SQL.format(service_marks=service_marks)
         params = [origin_stop_id, destination_stop_id, *sorted(active)]
-        extremes: list[tuple[str, int]] = []
+        extremes: list[tuple[str, int, int]] = []
         for direction in ("ASC", "DESC"):
             sql = (
-                "SELECT o.trip_id, o.stop_sequence "
+                "SELECT o.trip_id, o.stop_sequence, o.departure_secs "
                 f"{candidates} "
                 f"ORDER BY o.departure_secs {direction}, o.trip_id {direction}, "
                 f"o.stop_sequence {direction} LIMIT 1"
             )
             row = self._conn.execute(sql, params).fetchone()
-            extremes.append((row[0], row[1]))
+            extremes.append((row[0], row[1], row[2]))
         return extremes[0], extremes[1]
 
     def _trips_on(
@@ -3964,8 +3991,8 @@ class StaticIndex:
                     ),
                     destination_timepoint_exact=_timepoint_exact(d_timepoint),
                     destination_stop_headsign=d_stop_headsign,
-                    is_first=(trip_id, o_sequence) == first_key,
-                    is_last=(trip_id, o_sequence) == last_key,
+                    is_first=(trip_id, o_sequence, dep_secs) == first_key,
+                    is_last=(trip_id, o_sequence, dep_secs) == last_key,
                     trip_short_name=trip_short_name,
                     block_id=block_id,
                 )

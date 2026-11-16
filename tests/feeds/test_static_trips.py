@@ -1,7 +1,9 @@
 """Tests for origin→destination scheduled trip queries (upcoming_trips)."""
 
+import zipfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiomobilitydatabase.feeds.static_index import StaticIndex
 
@@ -181,4 +183,48 @@ def test_upcoming_trips_grace_reaches_before_now(tmp_path: Path) -> None:
         "S1", "S3", now_late, timedelta(hours=1), grace=timedelta(hours=1)
     )
     assert [trip.trip_id for trip in with_grace] == ["T1"]
+    index.close()
+
+
+def test_a_repeated_origin_stop_sequence_flags_each_journey_once(
+    tmp_path: Path,
+) -> None:
+    """A feed repeating an origin stop_sequence with another time has two
+    origin calls, each its own journey: the day's first and last are each
+    one of them, never both (the sequence alone names neither)."""
+    files = {
+        "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
+        f"A,Agency,https://example.com,{TZ}\n",
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nO,Origin,0,0\nD,Dest,0,0\n",
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\nR,A,1,3\n",
+        "trips.txt": "route_id,service_id,trip_id\nR,ALL,T1\nR,ALL,T2\n",
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "T1,08:00:00,08:00:00,O,1\n"
+        "T1,08:30:00,08:30:00,O,1\n"
+        "T1,09:00:00,09:00:00,D,2\n"
+        "T2,08:10:00,08:10:00,O,1\n"
+        "T2,08:50:00,08:50:00,D,2\n",
+        "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,"
+        "saturday,sunday,start_date,end_date\nALL,1,1,1,1,1,1,1,20260101,20271231\n",
+    }
+    zip_path = tmp_path / "repeat.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    index = StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+    trips = index.upcoming_trips("O", "D", NOW, timedelta(hours=2), 10)
+    flags = [
+        (
+            trip.trip_id,
+            trip.departure.astimezone(ZoneInfo(TZ)).strftime("%H:%M"),
+            trip.is_first,
+            trip.is_last,
+        )
+        for trip in trips
+    ]
+    assert flags == [
+        ("T1", "08:00", True, False),
+        ("T2", "08:10", False, False),
+        ("T1", "08:30", False, True),
+    ]
     index.close()

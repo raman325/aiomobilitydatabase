@@ -8,12 +8,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import StopLocationType
 from aiomobilitydatabase.feeds.static_index import (
     SCHEMA_VERSION,
     StaticIndex,
+    _coordinate,
     _lenient_date,
     _lenient_int,
     _strict_int,
@@ -946,3 +949,55 @@ def test_a_scratch_file_is_removed_when_its_connection_fails(
             _write_zip(tmp_path), str(tmp_path / "static.db"), DATASET, TZ
         )
     assert not list(tmp_path.glob("*.building*"))
+
+
+# -- stop_lat/stop_lon: finite ASCII decimals only -------------------------------
+
+_STOP_ROW = "ST1,Depot Station,34.0705,-118.2295,,1"
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        "٣٤.0705",  # Arabic-Indic digits
+        chr(0xFF13) + chr(0xFF14) + ".0705",  # full-width digits
+        "3_4.0705",  # PEP 515 grouping
+        "nan",
+        "inf",
+        "-Infinity",
+        "1e999",  # overflows to inf
+        "34. 0705",
+        "0x22",
+        "abc",
+    ],
+)
+@pytest.mark.parametrize("column", [2, 3], ids=["stop_lat", "stop_lon"])
+def test_a_coordinate_float_alone_would_read_fails_the_build(
+    tmp_path: Path, cell: str, column: int
+) -> None:
+    """GTFS writes a Float in ASCII decimal. float() also reads other
+    scripts' digits, underscores, nan and inf, each turning a corrupt cell
+    into a plausible -- or no -- position; they fail the build as ``abc``
+    always has."""
+    files = dict(_FILES)
+    files["stops.txt"] = _with_cell(_FILES["stops.txt"], _STOP_ROW, column, cell)
+    zip_path = _zip_from_files(tmp_path, files, "coordinate.zip")
+    with pytest.raises(FeedParseError, match=r"Malformed stops\.txt"):
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+_SPELLINGS = {
+    "repr": repr,
+    "signed": lambda value: f"{value:+}",
+    "exponent": lambda value: f"{value:e}",
+    "padded": lambda value: f" {value!r}\t",
+    "bare-fraction": lambda value: f"{value:f}".replace("0.", ".", 1),
+}
+
+
+@given(value=st.floats(-180, 180), spelling=st.sampled_from(sorted(_SPELLINGS)))
+def test_an_ascii_decimal_coordinate_reads_as_written(
+    value: float, spelling: str
+) -> None:
+    text = _SPELLINGS[spelling](value)
+    assert _coordinate(text, "stop_lat") == float(text.strip())
