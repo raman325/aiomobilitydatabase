@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+from typing import NamedTuple
 
 from .models import FlexPolygon
 
@@ -136,7 +137,7 @@ def _segment_distance(a: _Plane, b: _Plane) -> float:
     return abs(p[0] * dy - p[1] * dx) / math.hypot(dx, dy)
 
 
-def _edges(ring: Sequence[_Plane]) -> Iterator[tuple[_Plane, _Plane]]:
+def _edges(ring: Sequence[_Vertex]) -> Iterator[tuple[_Vertex, _Vertex]]:
     """Yield a closed ring's edges, each with its ends in a fixed order.
 
     The tests below round differently with an edge's direction (the
@@ -150,11 +151,99 @@ def _edges(ring: Sequence[_Plane]) -> Iterator[tuple[_Plane, _Plane]]:
         yield (a, b) if a <= b else (b, a)
 
 
-def _encloses_origin(ring: Sequence[_Plane]) -> bool:
-    """Return whether the origin is inside a closed planar ring (crossings)."""
+# A float's rounding unit: every operation below errs by at most this much
+# of its result, so of the sum of its operands' magnitudes.
+_UNIT = 2.0**-53
+_TINY = 2.0**-960  # below this a product may have lost bits to underflow
+
+
+class _Vertex(NamedTuple):
+    """A polygon position in the circle's plane.
+
+    ``(x, y)`` are metres east and north of the centre, as floats, each
+    within ``(ex, ey)`` of its exact value, which :meth:`offsets` gives up
+    to the plane's (positive) scales.
+    """
+
+    x: float
+    y: float
+    ex: float
+    ey: float
+    sources: tuple[float, float, float, float, float]  # lon, shift, clon, lat, clat
+
+    def offsets(self) -> tuple[Fraction, Fraction]:
+        """Return the exact degrees east and north of the centre."""
+        lon, shift, clon, lat, clat = self.sources
+        return (
+            Fraction(lon) + Fraction(shift) - Fraction(clon),
+            Fraction(lat) - Fraction(clat),
+        )
+
+
+def _sign(value: Fraction | float) -> int:
+    """Return -1, 0 or 1 by the sign of ``value``."""
+    return (value > 0) - (value < 0)
+
+
+def _cross_sign(a: _Vertex, b: _Vertex) -> int:
+    """Return the sign of ``a x b`` (``ax * by - bx * ay``) in the exact plane.
+
+    From the floats when the result is further from zero than everything
+    they and the products can be off by; else from the exact offsets (the
+    plane's scales are positive, so they keep every sign). A point a
+    rounding error from a line is on the side it is, not the one the
+    rounding says.
+    """
+    left, right = a.x * b.y, b.x * a.y
+    estimate = left - right
+    bound = (
+        abs(a.x) * b.ey
+        + abs(b.y) * a.ex
+        + a.ex * b.ey
+        + abs(b.x) * a.ey
+        + abs(a.y) * b.ex
+        + b.ex * a.ey
+        + 4 * _UNIT * (abs(left) + abs(right))
+    )
+    if abs(estimate) > 2 * bound and bound > _TINY:
+        return _sign(estimate)
+    (ax, ay), (bx, by) = a.offsets(), b.offsets()
+    return _sign(ax * by - bx * ay)
+
+
+def _axis_sign(vertex: _Vertex, axis: int) -> int:
+    """Return the exact sign of a vertex's x (axis 0) or y (axis 1)."""
+    value, error = (vertex.x, vertex.ex) if axis == 0 else (vertex.y, vertex.ey)
+    if abs(value) > 2 * error and error > _TINY:
+        return _sign(value)
+    return _sign(vertex.offsets()[axis])
+
+
+def _touches_origin(a: _Vertex, b: _Vertex) -> bool:
+    """Return whether the segment ab passes through the origin, exactly."""
+    return (
+        all(
+            min(_axis_sign(a, axis), _axis_sign(b, axis))
+            <= 0
+            <= max(_axis_sign(a, axis), _axis_sign(b, axis))
+            for axis in (0, 1)
+        )
+        and _cross_sign(a, b) == 0
+    )
+
+
+def _encloses_origin(ring: Sequence[_Vertex]) -> bool:
+    """Return whether the origin is inside a closed planar ring (crossings).
+
+    An edge straddling the x axis crosses it at ``(x1*y2 - x2*y1) / (y2 -
+    y1)``: right of the origin when the two have one sign. Compared by
+    exact sign (:func:`_cross_sign`) rather than by computing the
+    crossing, whose rounding put a point a few ulps outside a vertex in.
+    """
     inside = False
-    for (x1, y1), (x2, y2) in _edges(ring):
-        if (y1 > 0) != (y2 > 0) and x1 + (x2 - x1) * (0 - y1) / (y2 - y1) > 0:
+    for a, b in _edges(ring):
+        above_a, above_b = _axis_sign(a, 1) > 0, _axis_sign(b, 1) > 0
+        if above_a != above_b and _cross_sign(a, b) == (1 if above_b else -1):
             inside = not inside
     return inside
 
@@ -197,19 +286,29 @@ def polygon_overlaps_circle(polygon: FlexPolygon, zone: Circle) -> bool:
     nearest = _FULL_TURN_DEG * round((zone.longitude - middle) / _FULL_TURN_DEG)
 
     def overlaps(shift: float) -> bool:
-        def plane(ring: Sequence[tuple[float, float]]) -> list[_Plane]:
+        def plane(ring: Sequence[tuple[float, float]]) -> list[_Vertex]:
+            # Each step errs by at most _UNIT of its operands' magnitudes.
+            east = (abs(shift) + abs(zone.longitude)) * scale
             return [
-                (
+                _Vertex(
                     (lon + shift - zone.longitude) * scale,
                     (lat - zone.latitude) * _M_PER_DEG_LAT,
+                    4 * _UNIT * (abs(lon) * scale + east),
+                    4 * _UNIT * (abs(lat) + abs(zone.latitude)) * _M_PER_DEG_LAT,
+                    (lon, shift, zone.longitude, lat, zone.latitude),
                 )
                 for lat, lon in ring
             ]
 
         rings = [plane(polygon.exterior), *(plane(hole) for hole in polygon.holes)]
-        if any(
-            _segment_distance(a, b) <= radius for ring in rings for a, b in _edges(ring)
-        ):
+        # At radius zero, touching is exact: a distance rounded to 0.0 is no
+        # touch, nor one rounded off it a miss.
+        reaches = (
+            _touches_origin
+            if radius == 0
+            else lambda a, b: _segment_distance(a[:2], b[:2]) <= radius
+        )
+        if any(reaches(a, b) for ring in rings for a, b in _edges(ring)):
             return True
         return _encloses_origin(rings[0]) and not any(
             _encloses_origin(hole) for hole in rings[1:]
@@ -276,10 +375,6 @@ def _touch(a: _IntPoint, b: _IntPoint, c: _IntPoint, d: _IntPoint) -> bool:
         or (o3 == 0 and _within_box(a, c, d))
         or (o4 == 0 and _within_box(b, c, d))
     )
-
-
-def _sign(value: int) -> int:
-    return (value > 0) - (value < 0)
 
 
 def _meet_only_at_a_shared_end(

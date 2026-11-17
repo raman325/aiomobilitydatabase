@@ -1475,3 +1475,79 @@ def test_in_circle_keeps_points_past_the_centre_parallel_box(
 ) -> None:
     assert great_circle_m(zone.latitude, zone.longitude, *point) <= zone.radius_m
     assert in_circle(zone, *point)
+
+
+def _exactly_inside_or_on(ring: list[tuple[Fraction, Fraction]]) -> bool:
+    """Whether the origin is inside a closed ring or on it, in rationals."""
+    inside = False
+    for (x1, y1), (x2, y2) in itertools.pairwise(ring):
+        if (
+            x1 * y2 == x2 * y1
+            and min(x1, x2) <= 0 <= max(x1, x2)
+            and min(y1, y2) <= 0 <= max(y1, y2)
+        ):
+            return True
+        if (y1 > 0) != (y2 > 0) and (x1 * y2 - x2 * y1) / (y2 - y1) > 0:
+            inside = not inside
+    return inside
+
+
+_OFFSET = st.floats(-2, 2).filter(lambda value: value == 0 or abs(value) > 1e-3)
+
+
+@given(
+    latitude=st.floats(-60, 60),
+    longitude=st.floats(-170, 170),
+    offsets=st.lists(st.tuples(_OFFSET, _OFFSET), min_size=2, max_size=4),
+    vertex=st.integers(0, 4),
+    steps=st.integers(-3, 3),
+    east=st.booleans(),
+)
+@example(  # a step east of the eastmost vertex: the crossing rounded inside
+    latitude=56.0,
+    longitude=-1.0,
+    offsets=[(0.0, 0.0), (1.01171875, 0.0), (0.83984375, 0.9375)],
+    vertex=3,
+    steps=1,
+    east=True,
+)
+@example(  # a step off a vertex at 0: other vertices' offsets lose it
+    latitude=0.0,
+    longitude=0.0,
+    offsets=[(1.0, 1.0), (-1.0, -1.0)],
+    vertex=0,
+    steps=1,
+    east=False,
+)
+@settings(max_examples=500)
+def test_a_zero_radius_zone_overlaps_exactly_when_inside_or_on_the_polygon(  # noqa: PLR0917
+    latitude: float,
+    longitude: float,
+    offsets: list[tuple[float, float]],
+    vertex: int,
+    steps: int,
+    east: bool,
+) -> None:
+    """A zone a few float steps from a vertex: overlapping iff its centre is
+    inside the polygon or on its boundary in the exact plane. The crossing
+    test's rounding put a point one step outside a vertex in, and the
+    centre's offset from the other vertices could round away."""
+    points = [(latitude, longitude)] + [
+        (latitude + north, longitude + across) for north, across in offsets
+    ]
+    ring = (*points, points[0])
+    centre_lat, centre_lon = points[vertex % len(points)]
+    for _ in range(abs(steps)):
+        toward = math.copysign(math.inf, steps)
+        if east:
+            centre_lon = math.nextafter(centre_lon, toward)
+        else:
+            centre_lat = math.nextafter(centre_lat, toward)
+    zone = Circle(centre_lat, centre_lon, 0.0)
+    # Inside and on are unchanged by the plane's positive scales: degrees.
+    exact = [
+        (Fraction(lon) - Fraction(centre_lon), Fraction(lat) - Fraction(centre_lat))
+        for lat, lon in ring
+    ]
+    polygon = FlexPolygon(exterior=ring, holes=())
+    assert polygon_overlaps_circle(polygon, zone) is _exactly_inside_or_on(exact)

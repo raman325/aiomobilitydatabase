@@ -6,6 +6,7 @@ import math
 import re
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -72,6 +73,35 @@ _NO_VERSION: tuple[tuple[int, ...], int, str, int] = ((), 0, "", 0)
 
 # Every whole number up to here is exactly a float, and back.
 _EXACT_FLOAT = 2**53
+
+
+class _Fractional(float):
+    """A JSON number whose double is whole though the number isn't.
+
+    ``1.0000000000000001`` reads as the double 1.0: a number all the same,
+    but no count, id or Boolean, which only a whole number is.
+    """
+
+    __slots__ = ()
+
+
+def _json_number(text: str) -> int | float:
+    """Read one JSON number with a fraction or exponent, as written.
+
+    A whole one (``7.0``, ``1e2``, ``9007199254740993.0``) is the integer
+    its digits spell, which its double may not be past 2**53; one whose
+    double is whole only by rounding is :class:`_Fractional`. Anything
+    else is its double, as ``json`` reads it.
+    """
+    double = float(text)
+    if not double.is_integer():  # a fraction, or past every double
+        return double
+    exact = Decimal(text)
+    if exact == exact.to_integral_value():
+        return int(exact)
+    return _Fractional(double)
+
+
 _MALFORMED = object()  # json_loads refused the body
 
 
@@ -89,6 +119,8 @@ def _record_id(value: Any) -> str | None:
     no id at all, nor is a whole float past 2**53, whose digits are no
     longer the ones the producer wrote.
     """
+    if isinstance(value, _Fractional):
+        return None  # its digits aren't those of the double's integer
     if isinstance(value, float):
         if not math.isfinite(value):
             return None
@@ -272,9 +304,14 @@ def _count(value: Any) -> int | None:
     """Return a non-negative count; bools and junk degrade to None.
 
     JSON has one number type: ``2.0`` is the integer 2 (JSON Schema's
-    ``integer`` accepts it); ``2.5`` is no count.
+    ``integer`` accepts it); ``2.5`` is no count, nor is
+    ``1.0000000000000001``, whose double is whole (:class:`_Fractional`).
     """
-    if isinstance(value, float) and value.is_integer():
+    if (
+        isinstance(value, float)
+        and value.is_integer()
+        and not isinstance(value, _Fractional)
+    ):
         value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -346,7 +383,11 @@ def _as_bool(value: Any) -> bool | None:
     """
     if isinstance(value, bool):
         return value
-    if isinstance(value, int | float) and value in (0, 1):
+    if (
+        isinstance(value, int | float)
+        and not isinstance(value, _Fractional)
+        and value in (0, 1)
+    ):
         return value == 1
     return None
 
@@ -607,7 +648,7 @@ class GbfsFeedHandle:
             hops = _hops(resp, history)
             answered = str(resp.url)
         try:
-            document = json_loads(raw)
+            document = json_loads(raw, parse_float=_json_number)
         except ValueError:
             # Raised below, outside the except: a JSONDecodeError holds the
             # whole body (.doc), and would ride along as the context.

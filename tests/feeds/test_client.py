@@ -1,10 +1,14 @@
 """Tests for MobilityFeedsClient construction, catalog access, and close()."""
 
+import asyncio
 import shutil
+import tempfile
 from pathlib import Path
 
 import aiohttp
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from aiomobilitydatabase.const import PROD_BASE_URL
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
@@ -274,3 +278,54 @@ async def test_purge_cache_of_a_cache_dir_that_is_a_file_still_raises(
     with pytest.raises(NotADirectoryError):
         await client.purge_cache()
     await client.close()
+
+
+_ENTRY_KINDS = st.sampled_from(
+    ["feed", "file", "link_to_outside_dir", "link_to_feed", "link_to_file", "dangling"]
+)
+
+
+@given(kinds=st.lists(_ENTRY_KINDS, max_size=6))
+@settings(max_examples=60, deadline=None)
+def test_purging_every_feed_removes_each_feed_directory_and_nothing_else(
+    kinds: list[str],
+) -> None:
+    """A symlink to a directory in the cache made rmtree raise OSError,
+    leaving every later feed behind: each real feed directory goes, and no
+    symlink (nor what it points at) or stray file is touched."""
+    with tempfile.TemporaryDirectory() as scratch:
+        root, outside = Path(scratch) / "cache", Path(scratch) / "outside"
+        root.mkdir()
+        outside.mkdir()
+        (outside / "keep").write_bytes(b"x")
+        (root / "feed-anchor").mkdir()  # a feed a link can point at
+        feeds = [root / "feed-anchor"]
+        kept: list[Path] = []
+        for number, kind in enumerate(kinds):
+            entry = root / f"{number}-{kind}"
+            if kind == "feed":
+                entry.mkdir()
+                (entry / "static.db").write_bytes(b"x")
+                feeds.append(entry)
+                continue
+            if kind == "file":
+                entry.write_bytes(b"x")
+            else:
+                entry.symlink_to(
+                    {
+                        "link_to_outside_dir": outside,
+                        "link_to_feed": root / "feed-anchor",
+                        "link_to_file": outside / "keep",
+                        "dangling": outside / "missing",
+                    }[kind]
+                )
+            kept.append(entry)
+
+        async def purge() -> None:
+            async with MobilityFeedsClient(cache_dir=root) as client:
+                await client.purge_cache()
+
+        asyncio.run(purge())
+        assert not any(feed.exists() for feed in feeds)
+        assert all(entry.is_symlink() or entry.is_file() for entry in kept)
+        assert (outside / "keep").read_bytes() == b"x"

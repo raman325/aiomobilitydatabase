@@ -144,7 +144,9 @@ class MobilityFeedsClient:
         components and symlinked entries, but also the degenerate ids
         (``""``, ``"."``) that resolve to the cache root itself — a
         containment-only check accepts those, because every path is
-        relative to itself, and would delete every feed's cache.
+        relative to itself, and would delete every feed's cache. Purging
+        every feed likewise leaves a symlinked entry (and what it points
+        at) alone.
         """
         if self._cache_dir is None:
             return
@@ -174,7 +176,14 @@ class MobilityFeedsClient:
         elif not self._cache_dir.exists():
             return  # nothing cached yet: the directory is made on first build
         else:
-            targets = [path for path in self._cache_dir.iterdir() if path.is_dir()]
+            # The feed directories the library made: never a symlink, which
+            # rmtree refuses (an OSError that left every later feed behind)
+            # and whose target isn't the cache's to delete.
+            targets = [
+                path
+                for path in self._cache_dir.iterdir()
+                if path.is_dir() and not path.is_symlink()
+            ]
         for target in targets:
             if not target.exists():
                 continue
