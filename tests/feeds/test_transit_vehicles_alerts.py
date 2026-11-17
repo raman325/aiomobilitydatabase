@@ -7,11 +7,13 @@ import threading
 import zipfile
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from google.transit import gtfs_realtime_pb2
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
+from aiomobilitydatabase.feeds.const import STATIC_DB_FILENAME
 from aiomobilitydatabase.feeds.exceptions import (
     SourceConnectionError,
     StaticDataUnavailableError,
@@ -19,6 +21,7 @@ from aiomobilitydatabase.feeds.exceptions import (
 from aiomobilitydatabase.feeds.geo import Circle
 from aiomobilitydatabase.feeds.models import (
     ArrivalsQuery,
+    Route,
     ServiceAlert,
     StationGroup,
     TripQuery,
@@ -196,8 +199,9 @@ async def test_refresh_static_overtaken_by_another_build(
     overtaken: list[StaticIndex] = []
     closed: list[StaticIndex] = []
 
-    async def racing(cls: type, *args: object, **kwargs: object) -> StaticIndex:
-        index: StaticIndex = await real(cls, *args, **kwargs)
+    async def racing(cls: type, *args: object, **kwargs: object) -> object:
+        loaded = await real(cls, *args, **kwargs)
+        index: StaticIndex = loaded.index
         if len(overtaken) < races:
             index.dataset_id = "mdb-100-OTHER"  # what the file now holds
             overtaken.append(index)
@@ -208,7 +212,7 @@ async def test_refresh_static_overtaken_by_another_build(
                 close()
 
             index.close = recorded_close  # type: ignore[method-assign]
-        return index
+        return loaded
 
     monkeypatch.setattr(
         TransitFeedHandle, "_ensure_index_from_source", classmethod(racing)
@@ -348,6 +352,81 @@ async def test_close_releases_the_static_index_connection(
     handle.close()
     with pytest.raises(sqlite3.ProgrammingError):
         await handle.get_routes_serving("S1")
+
+
+async def test_close_waits_for_a_cancelled_reads_thread(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a query can't stop its worker thread; closing then must not
+    free the connection under it (that crashed the interpreter). The close
+    takes its turn after the read, and reads asked for once close() has
+    been called raise ProgrammingError at once."""
+    _mock_catalog(mock_api)
+    handle = await feeds_client.get_transit_feed("mdb-100")
+    index = handle._index
+    entered, release = threading.Event(), threading.Event()
+    answered: list[list[Route]] = []
+    real = index.routes_serving
+
+    def slow(stop_id: str) -> list[Route]:
+        entered.set()
+        release.wait(10)
+        answered.append(real(stop_id))  # on a connection closed under it: raises
+        return answered[-1]
+
+    monkeypatch.setattr(index, "routes_serving", slow)
+    task = asyncio.create_task(handle.get_routes_serving("S1"))
+    assert await asyncio.to_thread(entered.wait, 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    handle.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        await handle.get_headsigns_serving("S1")  # before the close's turn
+    index._conn.execute("SELECT 1")  # still open: the read holds its turn
+    release.set()
+    for thread in threading.enumerate():
+        if thread.name == "aiomobilitydatabase-index-close":
+            await asyncio.to_thread(thread.join, 10)
+    await asyncio.to_thread(handle._read_lock.acquire)  # the abandoned read is done
+    handle._read_lock.release()
+    assert [[route.id for route in routes] for routes in answered] == [["R1", "R2"]]
+    with pytest.raises(sqlite3.ProgrammingError):
+        index._conn.execute("SELECT 1")
+
+
+async def test_a_cached_index_whose_stop_names_no_longer_decode_is_rebuilt(
+    mock_api: MockApi, feeds_client_cached: MobilityFeedsClient, tmp_path: Path
+) -> None:
+    """A stop name damaged in a well-formed page passes quick_check; the
+    open reads stops at once, so the entry is a cache miss and is rebuilt
+    -- not FeedParseError on every open."""
+    _mock_catalog(mock_api)
+    _mock_catalog(mock_api)
+    first = await feeds_client_cached.get_transit_feed("mdb-100")
+    names = [stop.name for stop in first.stops]
+    first.close()
+    db_path = tmp_path / "mdb-100" / STATIC_DB_FILENAME
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE stops SET name = CAST(X'FF41' AS TEXT)")
+        conn.commit()
+        assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+    finally:
+        conn.close()
+    second = await feeds_client_cached.get_transit_feed("mdb-100")
+    try:
+        assert [stop.name for stop in second.stops] == names
+        assert [
+            request.method for request in mock_api.requests if request.path == ZIP_PATH
+        ] == [
+            "GET",
+            "GET",
+        ]
+    finally:
+        second.close()
 
 
 def test_service_alert_is_active() -> None:

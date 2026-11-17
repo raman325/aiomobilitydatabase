@@ -633,11 +633,13 @@ Notes on direct mode:
   double-building). A corrupt or unreadable cache is treated as a cache miss
   and rebuilt rather than raising: as a cached index is opened, SQLite checks
   every page (`PRAGMA quick_check`) and its schema is compared with the
-  library's, so one damaged page anywhere is a miss. Damage that check can't
-  see (a value that no longer decodes, or a file changed after it was
-  opened), met later by a query, is `FeedParseError`; `purge_cache()`
-  rebuilds it. Without a `cache_dir` the index is built in memory on every
-  startup.
+  library's, so one damaged page anywhere is a miss. That check reads pages,
+  not the values in them; the stops, routes, agencies, feed info and Flex
+  records a handle holds are read as it opens, so a damaged value among them
+  (one that no longer decodes, say) is a miss too. Damage met later by a
+  query (such a value elsewhere, or a file changed after it was opened) is
+  `FeedParseError`; `purge_cache()` rebuilds it. Without a `cache_dir` the
+  index is built in memory on every startup.
 - **Pull, not push**: `TransitFeedHandle`/`GbfsFeedHandle` return snapshots on
   demand — there's no built-in polling loop or scheduler. Bring your own (e.g.
   Home Assistant's `DataUpdateCoordinator`).
@@ -649,7 +651,10 @@ Notes on direct mode:
   every feed's cache. Purging a feed with no cache directory is a no-op, so
   repeated calls are idempotent.
   `transit.close()` releases a handle's SQLite connection — call it when you
-  are done with a handle; the client's `close()` does not do it for you.
+  are done with a handle; the client's `close()` does not do it for you. It
+  is safe with queries in flight, cancelled ones included: a read already
+  running on a worker thread finishes first, and any read asked for after
+  `close()` raises `sqlite3.ProgrammingError`.
 - **Producer authentication**: pass `api_key=` to `get_transit_feed()`; it is
   applied per the catalog's `authentication_type` (query parameter or header) —
   distinct from the refresh token used to authenticate with the catalog itself.
