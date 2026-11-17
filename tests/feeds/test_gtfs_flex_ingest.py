@@ -32,7 +32,7 @@ from aiomobilitydatabase.feeds.models import (
     LocationGroup,
 )
 from aiomobilitydatabase.feeds.static_index import StaticIndex, repetition_trip_id
-from aiomobilitydatabase.feeds.transit import TransitFeedHandle
+from aiomobilitydatabase.feeds.transit import TransitFeedHandle, _Loaded, _Snapshot
 
 from tests.feeds.fixtures import build_flex_gtfs_zip_bytes
 from tests.feeds.test_gtfs_schedule_conformance import _build, _feed, _zip
@@ -170,7 +170,7 @@ def test_the_handle_exposes_flex_records_and_replaces_them_on_refresh(
 
     async def body(handle: TransitFeedHandle) -> list[tuple[object, ...]]:
         before = (handle.flex_locations, handle.location_groups, handle.booking_rules)
-        await handle._swap_index(replacement)
+        await handle._swap_index(_Loaded(replacement, _Snapshot.of(replacement)))
         after = (handle.flex_locations, handle.location_groups, handle.booking_rules)
         return [before, after]
 

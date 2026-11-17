@@ -53,6 +53,7 @@ from aiomobilitydatabase.feeds.models import (
     FeedInfo,
     OccupancyStatus,
     PickupDropOffType,
+    StaticBuildPhase,
     StaticBuildProgress,
     Stop,
     StopArrival,
@@ -5591,7 +5592,7 @@ def test_build_progress_fraction_laws(done: int, total: int | None) -> None:
     vacuous by construction over this domain.
     """
     fraction = StaticBuildProgress(
-        phase="index", done_bytes=done, total_bytes=total
+        phase=StaticBuildPhase.INDEX, done_bytes=done, total_bytes=total
     ).fraction
     assert (fraction is None) is (not total)
     assert fraction is None or 0.0 <= fraction <= 1.0

@@ -24,6 +24,7 @@ from yarl import URL
 from aiomobilitydatabase.feeds import _redirects as redirects_module
 from aiomobilitydatabase.feeds._freshness import FreshnessCache
 from aiomobilitydatabase.feeds._redirects import _origin
+from aiomobilitydatabase.feeds._vocab import vocab_or_none
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
     SourceAuthenticationError,
@@ -46,7 +47,6 @@ from aiomobilitydatabase.feeds.rt import (
     _lenient_start_secs,
     _parse_feed_message,
     _pb_enum_name,
-    _vocab_or_none,
     alerts_from_message,
     fetch_feed_message,
     resolve_trip_predictions,
@@ -886,6 +886,33 @@ def test_vehicles_status_needs_current_stop_sequence() -> None:
     assert vehicle.current_status is None
 
 
+@given(
+    hours=st.integers(0, 47),
+    minutes=st.integers(0, 59),
+    seconds=st.integers(0, 59),
+)
+def test_a_vehicles_trip_start_time_is_a_gtfs_time(
+    hours: int, minutes: int, seconds: int
+) -> None:
+    """TripDescriptor.start_time ("HH:MM:SS", past 24:00:00 for a service
+    day's late runs) is a timedelta since the service day's start, as the
+    GTFS-Flex windows are; one that doesn't parse is None."""
+    msg = gtfs_realtime_pb2.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    for i, start_time in enumerate((f"{hours:02}:{minutes:02}:{seconds:02}", "8am")):
+        entity = msg.entity.add()
+        entity.id = f"vp-{i}"
+        entity.vehicle.trip.trip_id = "T1"
+        entity.vehicle.trip.start_time = start_time
+    timed, garbage = vehicles_from_message(
+        msg, routes_by_id={}, stops_by_id={}, trip_routes={}
+    )
+    assert timed.trip_start_time == timedelta(
+        hours=hours, minutes=minutes, seconds=seconds
+    )
+    assert garbage.trip_start_time is None
+
+
 def test_trip_updates_from_message() -> None:
     msg = gtfs_realtime_pb2.FeedMessage()
     msg.ParseFromString(TRIP_UPDATES_BASELINE)
@@ -1094,16 +1121,16 @@ def test_pb_enum_name_and_vocab_leniency() -> None:
     """
     assert _pb_enum_name(gtfs_realtime_pb2.Alert.Cause, 10) == "CONSTRUCTION"
     assert _pb_enum_name(gtfs_realtime_pb2.Alert.Cause, 999) is None
-    assert _vocab_or_none(AlertCause, "CONSTRUCTION") is AlertCause.CONSTRUCTION
-    assert _vocab_or_none(AlertCause, "FUTURE_SPEC_VALUE") is None
-    assert _vocab_or_none(AlertCause, None) is None
+    assert vocab_or_none(AlertCause, "CONSTRUCTION") is AlertCause.CONSTRUCTION
+    assert vocab_or_none(AlertCause, "FUTURE_SPEC_VALUE") is None
+    assert vocab_or_none(AlertCause, None) is None
     # The new VehiclePosition vocabularies ride the same two-layer leniency.
     assert (
         _pb_enum_name(gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus, 999) is None
     )
     assert _pb_enum_name(gtfs_realtime_pb2.VehiclePosition.CongestionLevel, 999) is None
-    assert _vocab_or_none(VehicleStopStatus, "FUTURE_STATUS") is None
-    assert _vocab_or_none(CongestionLevel, "FUTURE_LEVEL") is None
+    assert vocab_or_none(VehicleStopStatus, "FUTURE_STATUS") is None
+    assert vocab_or_none(CongestionLevel, "FUTURE_LEVEL") is None
 
 
 def test_trip_updates_delay_field_and_per_event_delays() -> None:

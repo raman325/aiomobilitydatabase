@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -101,7 +101,7 @@ def test_a_trip_id_less_selector_names_its_run_and_is_never_feed_wide() -> None:
     run = {
         "route_id": "R1",
         "direction_id": 0,
-        "start_secs": 8 * 3600,
+        "start_time": timedelta(hours=8),
         "start_date": date(2026, 7, 30),
     }
     assert alert.applies_to(**run)  # type: ignore[arg-type]
@@ -123,7 +123,7 @@ def test_a_trip_id_less_selector_names_its_run_and_is_never_feed_wide() -> None:
         # No start_date: the 08:00 run of which day?
         (
             {"trip": {"route_id": "R1", "direction_id": 0, "start_time": "08:00:00"}},
-            {"route_id": "R1", "direction_id": 0, "start_secs": 8 * 3600},
+            {"route_id": "R1", "direction_id": 0, "start_time": timedelta(hours=8)},
         ),
         # An empty trip names no run, so the stop does not stand alone.
         ({"stop_id": "S1", "trip": {}}, {"stop_id": "S1"}),
@@ -211,7 +211,7 @@ _ENTITY_POOL = {
     **_POOL,
     "trip_id": st.sampled_from(["T1", "T2"]),
     "start_date": st.sampled_from([date(2026, 7, 30), date(2026, 7, 31)]),
-    "start_secs": st.sampled_from([8 * 3600, 25 * 3600]),
+    "start_time": st.sampled_from([timedelta(hours=8), timedelta(hours=25)]),
 }
 
 
@@ -230,9 +230,9 @@ def _selector(draw: st.DrawFn) -> dict[str, Any]:
     return selector
 
 
-def _secs(start_time: str) -> int:
+def _time(start_time: str) -> timedelta:
     hours, minutes, seconds = (int(part) for part in start_time.split(":"))
-    return hours * 3600 + minutes * 60 + seconds
+    return timedelta(hours=hours, minutes=minutes, seconds=seconds)
 
 
 def _oracle(selector: dict[str, Any], entity: dict[str, Any]) -> bool:
@@ -260,7 +260,7 @@ def _oracle(selector: dict[str, Any], entity: dict[str, Any]) -> bool:
             raw = trip["start_date"]
             required["start_date"] = date(int(raw[:4]), int(raw[4:6]), int(raw[6:]))
         if "start_time" in trip:
-            required["start_secs"] = _secs(trip["start_time"])
+            required["start_time"] = _time(trip["start_time"])
     return bool(required) and all(
         entity.get(name) == value for name, value in required.items()
     )

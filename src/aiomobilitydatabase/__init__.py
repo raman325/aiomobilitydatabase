@@ -12,6 +12,7 @@ from .exceptions import (
 )
 from .models import (
     AccessToken,
+    BasicFeed,
     BoundingBox,
     BoundingFilterMethod,
     CoverageWindowSource,
@@ -22,6 +23,7 @@ from .models import (
     Feed,
     FeedRelatedLink,
     FeedReliabilityReport,
+    FeedReliabilitySummary,
     FeedStatus,
     GbfsEndpoint,
     GbfsFeed,
@@ -68,6 +70,7 @@ from .models import (
 
 __all__ = [
     "AccessToken",
+    "BasicFeed",
     "BoundingBox",
     "BoundingFilterMethod",
     "CoverageWindowSource",
@@ -78,6 +81,7 @@ __all__ = [
     "Feed",
     "FeedRelatedLink",
     "FeedReliabilityReport",
+    "FeedReliabilitySummary",
     "FeedStatus",
     "GbfsEndpoint",
     "GbfsFeed",

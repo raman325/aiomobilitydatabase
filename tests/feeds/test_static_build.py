@@ -1,5 +1,6 @@
 """Tests for SQLite index build and cache-open."""
 
+import asyncio
 import io
 import os
 import sqlite3
@@ -29,6 +30,7 @@ from aiomobilitydatabase.feeds.static_index import (
     _strict_int,
     parse_gtfs_time,
 )
+from aiomobilitydatabase.feeds.transit import TransitFeedHandle, _Snapshot
 
 from tests.feeds.fixtures import (
     _FILES,
@@ -2022,3 +2024,87 @@ def test_any_damage_opens_as_a_miss_or_reads_as_feed_parse_error(
                     assert str(err) == _DAMAGE_MESSAGE
         finally:
             index.close()
+
+
+def _opened_through_the_handle(db_path: Path) -> _Snapshot | None:
+    """What a handle's open takes from the cache: a snapshot, or None (rebuild)."""
+    loaded = asyncio.run(TransitFeedHandle._open_cached(db_path, DATASET))
+    if loaded is None:
+        return None
+    loaded.index.close()
+    return loaded.snapshot
+
+
+# Every column the open reads at once is in one of these tables (Flex ones
+# hold nothing in the fixture). Each value kind is one the build can't have
+# stored there: text that is no UTF-8, and bytes. (A number SQL writes to a
+# TEXT column is stored as text, by the column's affinity: no damage.)
+_SNAPSHOT_TEXT_COLUMNS = [
+    (table, column)
+    for table, columns in (
+        ("stops", ("id", "name", "parent_station", "stop_code", "timezone")),
+        ("routes", ("id", "short_name", "long_name", "agency_id", "color")),
+        ("agencies", ("id", "name", "url", "timezone", "lang")),
+    )
+    for column in columns
+]
+
+
+@given(
+    target=st.sampled_from(_SNAPSHOT_TEXT_COLUMNS),
+    value=st.sampled_from(["CAST(X'FF41' AS TEXT)", "X'4142'"]),
+    row=st.integers(1, 4),
+)
+@settings(max_examples=60, deadline=None)
+def test_a_damaged_value_the_open_reads_is_a_cache_miss(
+    tmp_path_factory: pytest.TempPathFactory,
+    target: tuple[str, str],
+    value: str,
+    row: int,
+) -> None:
+    """A value damaged in a well-formed page (quick_check still ok) in what
+    a handle reads at once: the handle's open takes the entry as a miss
+    and rebuilds it, or -- the row absent -- gets the pristine snapshot;
+    never the damaged index's FeedParseError on every open."""
+    tmp_path = tmp_path_factory.mktemp("damaged-value")
+    db_path = _built_file(tmp_path)
+    pristine = _opened_through_the_handle(db_path)
+    assert pristine is not None
+    table, column = target
+    conn = sqlite3.connect(db_path)
+    try:
+        damaged = conn.execute(
+            f"UPDATE {table} SET {column} = {value} WHERE rowid = ?", (row,)
+        ).rowcount
+        conn.commit()
+        assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+    finally:
+        conn.close()
+    assert _opened_through_the_handle(db_path) == (None if damaged else pristine)
+
+
+@given(
+    page=st.integers(1, 40),
+    fill=st.binary(min_size=1, max_size=4),
+    at=st.integers(0, 4095),
+    length=st.integers(1, 4096),
+)
+@settings(max_examples=150, deadline=None)
+def test_any_damage_opens_through_the_handle_as_a_miss_or_a_snapshot(
+    tmp_path_factory: pytest.TempPathFactory,
+    page: int,
+    fill: bytes,
+    at: int,
+    length: int,
+) -> None:
+    """Bytes overwritten anywhere in any page: the handle's open is total --
+    a snapshot, or None for a rebuild -- whatever the damage."""
+    tmp_path = tmp_path_factory.mktemp("damaged-open")
+    db_path = _built_file(tmp_path)
+    with db_path.open("r+b") as fp:
+        size = 4096
+        if (page - 1) * size >= db_path.stat().st_size:
+            return
+        fp.seek((page - 1) * size + at)
+        fp.write((fill * length)[: size - at])
+    _opened_through_the_handle(db_path)

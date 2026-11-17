@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import shutil
+import sqlite3
 import tempfile
 import threading
 from collections.abc import (
@@ -60,6 +61,7 @@ from .models import (
     PickupDropOffType,
     Route,
     ServiceAlert,
+    StaticBuildPhase,
     StaticBuildProgress,
     StationGroup,
     Stop,
@@ -85,6 +87,7 @@ from .rt import (
     feed_request_fields,
     feed_timestamp,
     fetch_feed_message,
+    gtfs_time,
     indexed_trip_updates,
     resolve_trip_predictions,
     stated_copy_calls,
@@ -92,10 +95,12 @@ from .rt import (
     trip_modifications_from_message,
     trip_update_records,
     vehicles_from_message,
+    whole_seconds,
 )
 from .static_index import (
     _EARLIEST_INSTANT,
     _LATEST_INSTANT,
+    DamagedIndexError,
     DatableCall,
     ScheduledDeparture,
     ScheduledTrip,
@@ -313,7 +318,7 @@ class _Alerts:
                     stop_id=place,
                     trip_id=trip_id,
                     start_date=start_date,
-                    start_secs=start_secs,
+                    start_time=gtfs_time(start_secs),
                 )
                 for place in places
             )
@@ -329,8 +334,13 @@ def _run_ref(trip: TripSelector) -> tuple[str, int, date, int] | None:
     if trip.trip_id is not None:
         return None
     assert trip.route_id is not None and trip.direction_id is not None
-    assert trip.start_date is not None and trip.start_secs is not None
-    return (trip.route_id, trip.direction_id, trip.start_date, trip.start_secs)
+    assert trip.start_date is not None and trip.start_time is not None
+    return (
+        trip.route_id,
+        trip.direction_id,
+        trip.start_date,
+        whole_seconds(trip.start_time),
+    )
 
 
 def _run_refs(alert: ServiceAlert) -> list[tuple[str, int, date, int]]:
@@ -1563,6 +1573,37 @@ class _FlexRecords:
         )
 
 
+@dataclass(frozen=True)
+class _Snapshot:
+    """What a handle holds of its dataset, read from the index at once."""
+
+    stops: tuple[Stop, ...]
+    routes: tuple[Route, ...]
+    agencies: tuple[Agency, ...]
+    # None when the dataset ships no feed_info.txt (an optional file).
+    feed_info: FeedInfo | None
+    flex: _FlexRecords
+
+    @classmethod
+    def of(cls, index: StaticIndex) -> _Snapshot:
+        """Read the snapshot (synchronous: call via ``asyncio.to_thread``)."""
+        return cls(
+            tuple(index.stops()),
+            tuple(index.routes()),
+            tuple(index.agencies()),
+            index.feed_info(),
+            _FlexRecords.of(index),
+        )
+
+
+@dataclass(frozen=True)
+class _Loaded:
+    """An index with its snapshot, as acquisition hands them to a handle."""
+
+    index: StaticIndex
+    snapshot: _Snapshot
+
+
 def _serialized[T](lock: threading.Lock, call: Callable[[], T]) -> T:
     """Run ``call`` holding ``lock`` (on the calling worker thread).
 
@@ -1664,6 +1705,7 @@ class TransitFeedHandle:
         *,
         direct: _DirectUrls | None = None,
         rt_min_interval: timedelta = timedelta(0),
+        snapshot: _Snapshot | None = None,
     ) -> None:
         """Construct via ``MobilityFeedsClient.get_transit_feed()`` instead."""
         self._client = client
@@ -1682,8 +1724,9 @@ class TransitFeedHandle:
         self._api_key = api_key
         self._guard = _IndexGuard()
         # One SQLite connection serves every read: worker threads take turns
-        # on it (see _index_read).
+        # on it (see _index_read), and close() takes its turn too.
         self._read_lock = threading.Lock()
+        self._closed = False
         self._refresh_lock = asyncio.Lock()
         # Per-url parsed messages, reused only as the producer allows: within
         # its declared freshness (RFC 9111), after a 304, or -- opted into
@@ -1693,12 +1736,13 @@ class TransitFeedHandle:
         self._rt_cache: FreshnessCache[gtfs_realtime_pb2.FeedMessage] = FreshnessCache(
             min_interval=rt_min_interval.total_seconds()
         )
-        self._stops: tuple[Stop, ...] = tuple(index.stops())
-        self._routes: tuple[Route, ...] = tuple(index.routes())
-        self._agencies: tuple[Agency, ...] = tuple(index.agencies())
-        # None when the dataset ships no feed_info.txt (an optional file).
-        self._feed_info: FeedInfo | None = index.feed_info()
-        self._flex = _FlexRecords.of(index)
+        if snapshot is None:
+            snapshot = _Snapshot.of(index)
+        self._stops = snapshot.stops
+        self._routes = snapshot.routes
+        self._agencies = snapshot.agencies
+        self._feed_info = snapshot.feed_info
+        self._flex = snapshot.flex
 
     async def _index_read[T](
         self, fn: Callable[..., T], *args: object, **kwargs: object
@@ -1710,8 +1754,13 @@ class TransitFeedHandle:
         other's rows -- or empty ones -- so concurrent calls (an arrivals
         and a vehicles coordinator polling together) would read garbage.
         Shielded so a cancelled caller returns at once while the guard keeps
-        waiting for the thread; see :meth:`_IndexGuard.track`.
+        waiting for the thread; see :meth:`_IndexGuard.track`. After
+        :meth:`close`, a read raises the closed connection's own
+        ``sqlite3.ProgrammingError`` at once, whether or not the close has
+        yet taken its turn.
         """
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         worker = asyncio.ensure_future(
             asyncio.to_thread(
                 _serialized, self._read_lock, partial(fn, *args, **kwargs)
@@ -1812,14 +1861,15 @@ class TransitFeedHandle:
                 rt_feeds.append(rt_self)
         else:
             raise ValueError(f"Feed {feed_id} is {feed.data_type}; use get_gbfs_feed()")
-        index = await cls._ensure_index(client, static_feed, on_progress)
+        loaded = await cls._ensure_index(client, static_feed, on_progress)
         return cls(
             client,
             static_feed,
             rt_feeds,
-            index,
+            loaded.index,
             api_key,
             rt_min_interval=rt_min_interval,
+            snapshot=loaded.snapshot,
         )
 
     @classmethod
@@ -1880,15 +1930,16 @@ class TransitFeedHandle:
             headers=headers,
             direct=True,
         )
-        index = await cls._ensure_index_from_source(client, source, on_progress)
+        loaded = await cls._ensure_index_from_source(client, source, on_progress)
         return cls(
             client,
             None,
             rt_feeds,
-            index,
+            loaded.index,
             None,
             direct=direct,
             rt_min_interval=rt_min_interval,
+            snapshot=loaded.snapshot,
         )
 
     @staticmethod
@@ -1929,7 +1980,7 @@ class TransitFeedHandle:
         client: MobilityFeedsClient,
         static_feed: GtfsFeed,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
-    ) -> StaticIndex:
+    ) -> _Loaded:
         """Catalog strategy: translate latest-dataset metadata to a source."""
         dataset = static_feed.latest_dataset
         if dataset is None or not dataset.id or not dataset.hosted_url:
@@ -1947,10 +1998,10 @@ class TransitFeedHandle:
         # this catalog record describes, and the two travel together. Such
         # a race is passing, so the build is tried once more.
         for _attempt in range(2):
-            index = await cls._ensure_index_from_source(client, source, on_progress)
-            if index.dataset_id == dataset.id:
-                return index
-            await asyncio.to_thread(index.close)
+            loaded = await cls._ensure_index_from_source(client, source, on_progress)
+            if loaded.index.dataset_id == dataset.id:
+                return loaded
+            await asyncio.to_thread(loaded.index.close)
         raise StaticDataUnavailableError(
             "The feed's index was replaced twice by concurrent builds of "
             "another dataset; try again later"
@@ -1962,7 +2013,7 @@ class TransitFeedHandle:
         client: MobilityFeedsClient,
         source: _StaticSource,
         on_progress: Callable[[StaticBuildProgress], None] | None = None,
-    ) -> StaticIndex:
+    ) -> _Loaded:
         """Shared download+build core behind both acquisition strategies.
 
         With a known ``dataset_id`` the cache is consulted before any
@@ -1990,9 +2041,7 @@ class TransitFeedHandle:
             await asyncio.to_thread(feed_dir.mkdir, parents=True, exist_ok=True)
             db_path = feed_dir / STATIC_DB_FILENAME
             if source.dataset_id is not None:
-                cached = await asyncio.to_thread(
-                    StaticIndex.open_cached, db_path, source.dataset_id
-                )
+                cached = await cls._open_cached(db_path, source.dataset_id)
                 if cached is not None:
                     return cached
         tmp_dir = await asyncio.to_thread(tempfile.mkdtemp)
@@ -2006,16 +2055,37 @@ class TransitFeedHandle:
                 sha = await asyncio.to_thread(_sha256_of_file, zip_path)
                 dataset_id = f"sha256:{sha}"
             if dataset_id != source.dataset_id and db_path is not None:
-                cached = await asyncio.to_thread(
-                    StaticIndex.open_cached, db_path, dataset_id
-                )
+                cached = await cls._open_cached(db_path, dataset_id)
                 if cached is not None:
                     return cached
-            return await cls._build_index(
+            index = await cls._build_index(
                 zip_path, db_path, dataset_id, source.timezone_name, on_progress
             )
+            return _Loaded(index, await asyncio.to_thread(_Snapshot.of, index))
         finally:
             await asyncio.to_thread(shutil.rmtree, tmp_dir, ignore_errors=True)
+
+    @staticmethod
+    async def _open_cached(db_path: Path, dataset_id: str) -> _Loaded | None:
+        """Open the cached index with its snapshot; None for a cache miss.
+
+        open_cached's check reads the file's structure, not its cells: a
+        value damaged in a well-formed page -- text no longer UTF-8, a
+        number turned to text -- shows only when read. The snapshot is read
+        here, so such damage in it is a miss like any other and the entry
+        is rebuilt, rather than failing every open. Damage only a later
+        query reads is that query's FeedParseError.
+        """
+        index = await asyncio.to_thread(StaticIndex.open_cached, db_path, dataset_id)
+        if index is None:
+            return None
+        try:
+            snapshot = await asyncio.to_thread(_Snapshot.of, index)
+        except DamagedIndexError:
+            # Raised by the read itself: its thread is done with the connection.
+            await asyncio.to_thread(index.close)
+            return None
+        return _Loaded(index, snapshot)
 
     @staticmethod
     async def _download_zip(
@@ -2074,7 +2144,7 @@ class TransitFeedHandle:
                     ):
                         on_progress(
                             StaticBuildProgress(
-                                phase="download",
+                                phase=StaticBuildPhase.DOWNLOAD,
                                 done_bytes=done_bytes,
                                 total_bytes=total_bytes,
                             )
@@ -2086,7 +2156,9 @@ class TransitFeedHandle:
             if on_progress is not None:
                 on_progress(
                     StaticBuildProgress(
-                        phase="download", done_bytes=done_bytes, total_bytes=total_bytes
+                        phase=StaticBuildPhase.DOWNLOAD,
+                        done_bytes=done_bytes,
+                        total_bytes=total_bytes,
                     )
                 )
         return etag
@@ -2108,7 +2180,7 @@ class TransitFeedHandle:
                 loop.call_soon_threadsafe(
                     on_progress,
                     StaticBuildProgress(
-                        phase="index", done_bytes=done, total_bytes=total
+                        phase=StaticBuildPhase.INDEX, done_bytes=done, total_bytes=total
                     ),
                 )
 
@@ -2265,7 +2337,13 @@ class TransitFeedHandle:
         ]
         vp_refs = [
             [
-                (vehicle.trip_id, vehicle.trip_start_date, vehicle.trip_start_secs)
+                (
+                    vehicle.trip_id,
+                    vehicle.trip_start_date,
+                    None
+                    if vehicle.trip_start_time is None
+                    else whole_seconds(vehicle.trip_start_time),
+                )
                 for vehicle in vehicles
                 if vehicle.trip_id
             ]
@@ -3384,7 +3462,7 @@ class TransitFeedHandle:
                 trip.trip_id
                 for trip, _ in trips
                 if trip.trip_id is not None
-                and (trip.start_secs is not None or trip.start_date is None)
+                and (trip.start_time is not None or trip.start_date is None)
             }
         )
         plain_starts = (
@@ -3703,8 +3781,8 @@ class TransitFeedHandle:
         dataset = fresh.latest_dataset
         if dataset is None or not dataset.id or dataset.id == self._index.dataset_id:
             return False
-        new_index = await self._ensure_index(self._client, fresh)
-        await self._swap_index(new_index, fresh)
+        loaded = await self._ensure_index(self._client, fresh)
+        await self._swap_index(loaded, fresh)
         return True
 
     async def _refresh_static_direct(self, direct: _DirectUrls) -> bool:
@@ -3728,15 +3806,15 @@ class TransitFeedHandle:
             headers=direct.headers,
             direct=True,
         )
-        new_index = await self._ensure_index_from_source(self._client, source)
-        if new_index.dataset_id == self._index.dataset_id:
-            await asyncio.to_thread(new_index.close)
+        loaded = await self._ensure_index_from_source(self._client, source)
+        if loaded.index.dataset_id == self._index.dataset_id:
+            await asyncio.to_thread(loaded.index.close)
             return False
-        await self._swap_index(new_index)
+        await self._swap_index(loaded)
         return True
 
     async def _swap_index(
-        self, new_index: StaticIndex, static_feed: GtfsFeed | None = None
+        self, loaded: _Loaded, static_feed: GtfsFeed | None = None
     ) -> None:
         """Publish the new index atomically, then close the old one.
 
@@ -3747,11 +3825,7 @@ class TransitFeedHandle:
         never leave ``static_dataset`` describing a dataset that is no
         longer the one being served.
         """
-        stops = tuple(await asyncio.to_thread(new_index.stops))
-        routes = tuple(await asyncio.to_thread(new_index.routes))
-        agencies = tuple(await asyncio.to_thread(new_index.agencies))
-        feed_info = await asyncio.to_thread(new_index.feed_info)
-        flex = await asyncio.to_thread(_FlexRecords.of, new_index)
+        new_index, snapshot = loaded.index, loaded.snapshot
         async with self._guard.writer():
             old_index = self._index
             if static_feed is not None:
@@ -3763,8 +3837,15 @@ class TransitFeedHandle:
                 self._agencies,
                 self._feed_info,
                 self._flex,
-            ) = (new_index, stops, routes, agencies, feed_info, flex)
-            await asyncio.to_thread(old_index.close)
+            ) = (
+                new_index,
+                snapshot.stops,
+                snapshot.routes,
+                snapshot.agencies,
+                snapshot.feed_info,
+                snapshot.flex,
+            )
+            await asyncio.to_thread(_serialized, self._read_lock, old_index.close)
 
     def stops_in(self, zone: Circle) -> list[Stop]:
         """Return stops within a circular zone (config-flow stop picker)."""
@@ -3967,6 +4048,24 @@ class TransitFeedHandle:
     def close(self) -> None:
         """Release the SQLite connection.
 
-        Not safe with queries in flight; stop polling before closing.
+        Safe with queries in flight, a cancelled one's included: cancelling
+        an await of an offloaded read can't stop its worker thread, so the
+        connection closes in its turn on the read lock -- at once if no read
+        holds it, else on a thread of its own once the running read ends --
+        and never under a read. Any read asked for afterwards, by a query
+        already running or a new one, raises ``sqlite3.ProgrammingError``.
         """
-        self._index.close()
+        self._closed = True
+        index = self._index
+        if self._read_lock.acquire(blocking=False):
+            try:
+                index.close()
+            finally:
+                self._read_lock.release()
+            return
+        threading.Thread(
+            target=_serialized,
+            args=(self._read_lock, index.close),
+            name="aiomobilitydatabase-index-close",
+            daemon=True,
+        ).start()

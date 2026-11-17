@@ -277,6 +277,15 @@ TOKEN_RESPONSE: dict[str, Any] = {
     "token_type": "Bearer",
 }
 
+RELIABILITY_SEAL: dict[str, Any] = {
+    "has_seal": False,
+    "earned_at": "2026-01-10T00:00:00Z",
+    "lost_at": "2026-08-01T00:00:00Z",
+    "evaluated_at": "2026-09-14T03:00:00Z",
+    "on_probation": True,
+    "probation_ends_at": "2027-02-01T00:00:00Z",
+}
+
 RELIABILITY_REPORT: dict[str, Any] = {
     "feed_id": "mdb-123",
     "has_seal": False,

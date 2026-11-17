@@ -219,8 +219,8 @@ class LatestDataset(DataClassDictMixin):
 
 
 @dataclass(frozen=True)
-class Feed(DataClassDictMixin):
-    """Common feed fields shared by all feed types."""
+class BasicFeed(DataClassDictMixin):
+    """The fields every feed type has (the spec's BasicFeed)."""
 
     id: str | None = None
     data_type: DataType | None = None
@@ -230,12 +230,40 @@ class Feed(DataClassDictMixin):
     feed_contact_email: str | None = None
     source_info: SourceInfo | None = None
     redirects: tuple[Redirect, ...] | None = None
+
+
+@dataclass(frozen=True)
+class Feed(BasicFeed):
+    """A catalog feed: GTFS and GTFS Realtime ones build on it (the spec's Feed).
+
+    ``seasonal`` is False when the feed has not been marked seasonal (the
+    spec's default): a seasonal feed serves only during recurring periods
+    of the year, and is left out of the rolling 7-day coverage checks.
+    """
+
     status: FeedStatus | None = None
     official: bool | None = None
     official_updated_at: datetime | None = None
+    seasonal: bool = False
     feed_name: str | None = None
     note: str | None = None
     related_links: tuple[FeedRelatedLink, ...] | None = None
+
+
+@dataclass(frozen=True)
+class FeedReliabilitySummary(DataClassDictMixin):
+    """A GTFS feed's Seal of Reliability, in brief.
+
+    ``probation_ends_at`` is the earliest the feed could regain the seal:
+    the end of the longest-running probation across its criteria.
+    """
+
+    has_seal: bool
+    on_probation: bool
+    earned_at: datetime | None = None
+    lost_at: datetime | None = None
+    evaluated_at: datetime | None = None
+    probation_ends_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -246,6 +274,7 @@ class GtfsFeed(Feed):
     latest_dataset: LatestDataset | None = None
     bounding_box: BoundingBox | None = None
     visualization_dataset_id: str | None = None
+    reliability_seal: FeedReliabilitySummary | None = None
 
 
 @dataclass(frozen=True)
@@ -290,12 +319,11 @@ class GbfsVersion(DataClassDictMixin):
 
 
 @dataclass(frozen=True)
-class GbfsFeed(Feed):
+class GbfsFeed(BasicFeed):
     """A GBFS feed.
 
-    The spec derives GbfsFeed from BasicFeed (without status/official/related
-    fields); sharing the Feed base here is harmless since all fields are
-    optional and unknown keys are ignored.
+    Built on :class:`BasicFeed`, as the spec's is: a GBFS feed has no
+    status, official flag, name, note or related links of its own.
     """
 
     locations: tuple[Location, ...] | None = None
@@ -315,6 +343,7 @@ class SearchFeedItemResult(DataClassDictMixin):
     status: FeedStatus
     created_at: datetime | None = None
     official: bool | None = None
+    seasonal: bool = False
     external_ids: tuple[ExternalId, ...] | None = None
     provider: str | None = None
     feed_name: str | None = None
@@ -327,6 +356,7 @@ class SearchFeedItemResult(DataClassDictMixin):
     entity_types: tuple[EntityType, ...] | None = None
     versions: tuple[str, ...] | None = None
     feed_references: tuple[str, ...] | None = None
+    reliability_seal: FeedReliabilitySummary | None = None
 
 
 @dataclass(frozen=True)

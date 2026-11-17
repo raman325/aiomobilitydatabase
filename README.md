@@ -80,6 +80,12 @@ each dataset's service coverage (`get_gtfs_feed_continuous_coverage()`), and
 validation report history (`get_gtfs_feed_validation_reports()`, whose
 `severities` filter narrows each report's notices).
 
+A `GtfsFeed` and a search result carry the feed's Seal of Reliability in
+brief (`reliability_seal`) and whether it is `seasonal`;
+`search_feeds(has_seal=True)` filters on the seal. As in the API, a
+`GbfsFeed` is a `BasicFeed`: it has no status, official flag, name, note or
+related links.
+
 ## Quick start — feeds
 
 `MobilityFeedsClient` resolves a feed ID (GTFS, GTFS-RT, or GBFS) into a handle
@@ -452,8 +458,9 @@ Notes on direct mode:
   and what filters key on; a `route_id` naming a route absent from
   `routes.txt` leaves `route` as `None` rather than inventing one.
 - **Vehicle positions name their trip instance**: `VehiclePosition` carries
-  the parsed `trip_start_date`/`trip_start_secs`, the pair a GTFS-RT
-  `TripDescriptor` uses to address one run. That is what lets two buses out
+  the parsed `trip_start_date`/`trip_start_time`, the pair a GTFS-RT
+  `TripDescriptor` uses to address one run (the start time a `timedelta`
+  since the start of the service day, as every GTFS time is here). That is what lets two buses out
   on the same headway-based trip be told apart — without it, concurrent
   repetitions of one template trip are indistinguishable. A vehicle that
   reports no position is still returned, with `latitude`/`longitude` of
@@ -533,7 +540,12 @@ Notes on direct mode:
   `pricing_plan_id`, and `region_id` on stations and vehicles into records.
   These documents are optional in GBFS (`vehicle_types` only conditionally
   required), so an unpublished one — or a listed one answering `404`,
-  which GBFS says is not an error — is `[]`.
+  which GBFS says is not an error — is `[]`. A vehicle type's
+  `form_factor`/`propulsion_type` and an alert's `type` are enums, as the
+  GTFS-RT vocabularies are: a value newer than this library is `None`. An
+  alert has `applies_to(station_id=..., region_id=...)` (no stations or
+  regions listed: the whole system) and `is_active(at)`, shaped like a
+  GTFS-RT alert's.
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
   `get_headsigns_serving()` alongside the stop/route helpers.
@@ -640,11 +652,13 @@ Notes on direct mode:
   double-building). A corrupt or unreadable cache is treated as a cache miss
   and rebuilt rather than raising: as a cached index is opened, SQLite checks
   every page (`PRAGMA quick_check`) and its schema is compared with the
-  library's, so one damaged page anywhere is a miss. Damage that check can't
-  see (a value that no longer decodes, or a file changed after it was
-  opened), met later by a query, is `FeedParseError`; `purge_cache()`
-  rebuilds it. Without a `cache_dir` the index is built in memory on every
-  startup.
+  library's, so one damaged page anywhere is a miss. That check reads pages,
+  not the values in them; the stops, routes, agencies, feed info and Flex
+  records a handle holds are read as it opens, so a damaged value among them
+  (one that no longer decodes, say) is a miss too. Damage met later by a
+  query (such a value elsewhere, or a file changed after it was opened) is
+  `FeedParseError`; `purge_cache()` rebuilds it. Without a `cache_dir` the
+  index is built in memory on every startup.
 - **Pull, not push**: `TransitFeedHandle`/`GbfsFeedHandle` return snapshots on
   demand — there's no built-in polling loop or scheduler. Bring your own (e.g.
   Home Assistant's `DataUpdateCoordinator`).
@@ -656,7 +670,10 @@ Notes on direct mode:
   every feed's cache. Purging a feed with no cache directory is a no-op, so
   repeated calls are idempotent.
   `transit.close()` releases a handle's SQLite connection — call it when you
-  are done with a handle; the client's `close()` does not do it for you.
+  are done with a handle; the client's `close()` does not do it for you. It
+  is safe with queries in flight, cancelled ones included: a read already
+  running on a worker thread finishes first, and any read asked for after
+  `close()` raises `sqlite3.ProgrammingError`.
 - **Producer authentication**: pass `api_key=` to `get_transit_feed()`; it is
   applied per the catalog's `authentication_type` (query parameter or header) —
   distinct from the refresh token used to authenticate with the catalog itself.
