@@ -73,6 +73,12 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+A `GtfsFeed` and a search result carry the feed's Seal of Reliability in
+brief (`reliability_seal`) and whether it is `seasonal`;
+`search_feeds(has_seal=True)` filters on the seal. As in the API, a
+`GbfsFeed` is a `BasicFeed`: it has no status, official flag, name, note or
+related links.
+
 ## Quick start — feeds
 
 `MobilityFeedsClient` resolves a feed ID (GTFS, GTFS-RT, or GBFS) into a handle
