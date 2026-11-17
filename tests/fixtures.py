@@ -276,3 +276,115 @@ TOKEN_RESPONSE: dict[str, Any] = {
     "expiration_datetime_utc": "2030-01-01T00:00:00Z",
     "token_type": "Bearer",
 }
+
+RELIABILITY_REPORT: dict[str, Any] = {
+    "feed_id": "mdb-123",
+    "has_seal": False,
+    "seal_status": "not_granted",
+    "earned_at": "2026-01-10T00:00:00Z",
+    "lost_at": "2026-08-01T00:00:00Z",
+    "evaluated_at": "2026-09-14T03:00:00Z",
+    "on_probation": True,
+    "probation_ends_at": "2027-02-01T00:00:00Z",
+    "criteria": [
+        {
+            "criterion": criterion,
+            "status": "fail" if criterion == "available" else "pass",
+            "in_grace_period": False,
+            "grace_period_ends_at": None,
+            "on_probation": criterion == "available",
+            "probation_ends_at": (
+                "2027-02-01T00:00:00Z" if criterion == "available" else None
+            ),
+            "evaluated_at": "2026-09-14T03:00:00Z",
+            "first_failure_at": (
+                "2026-07-20T00:00:00Z" if criterion == "available" else None
+            ),
+            "last_failure_at": None,
+        }
+        for criterion in (
+            "official",
+            "stable",
+            "available",
+            "compliant",
+            "fresh_coverage",
+            "fresh_continuous",
+        )
+    ],
+}
+
+_COVERAGE_FILES = [
+    {"name": "calendar.txt", "present": True},
+    {"name": "calendar_dates.txt", "present": False},
+    {"name": "feed_info.txt", "present": True},
+]
+
+COVERAGE_LATEST: dict[str, Any] = {
+    "dataset_id": "mdb-123-202609010000",
+    "is_latest": True,
+    "downloaded_at": "2026-09-01T00:00:00Z",
+    "coverage_window": {"start": "2026-09-01", "end": "2027-03-31", "days": 212},
+    "coverage_window_source": "feed_info",
+    "within_max_coverage_window": True,
+    "service_window": {"start": "2026-09-01", "end": "2027-03-31", "days": 212},
+    "feed_info_window": {"start": "2026-09-01", "end": "2027-03-31", "days": 212},
+    "feed_info_matches": True,
+    "previous_dataset_id": "mdb-123-202603010000",
+    "overlap_days": 30,
+    "gap_days": None,
+    "files": _COVERAGE_FILES,
+}
+
+COVERAGE_OLDER: dict[str, Any] = {
+    "dataset_id": "mdb-123-202603010000",
+    "is_latest": False,
+    "downloaded_at": "2026-03-01T00:00:00Z",
+    "coverage_window": {"start": "2026-03-01", "end": "2026-09-30", "days": 214},
+    "coverage_window_source": "service_dates",
+    "within_max_coverage_window": True,
+    "service_window": {"start": "2026-03-01", "end": "2026-09-30", "days": 214},
+    "feed_info_window": None,
+    "feed_info_matches": None,
+    "previous_dataset_id": None,
+    "overlap_days": None,
+    "gap_days": None,
+    "files": _COVERAGE_FILES,
+}
+
+CONTINUOUS_COVERAGE_RESPONSE: dict[str, Any] = {
+    "feed_id": "mdb-123",
+    "latest_state": {"newer": COVERAGE_LATEST, "older": COVERAGE_OLDER},
+    "latest_failure": None,
+    "total": 2,
+    "offset": 0,
+    "limit": 20,
+    "items": [COVERAGE_LATEST, COVERAGE_OLDER],
+}
+
+FEED_VALIDATION_REPORT: dict[str, Any] = {
+    "dataset_id": "mdb-123-202609010000",
+    "is_latest": True,
+    "validated_at": "2026-09-01T01:00:00Z",
+    "validator_version": "7.1.0",
+    "total_error": 2,
+    "total_warning": 15,
+    "total_info": 3,
+    "unique_error_count": 1,
+    "unique_warning_count": 4,
+    "unique_info_count": 1,
+    "url_json": "https://files.mobilitydatabase.org/mdb-123/report.json",
+    "url_html": "https://files.mobilitydatabase.org/mdb-123/report.html",
+    "notices": [
+        {"code": "foreign_key_violation", "severity": "ERROR", "total": 2},
+        {"code": "unused_shape", "severity": "WARNING", "total": 9},
+    ],
+}
+
+VALIDATION_REPORTS_RESPONSE: dict[str, Any] = {
+    "feed_id": "mdb-123",
+    "latest": FEED_VALIDATION_REPORT,
+    "total": 1,
+    "offset": 0,
+    "limit": 20,
+    "items": [FEED_VALIDATION_REPORT],
+}

@@ -15,7 +15,7 @@ import math
 import re
 import types
 import typing
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from functools import cache
 from typing import Any
@@ -31,6 +31,11 @@ _DATE_TIME = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
     r"(?:\.[0-9]+)?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])?"
 )
+# The API's date format (RFC 3339's full-date), which fromisoformat would
+# widen to the basic format ("20260731") and week dates.
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+# The text each temporal type is sent as.
+_WRITTEN_AS: dict[Any, re.Pattern[str]] = {datetime: _DATE_TIME, date: _DATE}
 
 
 @cache
@@ -46,7 +51,8 @@ def mismatch(annotation: Any, value: Any, where: str = "$") -> str | None:
     a boolean (JSON's ``true`` isn't 1); ``float`` a finite number (a
     ``1e400`` literal decodes to infinity); ``bool`` a boolean; a
     string enum a string, whose value mashumaro then checks; a
-    ``datetime`` an RFC 3339 date-time string; ``tuple[X, ...]`` an array
+    ``datetime`` an RFC 3339 date-time string; a ``date`` an RFC 3339
+    full-date string (whose calendar mashumaro then checks); ``tuple[X, ...]`` an array
     of X; a dataclass an object whose present fields conform (a missing
     required field is mashumaro's to report; keys the model doesn't know
     are ignored, as the API may add fields); ``X | None`` null or an X.
@@ -104,8 +110,8 @@ def _scalar_fits(annotation: Any, value: Any) -> bool:
         return isinstance(value, int)
     if annotation is float:
         return isinstance(value, int | float) and _finite(value)
-    if annotation is datetime:
-        return isinstance(value, str) and _DATE_TIME.fullmatch(value) is not None
+    if (written := _WRITTEN_AS.get(annotation)) is not None:
+        return isinstance(value, str) and written.fullmatch(value) is not None
     if annotation is str or issubclass(annotation, Enum):
         return isinstance(value, str)  # text: _json.loads refuses lone surrogates
     raise TypeError(f"no JSON type for {annotation!r}")  # pragma: no cover

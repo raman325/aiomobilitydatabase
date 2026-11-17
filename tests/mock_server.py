@@ -20,8 +20,8 @@ class RecordedRequest:
 
     method: str
     path: str
-    # NOTE: dict(request.query) keeps only the last value per repeated key.
-    # Fine while clients comma-join multi-values; beware if that changes.
+    # NOTE: dict(request.query) keeps only the last value per repeated key;
+    # ``query_items`` below keeps every pair, for a parameter sent repeated.
     query: dict[str, str]
     json: Any | None
     headers: dict[str, str]
@@ -30,6 +30,7 @@ class RecordedRequest:
     # a path segment rather than sending a raw special character; excludes
     # the query string (aiohttp's raw_path includes it when present).
     raw_path: str = ""
+    query_items: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -97,6 +98,7 @@ class MockApi:
                 json=body_json,
                 headers=dict(request.headers),
                 raw_path=request.raw_path.split("?", 1)[0],
+                query_items=list(request.query.items()),
             )
         )
         queue = self._queues.get((request.method, request.path), deque())
