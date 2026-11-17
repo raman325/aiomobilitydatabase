@@ -348,6 +348,9 @@ _PATH_METHODS: dict[str, tuple[str, str]] = {
     "get_gtfs_feed_datasets": ("/v1/gtfs_feeds/", "/datasets"),
     "get_gtfs_feed_gtfs_rt_feeds": ("/v1/gtfs_feeds/", "/gtfs_rt_feeds"),
     "get_gtfs_feed_availability": ("/v1/gtfs_feeds/", "/availability"),
+    "get_gtfs_feed_reliability": ("/v1/gtfs_feeds/", "/reliability"),
+    "get_gtfs_feed_continuous_coverage": ("/v1/gtfs_feeds/", "/continuous_coverage"),
+    "get_gtfs_feed_validation_reports": ("/v1/gtfs_feeds/", "/validation_reports"),
     "get_dataset_gtfs": ("/v1/datasets/gtfs/", ""),
     "get_license": ("/v1/licenses/", ""),
 }

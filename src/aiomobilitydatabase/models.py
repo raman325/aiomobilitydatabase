@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
 from mashumaro import DataClassDictMixin
@@ -78,6 +78,51 @@ class RequestMethod(StrEnum):
 
     HEAD = "HEAD"
     GET = "GET"
+
+
+class SealStatus(StrEnum):
+    """Descriptive status of a feed's Seal of Reliability."""
+
+    GRANTED = "granted"
+    NOT_GRANTED = "not_granted"
+    UNKNOWN = "unknown"
+    NEVER_EVALUATED = "never_evaluated"
+
+
+class SealCriterion(StrEnum):
+    """One of the six criteria the Seal of Reliability is evaluated on."""
+
+    OFFICIAL = "official"
+    STABLE = "stable"
+    AVAILABLE = "available"
+    COMPLIANT = "compliant"
+    FRESH_COVERAGE = "fresh_coverage"
+    FRESH_CONTINUOUS = "fresh_continuous"
+
+
+class CriterionStatus(StrEnum):
+    """A seal criterion's debounced verdict, its grace period applied."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    UNKNOWN = "unknown"
+    NOT_APPLICABLE = "not_applicable"
+    NEVER_EVALUATED = "never_evaluated"
+
+
+class CoverageWindowSource(StrEnum):
+    """Which input a dataset's coverage window was taken from."""
+
+    SERVICE_DATES = "service_dates"
+    FEED_INFO = "feed_info"
+
+
+class NoticeSeverity(StrEnum):
+    """Severity of a GTFS validator notice."""
+
+    ERROR = "ERROR"
+    WARNING = "WARNING"
+    INFO = "INFO"
 
 
 @dataclass(frozen=True)
@@ -382,6 +427,154 @@ class GtfsFeedAvailability(DataClassDictMixin):
     limit: int
     # Required by the API spec: an absent history is no empty one.
     checks: tuple[GtfsFeedAvailabilityCheck, ...]
+
+
+@dataclass(frozen=True)
+class ReliabilityCriterion(DataClassDictMixin):
+    """One Seal of Reliability criterion's state for a GTFS feed.
+
+    ``grace_period_ends_at`` is set only while ``in_grace_period``: the
+    check is failing, but not yet counting against the seal.
+    ``first_failure_at`` starts the current run of failures (None once the
+    criterion passes again); ``last_failure_at`` is history, never cleared.
+    """
+
+    criterion: SealCriterion
+    status: CriterionStatus
+    in_grace_period: bool
+    on_probation: bool
+    grace_period_ends_at: datetime | None = None
+    probation_ends_at: datetime | None = None
+    evaluated_at: datetime | None = None
+    first_failure_at: datetime | None = None
+    last_failure_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class FeedReliabilityReport(DataClassDictMixin):
+    """A GTFS feed's Seal of Reliability with every criterion's state.
+
+    ``has_seal`` is true only when ``seal_status`` is ``GRANTED``;
+    ``criteria`` always lists all six, in a stable order.
+    """
+
+    feed_id: str
+    has_seal: bool
+    on_probation: bool
+    criteria: tuple[ReliabilityCriterion, ...]
+    seal_status: SealStatus | None = None
+    earned_at: datetime | None = None
+    lost_at: datetime | None = None
+    evaluated_at: datetime | None = None
+    probation_ends_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ServiceDateWindow(DataClassDictMixin):
+    """A span of service dates, both bounds included."""
+
+    start: date
+    end: date
+    days: int | None = None
+
+
+@dataclass(frozen=True)
+class GtfsFeedContinuousCoverageFile(DataClassDictMixin):
+    """A file the coverage calculation reads, and whether a dataset had it."""
+
+    name: str
+    present: bool
+
+
+@dataclass(frozen=True)
+class GtfsFeedContinuousCoverageItem(DataClassDictMixin):
+    """One dataset's service coverage (the spec's GtfsFeedContinuousCoverage).
+
+    ``overlap_days``/``gap_days`` compare its ``coverage_window`` with the
+    dataset downloaded just before it (``previous_dataset_id``): days both
+    cover, or days neither does. ``feed_info_matches`` and
+    ``within_max_coverage_window`` are None where there is nothing to
+    compare, which is not a mismatch.
+    """
+
+    dataset_id: str
+    is_latest: bool
+    files: tuple[GtfsFeedContinuousCoverageFile, ...]
+    downloaded_at: datetime | None = None
+    coverage_window: ServiceDateWindow | None = None
+    coverage_window_source: CoverageWindowSource | None = None
+    within_max_coverage_window: bool | None = None
+    service_window: ServiceDateWindow | None = None
+    feed_info_window: ServiceDateWindow | None = None
+    feed_info_matches: bool | None = None
+    previous_dataset_id: str | None = None
+    overlap_days: int | None = None
+    gap_days: int | None = None
+
+
+@dataclass(frozen=True)
+class GtfsFeedContinuousCoverageBoundary(DataClassDictMixin):
+    """Two consecutive datasets: the newer one and the one before it."""
+
+    newer: GtfsFeedContinuousCoverageItem
+    older: GtfsFeedContinuousCoverageItem | None = None
+
+
+@dataclass(frozen=True)
+class GtfsFeedContinuousCoverage(DataClassDictMixin):
+    """Service coverage history for a GTFS feed, newest dataset first.
+
+    Named after its endpoint, as :class:`GtfsFeedAvailability` is; each
+    dataset's entry is a :class:`GtfsFeedContinuousCoverageItem`.
+    """
+
+    feed_id: str
+    total: int
+    offset: int
+    limit: int
+    items: tuple[GtfsFeedContinuousCoverageItem, ...]
+    latest_state: GtfsFeedContinuousCoverageBoundary | None = None
+    latest_failure: GtfsFeedContinuousCoverageBoundary | None = None
+
+
+@dataclass(frozen=True)
+class GtfsFeedValidationNotice(DataClassDictMixin):
+    """One validator notice code a report raised, and how many times."""
+
+    code: str
+    severity: NoticeSeverity
+    total: int
+
+
+@dataclass(frozen=True)
+class GtfsFeedValidationReport(DataClassDictMixin):
+    """One dataset's GTFS validation report summary."""
+
+    dataset_id: str
+    is_latest: bool
+    notices: tuple[GtfsFeedValidationNotice, ...]
+    validated_at: datetime | None = None
+    validator_version: str | None = None
+    total_error: int | None = None
+    total_warning: int | None = None
+    total_info: int | None = None
+    unique_error_count: int | None = None
+    unique_warning_count: int | None = None
+    unique_info_count: int | None = None
+    url_json: str | None = None
+    url_html: str | None = None
+
+
+@dataclass(frozen=True)
+class GtfsFeedValidationReports(DataClassDictMixin):
+    """Validation report history for a GTFS feed, newest first."""
+
+    feed_id: str
+    total: int
+    offset: int
+    limit: int
+    items: tuple[GtfsFeedValidationReport, ...]
+    latest: GtfsFeedValidationReport | None = None
 
 
 @dataclass(frozen=True)

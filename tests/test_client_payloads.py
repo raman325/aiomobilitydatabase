@@ -15,7 +15,7 @@ import math
 import re
 import types
 import typing
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
@@ -34,10 +34,13 @@ from aiomobilitydatabase.exceptions import (
 )
 from aiomobilitydatabase.models import (
     Feed,
+    FeedReliabilityReport,
     GbfsFeed,
     GtfsDataset,
     GtfsFeed,
     GtfsFeedAvailability,
+    GtfsFeedContinuousCoverage,
+    GtfsFeedValidationReports,
     GtfsRtFeed,
     License,
     LicenseWithRules,
@@ -99,6 +102,27 @@ _ENDPOINTS: dict[str, tuple[str, str, tuple[str, ...], type, bool]] = {
         "/v1/gtfs_feeds/mdb-1/availability",
         ("mdb-1",),
         GtfsFeedAvailability,
+        False,
+    ),
+    "get_gtfs_feed_reliability": (
+        "GET",
+        "/v1/gtfs_feeds/mdb-1/reliability",
+        ("mdb-1",),
+        FeedReliabilityReport,
+        False,
+    ),
+    "get_gtfs_feed_continuous_coverage": (
+        "GET",
+        "/v1/gtfs_feeds/mdb-1/continuous_coverage",
+        ("mdb-1",),
+        GtfsFeedContinuousCoverage,
+        False,
+    ),
+    "get_gtfs_feed_validation_reports": (
+        "GET",
+        "/v1/gtfs_feeds/mdb-1/validation_reports",
+        ("mdb-1",),
+        GtfsFeedValidationReports,
         False,
     ),
     "get_dataset_gtfs": (
@@ -321,6 +345,12 @@ def _faithful(annotation: Any, raw: Any, decoded: Any) -> bool:  # noqa: PLR0911
         )
     if annotation is datetime:
         return isinstance(raw, str) and decoded == _rfc3339(raw)
+    if annotation is date:
+        return (
+            isinstance(raw, str)
+            and type(decoded) is date
+            and decoded == date.fromisoformat(raw)
+        )
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         return (
             isinstance(raw, str)

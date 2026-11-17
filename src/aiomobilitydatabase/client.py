@@ -40,11 +40,14 @@ from .models import (
     DataType,
     EntityType,
     Feed,
+    FeedReliabilityReport,
     FeedStatus,
     GbfsFeed,
     GtfsDataset,
     GtfsFeed,
     GtfsFeedAvailability,
+    GtfsFeedContinuousCoverage,
+    GtfsFeedValidationReports,
     GtfsRtFeed,
     License,
     LicenseWithRules,
@@ -52,6 +55,7 @@ from .models import (
     LocationType,
     MatchingLicense,
     Metadata,
+    NoticeSeverity,
     SearchResults,
     SortOrder,
 )
@@ -132,12 +136,25 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _encode_value(value: Any) -> str:
+class _Repeated(tuple[Any, ...]):
+    """A multi-value filter the API takes as its parameter repeated.
+
+    OpenAPI's form style with ``explode`` (its default): ``severity=ERROR&
+    severity=WARNING``, where the filters declaring ``explode: false`` take
+    one comma-separated value instead (a plain list or tuple here).
+    """
+
+    __slots__ = ()
+
+
+def _encode_value(value: Any) -> str | tuple[str, ...]:
     """Encode one query parameter value: a scalar, or a list or tuple of them.
 
     A list is the API's comma-separated multi-value filter, so an item that
     holds a comma itself would be read as two: the caller's ValueError.
     """
+    if isinstance(value, _Repeated):
+        return tuple(_encode_scalar(item) for item in value)  # sent repeated
     if not isinstance(value, list | tuple):
         return _encode_scalar(value)
     items = [_encode_scalar(item) for item in value]
@@ -321,13 +338,15 @@ def _many[ModelT: DataClassDictMixin](model: type[ModelT], data: Any) -> list[Mo
     return [_one(model, item) for item in data]
 
 
-def encode_params(params: dict[str, Any]) -> dict[str, str]:
+def encode_params(params: dict[str, Any]) -> dict[str, str | tuple[str, ...]]:
     """Encode query parameters, dropping None values and empty containers.
 
     Booleans become "true"/"false", enums use their value, datetimes use ISO
     format, and lists/tuples are comma-joined (the API's convention for
-    multi-value filters). An empty list or tuple means "no filter" and is
-    dropped just like None, rather than encoding to an empty-string param.
+    multi-value filters) -- except a :class:`_Repeated` one, encoded item by
+    item for the request to send repeated. An empty list or tuple means "no
+    filter" and is dropped just like None, rather than encoding to an
+    empty-string param.
     """
     return {
         key: _encode_value(value)
@@ -737,6 +756,67 @@ class MobilityDatabaseClient:
             },
         )
         return _one(GtfsFeedAvailability, data)
+
+    async def get_gtfs_feed_reliability(self, feed_id: str) -> FeedReliabilityReport:
+        """Get a GTFS feed's Seal of Reliability, with each criterion's state."""
+        data = await self._request(
+            "GET", f"/v1/gtfs_feeds/{_quote_segment(feed_id)}/reliability"
+        )
+        return _one(FeedReliabilityReport, data)
+
+    async def get_gtfs_feed_continuous_coverage(
+        self,
+        feed_id: str,
+        *,
+        downloaded_after: datetime | None = None,
+        downloaded_before: datetime | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> GtfsFeedContinuousCoverage:
+        """Get the service coverage of a GTFS feed's datasets, newest first."""
+        data = await self._request(
+            "GET",
+            f"/v1/gtfs_feeds/{_quote_segment(feed_id)}/continuous_coverage",
+            params={
+                "downloaded_after": downloaded_after,
+                "downloaded_before": downloaded_before,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        return _one(GtfsFeedContinuousCoverage, data)
+
+    async def get_gtfs_feed_validation_reports(
+        self,
+        feed_id: str,
+        *,
+        validated_after: datetime | None = None,
+        validated_before: datetime | None = None,
+        min_errors: int | None = None,
+        min_warnings: int | None = None,
+        severities: list[NoticeSeverity] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> GtfsFeedValidationReports:
+        """Get a GTFS feed's validation report history, newest first.
+
+        ``severities`` limits each report's ``notices`` to those severities;
+        the counts are unaffected.
+        """
+        data = await self._request(
+            "GET",
+            f"/v1/gtfs_feeds/{_quote_segment(feed_id)}/validation_reports",
+            params={
+                "validated_after": validated_after,
+                "validated_before": validated_before,
+                "min_errors": min_errors,
+                "min_warnings": min_warnings,
+                "severity": _Repeated(severities or ()),
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        return _one(GtfsFeedValidationReports, data)
 
     async def get_dataset_gtfs(self, dataset_id: str) -> GtfsDataset:
         """Get a single GTFS dataset by ID."""

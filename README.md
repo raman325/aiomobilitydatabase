@@ -73,6 +73,13 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+Every catalog endpoint has a method, its filters as keyword arguments. Per
+GTFS feed there is the dataset list, availability checks, the Seal of
+Reliability with each criterion's state (`get_gtfs_feed_reliability()`),
+each dataset's service coverage (`get_gtfs_feed_continuous_coverage()`), and
+validation report history (`get_gtfs_feed_validation_reports()`, whose
+`severities` filter narrows each report's notices).
+
 A `GtfsFeed` and a search result carry the feed's Seal of Reliability in
 brief (`reliability_seal`) and whether it is `seasonal`;
 `search_feeds(has_seal=True)` filters on the seal. As in the API, a
