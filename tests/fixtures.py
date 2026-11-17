@@ -276,3 +276,12 @@ TOKEN_RESPONSE: dict[str, Any] = {
     "expiration_datetime_utc": "2030-01-01T00:00:00Z",
     "token_type": "Bearer",
 }
+
+RELIABILITY_SEAL: dict[str, Any] = {
+    "has_seal": False,
+    "earned_at": "2026-01-10T00:00:00Z",
+    "lost_at": "2026-08-01T00:00:00Z",
+    "evaluated_at": "2026-09-14T03:00:00Z",
+    "on_probation": True,
+    "probation_ends_at": "2027-02-01T00:00:00Z",
+}

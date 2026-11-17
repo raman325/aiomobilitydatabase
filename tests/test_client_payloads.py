@@ -310,12 +310,13 @@ def _faithful(annotation: Any, raw: Any, decoded: Any) -> bool:  # noqa: PLR0911
         )
     if dataclasses.is_dataclass(annotation):
         hints = typing.get_type_hints(annotation)
-        # A field the JSON leaves out decodes to None (every default is
-        # None): the decoder must invent nothing, such as an empty list.
+        # A field the JSON leaves out decodes to its default -- None, or
+        # the spec's own default (seasonal's False): the decoder must invent
+        # nothing else, such as an empty list.
         return isinstance(raw, dict) and all(
             _faithful(hints[field.name], raw[field.name], getattr(decoded, field.name))
             if field.name in raw
-            else getattr(decoded, field.name) is None
+            else getattr(decoded, field.name) is field.default
             for field in dataclasses.fields(annotation)
         )
     if annotation is datetime:
