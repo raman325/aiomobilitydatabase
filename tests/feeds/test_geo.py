@@ -1519,6 +1519,15 @@ _OFFSET = st.floats(-2, 2).filter(lambda value: value == 0 or abs(value) > 1e-3)
     steps=1,
     east=False,
 )
+@example(  # by a pole a degree of longitude is under a metre: the step
+    # east of the vertex underflows to 0.0 m, on the edge running west
+    latitude=89.9999,
+    longitude=0.0,
+    offsets=[(0.0, -1.0), (-1.0, 0.0)],
+    vertex=0,
+    steps=1,
+    east=True,
+)
 @settings(max_examples=500)
 def test_a_zero_radius_zone_overlaps_exactly_when_inside_or_on_the_polygon(  # noqa: PLR0917
     latitude: float,
