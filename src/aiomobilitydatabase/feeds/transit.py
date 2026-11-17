@@ -60,6 +60,7 @@ from .models import (
     PickupDropOffType,
     Route,
     ServiceAlert,
+    StaticBuildPhase,
     StaticBuildProgress,
     StationGroup,
     Stop,
@@ -85,6 +86,7 @@ from .rt import (
     feed_request_fields,
     feed_timestamp,
     fetch_feed_message,
+    gtfs_time,
     indexed_trip_updates,
     resolve_trip_predictions,
     stated_copy_calls,
@@ -92,6 +94,7 @@ from .rt import (
     trip_modifications_from_message,
     trip_update_records,
     vehicles_from_message,
+    whole_seconds,
 )
 from .static_index import (
     _EARLIEST_INSTANT,
@@ -313,7 +316,7 @@ class _Alerts:
                     stop_id=place,
                     trip_id=trip_id,
                     start_date=start_date,
-                    start_secs=start_secs,
+                    start_time=gtfs_time(start_secs),
                 )
                 for place in places
             )
@@ -329,8 +332,13 @@ def _run_ref(trip: TripSelector) -> tuple[str, int, date, int] | None:
     if trip.trip_id is not None:
         return None
     assert trip.route_id is not None and trip.direction_id is not None
-    assert trip.start_date is not None and trip.start_secs is not None
-    return (trip.route_id, trip.direction_id, trip.start_date, trip.start_secs)
+    assert trip.start_date is not None and trip.start_time is not None
+    return (
+        trip.route_id,
+        trip.direction_id,
+        trip.start_date,
+        whole_seconds(trip.start_time),
+    )
 
 
 def _run_refs(alert: ServiceAlert) -> list[tuple[str, int, date, int]]:
@@ -2074,7 +2082,7 @@ class TransitFeedHandle:
                     ):
                         on_progress(
                             StaticBuildProgress(
-                                phase="download",
+                                phase=StaticBuildPhase.DOWNLOAD,
                                 done_bytes=done_bytes,
                                 total_bytes=total_bytes,
                             )
@@ -2086,7 +2094,9 @@ class TransitFeedHandle:
             if on_progress is not None:
                 on_progress(
                     StaticBuildProgress(
-                        phase="download", done_bytes=done_bytes, total_bytes=total_bytes
+                        phase=StaticBuildPhase.DOWNLOAD,
+                        done_bytes=done_bytes,
+                        total_bytes=total_bytes,
                     )
                 )
         return etag
@@ -2108,7 +2118,7 @@ class TransitFeedHandle:
                 loop.call_soon_threadsafe(
                     on_progress,
                     StaticBuildProgress(
-                        phase="index", done_bytes=done, total_bytes=total
+                        phase=StaticBuildPhase.INDEX, done_bytes=done, total_bytes=total
                     ),
                 )
 
@@ -2265,7 +2275,13 @@ class TransitFeedHandle:
         ]
         vp_refs = [
             [
-                (vehicle.trip_id, vehicle.trip_start_date, vehicle.trip_start_secs)
+                (
+                    vehicle.trip_id,
+                    vehicle.trip_start_date,
+                    None
+                    if vehicle.trip_start_time is None
+                    else whole_seconds(vehicle.trip_start_time),
+                )
                 for vehicle in vehicles
                 if vehicle.trip_id
             ]
@@ -3384,7 +3400,7 @@ class TransitFeedHandle:
                 trip.trip_id
                 for trip, _ in trips
                 if trip.trip_id is not None
-                and (trip.start_secs is not None or trip.start_date is None)
+                and (trip.start_time is not None or trip.start_date is None)
             }
         )
         plain_starts = (

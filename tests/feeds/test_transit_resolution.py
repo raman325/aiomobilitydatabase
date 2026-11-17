@@ -10,7 +10,7 @@ from aiomobilitydatabase.feeds.exceptions import (
     SourceConnectionError,
     StaticDataUnavailableError,
 )
-from aiomobilitydatabase.feeds.models import StaticBuildProgress
+from aiomobilitydatabase.feeds.models import StaticBuildPhase, StaticBuildProgress
 
 from tests.feeds.fixtures import (
     GBFS_FEED,
@@ -221,7 +221,8 @@ async def test_static_build_progress_reported(
     _mock_catalog_for_gtfs(mock_api)
     events: list[StaticBuildProgress] = []
     await feeds_client.get_transit_feed("mdb-100", on_progress=events.append)
-    assert {event.phase for event in events} == {"download", "index"}
+    assert {event.phase for event in events} == set(StaticBuildPhase)
+    assert {event.phase for event in events} == {"download", "index"}  # StrEnum
     downloads = [event for event in events if event.phase == "download"]
     assert downloads[-1].done_bytes == downloads[-1].total_bytes
     index_events = [event for event in events if event.phase == "index"]

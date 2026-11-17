@@ -445,8 +445,9 @@ Notes on direct mode:
   and what filters key on; a `route_id` naming a route absent from
   `routes.txt` leaves `route` as `None` rather than inventing one.
 - **Vehicle positions name their trip instance**: `VehiclePosition` carries
-  the parsed `trip_start_date`/`trip_start_secs`, the pair a GTFS-RT
-  `TripDescriptor` uses to address one run. That is what lets two buses out
+  the parsed `trip_start_date`/`trip_start_time`, the pair a GTFS-RT
+  `TripDescriptor` uses to address one run (the start time a `timedelta`
+  since the start of the service day, as every GTFS time is here). That is what lets two buses out
   on the same headway-based trip be told apart — without it, concurrent
   repetitions of one template trip are indistinguishable. A vehicle that
   reports no position is still returned, with `latitude`/`longitude` of
@@ -526,7 +527,12 @@ Notes on direct mode:
   `pricing_plan_id`, and `region_id` on stations and vehicles into records.
   These documents are optional in GBFS (`vehicle_types` only conditionally
   required), so an unpublished one — or a listed one answering `404`,
-  which GBFS says is not an error — is `[]`.
+  which GBFS says is not an error — is `[]`. A vehicle type's
+  `form_factor`/`propulsion_type` and an alert's `type` are enums, as the
+  GTFS-RT vocabularies are: a value newer than this library is `None`. An
+  alert has `applies_to(station_id=..., region_id=...)` (no stations or
+  regions listed: the whole system) and `is_active(at)`, shaped like a
+  GTFS-RT alert's.
 - **Static metadata accessors**: `transit.agencies`, `transit.feed_info`
   (publisher, version, validity dates — useful for staleness checks), and
   `get_headsigns_serving()` alongside the stop/route helpers.

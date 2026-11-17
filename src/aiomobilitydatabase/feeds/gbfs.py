@@ -28,11 +28,15 @@ from ._urls import (  # deliberate friend access: shared URL guard
     _require_http_url,
     redact,
 )
+from ._vocab import vocab_or_none
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
 from .models import (
     GbfsAlert,
+    GbfsAlertType,
+    GbfsFormFactor,
     GbfsPricingPlan,
+    GbfsPropulsionType,
     GbfsStation,
     GbfsSystemInfo,
     GbfsSystemRegion,
@@ -721,8 +725,10 @@ class GbfsFeedHandle:
         return [
             GbfsVehicleType(
                 id=type_id,
-                form_factor=_plain_text(row.get("form_factor")),
-                propulsion_type=_plain_text(row.get("propulsion_type")),
+                form_factor=vocab_or_none(GbfsFormFactor, row.get("form_factor")),
+                propulsion_type=vocab_or_none(
+                    GbfsPropulsionType, row.get("propulsion_type")
+                ),
                 name=_localized(row.get("name")),
                 max_range_m=_number(row.get("max_range_meters")),
                 rider_capacity=_count(row.get("rider_capacity")),
@@ -763,7 +769,7 @@ class GbfsFeedHandle:
         return [
             GbfsAlert(
                 id=alert_id,
-                type=_plain_text(row.get("type")),
+                type=vocab_or_none(GbfsAlertType, row.get("type")),
                 summary=_localized(row.get("summary")),
                 description=_localized(row.get("description")),
                 url=_localized(row.get("url")) or None,
