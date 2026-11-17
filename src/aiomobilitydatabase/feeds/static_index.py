@@ -379,6 +379,15 @@ _WEEKDAY_COLUMNS = (
 )
 
 
+class DamagedIndexError(FeedParseError):
+    """A damaged index: its file, or a value stored in it, as a read finds it.
+
+    A :class:`FeedParseError` to callers. Told apart only where a cached
+    index is opened (see ``TransitFeedHandle._open_cached``), so damage in
+    what an open reads rebuilds the entry rather than failing the open.
+    """
+
+
 class _RefusedError(ValueError):
     """A cell or row the library refused, in the library's own words."""
 
@@ -1564,6 +1573,10 @@ class StaticIndex:
         damaged page anywhere -- stops and routes the handle reads at once,
         stop_times or an index a later query would meet -- is a miss too, so
         the entry is rebuilt rather than failing every open or query. The
+        check reads structure, not cells: a value damaged in a well-formed
+        page shows only when read, as :class:`DamagedIndexError` (the
+        handle reads what it holds at once before taking a cached index,
+        and rebuilds on that error). The
         check reads every page: about a second for a 746 MB index whose
         file is in the OS cache, longer from a cold disk -- once per open,
         on the caller's worker thread. What a damaged file can raise on the
@@ -2470,9 +2483,9 @@ class StaticIndex:
                 return rows
         raise self._damage()
 
-    def _damage(self) -> FeedParseError:
+    def _damage(self) -> DamagedIndexError:
         """Return the error a damaged index (its file, or a value in it) raises."""
-        return FeedParseError(
+        return DamagedIndexError(
             f"The static index of dataset {self.dataset_id!r} is damaged: "
             "SQLite reports a malformed database; purge the cache to rebuild it"
         )
