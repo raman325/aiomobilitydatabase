@@ -194,6 +194,61 @@ class OccupancyStatus(StrEnum):
     NOT_BOARDABLE = "NOT_BOARDABLE"
 
 
+class GbfsFormFactor(StrEnum):
+    """GBFS ``vehicle_types[].form_factor``: the vehicle's general form factor.
+
+    ``SCOOTER`` is v2.x's, replaced in v3.0 by the standing and seated kinds.
+    """
+
+    BICYCLE = "bicycle"
+    CARGO_BICYCLE = "cargo_bicycle"
+    CAR = "car"
+    MOPED = "moped"
+    SCOOTER = "scooter"
+    SCOOTER_STANDING = "scooter_standing"
+    SCOOTER_SEATED = "scooter_seated"
+    OTHER = "other"
+
+
+class GbfsPropulsionType(StrEnum):
+    """GBFS ``vehicle_types[].propulsion_type``: the primary propulsion."""
+
+    HUMAN = "human"
+    ELECTRIC_ASSIST = "electric_assist"
+    ELECTRIC = "electric"
+    COMBUSTION = "combustion"
+    COMBUSTION_DIESEL = "combustion_diesel"
+    HYBRID = "hybrid"
+    PLUG_IN_HYBRID = "plug_in_hybrid"
+    HYDROGEN_FUEL_CELL = "hydrogen_fuel_cell"
+
+
+class GbfsAlertType(StrEnum):
+    """GBFS ``alerts[].type``.
+
+    v1.0 to v2.0 spell the same values in upper case (``SYSTEM_CLOSURE``),
+    v2.1 on in lower case: either spelling is the member.
+    """
+
+    SYSTEM_CLOSURE = "system_closure"
+    STATION_CLOSURE = "station_closure"
+    STATION_MOVE = "station_move"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> GbfsAlertType | None:
+        if isinstance(value, str) and value.isupper():
+            return cls.__members__.get(value)
+        return None
+
+
+class StaticBuildPhase(StrEnum):
+    """Which step of a static dataset acquisition a progress report is for."""
+
+    DOWNLOAD = "download"
+    INDEX = "index"
+
+
 @dataclass(frozen=True)
 class Stop:
     """A transit stop from the static GTFS index.
@@ -668,8 +723,9 @@ class VehiclePosition:
     producer sent, which may name something the static dataset does not
     have (leaving the record None).
 
-    ``trip_start_date``/``trip_start_secs`` are the parsed
-    ``TripDescriptor.start_date``/``start_time`` -- the pair that pins
+    ``trip_start_date``/``trip_start_time`` are the parsed
+    ``TripDescriptor.start_date``/``start_time`` (a GTFS time: since the
+    start of the service day, as GTFS-Flex windows are) -- the pair that pins
     WHICH instance of a trip this vehicle is running. Without them a
     frequency-based trip's concurrent repetitions cannot be told apart.
     Both degrade to None on absent or malformed values, like every other
@@ -686,7 +742,7 @@ class VehiclePosition:
     route: Route | None
     trip_id: str | None
     trip_start_date: date | None
-    trip_start_secs: int | None
+    trip_start_time: timedelta | None
     occupancy_status: OccupancyStatus | None
     occupancy_percentage: int | None
     carriages: tuple[CarriageDetail, ...]
@@ -705,19 +761,19 @@ class VehiclePosition:
 class TripSelector:
     """The trip an alert's EntitySelector names (a GTFS-RT TripDescriptor).
 
-    Field names are the spec's; ``start_date``/``start_secs`` are the
-    parsed ``start_date``/``start_time``, as on :class:`VehiclePosition`.
-    With a ``trip_id`` it names that trip -- one run of it where
-    ``start_date``/``start_secs`` say which. Without one it names the run
-    of ``route_id`` and ``direction_id`` that starts at ``start_secs`` on
-    ``start_date``, all four set (a trip without them is not kept).
+    Field names are the spec's; ``start_date``/``start_time`` are parsed,
+    as on :class:`VehiclePosition`. With a ``trip_id`` it names that trip
+    -- one run of it where ``start_date``/``start_time`` say which. Without
+    one it names the run of ``route_id`` and ``direction_id`` that starts
+    at ``start_time`` on ``start_date``, all four set (a trip without them
+    is not kept).
     """
 
     trip_id: str | None
     route_id: str | None
     direction_id: int | None
     start_date: date | None
-    start_secs: int | None
+    start_time: timedelta | None
 
 
 @dataclass(frozen=True)
@@ -749,7 +805,7 @@ def _selects(
     stop_id: str | None,
     trip_id: str | None,
     start_date: date | None,
-    start_secs: int | None,
+    start_time: timedelta | None,
 ) -> bool:
     """Whether an entity with these values matches every field ``selector`` names.
 
@@ -772,7 +828,7 @@ def _selects(
             ((trip.trip_id, trip_id),)
             if trip.trip_id is not None
             else ((trip.route_id, route_id), (trip.direction_id, direction_id))
-        ) + ((trip.start_date, start_date), (trip.start_secs, start_secs))
+        ) + ((trip.start_date, start_date), (trip.start_time, start_time))
     wanted = [(field, value) for field, value in named if field is not None]
     return bool(wanted) and all(field == value for field, value in wanted)
 
@@ -866,7 +922,7 @@ class ServiceAlert:
         stop_id: str | None = None,
         trip_id: str | None = None,
         start_date: date | None = None,
-        start_secs: int | None = None,
+        start_time: timedelta | None = None,
     ) -> bool:
         """Return True if the alert applies to the entity these values describe.
 
@@ -876,7 +932,7 @@ class ServiceAlert:
         field that names one, so describe the entity in full: a stop and
         route alert applies to ``stop_id=S, route_id=R``, not to
         ``stop_id=S`` alone, and a selector naming one run of a trip
-        (``start_date``, ``start_secs``: its TripDescriptor start date and
+        (``start_date``, ``start_time``: its TripDescriptor start date and
         start time) applies only where those are given. A ``trip_id`` is
         the trip a selector names, its route and direction implied.
         """
@@ -890,7 +946,7 @@ class ServiceAlert:
                 stop_id=stop_id,
                 trip_id=trip_id,
                 start_date=start_date,
-                start_secs=start_secs,
+                start_time=start_time,
             )
             for selector in self.informed_entities
         )
@@ -1238,14 +1294,14 @@ class GbfsVehicleType:
     """One vehicle type a GBFS system rents.
 
     Resolves the ``vehicle_type_id`` that stations and vehicles reference.
-    ``form_factor``/``propulsion_type`` stay raw strings: GBFS adds new
-    values across minor versions, so a closed enum would reject a feed
-    that is merely newer than this library.
+    ``form_factor``/``propulsion_type`` are the spec's enumerations; as
+    with every enumeration here, a value this library doesn't know (GBFS
+    adds some across minor versions) is None.
     """
 
     id: str
-    form_factor: str | None
-    propulsion_type: str | None
+    form_factor: GbfsFormFactor | None
+    propulsion_type: GbfsPropulsionType | None
     name: str | None
     max_range_m: float | None
     rider_capacity: int | None
@@ -1281,14 +1337,14 @@ class GbfsAlert:
     """A GBFS system alert.
 
     Distinct from :class:`ServiceAlert`, which is GTFS-RT: this one scopes
-    to GBFS stations and regions rather than routes and trips, and its
-    ``type`` is a raw string for the same reason as
-    :attr:`GbfsVehicleType.form_factor`. Each active period has the start
-    GBFS requires; its end is None when it is open-ended.
+    to GBFS stations and regions rather than routes and trips
+    (:meth:`applies_to`). ``type`` is None for a value this library doesn't
+    know, as :attr:`GbfsVehicleType.form_factor` is. Each active period has
+    the start GBFS requires; its end is None when it is open-ended.
     """
 
     id: str
-    type: str | None
+    type: GbfsAlertType | None
     summary: str | None
     description: str | None
     url: str | None
@@ -1296,6 +1352,38 @@ class GbfsAlert:
     region_ids: tuple[str, ...]
     last_updated: datetime | None
     active_periods: tuple[tuple[datetime, datetime | None], ...]
+
+    def applies_to(
+        self, *, station_id: str | None = None, region_id: str | None = None
+    ) -> bool:
+        """Return True if the alert applies to the place these values describe.
+
+        "If both ``station_ids`` and ``region_ids`` are omitted, this alert
+        affects the entire system": it applies everywhere. Otherwise it
+        applies to a station it lists, and to a region it lists -- so
+        describe a station in full, ``station_id=S, region_id=R``, for an
+        alert on its region to apply to it.
+        """
+        if not self.station_ids and not self.region_ids:
+            return True
+        return (station_id is not None and station_id in self.station_ids) or (
+            region_id is not None and region_id in self.region_ids
+        )
+
+    def is_active(self, at: datetime) -> bool:
+        """Return True if the alert is in effect at the given instant.
+
+        An alert with no times is in effect while it is in the feed (GBFS's
+        times are optional). A period is in effect from its start, up to
+        but not including its end -- as :meth:`ServiceAlert.is_active`
+        reads GTFS-RT's -- and with no end, from its start on.
+        """
+        if not self.active_periods:
+            return True
+        return any(
+            start <= at and (end is None or at < end)
+            for start, end in self.active_periods
+        )
 
 
 @dataclass(frozen=True)
@@ -1324,7 +1412,7 @@ class GbfsSystemInfo:
 class StaticBuildProgress:
     """Progress of a static dataset acquisition (download, then index)."""
 
-    phase: str  # "download" or "index"
+    phase: StaticBuildPhase
     done_bytes: int
     total_bytes: int | None
 

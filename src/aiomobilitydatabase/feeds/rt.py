@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
-from enum import StrEnum
 from http import HTTPStatus
 from typing import Any
 
@@ -19,6 +18,7 @@ from ._freshness import hops as _hops
 from ._language import is_preferred_language
 from ._redirects import get_withholding, network
 from ._urls import _require_http_url, redact
+from ._vocab import vocab_or_none
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
     AlertCause,
@@ -86,24 +86,6 @@ def _pb_enum_name(enum_type: Any, value: int) -> str | None:
     """
     try:
         return str(enum_type.Name(value))
-    except ValueError:
-        return None
-
-
-def _vocab_or_none[StrEnumT: StrEnum](
-    enum_cls: type[StrEnumT], name: str | None
-) -> StrEnumT | None:
-    """Model-boundary StrEnum conversion: unknown/future names become None.
-
-    Mirrors the static side's ``_enum_or_none``: protobuf vocabularies are
-    closed per bindings version, but the spec adds members over time, so a
-    name the model enum doesn't know (newer bindings than this library)
-    must degrade to None, never raise.
-    """
-    if name is None:
-        return None
-    try:
-        return enum_cls(name)
     except ValueError:
         return None
 
@@ -752,7 +734,7 @@ def _carriages(
         CarriageDetail(
             id=carriage.id or None,
             label=carriage.label or None,
-            occupancy_status=_vocab_or_none(
+            occupancy_status=vocab_or_none(
                 OccupancyStatus,
                 _pb_enum_name(
                     gtfs_realtime_pb2.VehiclePosition.OccupancyStatus,
@@ -805,7 +787,7 @@ def vehicles_from_message(
             vehicle.trip.route_id or trip_routes.get(vehicle.trip.trip_id) or None
         )
         occupancy = (
-            _vocab_or_none(
+            vocab_or_none(
                 OccupancyStatus,
                 _pb_enum_name(
                     gtfs_realtime_pb2.VehiclePosition.OccupancyStatus,
@@ -819,7 +801,7 @@ def vehicles_from_message(
         # with one, "If current_status is missing IN_TRANSIT_TO is assumed"
         # (the proto2 default an unset field reads as).
         current_status = (
-            _vocab_or_none(
+            vocab_or_none(
                 VehicleStopStatus,
                 _pb_enum_name(
                     gtfs_realtime_pb2.VehiclePosition.VehicleStopStatus,
@@ -830,7 +812,7 @@ def vehicles_from_message(
             else None
         )
         congestion = (
-            _vocab_or_none(
+            vocab_or_none(
                 CongestionLevel,
                 _pb_enum_name(
                     gtfs_realtime_pb2.VehiclePosition.CongestionLevel,
@@ -856,7 +838,7 @@ def vehicles_from_message(
                 route=routes_by_id.get(route_id) if route_id else None,
                 trip_id=vehicle.trip.trip_id or None,
                 trip_start_date=_trip_start_date(vehicle.trip),
-                trip_start_secs=_trip_start_secs(vehicle.trip),
+                trip_start_time=gtfs_time(_trip_start_secs(vehicle.trip)),
                 occupancy_status=occupancy,
                 occupancy_percentage=_occupancy_percentage(vehicle),
                 carriages=_carriages(vehicle),
@@ -1286,6 +1268,16 @@ def _trip_start_secs(trip: _Started) -> int | None:
         return parse_gtfs_time(trip.start_time)
     except FeedParseError:
         return None
+
+
+def gtfs_time(secs: int | None) -> timedelta | None:
+    """Return a GTFS time in seconds as the models carry one: a timedelta."""
+    return None if secs is None else timedelta(seconds=secs)
+
+
+def whole_seconds(time: timedelta) -> int:
+    """Return a model's GTFS time (a timedelta of whole seconds) in seconds."""
+    return time // timedelta(seconds=1)
 
 
 def _trip_start_date(trip: _Started) -> date | None:
@@ -1726,7 +1718,7 @@ def _trip_selector(trip: gtfs_realtime_pb2.TripDescriptor) -> TripSelector | Non
         route_id=trip.route_id or None,
         direction_id=trip.direction_id if trip.HasField("direction_id") else None,
         start_date=start_date,
-        start_secs=start_secs,
+        start_time=gtfs_time(start_secs),
     )
 
 
@@ -1778,17 +1770,17 @@ def alerts_from_message(message: gtfs_realtime_pb2.FeedMessage) -> list[ServiceA
                 tts_description=_first_translation(alert.tts_description_text),
                 # Unset reads as the declared default (proto2's getter):
                 # UNKNOWN_CAUSE, UNKNOWN_EFFECT, UNKNOWN_SEVERITY.
-                cause=_vocab_or_none(
+                cause=vocab_or_none(
                     AlertCause,
                     _pb_enum_name(gtfs_realtime_pb2.Alert.Cause, alert.cause),
                 ),
                 cause_detail=_first_translation(alert.cause_detail),
-                effect=_vocab_or_none(
+                effect=vocab_or_none(
                     AlertEffect,
                     _pb_enum_name(gtfs_realtime_pb2.Alert.Effect, alert.effect),
                 ),
                 effect_detail=_first_translation(alert.effect_detail),
-                severity=_vocab_or_none(
+                severity=vocab_or_none(
                     AlertSeverity,
                     _pb_enum_name(
                         gtfs_realtime_pb2.Alert.SeverityLevel, alert.severity_level

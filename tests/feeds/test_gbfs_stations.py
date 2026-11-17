@@ -4,10 +4,13 @@ import copy
 import dataclasses
 import json
 import pickle
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds._vocab import vocab_or_none
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import FeedParseError, SourceConnectionError
 from aiomobilitydatabase.feeds.gbfs import (
@@ -19,6 +22,12 @@ from aiomobilitydatabase.feeds.gbfs import (
     _reported_at,
 )
 from aiomobilitydatabase.feeds.geo import Circle
+from aiomobilitydatabase.feeds.models import (
+    GbfsAlert,
+    GbfsAlertType,
+    GbfsFormFactor,
+    GbfsPropulsionType,
+)
 
 from tests.feeds.fixtures import (
     FREE_BIKE_STATUS_23,
@@ -672,8 +681,8 @@ async def test_lookup_documents_resolve_the_ids_rows_reference(
 
     types = {t.id: t for t in await handle.get_vehicle_types()}
     assert set(types) == {"ebike", "scooter"}  # the id-less row is skipped
-    assert types["ebike"].form_factor == "bicycle"
-    assert types["ebike"].propulsion_type == "electric_assist"
+    assert types["ebike"].form_factor is GbfsFormFactor.BICYCLE
+    assert types["ebike"].propulsion_type is GbfsPropulsionType.ELECTRIC_ASSIST
     assert types["ebike"].max_range_m == 60000.0
     assert types["ebike"].rider_capacity == 1
     assert types["scooter"].name is None
@@ -692,7 +701,7 @@ async def test_system_alerts_scope_to_stations_and_regions(
     handle = await _lookup_handle(mock_api, feeds_client)
     [alert] = await handle.get_alerts()
     assert alert.id == "a1"
-    assert alert.type == "SYSTEM_CLOSURE"
+    assert alert.type is GbfsAlertType.SYSTEM_CLOSURE  # v1.0-v2.0 spelling
     assert alert.summary == "Closed for a storm"
     # A numeric id is a legitimate GBFS id and is coerced, matching
     # _record_id elsewhere; only a null entry is dropped.
@@ -871,3 +880,132 @@ async def test_mapping_fields_are_frozen_and_serializable(
         encoded = json.loads(json.dumps(dataclasses.asdict(model), default=str))
         assert encoded["rental_uris"] == dict(model.rental_uris)
         assert hash(model) == hash(copy.deepcopy(model))
+
+
+_GBFS_VOCABULARIES = (GbfsFormFactor, GbfsPropulsionType, GbfsAlertType)
+
+
+@given(
+    vocabulary=st.sampled_from(_GBFS_VOCABULARIES),
+    value=st.one_of(
+        st.sampled_from(
+            [m.value for v in _GBFS_VOCABULARIES for m in v]
+            + [m.value.upper() for v in _GBFS_VOCABULARIES for m in v]
+            + ["Bicycle", "scooted_seated", "", "hoverboard"]
+        ),
+        st.text(max_size=20),
+        st.integers(),
+        st.none(),
+    ),
+)
+def test_a_gbfs_enumeration_takes_its_spec_values_and_nothing_else(
+    vocabulary: type[GbfsFormFactor | GbfsPropulsionType | GbfsAlertType],
+    value: object,
+) -> None:
+    """Each value the spec lists is its member; anything else -- a value a
+    newer GBFS adds, another case, no string at all -- is None, as with the
+    GTFS-RT enumerations. Alert types alone also take v1.0-v2.0's upper
+    case spelling of a value."""
+    members = {member.value: member for member in vocabulary}
+    if vocabulary is GbfsAlertType:
+        members |= {member.name: member for member in vocabulary}
+    expected = members.get(value) if isinstance(value, str) else None
+    assert vocab_or_none(vocabulary, value) is expected
+
+
+def _gbfs_alert(
+    station_ids: tuple[str, ...] = (),
+    region_ids: tuple[str, ...] = (),
+    active_periods: tuple[tuple[datetime, datetime | None], ...] = (),
+) -> GbfsAlert:
+    return GbfsAlert(
+        id="a",
+        type=None,
+        summary=None,
+        description=None,
+        url=None,
+        station_ids=station_ids,
+        region_ids=region_ids,
+        last_updated=None,
+        active_periods=active_periods,
+    )
+
+
+def test_a_gbfs_alert_applies_system_wide_or_to_what_it_lists() -> None:
+    system = _gbfs_alert()
+    assert system.applies_to()
+    assert system.applies_to(station_id="s9", region_id="r9")
+    station = _gbfs_alert(station_ids=("s1",))
+    assert station.applies_to(station_id="s1")
+    assert not station.applies_to(station_id="s2", region_id="r1")
+    assert not station.applies_to()
+    region = _gbfs_alert(region_ids=("r1",))
+    assert region.applies_to(station_id="s2", region_id="r1")
+    assert not region.applies_to(station_id="s2")  # describe the station in full
+
+
+_IDS = st.lists(st.sampled_from(["a", "b", "c"]), max_size=3).map(tuple)
+
+
+@given(
+    station_ids=_IDS,
+    region_ids=_IDS,
+    station_id=st.none() | st.sampled_from(["a", "b", "c"]),
+    region_id=st.none() | st.sampled_from(["a", "b", "c"]),
+)
+def test_gbfs_alert_scope_matches_the_spec(
+    station_ids: tuple[str, ...],
+    region_ids: tuple[str, ...],
+    station_id: str | None,
+    region_id: str | None,
+) -> None:
+    """ "If both station_ids and region_ids are omitted, this alert affects
+    the entire system"; otherwise the stations and regions it lists."""
+    alert = _gbfs_alert(station_ids, region_ids)
+    expected = (not station_ids and not region_ids) or (
+        station_id in station_ids or region_id in region_ids
+    )
+    assert alert.applies_to(station_id=station_id, region_id=region_id) is expected
+
+
+_T0 = datetime(2026, 7, 31, 12, tzinfo=UTC)
+
+
+def test_a_gbfs_alert_is_active_from_each_start_until_its_end() -> None:
+    assert _gbfs_alert().is_active(_T0)  # no times: in effect while listed
+    period = _gbfs_alert(active_periods=((_T0, _T0 + timedelta(hours=1)),))
+    assert not period.is_active(_T0 - timedelta(seconds=1))
+    assert period.is_active(_T0)
+    assert not period.is_active(_T0 + timedelta(hours=1))  # end excluded
+    open_ended = _gbfs_alert(active_periods=((_T0, None),))
+    assert open_ended.is_active(_T0 + timedelta(days=400))
+    assert not open_ended.is_active(_T0 - timedelta(seconds=1))
+
+
+@given(
+    periods=st.lists(
+        st.tuples(
+            st.integers(-5, 5),
+            st.none() | st.integers(0, 5),
+        ),
+        max_size=3,
+    ),
+    at=st.integers(-6, 11),
+)
+def test_gbfs_alert_activity_matches_its_periods(
+    periods: list[tuple[int, int | None]], at: int
+) -> None:
+    """In effect at t when t is in some period, start included, end not;
+    with no periods, always."""
+    hour = timedelta(hours=1)
+    active_periods = tuple(
+        (_T0 + start * hour, None if length is None else _T0 + (start + length) * hour)
+        for start, length in periods
+    )
+    expected = not periods or any(
+        start <= at and (length is None or at < start + length)
+        for start, length in periods
+    )
+    assert _gbfs_alert(active_periods=active_periods).is_active(_T0 + at * hour) is (
+        expected
+    )
