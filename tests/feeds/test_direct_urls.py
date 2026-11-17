@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 import pytest
@@ -1086,6 +1087,11 @@ _UNSENDABLE_CREDENTIALS = [
     ("http://:%F0%9F%9A%B2@127.0.0.1:9/f", "outside Latin-1"),  # password alone
     ("http://a%3Ab:p@127.0.0.1:9/f", "colon"),
     ("http://a%0Ab:p@127.0.0.1:9/f", "control character"),
+    # Octets that aren't UTF-8: yarl leaves them escaped, and the three
+    # characters "%FF" were sent in the byte's place.
+    ("http://u:%FF@127.0.0.1:9/f", "aren't UTF-8 text"),
+    ("http://%80:pw@127.0.0.1:9/f", "aren't UTF-8 text"),
+    ("http://u:p%C3@127.0.0.1:9/f", "aren't UTF-8 text"),  # a cut-off sequence
 ]
 
 
@@ -1786,3 +1792,30 @@ async def test_a_producer_url_with_credentials_beside_an_authorization_header(
             await handle.get_system_info()
     assert caught.value.__context__ is None
     assert "/si" not in [r.path for r in mock_api.requests]
+
+
+@given(user=st.binary(max_size=6), password=st.binary(max_size=6))
+@settings(max_examples=300)
+def test_percent_escaped_credentials_are_sent_only_as_the_text_they_spell(
+    user: bytes, password: bytes
+) -> None:
+    """Credentials in a URL are percent-escaped octets: refused unless they
+    spell UTF-8 text Basic auth can send, and then sent as that text."""
+    url = f"http://{quote(user, safe='')}:{quote(password, safe='')}@h/f"
+    try:
+        text = (user.decode("utf-8"), password.decode("utf-8"))
+    except UnicodeDecodeError:
+        text = None
+    sendable = (
+        text is not None
+        and ":" not in text[0]
+        and all(" " <= ch <= "\xff" and ch != "\x7f" for ch in text[0] + text[1])
+    )
+    if not sendable:
+        with pytest.raises(SourceConnectionError):
+            _require_http_url(url, "test URL")
+        return
+    _require_http_url(url, "test URL")
+    assert text is not None
+    parsed = URL(url)
+    assert ((parsed.user or ""), (parsed.password or "")) == text

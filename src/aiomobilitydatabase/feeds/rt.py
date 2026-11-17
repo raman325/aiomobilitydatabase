@@ -1642,11 +1642,16 @@ def _first_translation(translated: object) -> str | None:
     English). A translation without text is no translation. Where none
     of those exist, the first translation with text: some text over none,
     as for GBFS. None when there is none.
+
+    Text that isn't text is no text either: a message the library parses
+    has none (:func:`_parse_feed_message`), but upb hands a proto2
+    string's invalid UTF-8 back as ``bytes`` to a caller who parsed one
+    itself, and ``str()`` would make the bytes' repr of it.
     """
     usable = [
         candidate
         for candidate in getattr(translated, "translation", ())
-        if candidate.text
+        if isinstance(candidate.text, str) and candidate.text
     ]
     for candidate in usable:
         if is_preferred_language(candidate.language):

@@ -744,7 +744,7 @@ async def test_an_id_that_is_no_str_is_refused(
     mock_api: MockApi, client: MobilityDatabaseClient, feed_id: Any
 ) -> None:
     """b".." isn't "..": without the type check it reached /v1/."""
-    with pytest.raises(TypeError, match="must be a str"):
+    with pytest.raises(TypeError, match="feed_id must be str, not"):
         await client.get_feed(feed_id)
     assert mock_api.requests == []
 

@@ -123,6 +123,40 @@ async def test_an_optional_file_answering_404_is_no_records(
     assert excinfo.value.status == 500
 
 
+@pytest.mark.parametrize("vehicle_file", ["vehicle_status", "free_bike_status"])
+@pytest.mark.parametrize("docked", [True, False])
+async def test_a_vehicle_file_answering_404_is_no_records_only_where_optional(
+    mock_api: MockApi,
+    direct_client: MobilityFeedsClient,
+    vehicle_file: str,
+    docked: bool,
+) -> None:
+    """vehicle_status (free_bike_status before 3.0) is "REQUIRED for free
+    floating (dockless) vehicles. OPTIONAL for station based (docked)
+    vehicles": its 404 is no vehicles for a system publishing stations, and
+    still an error for one that doesn't. Any other error is one for both."""
+    names = [vehicle_file, *(["station_information"] if docked else [])]
+    feeds = [
+        {"name": name, "url": mock_api.url(f"/gbfs/{name}.json")} for name in names
+    ]
+    mock_api.get(
+        "/gbfs/gbfs.json", payload={**_doc({"feeds": feeds}), "version": "3.0"}
+    )
+    path = f"/gbfs/{vehicle_file}.json"
+    mock_api.get(path, status=404, body=b"", content_type="text/plain")
+    mock_api.get(path, status=500, body=b"", content_type="text/plain")
+    handle = await direct_client.get_gbfs_feed_from_url(mock_api.url("/gbfs/gbfs.json"))
+    if docked:
+        assert await handle.get_vehicles() == []
+    else:
+        with pytest.raises(SourceConnectionError) as missing:
+            await handle.get_vehicles()
+        assert missing.value.status == 404
+    with pytest.raises(SourceConnectionError) as failed:
+        await handle.get_vehicles()
+    assert failed.value.status == 500
+
+
 # -- D5: the discovery document's ttl --------------------------------------------
 
 

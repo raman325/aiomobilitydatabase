@@ -50,6 +50,7 @@ from aiomobilitydatabase.feeds.rt import (
     alerts_from_message,
     fetch_feed_message,
     resolve_trip_predictions,
+    stops_from_message,
     trip_modifications_from_message,
     trip_updates_from_message,
     vehicles_from_message,
@@ -1767,3 +1768,39 @@ def test_trip_modifications_without_a_usable_service_date_are_skipped(
     entity.trip_modifications.selected_trips.add().trip_ids.append("T1")
     entity.trip_modifications.service_dates.extend(dates)
     assert trip_modifications_from_message(message) == []
+
+
+def _message_with_text(raw: bytes) -> gtfs_realtime_pb2.FeedMessage:
+    """A stop and an alert whose only translation's text is ``raw``, as upb
+    parses it for a caller who skips the library's parse: a proto2 string
+    keeps whatever octets it was sent. Built with placeholder text of the
+    same length, so every enclosing length prefix still holds."""
+    mark = "Q" * len(raw)
+    built = gtfs_realtime_pb2.FeedMessage()
+    built.header.gtfs_realtime_version = "2.0"
+    stop = built.entity.add(id="s")
+    stop.stop.stop_id = "S1"
+    stop.stop.stop_name.translation.add(text=mark)
+    alert = built.entity.add(id="a")
+    alert.alert.informed_entity.add(stop_id="S1")
+    alert.alert.header_text.translation.add(text=mark)
+    wire = built.SerializeToString()
+    marked = b"\x0a" + bytes([len(raw)]) + mark.encode()  # translation.text
+    assert wire.count(marked) == 2
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.ParseFromString(wire.replace(marked, marked[:2] + raw))
+    return message
+
+
+@given(raw=st.binary(min_size=1, max_size=8))
+def test_translated_text_is_the_text_its_octets_spell_or_none(raw: bytes) -> None:
+    """A translation whose octets aren't UTF-8 is no text: the bytes' repr
+    ("b'\\x80'") was returned as a stop's name and an alert's header."""
+    try:
+        expected: str | None = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        expected = None
+    message = _message_with_text(raw)
+    assert stops_from_message(message)["S1"].name == expected
+    [alert] = alerts_from_message(message)
+    assert alert.header == expected

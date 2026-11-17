@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
+from urllib.parse import unquote
 
 from yarl import URL
 
@@ -101,7 +102,15 @@ def _credentials_problem(parsed: URL) -> str | None:
     RFC 7617 section 2: neither user-id nor password holds a control
     character, and the user-id no colon (it ends the user-id); and every
     character must be one the Basic credentials are encoded to (Latin-1).
+    First of all they must be text: percent-escaped octets that aren't
+    UTF-8 (``%FF``) are none, and yarl leaves them escaped, so the three
+    characters ``%FF`` would be sent in the byte's place.
     """
+    for raw in (parsed.raw_user, parsed.raw_password):
+        try:
+            unquote(raw or "", errors="strict")
+        except UnicodeDecodeError:
+            return "the URL's credentials aren't UTF-8 text"
     user, password = parsed.user or "", parsed.password or ""
     if _CONTROL.search(user) or _CONTROL.search(password):
         return "the URL's credentials hold a control character"

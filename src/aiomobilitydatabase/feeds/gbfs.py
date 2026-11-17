@@ -880,7 +880,11 @@ class GbfsFeedHandle:
         """Vehicles not in active rental, optionally filtered to a circular zone.
 
         Uses ``vehicle_status`` (GBFS 3.x) when published, else falls back to
-        ``free_bike_status`` (2.x). Returns [] for docked-only systems.
+        ``free_bike_status`` (2.x). Returns [] for docked-only systems,
+        and for a docked system (one publishing ``station_information``)
+        whose listed vehicle file answers 404: the file is OPTIONAL there,
+        and "a 404 of an OPTIONAL file SHOULD NOT be considered an error".
+        For a dockless system it is REQUIRED, so its 404 still raises.
         Filtering is client-side: GBFS has no server-side geo-query.
         Rows without a usable id are skipped. A vehicle at a station need not
         report coordinates (``lat``/``lon`` are REQUIRED only without a
@@ -891,13 +895,23 @@ class GbfsFeedHandle:
         """
         endpoints = await self._endpoint_table()
         if "vehicle_status" in endpoints:
-            rows = _rows(await self._document("vehicle_status", endpoints), "vehicles")
-            id_key = "vehicle_id"
+            name, key, id_key = "vehicle_status", "vehicles", "vehicle_id"
         elif "free_bike_status" in endpoints:
-            rows = _rows(await self._document("free_bike_status", endpoints), "bikes")
-            id_key = "bike_id"
+            name, key, id_key = "free_bike_status", "bikes", "bike_id"
         else:
             return []
+        try:
+            rows = _rows(await self._document(name, endpoints), key)
+        except SourceConnectionError as err:
+            # The file is OPTIONAL for a docked system (one publishing
+            # station_information) and REQUIRED for a dockless one, so its
+            # 404 is "no records" only for the first (see _optional_rows).
+            if (
+                err.status == HTTPStatus.NOT_FOUND
+                and "station_information" in endpoints
+            ):
+                return []
+            raise
         station_at = (
             await self._station_positions(endpoints)
             if zone is not None

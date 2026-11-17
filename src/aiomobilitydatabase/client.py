@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 import ipaddress
 import math
 import re
+import types
+import typing
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from http import HTTPStatus
@@ -134,6 +139,61 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _fits(value: Any, expected: Any) -> bool:
+    """Whether ``value`` is of the annotated type ``expected``.
+
+    The annotations the catalog methods use: a union (``X | None``), a
+    class, ``list[T]`` (a list or tuple of T, as the encoder takes) and a
+    fixed-length ``tuple``. A bool is no int (``limit=True``), and an int is
+    a float, as typing reads it.
+    """
+    origin = typing.get_origin(expected)
+    arguments = typing.get_args(expected)
+    if origin in (types.UnionType, typing.Union):
+        return any(_fits(value, arm) for arm in arguments)
+    if origin in (list, tuple):
+        if not isinstance(value, list | tuple):
+            return False
+        # list[T]: any number of T; tuple[A, B]: exactly an A and a B.
+        items = arguments * len(value) if origin is list else arguments
+        return len(value) == len(items) and all(map(_fits, value, items))
+    if isinstance(value, bool) and expected is not bool:
+        return False
+    return isinstance(value, int | float if expected is float else expected)
+
+
+def _typed[**P, R](
+    method: Callable[P, Coroutine[Any, Any, R]],
+) -> Callable[P, Coroutine[Any, Any, R]]:
+    """Check a catalog method's arguments against its annotations.
+
+    The encoder takes any value of a type some parameter takes, so
+    ``limit=0.5``, ``limit="abc"`` or ``provider=7`` would reach the API as
+    a filter it was never meant to be: the caller's TypeError instead,
+    raised before any request. The annotations are read on the first call
+    (they are strings until then).
+    """
+    signature = inspect.signature(method)
+    expected: dict[str, Any] = {}
+
+    @functools.wraps(method)
+    async def checked(*args: P.args, **kwargs: P.kwargs) -> R:
+        if not expected:
+            hints = typing.get_type_hints(method)
+            expected.update(
+                (name, hints[name])
+                for name in signature.parameters
+                if name != "self" and name in hints
+            )
+        for name, value in signature.bind(*args, **kwargs).arguments.items():
+            if name in expected and not _fits(value, expected[name]):
+                shown = method.__annotations__[name]  # as written: "int | None"
+                raise TypeError(f"{name} must be {shown}, not {type(value).__name__}")
+        return await method(*args, **kwargs)
+
+    return checked
 
 
 class _Repeated(tuple[Any, ...]):
@@ -558,6 +618,7 @@ class MobilityDatabaseClient:
         data = await self._request("GET", "/v1/metadata")
         return _one(Metadata, data)
 
+    @_typed
     async def get_feeds(
         self,
         *,
@@ -583,11 +644,13 @@ class MobilityDatabaseClient:
         )
         return _many(Feed, data)
 
+    @_typed
     async def get_feed(self, feed_id: str) -> Feed:
         """Get a single feed by ID."""
         data = await self._request("GET", f"/v1/feeds/{_quote_segment(feed_id)}")
         return _one(Feed, data)
 
+    @_typed
     async def get_gtfs_feeds(
         self,
         *,
@@ -623,11 +686,13 @@ class MobilityDatabaseClient:
         )
         return _many(GtfsFeed, data)
 
+    @_typed
     async def get_gtfs_feed(self, feed_id: str) -> GtfsFeed:
         """Get a single GTFS feed by ID."""
         data = await self._request("GET", f"/v1/gtfs_feeds/{_quote_segment(feed_id)}")
         return _one(GtfsFeed, data)
 
+    @_typed
     async def get_gtfs_rt_feeds(
         self,
         *,
@@ -659,6 +724,7 @@ class MobilityDatabaseClient:
         )
         return _many(GtfsRtFeed, data)
 
+    @_typed
     async def get_gtfs_rt_feed(self, feed_id: str) -> GtfsRtFeed:
         """Get a single GTFS Realtime feed by ID."""
         data = await self._request(
@@ -666,6 +732,7 @@ class MobilityDatabaseClient:
         )
         return _one(GtfsRtFeed, data)
 
+    @_typed
     async def get_gbfs_feeds(
         self,
         *,
@@ -697,11 +764,13 @@ class MobilityDatabaseClient:
         )
         return _many(GbfsFeed, data)
 
+    @_typed
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeed:
         """Get a single GBFS feed by ID."""
         data = await self._request("GET", f"/v1/gbfs_feeds/{_quote_segment(feed_id)}")
         return _one(GbfsFeed, data)
 
+    @_typed
     async def get_gtfs_feed_datasets(
         self,
         feed_id: str,
@@ -726,6 +795,7 @@ class MobilityDatabaseClient:
         )
         return _many(GtfsDataset, data)
 
+    @_typed
     async def get_gtfs_feed_gtfs_rt_feeds(self, feed_id: str) -> list[GtfsRtFeed]:
         """Get GTFS Realtime feeds related to a GTFS feed."""
         data = await self._request(
@@ -733,6 +803,7 @@ class MobilityDatabaseClient:
         )
         return _many(GtfsRtFeed, data)
 
+    @_typed
     async def get_gtfs_feed_availability(
         self,
         feed_id: str,
@@ -757,6 +828,7 @@ class MobilityDatabaseClient:
         )
         return _one(GtfsFeedAvailability, data)
 
+    @_typed
     async def get_gtfs_feed_reliability(self, feed_id: str) -> FeedReliabilityReport:
         """Get a GTFS feed's Seal of Reliability, with each criterion's state."""
         data = await self._request(
@@ -764,6 +836,7 @@ class MobilityDatabaseClient:
         )
         return _one(FeedReliabilityReport, data)
 
+    @_typed
     async def get_gtfs_feed_continuous_coverage(
         self,
         feed_id: str,
@@ -786,6 +859,7 @@ class MobilityDatabaseClient:
         )
         return _one(GtfsFeedContinuousCoverage, data)
 
+    @_typed
     async def get_gtfs_feed_validation_reports(
         self,
         feed_id: str,
@@ -818,6 +892,7 @@ class MobilityDatabaseClient:
         )
         return _one(GtfsFeedValidationReports, data)
 
+    @_typed
     async def get_dataset_gtfs(self, dataset_id: str) -> GtfsDataset:
         """Get a single GTFS dataset by ID."""
         data = await self._request(
@@ -825,6 +900,7 @@ class MobilityDatabaseClient:
         )
         return _one(GtfsDataset, data)
 
+    @_typed
     async def search_feeds(
         self,
         *,
@@ -864,6 +940,7 @@ class MobilityDatabaseClient:
         )
         return _one(SearchResults, data)
 
+    @_typed
     async def get_locations(
         self,
         *,
@@ -889,6 +966,7 @@ class MobilityDatabaseClient:
         )
         return _one(LocationSearchResults, data)
 
+    @_typed
     async def get_licenses(
         self, *, limit: int | None = None, offset: int | None = None
     ) -> list[License]:
@@ -898,11 +976,13 @@ class MobilityDatabaseClient:
         )
         return _many(License, data)
 
+    @_typed
     async def get_license(self, license_id: str) -> LicenseWithRules:
         """Get a single license, including its rules."""
         data = await self._request("GET", f"/v1/licenses/{_quote_segment(license_id)}")
         return _one(LicenseWithRules, data)
 
+    @_typed
     async def get_matching_licenses(self, license_url: str) -> list[MatchingLicense]:
         """Match a license URL against the license database."""
         if not isinstance(license_url, str):

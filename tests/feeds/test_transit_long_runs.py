@@ -19,6 +19,7 @@ from hypothesis import example, given
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds import transit as transit_module
+from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import ArrivalsQuery, StopArrival, TripQuery
 from aiomobilitydatabase.feeds.transit import TransitFeedHandle
 
@@ -1607,3 +1608,39 @@ def test_a_plain_trips_own_start_time_reaches_its_journey() -> None:
         assert trip.delay_seconds == 300
 
     _run(_index_from_zip_bytes(feed), body, message)
+
+
+_STORABLE = 2**63 - 1  # SQLite's INTEGER
+
+
+def _clock(secs: int) -> str:
+    hours, rest = divmod(secs, 3600)
+    return f"{hours}:{rest // 60:02}:{rest % 60:02}"
+
+
+@given(
+    first=st.integers(0, 10**6),
+    span=st.integers(0, 10**6),
+    start=st.integers(_STORABLE - 3 * 10**6, _STORABLE - 1),
+)
+@example(first=0, span=3600, start=_STORABLE - 3600)  # the last storable second
+@example(first=0, span=3600, start=_STORABLE - 3599)  # one past it
+def test_a_repetition_past_what_can_be_stored_fails_the_build_in_words(
+    first: int, span: int, start: int
+) -> None:
+    """Every time was storable as read, but a frequency repetition adds its
+    shift: the build fails naming the trip, not with an OverflowError at
+    INSERT, and only when a repeated time can't be stored."""
+    feed = _feed(
+        f"T,{_clock(first)},{_clock(first)},A,1\n"
+        f"T,{_clock(first + span)},{_clock(first + span)},B,2\n",
+        extra={
+            "frequencies.txt": "trip_id,start_time,end_time,headway_secs\n"
+            f"T,{_clock(start)},{_clock(start + 1)},600\n"
+        },
+    )
+    if start + span <= _STORABLE:  # the one repetition's last call
+        _index_from_zip_bytes(feed)
+    else:
+        with pytest.raises(FeedParseError, match="frequency trip 'T'"):
+            _index_from_zip_bytes(feed)
