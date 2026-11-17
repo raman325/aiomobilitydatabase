@@ -41,6 +41,7 @@ from tests.feeds.fixtures import (
     build_gtfs_zip_bytes,
     with_base,
 )
+from tests.feeds.test_static_build import damage_page
 from tests.mock_server import MockApi
 
 PB = "application/octet-stream"
@@ -143,6 +144,49 @@ async def test_direct_transit_cache_hit_skips_download(
     assert {stop.id for stop in handle.stops} == {"S1", "S2", "S3", "ST1"}
     assert len(_requests_for(mock_api, "HEAD", STATIC_PATH)) == 2
     assert len(_requests_for(mock_api, "GET", STATIC_PATH)) == 1
+
+
+@pytest.mark.parametrize("damaged", ["stops", "routes", "stop_times"])
+async def test_a_damaged_cached_index_is_rebuilt(
+    mock_api: MockApi,
+    direct_client_cached: MobilityFeedsClient,
+    tmp_path: Path,
+    damaged: str,
+) -> None:
+    """One bad page in the cached file -- in stops or routes, which the
+    handle reads as it opens, or stop_times, which a query would meet --
+    and the next acquisition rebuilds from the zip instead of failing."""
+    mock_api.head(STATIC_PATH, headers={"ETag": '"v1"'})
+    mock_api.get(
+        STATIC_PATH,
+        body=build_gtfs_zip_bytes(),
+        content_type="application/zip",
+        headers={"ETag": '"v1"'},
+    )
+    handle = await direct_client_cached.get_transit_feed_from_urls(
+        mock_api.url(STATIC_PATH)
+    )
+    handle.close()
+    damage_page(tmp_path / handle.static_feed_id / "static.db", damaged)
+    mock_api.head(STATIC_PATH, headers={"ETag": '"v1"'})
+    mock_api.get(
+        STATIC_PATH,
+        body=build_gtfs_zip_bytes(),
+        content_type="application/zip",
+        headers={"ETag": '"v1"'},
+    )
+    handle = await direct_client_cached.get_transit_feed_from_urls(
+        mock_api.url(STATIC_PATH)
+    )
+    try:
+        assert {stop.id for stop in handle.stops} == {"S1", "S2", "S3", "ST1"}
+        [board] = await handle.get_scheduled_departures(
+            [ArrivalsQuery(["S1"], limit=1)], start=NOW
+        )
+        assert board
+    finally:
+        handle.close()
+    assert len(_requests_for(mock_api, "GET", STATIC_PATH)) == 2  # rebuilt
 
 
 async def test_direct_refresh_static_etag(

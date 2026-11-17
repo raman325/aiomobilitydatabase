@@ -3,16 +3,21 @@
 import io
 import os
 import sqlite3
+import struct
 import traceback
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 import pytest
-from hypothesis import given
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds._numbers import exact_number
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import StopLocationType
 from aiomobilitydatabase.feeds.static_index import (
@@ -25,7 +30,11 @@ from aiomobilitydatabase.feeds.static_index import (
     parse_gtfs_time,
 )
 
-from tests.feeds.fixtures import _FILES, build_gtfs_zip_bytes
+from tests.feeds.fixtures import (
+    _FILES,
+    build_flex_gtfs_zip_bytes,
+    build_gtfs_zip_bytes,
+)
 
 DATASET = "mdb-100-202607310000"
 TZ = "America/Los_Angeles"
@@ -1017,6 +1026,11 @@ def test_an_ascii_decimal_coordinate_reads_as_written(
         (3, "180.0001"),
         (3, "-181"),
         (3, "1e300"),
+        # Past the limit as written, though each one's double is the limit.
+        (2, "90.000000000000001"),
+        (2, "-90.0000000000000000000000000001"),
+        (3, "180.00000000000001"),
+        (3, "-1800000000000000000000000000001e-28"),
     ],
 )
 def test_a_coordinate_outside_wgs84_fails_the_build(
@@ -1033,7 +1047,15 @@ def test_a_coordinate_outside_wgs84_fails_the_build(
 
 
 @pytest.mark.parametrize(
-    ("lat", "lon"), [("90", "180"), ("-90", "-180"), ("+90.0", "-180.000")]
+    ("lat", "lon"),
+    [
+        ("90", "180"),
+        ("-90", "-180"),
+        ("+90.0", "-180.000"),
+        ("9e1", "18000000000000000000000000000000e-29"),
+        # Inside as written; its double is the limit, which is a place.
+        ("89.99999999999999999", "-179.99999999999999999"),
+    ],
 )
 def test_the_wgs84_edges_are_coordinates(tmp_path: Path, lat: str, lon: str) -> None:
     files = dict(_FILES)
@@ -1046,6 +1068,50 @@ def test_the_wgs84_edges_are_coordinates(tmp_path: Path, lat: str, lon: str) -> 
     )
     assert (stored[2], stored[3]) == (float(lat), float(lon))
     index.close()
+
+
+_LIMIT_OFFSETS = st.integers(1, 40).map(lambda places: Decimal(10) ** -places)
+
+
+@given(
+    limit=st.sampled_from([90, 180]),
+    side=st.sampled_from([-1, 1]),
+    offset=st.one_of(_LIMIT_OFFSETS, _LIMIT_OFFSETS.map(lambda d: -d), st.just(0)),
+    spelling=st.sampled_from(["plain", "exponent"]),
+)
+def test_a_coordinate_is_in_range_exactly_as_written(
+    limit: int, side: int, offset: Decimal, spelling: str
+) -> None:
+    """At any distance from either limit, however small: refused iff the
+    text's own value is past it -- even where its double is the limit."""
+    value = side * (limit + offset)
+    text = f"{value:f}" if spelling == "plain" else f"{value:E}"
+    inside = abs(Fraction(text)) <= limit  # an exact oracle, not Decimal
+    if inside:
+        assert _coordinate(text, "stop_lat", limit) == float(text)
+    else:
+        with pytest.raises(ValueError, match="outside"):
+            _coordinate(text, "stop_lat", limit)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("90.000000000000001", Decimal("90.000000000000001")),
+        (" -.5e1\t", Decimal(-5)),
+        # Exponents past what Decimal holds: infinitely far, or zero.
+        ("9e9999999999999999999999", Decimal("Infinity")),
+        ("-9e9999999999999999999999", Decimal("-Infinity")),
+        ("9e-9999999999999999999999", Decimal(0)),
+        ("0.0e9999999999999999999999", Decimal(0)),
+        ("1_0", None),
+        ("nan", None),
+    ],
+)
+def test_exact_number_reads_the_value_as_written(
+    text: str, expected: Decimal | None
+) -> None:
+    assert exact_number(text) == expected
 
 
 # -- A row shorter than its header is malformed, in every file --------------------
@@ -1246,3 +1312,713 @@ def test_a_malformed_file_carries_nothing_of_the_error_behind_it(
             shown = repr(value)
             assert "SECRETBYTES" not in shown, (frame.f_code.co_name, name)
             assert not isinstance(value, UnicodeError), (frame.f_code.co_name, name)
+
+
+# -- A corrupt archive is FeedParseError, whatever part of it is damaged ----------
+
+
+_CENTRAL = b"PK\x01\x02"
+_LOCAL = b"PK\x03\x04"
+_END = b"PK\x05\x06"
+
+
+def _archive(method: int = zipfile.ZIP_STORED) -> bytearray:
+    """The fixture feed as zip bytes, every member compressed by ``method``."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", method) as zf:
+        for member, content in _FILES.items():
+            zf.writestr(member, content)
+    return bytearray(buf.getvalue())
+
+
+def _member_data(data: bytearray, member: str) -> int:
+    """Where ``member``'s compressed bytes start."""
+    start = data.index(_LOCAL)  # the first local header
+    while True:
+        name_length, extra_length = struct.unpack_from("<HH", data, start + 26)
+        name = bytes(data[start + 30 : start + 30 + name_length])
+        if name == member.encode():
+            return start + 30 + name_length + extra_length
+        start = data.index(_LOCAL, start + 4)
+
+
+def _build_bytes(tmp_path: Path, data: bytes | bytearray) -> StaticIndex:
+    zip_path = tmp_path / "corrupt.zip"
+    zip_path.write_bytes(bytes(data))
+    return StaticIndex.build(zip_path, ":memory:", DATASET, TZ)
+
+
+def _assert_refused(
+    tmp_path: Path, data: bytes | bytearray, message: str | None = None
+) -> None:
+    """The build fails with FeedParseError alone: nothing chained, and no
+    frame on the traceback keeps another error as a local."""
+    with pytest.raises(FeedParseError) as caught:
+        _build_bytes(tmp_path, data).close()
+    if message is not None:
+        assert str(caught.value) == message
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_code.co_filename == __file__:
+            continue
+        for name, value in frame.f_locals.items():
+            assert not isinstance(value, BaseException) or isinstance(
+                value, FeedParseError
+            ), (frame.f_code.co_name, name)
+
+
+def test_a_name_flagged_utf8_that_is_not_is_an_unreadable_zip(
+    tmp_path: Path,
+) -> None:
+    """ZipFile() decodes a name whose UTF-8 flag is set as UTF-8; bytes that
+    are not were a bare UnicodeDecodeError."""
+    data = _archive()
+    central = data.index(_CENTRAL)
+    flags = struct.unpack_from("<H", data, central + 8)[0]
+    struct.pack_into("<H", data, central + 8, flags | 0x800)
+    data[central + 46] = 0xFF  # the first byte of its name
+    _assert_refused(tmp_path, data, "Unreadable GTFS zip: UnicodeDecodeError")
+
+
+def test_a_central_directory_offset_before_the_file_is_an_unreadable_member(
+    tmp_path: Path,
+) -> None:
+    """The end record placing the central directory further in than it is
+    shifts every member's header to before the file's start: seeking there
+    was a bare OSError (errno 22) from archive.open."""
+    data = _archive()
+    end = data.rindex(_END)
+    offset = struct.unpack_from("<I", data, end + 16)[0]
+    struct.pack_into("<I", data, end + 16, offset + 10_000)
+    _assert_refused(tmp_path, data, "Unreadable agency.txt: OSError")
+
+
+# Each method's stream, and where its data starts: zipfile's LZMA member
+# opens with a 4-byte header and 5 bytes of properties.
+_METHOD_ERRORS = [
+    pytest.param(zipfile.ZIP_DEFLATED, 0, "error", id="deflate"),
+    pytest.param(zipfile.ZIP_BZIP2, 0, "OSError", id="bzip2"),
+    pytest.param(zipfile.ZIP_LZMA, 9, "LZMAError", id="lzma"),
+]
+if hasattr(zipfile, "ZIP_ZSTANDARD"):  # Python 3.14+
+    _METHOD_ERRORS.append(
+        pytest.param(zipfile.ZIP_ZSTANDARD, 0, "ZstdError", id="zstandard")
+    )
+
+
+@pytest.mark.parametrize(("method", "skip", "reason"), _METHOD_ERRORS)
+def test_bad_compressed_data_is_a_malformed_member(
+    tmp_path: Path, method: int, skip: int, reason: str
+) -> None:
+    """Each method raises its own error for data it can't decompress --
+    bzip2 a bare OSError, Zstandard a ZstdError -- and each is the member's
+    FeedParseError, named by type."""
+    try:
+        data = _archive(method)
+    except RuntimeError:  # zstd: this Python was built without the module
+        pytest.skip("compression method unavailable")
+    start = _member_data(data, "stops.txt") + skip
+    data[start : start + 8] = b"\xff" * 8  # no stream starts like this
+    _assert_refused(tmp_path, data, f"Malformed stops.txt: {reason}")
+
+
+_METHODS = [
+    zipfile.ZIP_STORED,
+    zipfile.ZIP_DEFLATED,
+    zipfile.ZIP_BZIP2,
+    zipfile.ZIP_LZMA,
+    *([zipfile.ZIP_ZSTANDARD] if hasattr(zipfile, "ZIP_ZSTANDARD") else []),
+]
+
+
+@given(
+    method=st.sampled_from(_METHODS),
+    edits=st.lists(
+        st.tuples(st.floats(0, 1, exclude_max=True), st.integers(0, 255)),
+        min_size=1,
+        max_size=8,
+    ),
+    cut=st.one_of(st.none(), st.floats(0, 1, exclude_max=True)),
+)
+@settings(max_examples=300, deadline=None)
+def test_a_damaged_archive_builds_or_fails_as_feed_parse_error(
+    tmp_path_factory: pytest.TempPathFactory,
+    method: int,
+    edits: list[tuple[float, int]],
+    cut: float | None,
+) -> None:
+    """Any bytes changed anywhere, maybe cut short, under any method: the
+    build succeeds or raises FeedParseError with nothing chained -- never
+    zipfile's or a decompressor's own error."""
+    try:
+        data = _archive(method)
+    except RuntimeError:  # zstd unavailable
+        return
+    for where, value in edits:
+        data[int(where * len(data))] = value
+    if cut is not None:
+        data = data[: int(cut * len(data))]
+    tmp_path = tmp_path_factory.mktemp("damaged")
+    try:
+        _build_bytes(tmp_path, data).close()
+    except FeedParseError:
+        refused = True
+    else:
+        refused = False
+    if refused:  # checked again outside the except: it would chain to this one
+        _assert_refused(tmp_path, data)
+
+
+# -- stop_sequence MUST increase along a trip: a repeat fails the build -----------
+
+
+_CALLS_HEADER = (
+    "trip_id,arrival_time,departure_time,stop_id,location_id,"
+    "start_pickup_drop_off_window,end_pickup_drop_off_window,stop_sequence\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("rows", "trip", "sequence"),
+    [
+        pytest.param(
+            "T1,08:00:00,08:00:00,S1,,,,1\nT1,08:10:00,08:10:00,S2,,,,1\n",
+            "'T1'",
+            1,
+            id="two fixed calls",
+        ),
+        pytest.param(
+            "T1,08:00:00,08:00:00,S1,,,,1\nT1,08:10:00,08:10:00,S2,,,,01\n",
+            "'T1'",
+            1,
+            id="one value, spelled two ways",
+        ),
+        pytest.param(
+            "T1,08:00:00,08:00:00,S1,,,,1\nT1,,,,Z,08:05:00,08:25:00,1\n",
+            "'T1'",
+            1,
+            id="a zone call and a fixed call",
+        ),
+        pytest.param(
+            "T1,,,,Z,08:05:00,08:25:00,4\nT1,,,S1,,09:00:00,09:30:00,4\n",
+            "'T1'",
+            4,
+            id="two on-demand calls",
+        ),
+        pytest.param(
+            'T1,08:00:00,08:00:00,S1,,,,1\n"T\'1",,,S1,,,,2\n"T\'1",,,S2,,,,2\n',
+            '"T\'1"',
+            2,
+            id="the trip id quoted as written",
+        ),
+    ],
+)
+def test_a_repeated_stop_sequence_fails_the_build(
+    tmp_path: Path, rows: str, trip: str, sequence: int
+) -> None:
+    """GTFS: stop_sequence "values must increase along the trip" -- a repeat
+    leaves the trip's call order unstated, whatever kind of call each is."""
+    files = {**_FILES, "stop_times.txt": _CALLS_HEADER + rows}
+    zip_path = _zip_from_files(tmp_path, files, "repeat.zip")
+    _assert_refused(
+        tmp_path,
+        zip_path.read_bytes(),
+        f"Malformed stop_times.txt: trip {trip} repeats stop_sequence {sequence}: "
+        "it must increase along the trip",
+    )
+
+
+def test_a_trip_named_like_a_repetition_fails_the_build(tmp_path: Path) -> None:
+    """A real trip whose id is a frequency repetition's (``F#21600``) would
+    share that id's calls with the repetition: refused, not merged."""
+    files = {
+        **_FILES,
+        "trips.txt": _FILES["trips.txt"] + "R1,WKDY,F,A\nR1,WKDY,F#21600,B\n",
+        "stop_times.txt": _FILES["stop_times.txt"]
+        + "F,06:00:00,06:00:00,S1,1\nF,06:10:00,06:10:00,S2,2\n"
+        + "F#21600,09:00:00,09:00:00,S1,1\nF#21600,09:10:00,09:10:00,S2,2\n",
+        "frequencies.txt": "trip_id,start_time,end_time,headway_secs\n"
+        "F,06:00:00,07:00:00,1800\n",
+    }
+    zip_path = _zip_from_files(tmp_path, files, "collide.zip")
+    _assert_refused(
+        tmp_path,
+        zip_path.read_bytes(),
+        "Malformed frequencies.txt: trip 'F#21600' has the id of a repetition "
+        "of frequency trip 'F' (starting at 21600s)",
+    )
+
+
+@given(
+    calls=st.lists(
+        st.tuples(
+            st.sampled_from(["T1", "T2", "T9"]),
+            st.integers(0, 6),
+            st.sampled_from(["fixed", "zone", "window"]),
+        ),
+        min_size=1,
+        max_size=10,
+    )
+)
+@settings(max_examples=150, deadline=None)
+def test_a_build_fails_exactly_when_a_trip_repeats_a_stop_sequence(
+    tmp_path_factory: pytest.TempPathFactory,
+    calls: list[tuple[str, int, str]],
+) -> None:
+    """For any calls of any kinds: the build succeeds iff no trip names one
+    stop_sequence twice, and a failure names a repeated pair."""
+    cells = {
+        "fixed": "08:00:00,08:00:00,S1,,,",
+        "zone": ",,,Z,08:00:00,09:00:00",
+        "window": ",,S1,,08:00:00,09:00:00",
+    }
+    rows = "".join(
+        f"{trip},{cells[kind]},{sequence}\n" for trip, sequence, kind in calls
+    )
+    files = {**_FILES, "stop_times.txt": _CALLS_HEADER + rows}
+    tmp_path = tmp_path_factory.mktemp("sequences")
+    zip_path = _zip_from_files(tmp_path, files, "calls.zip")
+    keys = [(trip, sequence) for trip, sequence, _kind in calls]
+    repeated = {key for key in keys if keys.count(key) > 1}
+    try:
+        StaticIndex.build(zip_path, ":memory:", DATASET, TZ).close()
+    except FeedParseError as err:
+        message = str(err)
+    else:
+        message = None
+    if not repeated:
+        assert message is None
+    else:
+        assert message is not None
+        assert any(
+            message == f"Malformed stop_times.txt: trip {trip!r} repeats stop_sequence "
+            f"{sequence}: it must increase along the trip"
+            for trip, sequence in repeated
+        )
+
+
+# -- A damaged cached index: a miss when opened, FeedParseError when met later ----
+
+
+def damage_page(db_path: Path, name: str, fill: bytes = b"\xff") -> None:
+    """Overwrite the root page of table or index ``name`` in a closed file."""
+    conn = sqlite3.connect(db_path)
+    try:
+        [(root,)] = conn.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchall()
+        [(size,)] = conn.execute("PRAGMA page_size").fetchall()
+    finally:
+        conn.close()
+    with db_path.open("r+b") as fp:
+        fp.seek((root - 1) * size)
+        fp.write(fill * size)
+
+
+def _built_file(tmp_path: Path) -> Path:
+    db_path = tmp_path / "static.db"
+    StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ).close()
+    return db_path
+
+
+def _unchecked(db_path: Path) -> StaticIndex:
+    """The file as an index, skipping open_cached's check: damage met later."""
+    return StaticIndex(sqlite3.connect(db_path), DATASET, TZ)
+
+
+_NOW_UTC = datetime(2026, 6, 10, 14, tzinfo=UTC)
+_DAMAGE_MESSAGE = (
+    f"The static index of dataset {DATASET!r} is damaged: SQLite reports a "
+    "malformed database; purge the cache to rebuild it"
+)
+
+
+def _damaged_reads() -> dict[str, Callable[[StaticIndex], object]]:
+    return {
+        "stops": lambda index: index.stops(),
+        "routes": lambda index: index.routes(),
+        "trips": lambda index: index.trip_summaries(["T1"]),
+        "stop_times": lambda index: index.upcoming_departures(
+            ["S1"], None, _NOW_UTC, timedelta(hours=4)
+        ),
+        "ix_stop_times_stop_departure": lambda index: index.upcoming_departures(
+            ["S1"], None, _NOW_UTC, timedelta(hours=4)
+        ),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_damaged_reads()))
+def test_a_damaged_page_is_a_cache_miss(tmp_path: Path, name: str) -> None:
+    """Damage anywhere -- stops and routes the handle reads at once, a table
+    or index a later query meets -- and open_cached misses, so the entry is
+    rebuilt (it opened, and every open or query raised DatabaseError)."""
+    db_path = _built_file(tmp_path)
+    damage_page(db_path, name)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+@pytest.mark.parametrize("name", sorted(_damaged_reads()))
+def test_damage_met_by_a_query_is_feed_parse_error(tmp_path: Path, name: str) -> None:
+    """Damage the check never saw (the file changed after it was opened) is
+    the index's FeedParseError, in the library's words with nothing chained
+    -- not sqlite3.DatabaseError."""
+    db_path = _built_file(tmp_path)
+    damage_page(db_path, name)
+    index = _unchecked(db_path)
+    try:
+        with pytest.raises(FeedParseError) as caught:
+            _damaged_reads()[name](index)
+    finally:
+        index.close()
+    assert str(caught.value) == _DAMAGE_MESSAGE
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        for local in frame.f_locals.values():
+            assert not isinstance(local, sqlite3.Error)
+
+
+def _rename_in_schema(db_path: Path) -> None:
+    """Rewrite stops' schema text so it still parses but names another column."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql = replace(sql, 'platform_code', "
+            "'platform_kode') WHERE name = 'stops'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _damage_header(db_path: Path) -> None:
+    """Write past what this SQLite reads into the header's format fields."""
+    with db_path.open("r+b") as fp:
+        fp.seek(31)
+        fp.write(b"\x05" * 17)
+
+
+@pytest.mark.parametrize("damage", [_rename_in_schema, _damage_header])
+def test_damage_sqlite_has_no_code_for(
+    tmp_path: Path, damage: Callable[[Path], None]
+) -> None:
+    """Schema text that parses but names other columns, or a header this
+    SQLite can't read, raise SQLITE_ERROR as a mistaken statement would:
+    the file no longer checks out, so it is a miss when opened and the
+    index's FeedParseError when met by a query."""
+    db_path = _built_file(tmp_path)
+    damage(db_path)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+    index = _unchecked(db_path)
+    try:
+        with pytest.raises(FeedParseError, match="is damaged"):
+            index.stops()
+    finally:
+        index.close()
+
+
+def _undecodable_name(db_path: Path) -> None:
+    """Store bytes that are no UTF-8 as a stop's name: pages stay well formed."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE stops SET name = CAST(X'FF41' AS TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _undecodable_schema_error(db_path: Path) -> None:
+    """Damage stops' schema row so SQLite's own message quotes non-UTF-8 bytes."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute(
+            "UPDATE sqlite_master SET name = CAST(X'FF' AS TEXT), "
+            "sql = sql || ' nonsense' WHERE name = 'stops'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        # sqlite3's own OperationalError, with no SQLite code: quick_check
+        # can't see it, so only the read meets it.
+        _undecodable_name,
+        # A UnicodeDecodeError: SQLite's message can't become a str.
+        _undecodable_schema_error,
+    ],
+)
+def test_text_that_no_longer_decodes_is_damage(
+    tmp_path: Path, damage: Callable[[Path], None]
+) -> None:
+    db_path = _built_file(tmp_path)
+    damage(db_path)
+    index = _unchecked(db_path)
+    try:
+        with pytest.raises(FeedParseError) as caught:
+            index.stops()
+    finally:
+        index.close()
+    assert str(caught.value) == _DAMAGE_MESSAGE
+    assert caught.value.__context__ is None
+
+
+def test_a_damaged_length_that_runs_out_of_memory_is_damage(tmp_path: Path) -> None:
+    """A routes index cell whose damaged length asks SQLite for more memory
+    than there is (SQLITE_NOMEM, sqlite3's bare MemoryError): the file no
+    longer checks out, so it is a miss when opened and the index's
+    FeedParseError when met by a query."""
+    db_path = _built_file(tmp_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        [(root,)] = conn.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = ?",
+            ("sqlite_autoindex_routes_1",),
+        ).fetchall()
+    finally:
+        conn.close()
+    with db_path.open("r+b") as fp:
+        fp.seek((root - 1) * 4096 + 498)
+        fp.write((b"\x88\x80" * 1796)[: 4096 - 498])
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+    index = _unchecked(db_path)
+    try:
+        with pytest.raises(FeedParseError, match="is damaged"):
+            index.routes()
+    finally:
+        index.close()
+
+
+def test_an_undecodable_schema_is_a_cache_miss(tmp_path: Path) -> None:
+    """Opening a file whose schema SQLite can only describe in bytes that
+    are no UTF-8 raises UnicodeDecodeError at the first statement: a miss,
+    not an error that would fail the feed on every open."""
+    db_path = _built_file(tmp_path)
+    _undecodable_schema_error(db_path)
+    assert StaticIndex.open_cached(db_path, DATASET) is None
+
+
+def _flex_file(tmp_path: Path) -> Path:
+    zip_path = tmp_path / "flex.zip"
+    zip_path.write_bytes(build_flex_gtfs_zip_bytes())
+    db_path = tmp_path / "flex.db"
+    StaticIndex.build(zip_path, str(db_path), DATASET, None).close()
+    return db_path
+
+
+_FLEX_DAY = date(2026, 6, 10)  # a Wednesday: WEEKDAYS runs
+_FLEX_MORNING = datetime(2026, 6, 10, 12, tzinfo=UTC)
+
+_STORED_DAMAGE = {
+    "polygons no longer JSON": (
+        "UPDATE locations SET polygons = '[[[[41.0, -87.0'",
+        lambda index: index.flex_locations(),
+    ),
+    "polygons of another shape": (
+        "UPDATE locations SET polygons = '[[[[41.0]]]]'",
+        lambda index: index.flex_locations(),
+    ),
+    # Decodes, but no ring the build kept: a ring has four or more positions.
+    # A number of the wrong storage class, in pages that stay well formed:
+    # it raised TypeError where a read computed with it, or read as None.
+    "stop_times seconds turned into text": (
+        "UPDATE stop_times SET arrival_secs = 'x'",
+        lambda index: index.upcoming_departures(
+            ["S1"], None, _FLEX_MORNING, timedelta(hours=4)
+        ),
+    ),
+    "stop_times seconds turned into bytes": (
+        "UPDATE stop_times SET departure_secs = X'01'",
+        lambda index: index.instance_trip_calls([("DEV1", _FLEX_DAY)]),
+    ),
+    "a pickup type turned into text": (
+        "UPDATE stop_times SET pickup_type = 'x'",
+        lambda index: index.instance_trip_calls([("DEV1", _FLEX_DAY)]),
+    ),
+    "a trip's first departure turned into bytes": (
+        "UPDATE trips SET first_secs = X'01'",
+        lambda index: index.plain_trip_starts(["DEV1"]),
+    ),
+    "a repetition's slot turned into text": (
+        "UPDATE trips SET start_secs = 28800, slot_secs = 'x' WHERE id = 'DEV1'",
+        lambda index: index.slot_runs([("DEV1", _FLEX_DAY, 28800)]),
+    ),
+    "flex window seconds turned into text": (
+        "UPDATE flex_stop_times SET start_window_secs = 'x'",
+        lambda index: index.on_demand_rows(["TOWN"], [], []),
+    ),
+    "a stop latitude turned into text": (
+        "UPDATE stops SET lat = 'north'",
+        lambda index: index.stops(),
+    ),
+    "a ring too short": (
+        "UPDATE locations SET polygons = '[[[[41.0, -87.0], [41.0, -87.0]]]]'",
+        lambda index: index.flex_locations(),
+    ),
+    "polygons turned into a number": (
+        "UPDATE locations SET polygons = 7",
+        lambda index: index.flex_locations(),
+    ),
+    "a calendar date no longer canonical": (
+        "UPDATE calendar SET end_date = '2027-12-31'",
+        lambda index: index.departures_ceiling(["H1"]),
+    ),
+    # A BLOB: TEXT affinity would store a number as its text.
+    "a calendar date turned into bytes": (
+        "UPDATE calendar SET end_date = X'3230323731323331'",
+        lambda index: index.departures_ceiling(["S1"]),
+    ),
+    "an exception date no longer canonical": (
+        "INSERT INTO calendar_dates VALUES ('WEEKDAYS', '2026061', 1)",
+        lambda index: index.departures_ceiling(["H1"]),
+    ),
+    "a feed_info date turned into bytes": (
+        "INSERT INTO feed_info (publisher_name, start_date) "
+        "VALUES ('P', X'3230323630313031')",
+        lambda index: index.feed_info(),
+    ),
+    "booking seconds turned into text": (
+        "UPDATE booking_rules SET prior_notice_last_secs = '17:00'",
+        lambda index: index.booking_rules(),
+    ),
+    "unreadable names turned into bytes": (
+        "UPDATE booking_rules SET unreadable = X'05'",
+        lambda index: index.booking_rules(),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_STORED_DAMAGE))
+def test_a_damaged_stored_value_is_feed_parse_error(tmp_path: Path, case: str) -> None:
+    """quick_check reads structure, not cells: a value the build could not
+    have stored -- in pages that stay well formed -- is the index's
+    FeedParseError where a read decodes it, with nothing chained (it was a
+    raw JSONDecodeError, TypeError or AttributeError)."""
+    sql, read = _STORED_DAMAGE[case]
+    db_path = _flex_file(tmp_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(sql)
+        conn.commit()
+    finally:
+        conn.close()
+    index = StaticIndex.open_cached(db_path, DATASET)
+    assert index is not None  # well formed: the check can't see it
+    try:
+        with pytest.raises(FeedParseError) as caught:
+            read(index)
+    finally:
+        index.close()
+    assert str(caught.value) == _DAMAGE_MESSAGE
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_a_build_that_cannot_be_reopened_chains_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reopen after a file build failing is FeedParseError in the
+    library's words, with nothing chained."""
+    real_connect = sqlite3.connect
+
+    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if kwargs.get("uri"):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    db_path = tmp_path / "static.db"
+    with pytest.raises(FeedParseError) as caught:
+        StaticIndex.build(_write_zip(tmp_path), str(db_path), DATASET, TZ)
+    assert str(caught.value) == f"{db_path} could not be reopened after its build"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_running_out_of_memory_reopening_a_build_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the file a build just wrote, MemoryError is the machine's: it
+    propagates rather than reading as "not a built static index"."""
+    real_connect = sqlite3.connect
+
+    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if kwargs.get("uri"):
+            raise MemoryError
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    with pytest.raises(MemoryError):
+        StaticIndex.build(
+            _write_zip(tmp_path), str(tmp_path / "static.db"), DATASET, TZ
+        )
+
+
+def test_a_mistaken_statement_on_an_intact_index_is_not_damage(
+    tmp_path: Path,
+) -> None:
+    """SQLITE_ERROR from a file that checks out is the statement's own:
+    passed on as SQLite raised it, never blamed on the index."""
+    index = _unchecked(_built_file(tmp_path))
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="no such column"):
+            index._query("SELECT no_such_column FROM stops")
+    finally:
+        index.close()
+
+
+def test_a_closed_index_still_raises_programming_error(tmp_path: Path) -> None:
+    """Querying a closed index is the caller's misuse: it stays sqlite3's
+    ProgrammingError, not a damaged index."""
+    index = _unchecked(_built_file(tmp_path))
+    index.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        index.stops()
+
+
+@given(
+    page=st.integers(1, 40),
+    fill=st.binary(min_size=1, max_size=4),
+    at=st.integers(0, 4095),
+    length=st.integers(1, 4096),
+)
+# Non-UTF-8 bytes in schema text: SQLite's error text no longer decodes, so
+# open_cached's meta read raised a bare UnicodeDecodeError (review, PR #84).
+@example(page=21, fill=b"\x81", at=38, length=1779)
+@settings(max_examples=150, deadline=None)
+def test_any_damage_opens_as_a_miss_or_reads_as_feed_parse_error(
+    tmp_path_factory: pytest.TempPathFactory,
+    page: int,
+    fill: bytes,
+    at: int,
+    length: int,
+) -> None:
+    """Bytes overwritten anywhere in any page: open_cached misses or opens
+    an index; either way every query answers or raises the damaged index's
+    FeedParseError (a cell the check can't judge is met by the read that
+    decodes it) -- never sqlite3.DatabaseError or a decoding error."""
+    tmp_path = tmp_path_factory.mktemp("damaged-db")
+    db_path = _built_file(tmp_path)
+    with db_path.open("r+b") as fp:
+        size = 4096
+        if (page - 1) * size >= db_path.stat().st_size:
+            return
+        fp.seek((page - 1) * size + at)
+        fp.write((fill * length)[: size - at])
+    opened = StaticIndex.open_cached(db_path, DATASET)
+    for index in (opened, _unchecked(db_path)):
+        if index is None:
+            continue
+        try:
+            for read in _damaged_reads().values():
+                try:
+                    read(index)
+                except FeedParseError as err:
+                    assert str(err) == _DAMAGE_MESSAGE
+        finally:
+            index.close()

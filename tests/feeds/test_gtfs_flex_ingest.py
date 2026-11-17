@@ -359,6 +359,38 @@ def test_a_number_past_the_int_digit_limit_skips_only_its_feature(
     index.close()
 
 
+@pytest.mark.parametrize(
+    ("position", "kept"),
+    [
+        # Past the limit as written, though each one's double is the limit.
+        ("[1, 90.000000000000001]", False),
+        ("[180.00000000000001, 1]", False),
+        ("[-180.00000000000001, 1]", False),
+        ("[1, -9.00000000000000000000001e1]", False),
+        ("[1, 1e9999999999999999999999]", False),
+        # Inside as written: kept, at the limit its double is.
+        ("[1, 89.99999999999999999]", True),
+        ("[179.99999999999999999, 1]", True),
+        ("[1, 9e1]", True),
+    ],
+)
+def test_a_position_is_in_range_exactly_as_written(
+    tmp_path: Path, position: str, kept: bool
+) -> None:
+    """As for stops.txt: a coordinate's range is checked on the number the
+    file writes, not its nearest double; one past it skips its Feature."""
+    zone = json.dumps(_zone("EDGE"))
+    assert zone.count("[1, 1]") == 1
+    document = (
+        '{"type": "FeatureCollection", "features": ['
+        f"{zone.replace('[1, 1]', position)}, {json.dumps(_zone('KEPT'))}]}}"
+    )
+    index = _build(tmp_path, _with_zones(document))
+    expected = ["EDGE", "KEPT"] if kept else ["KEPT"]
+    assert sorted(location.id for location in index.flex_locations()) == expected
+    index.close()
+
+
 def test_a_multipolygon_keeps_every_part_and_hole(tmp_path: Path) -> None:
     hole = [[0.2, 0.2], [0.2, 0.4], [0.4, 0.4], [0.2, 0.2]]
     far = [[10, 10], [11, 10], [11, 11], [10, 10]]

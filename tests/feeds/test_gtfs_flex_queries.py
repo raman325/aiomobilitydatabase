@@ -9,16 +9,15 @@ falls in it, with the records they name.
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections import Counter
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from aiomobilitydatabase.feeds import static_index
 from aiomobilitydatabase.feeds.geo import Circle, polygon_overlaps_circle
 from aiomobilitydatabase.feeds.models import (
     BookingType,
@@ -185,11 +184,13 @@ def test_a_row_naming_two_places_is_listed_once_with_both(tmp_path: Path) -> Non
 
 
 def test_many_places_are_read_in_slices(tmp_path: Path) -> None:
-    """Ids are bound a slice at a time, under SQLite's variable limit: with
-    slices of one, the same calls come back."""
+    """Ids are bound a slice at a time, under the connection's variable
+    limit: with that limit lowered to what the dating queries need (three),
+    the same calls come back."""
     expected = _calls(_services(_flex_index(tmp_path), Circle(41.01, -87.02, 3000)))
-    with patch.object(static_index, "_ID_SLICE", 1):
-        sliced = _calls(_services(_flex_index(tmp_path), Circle(41.01, -87.02, 3000)))
+    index = _flex_index(tmp_path)
+    index._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 3)
+    sliced = _calls(_services(index, Circle(41.01, -87.02, 3000)))
     assert sliced == expected
     assert len(expected) == 3
 

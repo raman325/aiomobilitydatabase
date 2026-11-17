@@ -1069,9 +1069,9 @@ def _trip_spans(
     """Each trip's (first departure, last arrival), from the raw CSV.
 
     The first and last TIMED calls by stop_sequence; a call's departure
-    stands in for a missing arrival and vice versa; repeated sequences
-    take the earliest departure and the latest arrival; a trip of one call
-    lasts from its arrival to its departure.
+    stands in for a missing arrival and vice versa (a sequence never
+    repeats: the build refuses it); a trip of one call lasts from its
+    arrival to its departure.
     """
     calls: dict[str, list[tuple[int, int | None, int | None]]] = {}
     for row in csv.DictReader(io.StringIO(stop_times_csv)):

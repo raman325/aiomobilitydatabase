@@ -186,12 +186,12 @@ def test_upcoming_trips_grace_reaches_before_now(tmp_path: Path) -> None:
     index.close()
 
 
-def test_a_repeated_origin_stop_sequence_flags_each_journey_once(
+def test_a_loop_trips_origin_calls_flag_each_journey_once(
     tmp_path: Path,
 ) -> None:
-    """A feed repeating an origin stop_sequence with another time has two
-    origin calls, each its own journey: the day's first and last are each
-    one of them, never both (the sequence alone names neither)."""
+    """A trip leaving the origin twice has two origin calls, each its own
+    journey: the day's first and last are each one of them, never both
+    (the trip alone names neither)."""
     files = {
         "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
         f"A,Agency,https://example.com,{TZ}\n",
@@ -200,8 +200,8 @@ def test_a_repeated_origin_stop_sequence_flags_each_journey_once(
         "trips.txt": "route_id,service_id,trip_id\nR,ALL,T1\nR,ALL,T2\n",
         "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
         "T1,08:00:00,08:00:00,O,1\n"
-        "T1,08:30:00,08:30:00,O,1\n"
-        "T1,09:00:00,09:00:00,D,2\n"
+        "T1,08:30:00,08:30:00,O,2\n"
+        "T1,09:00:00,09:00:00,D,3\n"
         "T2,08:10:00,08:10:00,O,1\n"
         "T2,08:50:00,08:50:00,D,2\n",
         "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,"

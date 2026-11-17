@@ -1237,8 +1237,9 @@ def _utc_window(
     clock, ignoring their offsets: a ``start`` given in the feed's own
     zone would shift by a DST jump against the service-day starts. In UTC
     it never does. A naive datetime names no instant at all. ``grace``
-    must not be negative, and ``start`` (less ``grace``) must lie in the
-    range service days can be dated in, from 0001-01-03 to 9999-12-01 UTC;
+    must not be negative, and the window must open where service days can
+    be dated: ``start - grace`` no earlier than 0001-01-03 00:00 UTC, and
+    ``start`` itself before 9999-12-01 00:00 UTC (that instant excluded);
     a later ``end`` reads to its end.
     """
     if grace < timedelta(0):
@@ -1263,8 +1264,8 @@ def _utc_window(
         earliest = None
     if earliest is None or earliest < _EARLIEST_INSTANT or utc_start >= _LATEST_INSTANT:
         raise ValueError(
-            f"start (less grace) must fall between {_EARLIEST_INSTANT} and "
-            f"{_LATEST_INSTANT}, got {start!r}"
+            f"start - grace must be at or after {_EARLIEST_INSTANT}, and start "
+            f"before {_LATEST_INSTANT}; got start={start!r}, grace={grace!r}"
         )
     return utc_start, utc_end
 
@@ -1363,31 +1364,19 @@ def _pushdown(
     return stops, routes, headsigns
 
 
-# A scheduled row's identity: one stop_times row of one run. Rows read up
-# front and rows read by the scan are the same row only when all of it
-# matches -- an (invalid) feed repeating a stop_sequence within a trip
-# keeps both rows, whichever path reads them.
-_RowKey = tuple[str, date, int, str, datetime]
+# A scheduled row's identity: one stop_times row of one run, named by its
+# trip, service day and stop_sequence (the build refuses a trip repeating a
+# sequence). Rows read up front and rows read by the scan are the same row
+# exactly when these match.
+_RowKey = tuple[str, date, int]
 
 
 def _departure_key(dep: ScheduledDeparture) -> _RowKey:
-    return (
-        dep.trip_id,
-        dep.service_date,
-        dep.stop_sequence,
-        dep.stop_id,
-        dep.departure,
-    )
+    return (dep.trip_id, dep.service_date, dep.stop_sequence)
 
 
 def _journey_key(trip: ScheduledTrip) -> _RowKey:
-    return (
-        trip.trip_id,
-        trip.service_date,
-        trip.origin_stop_sequence,
-        trip.destination_stop_id,
-        trip.departure,
-    )
+    return (trip.trip_id, trip.service_date, trip.origin_stop_sequence)
 
 
 def _board_settles(
@@ -2544,10 +2533,11 @@ class TransitFeedHandle:
         The answer is exactly that of reading the whole window at once.
         Open-ended queries need a limit: ``end=None`` with any
         ``limit=None`` query raises ``ValueError``, as does a naive
-        (timezone-less) or unrepresentable ``start`` or ``end``, or a
-        ``start - grace`` outside the range service days can be dated in
-        (0001-01-03 to 9999-12-01 UTC), or a negative ``grace``. ``end <
-        start`` returns empty boards.
+        (timezone-less) or unrepresentable ``start`` or ``end``, a window
+        opening where service days can't be dated -- ``start - grace``
+        before 0001-01-03 00:00 UTC, or ``start`` at or after 9999-12-01
+        00:00 UTC -- or a negative ``grace``. ``end < start`` returns empty
+        boards.
 
         ``grace`` reaches that far BEFORE ``start`` when collecting
         scheduled candidates, so a trip whose scheduled time has passed
@@ -3004,8 +2994,8 @@ class TransitFeedHandle:
         result fills to its ``limit`` however far ahead the next journeys
         are, and ``end=None`` with a ``limit=None`` query raises
         ``ValueError``, as does a naive or unrepresentable ``start``/``end``,
-        a ``start - grace`` outside 0001-01-03 to 9999-12-01 UTC, or a
-        negative ``grace``.
+        a ``start - grace`` before 0001-01-03 00:00 UTC, a ``start`` at or
+        after 9999-12-01 00:00 UTC, or a negative ``grace``.
         Each query's ``limit`` caps its merged result,
         nearest effective origin departure first. A cancelled run is kept,
         flagged ``canceled`` at its scheduled departure, and counts toward
@@ -3583,8 +3573,8 @@ class TransitFeedHandle:
         :class:`ArrivalsQuery` batch, same ``start``/``end``/``limit``
         rules (open-ended by default, ``ValueError`` for ``end=None`` with
         a ``limit=None`` query, a naive ``start``/``end`` or a ``start``
-        outside 0001-01-03 to 9999-12-01 UTC; ``end < start`` gives empty
-        boards), but no
+        before 0001-01-03 00:00 UTC or at or after 9999-12-01 00:00 UTC;
+        ``end < start`` gives empty boards), but no
         realtime overlay and no ``grace``. It never makes a network request,
         so a calendar view or a config flow keeps working when a producer's
         realtime endpoint is down or its API key has lapsed. For "every
@@ -3900,7 +3890,8 @@ class TransitFeedHandle:
         rules as :meth:`get_scheduled_departures` (``start`` defaulting to
         now, open-ended by default, ``ValueError`` for ``end=None`` without
         a ``limit``, a negative ``limit``, a naive ``start``/``end`` or a
-        ``start`` outside 0001-01-03 to 9999-12-01 UTC; ``end < start`` or
+        ``start`` before 0001-01-03 00:00 UTC or at or after 9999-12-01
+        00:00 UTC; ``end < start`` or
         ``limit=0`` gives no windows). A call whose window is unknown (see
         :class:`OnDemandService`), ends before it starts, or ends past year
         9999 once placed on a date (garbage) has no dated window, and is

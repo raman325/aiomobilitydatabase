@@ -289,9 +289,10 @@ Notes on direct mode:
   12h" of the service day, in elapsed time as GTFS specifies, so on a
   DST-change day they are off local midnight by the size of the jump. An
   open-ended query with no limit raises `ValueError`, as do a naive
-  (timezone-less) or unrepresentable `start`/`end`, and a `start` (less
-  `grace`) outside 0001-01-03 to 9999-12-01 UTC, where service days can
-  be dated, and a negative `grace`.
+  (timezone-less) or unrepresentable `start`/`end`, a window opening where
+  service days can't be dated (`start - grace` before 0001-01-03 00:00
+  UTC, or `start` at or after 9999-12-01 00:00 UTC), and a negative
+  `grace`.
   `end` bounds scheduled times (a realtime-only trip's `scheduled_time`,
   or its predicted time where it gives none); a delayed trip predicted
   past it still shows.
@@ -481,8 +482,11 @@ Notes on direct mode:
   as a plausible value. A malformed **structural** cell — `stop_times` times,
   `stop_sequence`, `headway_secs`, `exception_type`, calendar weekday flags —
   fails the build, because a wrong departure time or a wrong call order is
-  worse than no feed at all. A malformed **descriptive** cell still degrades
-  to `None`.
+  worse than no feed at all. So does a trip repeating a `stop_sequence`
+  (fixed or GTFS-Flex calls alike), which GTFS requires to increase along
+  the trip, and a trip in `trips.txt` named like one of a frequency trip's
+  `{trip_id}#{start_secs}` repetitions. A malformed **descriptive** cell
+  still degrades to `None`.
 - **Detours are applied, not annotated**: a GTFS-RT `TripModifications`
   entity REPLACES a span of a trip's calls, so a board that ignored it
   would keep showing departures at stops the vehicle no longer serves, and
@@ -532,7 +536,8 @@ Notes on direct mode:
   groups with their `stop_ids`), and `transit.booking_rules` (every
   `booking_rules.txt` column; `BookingType` for `booking_type`). A Feature
   without an id, or with a geometry that is not a well-formed Polygon or
-  MultiPolygon, is skipped whole -- including a polygon that is not valid as
+  MultiPolygon (a position past ±90/±180 as written counts, as for stops), is
+  skipped whole -- including a polygon that is not valid as
   GTFS-Flex requires (OGC Simple Features 6.1.11): a ring crossing itself or
   another, a hole outside its exterior or overlapping another hole, or holes
   touching the exterior and each other so as to cut the zone in two. A
@@ -626,8 +631,13 @@ Notes on direct mode:
   safe to call while queries are in flight: the swap waits for in-flight reads
   to finish, and two overlapping refreshes run back to back rather than
   double-building). A corrupt or unreadable cache is treated as a cache miss
-  and rebuilt rather than raising. Without a `cache_dir` the index is built in
-  memory on every startup.
+  and rebuilt rather than raising: as a cached index is opened, SQLite checks
+  every page (`PRAGMA quick_check`) and its schema is compared with the
+  library's, so one damaged page anywhere is a miss. Damage that check can't
+  see (a value that no longer decodes, or a file changed after it was
+  opened), met later by a query, is `FeedParseError`; `purge_cache()`
+  rebuilds it. Without a `cache_dir` the index is built in memory on every
+  startup.
 - **Pull, not push**: `TransitFeedHandle`/`GbfsFeedHandle` return snapshots on
   demand — there's no built-in polling loop or scheduler. Bring your own (e.g.
   Home Assistant's `DataUpdateCoordinator`).
@@ -725,7 +735,7 @@ each define their own subtree beneath it, so you can catch broadly
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
 | `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP, `.url`) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
-| `FeedParseError` | feeds | Undecodable protobuf (a string field that isn't UTF-8 included), malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180) |
+| `FeedParseError` | feeds | Undecodable protobuf (a string field that isn't UTF-8 included), malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), a trip repeating a `stop_sequence`, a cached static index a query finds damaged, or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
 
 The GBFS and GTFS-RT parse paths are **total** with respect to this table:

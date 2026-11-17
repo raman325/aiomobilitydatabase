@@ -13,6 +13,7 @@ def loads(
     raw: bytes,
     *,
     parse_int: Callable[[str], Any] | None = None,
+    parse_float: Callable[[str], Any] | None = None,
     lone_surrogates: bool = False,
 ) -> Any:
     r"""Parse JSON text, or raise ValueError when the bytes are none.
@@ -29,8 +30,8 @@ def loads(
     (``"\ud800"``; section 8.2 leaves its meaning unpredictable): no text,
     it can't even be sent back. With ``lone_surrogates`` such strings are
     kept, for a caller that judges each value itself (a GeoJSON Feature
-    with one is skipped, not the whole file). ``parse_int`` is
-    ``json.loads``'s.
+    with one is skipped, not the whole file). ``parse_int`` and
+    ``parse_float`` are ``json.loads``'s.
     """
     try:
         value = json.loads(
@@ -38,6 +39,7 @@ def loads(
             object_pairs_hook=_unique_object,
             parse_constant=_reject_constant,
             parse_int=parse_int,
+            parse_float=parse_float,
         )
     except RecursionError:
         failure = "JSON nests deeper than can be parsed"
