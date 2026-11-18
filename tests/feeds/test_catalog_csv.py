@@ -1,23 +1,29 @@
-"""Reading the public catalog export into the catalog API's models."""
+"""Reading the public catalog export into its models."""
 
 from __future__ import annotations
 
 import codecs
 import csv
 from datetime import datetime
+from itertools import chain
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
+from aiomobilitydatabase.feeds import PublicGbfsFeed, PublicGtfsFeed, PublicGtfsRtFeed
 from aiomobilitydatabase.feeds._bounds import Box
-from aiomobilitydatabase.feeds._catalog_csv import CatalogFormatError, read_catalog
+from aiomobilitydatabase.feeds._catalog_csv import (
+    CatalogFormatError,
+    CatalogRows,
+    _Lines,
+    _record_ends,
+    read_catalog,
+)
 from aiomobilitydatabase.models import (
     BoundingBox,
-    DataType,
     EntityType,
     FeedStatus,
-    GbfsFeed,
-    GtfsFeed,
-    GtfsRtFeed,
     Redirect,
     SourceInfo,
 )
@@ -25,14 +31,22 @@ from aiomobilitydatabase.models import (
 from tests.feeds.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, box, export
 
 
-def test_a_gtfs_row_maps_to_the_api_s_gtfs_feed() -> None:
+def _rt(rows: CatalogRows) -> list[PublicGtfsRtFeed]:
+    """The GTFS Realtime feeds, in the export's order."""
+    return [feed for feed in rows.by_id.values() if isinstance(feed, PublicGtfsRtFeed)]
+
+
+def test_a_gtfs_row_maps_to_a_public_gtfs_feed() -> None:
     rows = read_catalog(export(GTFS_ROW))
     assert rows.gtfs == (
-        GtfsFeed(
+        PublicGtfsFeed(
             id="mdb-10",
-            data_type=DataType.GTFS,
             provider="MTA New York City Transit",
+            feed_name="NYC Subway",
+            note="Line one\nline two, with a comma",
             feed_contact_email="gtfs@example.com",
+            status=FeedStatus.ACTIVE,
+            official=True,
             source_info=SourceInfo(
                 producer_url="https://example.com/subway.zip",
                 authentication_type=0,
@@ -42,22 +56,22 @@ def test_a_gtfs_row_maps_to_the_api_s_gtfs_feed() -> None:
                 Redirect(target_id="mdb-11", comment="merged"),
                 Redirect(target_id="mdb-12", comment=None),
             ),
-            status=FeedStatus.ACTIVE,
-            official=True,
-            feed_name="NYC Subway",
-            note="Line one\nline two, with a comma",
             bounding_box=BoundingBox(40.5, 40.9, -74.3, -73.7),
         ),
     )
     assert rows.by_id["mdb-10"] is rows.gtfs[0]
 
 
-def test_a_gtfs_rt_row_maps_to_the_api_s_gtfs_rt_feed() -> None:
-    (feed,) = read_catalog(export(GTFS_RT_ROW)).gtfs_rt
-    assert feed == GtfsRtFeed(
+def test_a_gtfs_rt_row_maps_to_a_public_gtfs_rt_feed() -> None:
+    (feed,) = _rt(read_catalog(export(GTFS_RT_ROW)))
+    assert feed == PublicGtfsRtFeed(
         id="mdb-20",
-        data_type=DataType.GTFS_RT,
         provider="MTA New York City Transit",
+        feed_name=None,
+        note=None,
+        feed_contact_email=None,
+        status=FeedStatus.ACTIVE,
+        official=False,
         source_info=SourceInfo(
             producer_url="https://example.com/rt",
             authentication_type=2,
@@ -65,8 +79,6 @@ def test_a_gtfs_rt_row_maps_to_the_api_s_gtfs_rt_feed() -> None:
             api_key_parameter_name="x-api-key",
         ),
         redirects=(),
-        status=FeedStatus.ACTIVE,
-        official=False,
         entity_types=(
             EntityType.SERVICE_ALERTS,
             EntityType.TRIP_UPDATES,
@@ -78,10 +90,10 @@ def test_a_gtfs_rt_row_maps_to_the_api_s_gtfs_rt_feed() -> None:
 
 def test_a_gbfs_row_maps_to_the_api_s_gbfs_feed() -> None:
     (feed,) = read_catalog(export(GBFS_ROW)).gbfs
-    assert feed == GbfsFeed(
+    assert feed == PublicGbfsFeed(
         id="gbfs-citibike",
-        data_type=DataType.GBFS,
         provider="Citi Bike",
+        feed_contact_email=None,
         source_info=SourceInfo(
             producer_url="https://gbfs.example.com/gbfs.json",
             authentication_type=0,
@@ -216,13 +228,13 @@ def test_authentication_type_is_read_only_as_ascii_digits(
 
 
 def test_unknown_entity_types_are_left_out() -> None:
-    (feed,) = read_catalog(export({**GTFS_RT_ROW, "entity_type": "tu|xx"})).gtfs_rt
+    (feed,) = _rt(read_catalog(export({**GTFS_RT_ROW, "entity_type": "tu|xx"})))
     assert feed.entity_types == (EntityType.TRIP_UPDATES,)
 
 
 def test_empty_list_columns_are_empty_tuples() -> None:
     row = {**GTFS_RT_ROW, "entity_type": "", "static_reference": ""}
-    (feed,) = read_catalog(export(row)).gtfs_rt
+    (feed,) = _rt(read_catalog(export(row)))
     assert feed.entity_types == ()
     assert feed.feed_references == ()
     assert feed.redirects == ()
@@ -244,13 +256,29 @@ def test_rows_without_an_id_or_of_another_type_are_skipped() -> None:
             {**GTFS_ROW, "id": "mdb-99", "data_type": "gtfs_flex"},
         )
     )
-    assert rows.gtfs == rows.gtfs_rt == rows.gbfs == ()
+    assert (rows.gtfs, rows.gtfs_rt_listed, rows.gbfs) == ((), (), ())
     assert dict(rows.by_id) == {}
 
 
 def test_a_repeated_id_keeps_the_first_row() -> None:
     rows = read_catalog(export(GTFS_ROW, {**GTFS_ROW, "provider": "Other"}))
     assert [feed.provider for feed in rows.gtfs] == ["MTA New York City Transit"]
+
+
+def test_the_first_row_of_an_id_wins_whatever_its_data_type() -> None:
+    rows = read_catalog(
+        export(
+            {**GTFS_ROW, "id": "mdb-1", "data_type": "gtfs_flex"},
+            {**GTFS_ROW, "id": "mdb-1"},
+            {**GTFS_ROW, "id": "mdb-2"},
+            {**GBFS_ROW, "id": "mdb-2"},
+            {**GTFS_RT_ROW, "id": "mdb-2"},
+        )
+    )
+    # mdb-1's first row is of a type this library lacks: no feed at all.
+    assert list(rows.by_id) == ["mdb-2"]
+    assert isinstance(rows.by_id["mdb-2"], PublicGtfsFeed)
+    assert (rows.gbfs, rows.gtfs_rt_listed) == ((), ())
 
 
 def test_feeds_are_ordered_by_provider_then_id_with_no_provider_last() -> None:
@@ -286,13 +314,20 @@ def test_missing_optional_columns_read_as_empty() -> None:
         b"\xff\xfe not utf-8",
         b"provider,status\nA,active\n",  # no id / data_type
         b"",
-        b"id,data_type\n"
-        + b"x" * (csv.field_size_limit() + 1)
-        + b",gtfs\n",  # csv.Error
+        # A header past the field size limit: no columns to read rows by.
+        b"id,data_type," + b"x" * (csv.field_size_limit() + 1) + b"\nmdb-1,gtfs\n",
         # An unclosed quote would otherwise swallow every later row.
         b'id,data_type,provider\nmdb-1,gtfs,"A\nmdb-2,gtfs,B\n',
         # Text after a closing quote would otherwise be joined onto the cell.
         b'id,data_type\n"mdb-1"x,gtfs\n',
+        # An unclosed quote running on to a later quote reads as a stray
+        # one: the records it swallowed can't be told, so none is guessed.
+        b'id,data_type,provider\nmdb-1,gtfs,"A\nmdb-2,gtfs,"B"\nmdb-3,gtfs,C\n',
+        b'id,data_type,provider\nmdb-1,gtfs,"A\nmdb-2,gtfs,B"x\nmdb-3,gtfs,C\n',
+        # A broken quote in a later line of a multi-line record.
+        b'id,data_type,note\nmdb-1,gtfs,"a\nb"c\nmdb-2,gtfs,d\n',
+        # In the header.
+        b'id,"data_type"x\nmdb-1,gtfs\n',
     ],
 )
 def test_a_body_that_is_no_export_raises(body: bytes) -> None:
@@ -344,6 +379,84 @@ def test_the_rt_list_holds_feeds_with_an_entity_type_cell() -> None:
             {**GTFS_RT_ROW, "id": "mdb-22", "entity_type": "xx"},
         )
     )
-    assert [feed.id for feed in rows.gtfs_rt] == ["mdb-20", "mdb-21", "mdb-22"]
+    assert [feed.id for feed in _rt(rows)] == ["mdb-20", "mdb-21", "mdb-22"]
     # The API's list inner-joins the entity types; a type unknown here counts.
     assert [feed.id for feed in rows.gtfs_rt_listed] == ["mdb-20", "mdb-22"]
+
+
+_TOO_LONG = "x" * (csv.field_size_limit() + 1)
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        pytest.param(_TOO_LONG, id="unquoted"),
+        pytest.param(f"{_TOO_LONG}, quoted", id="quoted"),
+        # The reader stops inside the cell; its later lines, which here look
+        # like a feed's row, are read past rather than as records.
+        pytest.param(
+            f"{_TOO_LONG}\r\nmdb-3,gtfs,,,,,Fake\r\nmdb-1,gtfs,,,,,Fake\r\n",
+            id="multi-line",
+        ),
+        pytest.param(f'a ""quote"" {_TOO_LONG}\n" end', id="doubled-quotes"),
+    ],
+)
+def test_a_record_past_the_field_size_limit_is_skipped(note: str) -> None:
+    limit = csv.field_size_limit()
+    rows = read_catalog(
+        export(
+            {**GTFS_ROW, "id": "mdb-1"},
+            {**GTFS_ROW, "id": "mdb-2", "note": note},
+            {**GTFS_ROW, "id": "mdb-4"},
+        )
+    )
+    assert list(rows.by_id) == ["mdb-1", "mdb-4"]
+    assert csv.field_size_limit() == limit  # the process-wide limit untouched
+
+
+def test_a_skipped_record_doesn_t_claim_its_id() -> None:
+    rows = read_catalog(
+        export(
+            {**GTFS_ROW, "id": "mdb-1", "note": _TOO_LONG},
+            {**GTFS_ROW, "id": "mdb-1", "provider": "Second"},
+        )
+    )
+    assert [feed.provider for feed in rows.gtfs] == ["Second"]
+
+
+def test_blank_lines_between_records_are_skipped() -> None:
+    body = b"id,data_type\r\n\r\nmdb-1,gtfs\r\n\r\n\nmdb-2,gtfs\r\n"
+    assert list(read_catalog(body).by_id) == ["mdb-1", "mdb-2"]
+
+
+def _splits(text: str, *, by_csv: bool) -> list[int | str]:
+    """Each record's line count, then "broken" if one's quoting is."""
+    lines = _Lines(text)
+    reader = csv.reader(lines, strict=True)
+    counts: list[int | str] = []
+    while True:
+        lines.record.clear()
+        try:
+            if by_csv:
+                next(reader)
+            elif not _record_ends(chain((next(lines),), lines)):
+                return [*counts, "broken"]
+        except StopIteration:
+            return counts
+        except csv.Error:
+            return [*counts, "broken"]
+        counts.append(len(lines.record))
+
+
+@settings(max_examples=500)
+@given(
+    st.lists(
+        st.sampled_from(["a", ",", '"', '""', "\r", "\n", "\r\n", "\u00e9", "\x00"]),
+        max_size=30,
+    ).map("".join)
+)
+def test_records_end_where_the_csv_module_s_strict_reader_ends_them(
+    text: str,
+) -> None:
+    """Below the field size limit, every csv.Error is broken quoting."""
+    assert _splits(text, by_csv=False) == _splits(text, by_csv=True)

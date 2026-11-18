@@ -34,16 +34,9 @@ from ..exceptions import (
     MobilityDatabaseNotFoundError,
     MobilityDatabaseRateLimitError,
 )
-from ..models import (
-    BoundingFilterMethod,
-    EntityType,
-    Feed,
-    GbfsFeed,
-    GtfsFeed,
-    GtfsRtFeed,
-)
+from ..models import BoundingFilterMethod, EntityType
 from ._bounds import Box, matches
-from ._catalog_csv import CatalogFeed, CatalogFormatError, CatalogRows, read_catalog
+from ._catalog_csv import CatalogFormatError, CatalogRows, PublicFeed, read_catalog
 from ._freshness import (
     FreshnessCache,
     Response,
@@ -52,6 +45,7 @@ from ._freshness import (
     request_fields,
 )
 from .const import DEFAULT_TIMEOUT_SECONDS, PUBLIC_CATALOG_URL
+from .models import PublicGbfsFeed, PublicGtfsFeed, PublicGtfsRtFeed
 
 # The API's paging bounds (mobility-feed-api, feeds_api.py: ``limit`` is
 # ``Query(N, ge=0, le=N)``, ``offset`` ``ge=0``): each endpoint's default
@@ -137,16 +131,16 @@ async def _exchange(
 class MobilityDatabasePublicCatalog:
     r"""The Mobility Database catalog's public export, without an account.
 
-    Reads ``feeds_v2.csv`` (MobilityData regenerates it daily) and answers
-    with the catalog API's own models and filter semantics. A field holds
-    the value the API returns for the same feed, or None where the export
-    doesn't carry it, with these differences:
+    Reads ``feeds_v2.csv`` (MobilityData regenerates it daily) into
+    :class:`~.models.PublicGtfsFeed`, :class:`~.models.PublicGtfsRtFeed`
+    and :class:`~.models.PublicGbfsFeed`: the export's columns that mean
+    what the catalog API's same-named fields mean, each holding the value
+    the API returns for the same feed. The methods take the API client's
+    names, parameters and filter semantics, with these differences:
 
-    - ``locations`` is always None, and there are no location filters: the
-      export's location is usually the one extracted from the feed's stops,
-      not the registered locations the API returns and filters on.
-    - ``seasonal`` isn't in the export: it holds the model's default
-      (False), which says nothing about the feed.
+    - There are no location filters: the export's location is usually the
+      one extracted from the feed's stops, not the registered locations the
+      API filters on (and the models have no ``locations``).
     - ``get_gbfs_feeds`` filters on the system's bounding box (the API has
       no such filter) and has no ``system_id`` or ``version`` filter.
     - Results are ordered by provider, then id, by code point (the API's
@@ -309,24 +303,24 @@ class MobilityDatabasePublicCatalog:
         raise MobilityDatabaseConnectionError(f"Public catalog unreadable: {problem}")
 
     @_typed
-    async def get_gtfs_feed(self, feed_id: str) -> GtfsFeed:
+    async def get_gtfs_feed(self, feed_id: str) -> PublicGtfsFeed:
         """Get a single GTFS feed by ID."""
         key = _require_id(feed_id)  # as the client's, before any request
-        return _find(await self._rows(), key, GtfsFeed)
+        return _find(await self._rows(), key, PublicGtfsFeed)
 
     @_typed
-    async def get_gtfs_rt_feed(self, feed_id: str) -> GtfsRtFeed:
+    async def get_gtfs_rt_feed(self, feed_id: str) -> PublicGtfsRtFeed:
         """Get a single GTFS Realtime feed by ID."""
         key = _require_id(feed_id)  # as the client's, before any request
-        return _find(await self._rows(), key, GtfsRtFeed)
+        return _find(await self._rows(), key, PublicGtfsRtFeed)
 
     @_typed
-    async def get_gbfs_feed(self, feed_id: str) -> GbfsFeed:
+    async def get_gbfs_feed(self, feed_id: str) -> PublicGbfsFeed:
         """Get a single GBFS feed by ID."""
         key = _require_id(feed_id)  # as the client's, before any request
         rows = await self._rows()
         _gbfs(rows)
-        return _find(rows, key, GbfsFeed)
+        return _find(rows, key, PublicGbfsFeed)
 
     @_typed
     async def get_gtfs_feeds(
@@ -340,7 +334,7 @@ class MobilityDatabasePublicCatalog:
         dataset_longitudes: tuple[float, float] | None = None,
         bounding_filter_method: BoundingFilterMethod | None = None,
         is_official: bool | None = None,
-    ) -> list[GtfsFeed]:
+    ) -> list[PublicGtfsFeed]:
         """Get GTFS schedule feeds.
 
         Filters as :meth:`MobilityDatabaseClient.get_gtfs_feeds`.
@@ -369,7 +363,7 @@ class MobilityDatabasePublicCatalog:
         producer_url: str | None = None,
         entity_types: list[EntityType] | None = None,
         is_official: bool | None = None,
-    ) -> list[GtfsRtFeed]:
+    ) -> list[PublicGtfsRtFeed]:
         """Get GTFS Realtime feeds.
 
         Filters as :meth:`MobilityDatabaseClient.get_gtfs_rt_feeds`.
@@ -399,7 +393,7 @@ class MobilityDatabasePublicCatalog:
         dataset_latitudes: tuple[float, float] | None = None,
         dataset_longitudes: tuple[float, float] | None = None,
         bounding_filter_method: BoundingFilterMethod | None = None,
-    ) -> list[GbfsFeed]:
+    ) -> list[PublicGbfsFeed]:
         """Get GBFS feeds; the bounding filters apply to the system's box."""
         query = _Query.of(
             limit=limit,
@@ -416,7 +410,7 @@ class MobilityDatabasePublicCatalog:
         return query.select(_gbfs(rows), rows.boxes)
 
 
-def _find[F: CatalogFeed](rows: CatalogRows, feed_id: str, kind: type[F]) -> F:
+def _find[F: PublicFeed](rows: CatalogRows, feed_id: str, kind: type[F]) -> F:
     """Return the feed with this id and type, or raise not found."""
     feed = rows.by_id.get(feed_id)
     # The three feed models are siblings: an instance is of exactly one.
@@ -425,7 +419,7 @@ def _find[F: CatalogFeed](rows: CatalogRows, feed_id: str, kind: type[F]) -> F:
     return feed
 
 
-def _gbfs(rows: CatalogRows) -> tuple[GbfsFeed, ...]:
+def _gbfs(rows: CatalogRows) -> tuple[PublicGbfsFeed, ...]:
     """Return the export's GBFS feeds; raise when it carries none at all.
 
     An export without a GBFS section (one written before mobility-feed-api
@@ -568,7 +562,7 @@ class _Query:
             entity_types=frozenset(entity_types) if entity_types else None,
         )
 
-    def _keeps(self, feed: CatalogFeed, boxes: Mapping[str, Box]) -> bool:
+    def _keeps(self, feed: PublicFeed, boxes: Mapping[str, Box]) -> bool:
         source = feed.source_info
         if not (
             _like(self.provider, feed.provider)
@@ -578,25 +572,24 @@ class _Query:
         # The API's is_official=False keeps False and unknown.
         if (
             self.is_official is not None
-            and isinstance(feed, Feed)
+            and not isinstance(feed, PublicGbfsFeed)
             and (feed.official is True) is not self.is_official
         ):
             return False
         if (
             self.entity_types is not None
-            and isinstance(feed, GtfsRtFeed)
-            and not self.entity_types.intersection(feed.entity_types or ())
+            and isinstance(feed, PublicGtfsRtFeed)
+            and not self.entity_types.intersection(feed.entity_types)
         ):
             return False
         box = self.box
         # A GTFS Realtime feed has no box: the API has no such filter for it.
-        if box is None or isinstance(feed, GtfsRtFeed):
+        if box is None or isinstance(feed, PublicGtfsRtFeed):
             return True
-        # Every export feed has an id; the model allows None.
-        feed_box = None if feed.id is None else boxes.get(feed.id)
+        feed_box = boxes.get(feed.id)
         return feed_box is not None and matches(self.method, feed_box, box)
 
-    def select[F: CatalogFeed](
+    def select[F: PublicFeed](
         self, feeds: Sequence[F], boxes: Mapping[str, Box]
     ) -> list[F]:
         """Return the feeds that pass, then apply ``offset`` and ``limit``.

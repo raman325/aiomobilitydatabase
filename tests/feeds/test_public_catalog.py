@@ -23,14 +23,13 @@ from aiomobilitydatabase.exceptions import (
     MobilityDatabaseRateLimitError,
 )
 from aiomobilitydatabase.feeds import public_catalog
-from aiomobilitydatabase.feeds._catalog_csv import CatalogRows
+from aiomobilitydatabase.feeds._catalog_csv import CatalogRows, PublicFeed
 from aiomobilitydatabase.feeds.public_catalog import (
     _GBFS_FEEDS_MAX_LIMIT,
     _GTFS_FEEDS_MAX_LIMIT,
     _GTFS_RT_FEEDS_MAX_LIMIT,
     MobilityDatabasePublicCatalog,
 )
-from aiomobilitydatabase.models import Feed
 
 from tests.feeds.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, box, export
 from tests.mock_server import MockApi
@@ -550,7 +549,7 @@ async def filtered(
     return public
 
 
-async def ids(feeds: Awaitable[Sequence[Feed]]) -> list[str]:
+async def ids(feeds: Awaitable[Sequence[PublicFeed]]) -> list[str]:
     return [feed.id for feed in await feeds]
 
 

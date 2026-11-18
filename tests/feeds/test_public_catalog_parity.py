@@ -1,9 +1,10 @@
-"""The public catalog's models equal the API client's, field by field.
+"""The public catalog's fields equal the API client's same-named ones.
 
 Each parity case takes an API payload, writes the export row
 mobility-feed-api's ``export_csv`` writes for that same feed, reads it, and
-compares it with the API payload decoded by the API client. Only the fields
-the export doesn't carry are set aside; everything else must be equal.
+compares each field of the public model with the same-named field of the
+API payload decoded by the API client. Only ``source_info``'s fields the
+export doesn't carry are set aside.
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ from typing import Any
 
 import pytest
 
-from aiomobilitydatabase.feeds._catalog_csv import CatalogFeed, read_catalog
+from aiomobilitydatabase.feeds import PublicGbfsFeed, PublicGtfsFeed, PublicGtfsRtFeed
+from aiomobilitydatabase.feeds._catalog_csv import PublicFeed, read_catalog
 from aiomobilitydatabase.models import (
     EntityType,
     GbfsFeed,
@@ -123,21 +125,7 @@ def _row(
     return row
 
 
-# What the export doesn't carry: the API's value is replaced by None, as
-# the public catalog leaves it. Everything else must be equal.
-_NOT_EXPORTED = (
-    "created_at",
-    "external_ids",
-    "official_updated_at",
-    "related_links",
-    "locations",
-    "latest_dataset",
-    "visualization_dataset_id",
-    "reliability_seal",
-    "system_id",
-    "provider_url",
-    "versions",
-)
+# source_info's fields the export doesn't carry: None in the public model.
 _SOURCE_NOT_EXPORTED = (
     "is_producer_url_unstable",
     "license_id",
@@ -145,23 +133,26 @@ _SOURCE_NOT_EXPORTED = (
     "license_notes",
     "license_tags",
 )
+_PUBLIC = {
+    GtfsFeed: PublicGtfsFeed,
+    GtfsRtFeed: PublicGtfsRtFeed,
+    GbfsFeed: PublicGbfsFeed,
+}
 
 
-def _expected(model: Any) -> Any:
-    fields = {f.name for f in dataclasses.fields(model)}
-    # seasonal isn't exported either: the model's default stands (R2: own models).
-    defaults = {"seasonal": False} if "seasonal" in fields else {}
-    return dataclasses.replace(
-        model,
-        **dict.fromkeys(fields.intersection(_NOT_EXPORTED)),
-        **defaults,
-        source_info=dataclasses.replace(
-            model.source_info, **dict.fromkeys(_SOURCE_NOT_EXPORTED)
-        ),
-    )
+def _assert_parity(feed: PublicFeed, api: GtfsFeed | GtfsRtFeed | GbfsFeed) -> None:
+    """Every field of ``feed`` equals the API model's same-named field."""
+    assert type(feed) is _PUBLIC[type(api)]
+    for field in dataclasses.fields(feed):
+        expected = getattr(api, field.name)
+        if field.name == "source_info":
+            expected = dataclasses.replace(
+                expected, **dict.fromkeys(_SOURCE_NOT_EXPORTED)
+            )
+        assert getattr(feed, field.name) == expected, field.name
 
 
-def _read_one(row: dict[str, str]) -> CatalogFeed:
+def _read_one(row: dict[str, str]) -> PublicFeed:
     rows = read_catalog(export(row))
     (feed,) = rows.by_id.values()
     return feed
@@ -202,7 +193,7 @@ _REDIRECTS = [
 def test_gtfs_parity() -> None:
     api = copy.deepcopy(GTFS_FEED)
     feed = _read_one(_row(api))
-    assert feed == _expected(GtfsFeed.from_dict(api))
+    _assert_parity(feed, GtfsFeed.from_dict(api))
 
 
 @pytest.mark.parametrize("redirects", _REDIRECTS)
@@ -218,7 +209,7 @@ def test_gtfs_parity_redirects_and_text(redirects: list[dict[str, Any]]) -> None
     )
     api["source_info"] = {**api["source_info"], "authentication_type": 0}
     feed = _read_one(_row(api))
-    assert feed == _expected(GtfsFeed.from_dict(api))
+    _assert_parity(feed, GtfsFeed.from_dict(api))
 
 
 def test_gtfs_rt_parity() -> None:
@@ -230,7 +221,7 @@ def test_gtfs_rt_parity() -> None:
     # order; the export sorts them, so their order is the export's.
     api["entity_types"] = sorted(api["entity_types"])
     feed = _read_one(_row(api, referenced_box=BOUNDING_BOX))
-    assert feed == _expected(GtfsRtFeed.from_dict(api))
+    _assert_parity(feed, GtfsRtFeed.from_dict(api))
 
 
 @pytest.mark.parametrize("redirects", _REDIRECTS)
@@ -249,9 +240,8 @@ def test_gtfs_rt_parity_references_types_and_redirects(
         status="inactive",
     )
     feed = _read_one(_row(api, referenced_box=BOUNDING_BOX))
-    expected = _expected(GtfsRtFeed.from_dict(api))
-    assert feed == expected
-    assert isinstance(feed, GtfsRtFeed)
+    _assert_parity(feed, GtfsRtFeed.from_dict(api))
+    assert isinstance(feed, PublicGtfsRtFeed)
     assert feed.entity_types == (
         EntityType.SERVICE_ALERTS,
         EntityType.TRIP_UPDATES,
@@ -272,7 +262,7 @@ def test_gbfs_parity(generated_at: str) -> None:
     api = copy.deepcopy(GBFS_FEED)
     api["bounding_box_generated_at"] = generated_at
     feed = _read_one(_row(api))
-    assert feed == _expected(GbfsFeed.from_dict(api))
+    _assert_parity(feed, GbfsFeed.from_dict(api))
 
 
 @pytest.mark.parametrize("redirects", _REDIRECTS)
@@ -284,14 +274,14 @@ def test_gbfs_parity_redirects(redirects: list[dict[str, Any]]) -> None:
         feed_contact_email="gbfs@example.com",
     )
     feed = _read_one(_row(api))
-    assert feed == _expected(GbfsFeed.from_dict(api))
+    _assert_parity(feed, GbfsFeed.from_dict(api))
 
 
 def test_gbfs_parity_without_a_box() -> None:
     api = copy.deepcopy(GBFS_FEED)
     api.update(bounding_box=None, bounding_box_generated_at=None)
     feed = _read_one(_row(api))
-    assert feed == _expected(GbfsFeed.from_dict(api))
+    _assert_parity(feed, GbfsFeed.from_dict(api))
 
 
 def test_the_recorded_export_is_the_csv_modules_bytes() -> None:
@@ -315,24 +305,27 @@ def test_the_recorded_export_is_the_csv_modules_bytes() -> None:
 
 def test_the_recorded_export_reads_and_every_row_maps() -> None:
     rows = read_catalog(SLICE.read_bytes())
-    assert (len(rows.gtfs), len(rows.gtfs_rt), len(rows.gbfs)) == (260, 40, 0)
+    gtfs_rt = [f for f in rows.by_id.values() if isinstance(f, PublicGtfsRtFeed)]
+    assert (len(rows.gtfs), len(gtfs_rt), len(rows.gbfs)) == (260, 40, 0)
     assert len(rows.by_id) == 300
-    for feed in (*rows.gtfs, *rows.gtfs_rt):
-        assert feed.id and feed.provider and feed.source_info is not None
+    assert rows.gtfs_rt_listed == tuple(
+        sorted(gtfs_rt, key=lambda f: (f.provider, f.id))
+    )
+    transit: list[PublicGtfsFeed | PublicGtfsRtFeed] = [*rows.gtfs, *gtfs_rt]
+    for feed in transit:
+        assert feed.id and feed.provider
         assert feed.source_info.producer_url
         assert feed.source_info.authentication_type == 0
         assert feed.status is not None
     assert sum(feed.bounding_box is not None for feed in rows.gtfs) == 255
-    assert all(feed.entity_types for feed in rows.gtfs_rt)
-    assert all(feed.feed_references for feed in rows.gtfs_rt)
+    assert all(feed.entity_types for feed in gtfs_rt)
+    assert all(feed.feed_references for feed in gtfs_rt)
     assert sum(1 for f in rows.gtfs if f.note and "\n" in f.note) == 23
     assert sum(1 for f in rows.gtfs if f.provider and not f.provider.isascii()) > 0
-    redirected = [f for f in (*rows.gtfs, *rows.gtfs_rt) if f.redirects]
+    redirected = [f for f in transit if f.redirects]
     assert len(redirected) == 30
     commented = {
-        f.id: f.redirects
-        for f in redirected
-        if any(r.comment for r in f.redirects or ())
+        f.id: f.redirects for f in redirected if any(r.comment for r in f.redirects)
     }
     assert len(commented) == 8
     assert commented["mdb-108"] == (Redirect(target_id="tld-461", comment="nan"),)

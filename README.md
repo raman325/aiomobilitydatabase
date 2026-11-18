@@ -250,14 +250,15 @@ Notes on direct mode:
 
 `public_catalog` finds feeds without a refresh token, from the catalog's
 public export (`feeds_v2.csv`, regenerated daily and cached as its HTTP
-headers allow). It returns the catalog API's `GtfsFeed`, `GtfsRtFeed` and
-`GbfsFeed` with the API's filters, holding the values the export carries and
-`None` elsewhere. What differs from the API:
+headers allow). It returns `PublicGtfsFeed`, `PublicGtfsRtFeed` and
+`PublicGbfsFeed` (from `aiomobilitydatabase.feeds`): only the export's columns
+that mean what the catalog API's same-named fields mean, holding the API's
+values for the same feed (no `seasonal`, no `locations`). The methods take the
+API's filters. What differs from the API:
 
-- **Locations**: `locations` is always `None` and there are no location
-  filters (the export's location is usually the one extracted from the feed's
-  stops, not the registered locations the API returns and filters on).
-- **Seasonal**: `seasonal` is `None` (unknown).
+- **Locations**: there are no location filters (the export's location is
+  usually the one extracted from the feed's stops, not the registered
+  locations the API filters on).
 - **GBFS filters**: `get_gbfs_feeds` filters on each system's bounding box
   (the API has no such filter) and has no `system_id` or `version` filter.
 - **Ordering**: feeds are ordered by provider, then id, by code point; the
@@ -318,8 +319,8 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`MobilityDatabasePublicCatalog` can also be used on its own, without the
-feeds layer.
+`MobilityDatabasePublicCatalog` (in `aiomobilitydatabase.feeds.public_catalog`)
+can also be used on its own, without a `MobilityFeedsClient`.
 
 ## How it works
 
