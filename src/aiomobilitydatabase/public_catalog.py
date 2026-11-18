@@ -360,12 +360,14 @@ def _ilike(value: str) -> re.Pattern[str]:
     literal backslash here. The pattern matches a whole lower-cased string
     (``fullmatch``).
 
-    Not ``%`` as ``.*``: a few of those backtrack exponentially over a long
-    value. The ``%`` split the value into fixed-width segments (literals and
-    ``_``); the first must start the string and the last end it, and each
-    one between is taken at its first occurrence after the previous -- an
-    atomic lazy group, never revisited. The first occurrence is always
-    right: it leaves the most string for the rest. Linear in the value.
+    Not ``%`` as ``.*``: backtracking through those takes time growing as
+    the value's length to the power of their count (seconds to minutes for
+    a short filter over the export). The ``%`` split the value into
+    fixed-width segments (literals and ``_``); the first must start the
+    string and the last end it, and each one between is taken at its first
+    occurrence after the previous -- an atomic lazy group, never revisited.
+    The first occurrence is always right: it leaves the most string for the
+    rest. Linear in the value.
     """
     if "%" not in value:
         value = f"%{value}%"
