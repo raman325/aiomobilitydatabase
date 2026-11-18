@@ -29,7 +29,6 @@ from aiomobilitydatabase.feeds import (
 from aiomobilitydatabase.feeds._catalog_csv import CatalogRows, PublicFeed
 from aiomobilitydatabase.feeds.const import (
     PROD_PUBLIC_CATALOG_URL,
-    QA_PUBLIC_CATALOG_URL,
 )
 from aiomobilitydatabase.feeds.public_catalog import (
     _GBFS_FEEDS_MAX_LIMIT,
@@ -250,32 +249,45 @@ async def test_a_catalog_kept_past_close_goes_on_as_a_gbfs_handle_does(
 
 
 @pytest.mark.parametrize(
-    ("base_url", "expected"),
+    "base_url",
     [
-        (None, PROD_PUBLIC_CATALOG_URL),
-        (PROD_BASE_URL, PROD_PUBLIC_CATALOG_URL),
-        (f"{PROD_BASE_URL}/", PROD_PUBLIC_CATALOG_URL),
-        (QA_BASE_URL, QA_PUBLIC_CATALOG_URL),
+        None,
+        PROD_BASE_URL,
+        "https://api.mobilitydatabase.org/",
+        "https://API.mobilitydatabase.org",
+        "HTTPS://api.MobilityDatabase.org",
+        "https://api.mobilitydatabase.org:443/",
     ],
 )
-async def test_the_export_is_the_base_url_s_environment_s(
-    base_url: str | None, expected: str
+async def test_production_s_base_url_has_production_s_export(
+    base_url: str | None,
 ) -> None:
     async with MobilityFeedsClient(base_url=base_url) as client:
-        assert client.public_catalog._url == expected  # deliberate friend access
+        # deliberate friend access
+        assert client.public_catalog._url == PROD_PUBLIC_CATALOG_URL
 
 
 async def test_a_given_public_catalog_url_wins(mock_api: MockApi) -> None:
     async with MobilityFeedsClient(
-        base_url=QA_BASE_URL, public_catalog_url=mock_api.url(PATH)
+        base_url=PROD_BASE_URL, public_catalog_url=mock_api.url(PATH)
     ) as client:
         assert client.public_catalog._url == mock_api.url(PATH)
 
 
 @pytest.mark.parametrize(
-    # DEV's export (dev-files.mobilitydatabase.org) answers 403: none known.
+    # QA's export is stale (last regenerated April 2025), DEV's answers 403.
     "base_url",
-    [DEV_BASE_URL, "https://catalog.example.com"],
+    [
+        QA_BASE_URL,
+        DEV_BASE_URL,
+        "https://catalog.example.com",
+        "http://api.mobilitydatabase.org",  # another scheme
+        "https://api.mobilitydatabase.org:8443",
+        "https://api.mobilitydatabase.org/v2",
+        "https://api.mobilitydatabase.org:99999",  # no URL at all
+        "https://[::1",
+        b"https://api.mobilitydatabase.org",  # no str
+    ],
 )
 async def test_another_base_url_needs_a_public_catalog_url(base_url: str) -> None:
     async with MobilityFeedsClient(base_url=base_url) as client:
