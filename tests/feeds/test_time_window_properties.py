@@ -178,6 +178,10 @@ async def _uncapped[T](
     def generous_look_back(window_start: datetime, local_today: date) -> date:
         return local_today - look_back
 
+    def to_the_window_s_end(end_local: date) -> date:
+        # The day after its local end, whatever the feed's last service day.
+        return end_local + timedelta(days=1)
+
     def no_long_reach(*_a: object) -> set[date]:
         return set()
 
@@ -241,6 +245,7 @@ async def _uncapped[T](
     handle._addressed_runs = nothing_up_front  # type: ignore[method-assign]
     handle._detoured_runs = naive_detours  # type: ignore[method-assign]
     index._scan_start = generous_look_back  # type: ignore[method-assign]
+    index._scan_end = to_the_window_s_end  # type: ignore[method-assign]
     index._long_reach_days = no_long_reach  # type: ignore[method-assign]
     transit_module._horizons = one_pass
     try:
@@ -251,6 +256,7 @@ async def _uncapped[T](
         del handle._addressed_runs
         del handle._detoured_runs
         del index._scan_start
+        del index._scan_end
         del index._long_reach_days
 
 

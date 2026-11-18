@@ -3627,17 +3627,31 @@ class StaticIndex:
         A run on day D reaches D's start plus its latest stop time; with the
         normal reach (see :meth:`_reach_profile`) that is exact in any zone
         -- a two-hour DST jump, a skipped day -- by binary search, never
-        before the feed's first service day. Long-reaching rows are placed
-        separately (:meth:`_long_reach_days`). The search alone is exact --
-        on a fall-back night too, where an instant's local date precedes the
-        start of its own service day.
+        before the feed's first service day: a window opening before the
+        feed starts scans from that day, not from the window's own date.
+        Long-reaching rows are placed separately (:meth:`_long_reach_days`).
+        The search alone is exact -- on a fall-back night too, where an
+        instant's local date precedes the start of its own service day.
         """
         first = self._first_service_date()
         if first is None:
             return local_today
+        if local_today <= first:
+            return first  # no earlier day has a service to run
         normal = self._reach_profile()[0]
         reaching = self._first_reaching_day(first, local_today, normal, window_start)
         return reaching or local_today
+
+    def _scan_end(self, end_local: date) -> date:
+        """Return the last service day a window ending on ``end_local`` reads.
+
+        One day after the window's local end date (enclosure margin for DST
+        edge instants), never past the feed's last service day: a window
+        reaching centuries beyond the feed reads only the feed's days.
+        """
+        scan_end = end_local + timedelta(days=1)
+        last = max(self._service_last_dates().values(), default=None)
+        return scan_end if last is None else min(scan_end, last)
 
     def _service_last_dates(self) -> dict[str, date]:
         """Map each service id to the last service date it can be active on.
@@ -4098,7 +4112,8 @@ class StaticIndex:
         the window (see :meth:`_scan_start`; times past 24:00:00 are still
         upcoming), plus the few earlier days a long-reaching stop time lands
         from (:meth:`_long_reach_days`), through one day AFTER the window's
-        local end date (enclosure margin for DST edge instants). Empty days
+        local end date (:meth:`_scan_end`) -- all within the feed's first
+        and last service days, however far the window reaches past them. Empty days
         cost one cheap indexed query; silently narrower bounds cost dropped
         departures (hypothesis-found bug, 2026-07-31: the old hardcoded
         local_today +/- 1 day tuple ignored `lookahead` entirely).
@@ -4111,10 +4126,12 @@ class StaticIndex:
         # Clamped so a window reaching the end of datetime (an explicit far
         # end, or a calendar running "forever") never overflows date math.
         window_end = min(now + lookahead, _LATEST_INSTANT)
+        if self._first_service_date() is None:
+            return  # no service can run on any day
         local_today = window_start.astimezone(self._tz).date()
         end_local = window_end.astimezone(self._tz).date()
         scan_start = self._scan_start(window_start, local_today)
-        scan_end = end_local + timedelta(days=1)
+        scan_end = self._scan_end(end_local)
         days = [
             scan_start + timedelta(days=offset)
             for offset in range((scan_end - scan_start).days + 1)
