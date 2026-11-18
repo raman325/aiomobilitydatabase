@@ -17,6 +17,7 @@ One copy for the catalog client and the feeds, so the two can't drift:
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from typing import TYPE_CHECKING, Any, Final
 
@@ -72,6 +73,47 @@ def require_text(value: str, what: str) -> str:
     if not is_text(value):
         raise ValueError(f"{what} holds a lone surrogate, not text")
     return value
+
+
+def is_loopback(host: str) -> bool:
+    """Whether a host names this machine (where plain http stays local)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def require_http_url(
+    url: str, name: str, *, query: bool, https_reason: str = ""
+) -> None:
+    """Raise ValueError unless ``url`` is an http(s) URL a client may request.
+
+    A host, no credentials and no fragment -- nor a query unless ``query``
+    -- and plain http only on loopback. ``name`` names the argument in each
+    message and ``https_reason`` follows "must be https". No message quotes
+    the URL: it may hold a password.
+    """
+    host: str | None = None
+    try:
+        parsed = URL(url)
+        host = parsed.host
+    except URL_ERRORS:
+        parsed = None
+    if parsed is None:  # outside the except: the error would quote the URL
+        raise ValueError(f"{name} is no URL")
+    if parsed.scheme not in ("http", "https") or not host:
+        raise ValueError(f"{name} must be an http(s) URL with a host")
+    if parsed.user is not None or parsed.raw_password is not None:
+        raise ValueError(f"{name} must not hold credentials")
+    if query:
+        if parsed.raw_fragment or "#" in url:
+            raise ValueError(f"{name} must not hold a fragment")
+    elif parsed.raw_query_string or parsed.raw_fragment or "?" in url or "#" in url:
+        raise ValueError(f"{name} must not hold a query or fragment")
+    if parsed.scheme == "http" and not is_loopback(host):
+        raise ValueError(f"{name} must be https{https_reason}")
 
 
 def require_session(session: aiohttp.ClientSession) -> None:

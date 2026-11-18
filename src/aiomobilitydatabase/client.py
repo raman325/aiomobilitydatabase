@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-import ipaddress
 import math
 import re
 import types
@@ -20,9 +19,8 @@ from urllib.parse import quote
 
 import aiohttp
 from mashumaro import DataClassDictMixin
-from yarl import URL
 
-from ._http import URL_ERRORS, require_session, require_text
+from ._http import require_http_url, require_session, require_text
 from ._json import loads as json_loads
 from ._payload import mismatch
 from ._transport import Answer, exchange
@@ -86,26 +84,12 @@ def _require_base_url(base_url: str) -> str:
     query or fragment would swallow every path). RFC 6750 section 5.3: a
     bearer token travels over TLS only, so plain http is for loopback.
     """
-    try:
-        parsed = URL(base_url)
-        host = parsed.host
-    except URL_ERRORS:
-        parsed = None
-    if parsed is None:  # outside the except, quoting nothing: it may hold a password
-        raise ValueError("base_url is no URL")
-    if parsed.scheme not in ("http", "https") or not host:
-        raise ValueError("base_url must be an http(s) URL with a host")
-    if parsed.user is not None or parsed.raw_password is not None:
-        raise ValueError("base_url must not hold credentials")
-    if (
-        parsed.raw_query_string
-        or parsed.raw_fragment
-        or "?" in base_url
-        or "#" in base_url
-    ):
-        raise ValueError("base_url must not hold a query or fragment")
-    if parsed.scheme == "http" and not _is_loopback(host):
-        raise ValueError("base_url must be https: bearer tokens travel over TLS only")
+    require_http_url(
+        base_url,
+        "base_url",
+        query=False,
+        https_reason=": bearer tokens travel over TLS only",
+    )
     return base_url.rstrip("/")
 
 
@@ -129,16 +113,6 @@ def _timeout_seconds(request_timeout: object) -> float:
     if not 0 < seconds < math.inf:
         raise ValueError("request_timeout must be a finite positive number of seconds")
     return seconds
-
-
-def _is_loopback(host: str) -> bool:
-    """Whether a host names this machine (where plain http stays local)."""
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 def _fits(value: Any, expected: Any) -> bool:

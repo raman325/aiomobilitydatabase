@@ -13,18 +13,16 @@ from types import TracebackType
 from typing import Self
 
 import aiohttp
-from yarl import URL
 
 from ._bounds import Box, matches
 from ._catalog_csv import CatalogFeed, CatalogFormatError, CatalogRows, read_catalog
 from ._freshness import FreshnessCache, Response, Validators, request_fields
-from ._http import URL_ERRORS, require_text
+from ._http import require_http_url, require_text
 from ._transport import exchange
 
 # Deliberate friend access: the argument checks are shared with the API
 # client so both answer a bad argument alike.
 from .client import (
-    _is_loopback,
     _require_catalog_session,
     _require_id,
     _text,
@@ -63,22 +61,7 @@ def _require_export_url(url: object) -> str:
     """
     if not isinstance(url, str):
         raise TypeError("url must be a str")
-    host: str | None = None
-    try:
-        parsed = URL(url)
-        host = parsed.host
-    except URL_ERRORS:
-        parsed = None
-    if parsed is None:  # outside the except: the error would ride along
-        raise ValueError("url is no URL")
-    if parsed.scheme not in ("http", "https") or not host:
-        raise ValueError("url must be an http(s) URL with a host")
-    if parsed.user is not None or parsed.raw_password is not None:
-        raise ValueError("url must not hold credentials")
-    if parsed.raw_fragment or "#" in url:
-        raise ValueError("url must not hold a fragment")
-    if parsed.scheme == "http" and not _is_loopback(host):
-        raise ValueError("url must be https")
+    require_http_url(url, "url", query=True)
     return url
 
 
