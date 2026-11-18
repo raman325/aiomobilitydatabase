@@ -8,8 +8,8 @@ from datetime import datetime
 
 import pytest
 
-from aiomobilitydatabase._bounds import Box
-from aiomobilitydatabase._catalog_csv import CatalogFormatError, read_catalog
+from aiomobilitydatabase.feeds._bounds import Box
+from aiomobilitydatabase.feeds._catalog_csv import CatalogFormatError, read_catalog
 from aiomobilitydatabase.models import (
     BoundingBox,
     DataType,
@@ -22,7 +22,7 @@ from aiomobilitydatabase.models import (
     SourceInfo,
 )
 
-from tests.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, box, export
+from tests.feeds.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, box, export
 
 
 def test_a_gtfs_row_maps_to_the_api_s_gtfs_feed() -> None:
@@ -44,7 +44,6 @@ def test_a_gtfs_row_maps_to_the_api_s_gtfs_feed() -> None:
             ),
             status=FeedStatus.ACTIVE,
             official=True,
-            seasonal=None,
             feed_name="NYC Subway",
             note="Line one\nline two, with a comma",
             bounding_box=BoundingBox(40.5, 40.9, -74.3, -73.7),
@@ -68,7 +67,6 @@ def test_a_gtfs_rt_row_maps_to_the_api_s_gtfs_rt_feed() -> None:
         redirects=(),
         status=FeedStatus.ACTIVE,
         official=False,
-        seasonal=None,
         entity_types=(
             EntityType.SERVICE_ALERTS,
             EntityType.TRIP_UPDATES,

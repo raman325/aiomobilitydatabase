@@ -67,7 +67,6 @@ from .models import (
     ValidationReport,
     ValidationReportSummary,
 )
-from .public_catalog import MobilityDatabasePublicCatalog
 
 __all__ = [
     "AccessToken",
@@ -118,7 +117,6 @@ __all__ = [
     "MobilityDatabaseConnectionError",
     "MobilityDatabaseError",
     "MobilityDatabaseNotFoundError",
-    "MobilityDatabasePublicCatalog",
     "MobilityDatabaseRateLimitError",
     "NoticeSeverity",
     "Redirect",

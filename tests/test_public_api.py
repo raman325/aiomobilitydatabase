@@ -6,7 +6,6 @@ import aiomobilitydatabase
 def test_public_exports() -> None:
     for name in (
         "MobilityDatabaseClient",
-        "MobilityDatabasePublicCatalog",
         "Feed",
         "GtfsFeed",
         "GtfsRtFeed",

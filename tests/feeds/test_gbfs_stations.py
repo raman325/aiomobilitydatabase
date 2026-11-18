@@ -12,7 +12,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from aiomobilitydatabase._json import loads as json_loads
-from aiomobilitydatabase._vocab import vocab_or_none
+from aiomobilitydatabase.feeds._vocab import vocab_or_none
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import FeedParseError, SourceConnectionError
 from aiomobilitydatabase.feeds.gbfs import (

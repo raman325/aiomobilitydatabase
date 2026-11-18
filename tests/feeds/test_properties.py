@@ -23,8 +23,8 @@ from google.transit import gtfs_realtime_pb2
 from hypothesis import HealthCheck, event, example, given, settings
 from hypothesis import strategies as st
 
-from aiomobilitydatabase._freshness import FreshnessCache, _Entry
 from aiomobilitydatabase.feeds import TripQuery
+from aiomobilitydatabase.feeds._freshness import FreshnessCache, _Entry
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,

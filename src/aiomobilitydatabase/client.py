@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import ipaddress
 import math
 import re
 import types
@@ -13,16 +14,17 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from http import HTTPStatus
-from typing import Any, Final
+from types import TracebackType
+from typing import Any, Final, Self
 from urllib.parse import quote
 
 import aiohttp
 from mashumaro import DataClassDictMixin
+from yarl import URL
 
-from ._http import require_http_url, require_session, require_text
+from ._http import URL_ERRORS, require_session, require_text
 from ._json import loads as json_loads
 from ._payload import mismatch
-from ._session import OwnedSession
 from ._transport import Answer, exchange
 from .const import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -84,12 +86,26 @@ def _require_base_url(base_url: str) -> str:
     query or fragment would swallow every path). RFC 6750 section 5.3: a
     bearer token travels over TLS only, so plain http is for loopback.
     """
-    require_http_url(
-        base_url,
-        "base_url",
-        query=False,
-        https_reason=": bearer tokens travel over TLS only",
-    )
+    try:
+        parsed = URL(base_url)
+        host = parsed.host
+    except URL_ERRORS:
+        parsed = None
+    if parsed is None:  # outside the except, quoting nothing: it may hold a password
+        raise ValueError("base_url is no URL")
+    if parsed.scheme not in ("http", "https") or not host:
+        raise ValueError("base_url must be an http(s) URL with a host")
+    if parsed.user is not None or parsed.raw_password is not None:
+        raise ValueError("base_url must not hold credentials")
+    if (
+        parsed.raw_query_string
+        or parsed.raw_fragment
+        or "?" in base_url
+        or "#" in base_url
+    ):
+        raise ValueError("base_url must not hold a query or fragment")
+    if parsed.scheme == "http" and not _is_loopback(host):
+        raise ValueError("base_url must be https: bearer tokens travel over TLS only")
     return base_url.rstrip("/")
 
 
@@ -113,6 +129,16 @@ def _timeout_seconds(request_timeout: object) -> float:
     if not 0 < seconds < math.inf:
         raise ValueError("request_timeout must be a finite positive number of seconds")
     return seconds
+
+
+def _is_loopback(host: str) -> bool:
+    """Whether a host names this machine (where plain http stays local)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _fits(value: Any, expected: Any) -> bool:
@@ -398,7 +424,7 @@ def encode_params(params: dict[str, Any]) -> dict[str, str | tuple[str, ...]]:
     }
 
 
-class MobilityDatabaseClient(OwnedSession):
+class MobilityDatabaseClient:
     """Async client for the Mobility Database catalog API.
 
     If ``session`` is not provided, the client lazily creates its own
@@ -437,6 +463,35 @@ class MobilityDatabaseClient(OwnedSession):
         self._access_token: str | None = None
         self._token_expiration: datetime | None = None
         self._token_lock = asyncio.Lock()
+
+    async def __aenter__(self) -> Self:
+        """Enter the async context manager."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Exit the async context manager, closing owned resources."""
+        await self.close()
+
+    async def close(self) -> None:
+        """Close the underlying session if this client owns it. Idempotent."""
+        if (
+            self._owns_session
+            and self._session is not None
+            and not self._session.closed
+        ):
+            await self._session.close()
+            self._session = None
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """Return the session, lazily creating an owned one if needed."""
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
 
     def _token_needs_refresh(self) -> bool:
         """Return True if there is no token or it is at/near expiration."""

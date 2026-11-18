@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from .models import BoundingFilterMethod
+from ..models import BoundingFilterMethod
 
 
 class Box(NamedTuple):

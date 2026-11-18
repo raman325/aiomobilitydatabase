@@ -15,24 +15,25 @@ from collections.abc import AsyncGenerator, Awaitable, Sequence
 import aiohttp
 import pytest
 
-from aiomobilitydatabase import BoundingFilterMethod, EntityType, public_catalog
-from aiomobilitydatabase._catalog_csv import CatalogRows
+from aiomobilitydatabase import BoundingFilterMethod, EntityType
 from aiomobilitydatabase.exceptions import (
     MobilityDatabaseApiError,
     MobilityDatabaseConnectionError,
     MobilityDatabaseNotFoundError,
     MobilityDatabaseRateLimitError,
 )
-from aiomobilitydatabase.models import Feed
-from aiomobilitydatabase.public_catalog import (
+from aiomobilitydatabase.feeds import public_catalog
+from aiomobilitydatabase.feeds._catalog_csv import CatalogRows
+from aiomobilitydatabase.feeds.public_catalog import (
     _GBFS_FEEDS_MAX_LIMIT,
     _GTFS_FEEDS_MAX_LIMIT,
     _GTFS_RT_FEEDS_MAX_LIMIT,
     MobilityDatabasePublicCatalog,
 )
+from aiomobilitydatabase.models import Feed
 
+from tests.feeds.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, box, export
 from tests.mock_server import MockApi
-from tests.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, box, export
 
 PATH = "/feeds_v2.csv"
 BODY = export(GTFS_ROW, GTFS_RT_ROW, GBFS_ROW)

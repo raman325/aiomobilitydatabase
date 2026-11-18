@@ -11,7 +11,7 @@ repos:
       - id: end-of-file-fixer
         # Keep Google's canonical sample feed byte-identical to upstream, and
         # the recorded catalog export byte-identical to the live file.
-        exclude: ^(tests/feeds/data/sample_feed/.*\.txt|tests/data/.*\.csv)$
+        exclude: ^(tests/feeds/data/sample_feed/.*\.txt|tests/feeds/data/.*\.csv)$
       - id: trailing-whitespace
-        exclude: ^(tests/feeds/data/sample_feed/.*\.txt|tests/data/.*\.csv)$
+        exclude: ^(tests/feeds/data/sample_feed/.*\.txt|tests/feeds/data/.*\.csv)$
       - id: check-yaml

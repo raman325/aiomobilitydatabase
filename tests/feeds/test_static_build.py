@@ -18,7 +18,7 @@ import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
-from aiomobilitydatabase._numbers import exact_number
+from aiomobilitydatabase.feeds._numbers import exact_number
 from aiomobilitydatabase.feeds.exceptions import FeedParseError
 from aiomobilitydatabase.feeds.models import StopLocationType
 from aiomobilitydatabase.feeds.static_index import (

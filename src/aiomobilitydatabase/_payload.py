@@ -56,8 +56,6 @@ def mismatch(annotation: Any, value: Any, where: str = "$") -> str | None:
     of X; a dataclass an object whose present fields conform (a missing
     required field is mashumaro's to report; keys the model doesn't know
     are ignored, as the API may add fields); ``X | None`` null or an X.
-    A dataclass field marked ``metadata={"not_null": True}`` is never null,
-    whatever its annotation.
     """
     origin = typing.get_origin(annotation)
     if origin in (typing.Union, types.UnionType):
@@ -95,9 +93,6 @@ def _object_mismatch(model: type, value: Any, where: str) -> str | None:
     hints = _hints(model)
     for field in dataclasses.fields(model):
         if field.name in value:
-            if value[field.name] is None and field.metadata.get("not_null"):
-                # Optional in the model, never null from the API.
-                return f"{where}.{field.name} is null"
             found = mismatch(
                 hints[field.name], value[field.name], f"{where}.{field.name}"
             )

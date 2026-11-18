@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 
@@ -239,14 +239,12 @@ class Feed(BasicFeed):
     ``seasonal`` is False when the feed has not been marked seasonal (the
     spec's default): a seasonal feed serves only during recurring periods
     of the year, and is left out of the rolling 7-day coverage checks.
-    None means unknown: the public catalog export doesn't carry it (the API
-    always does, and never sends null).
     """
 
     status: FeedStatus | None = None
     official: bool | None = None
     official_updated_at: datetime | None = None
-    seasonal: bool | None = field(default=False, metadata={"not_null": True})
+    seasonal: bool = False
     feed_name: str | None = None
     note: str | None = None
     related_links: tuple[FeedRelatedLink, ...] | None = None

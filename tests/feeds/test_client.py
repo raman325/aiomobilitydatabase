@@ -10,9 +10,9 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from aiomobilitydatabase import MobilityDatabasePublicCatalog
 from aiomobilitydatabase.const import PROD_BASE_URL
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
+from aiomobilitydatabase.feeds.public_catalog import MobilityDatabasePublicCatalog
 
 from tests.feeds.fixtures import TOKEN_RESPONSE
 from tests.mock_server import MockApi

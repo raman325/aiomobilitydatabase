@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any
 
 from google.transit import gtfs_realtime_pb2
 
-from .._freshness import FreshnessCache, _etag, header_fields
 from ..models import (
     DataType,
     EntityType,
@@ -36,6 +35,7 @@ from ..models import (
     LatestDataset,
     SourceInfo,
 )
+from ._freshness import FreshnessCache, _etag, header_fields
 from ._redirects import get_withholding, network
 from ._urls import (
     _require_http_url,  # deliberate friend access: shared data-origin URL guard

@@ -12,13 +12,13 @@ from typing import Any
 import aiohttp
 from google.transit import gtfs_realtime_pb2
 
-from .._freshness import Response, Validators, header_fields, request_fields
-from .._freshness import hops as _hops
 from .._http import is_text, is_token
-from .._vocab import vocab_or_none
+from ._freshness import Response, Validators, header_fields, request_fields
+from ._freshness import hops as _hops
 from ._language import is_preferred_language
 from ._redirects import get_withholding, network
 from ._urls import _require_http_url, redact
+from ._vocab import vocab_or_none
 from .exceptions import FeedParseError, SourceAuthenticationError, SourceConnectionError
 from .models import (
     AlertCause,
@@ -169,8 +169,7 @@ def feed_request_fields(
     """Return the header fields :func:`fetch_feed_message` would send now.
 
     Unconditional: what a stored response's Vary is matched against (see
-    :func:`~aiomobilitydatabase._freshness.request_fields`; None when they can't
-    be known).
+    :func:`~._freshness.request_fields`; None when they can't be known).
     """
     _require_http_url(url, "GTFS-RT producer URL")  # request_fields parses it
     _params, req_headers = _feed_request(auth_type, api_key_name, api_key, headers)

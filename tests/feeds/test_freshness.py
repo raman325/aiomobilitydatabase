@@ -21,8 +21,8 @@ from hypothesis.stateful import (
 from multidict import CIMultiDict
 from yarl import URL
 
-from aiomobilitydatabase import _freshness as freshness_module
-from aiomobilitydatabase._freshness import (
+from aiomobilitydatabase.feeds import _freshness as freshness_module
+from aiomobilitydatabase.feeds._freshness import (
     Freshness,
     FreshnessCache,
     Hop,

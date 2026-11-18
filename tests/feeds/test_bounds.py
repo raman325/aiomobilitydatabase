@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import cache
 from itertools import product
 
-from aiomobilitydatabase._bounds import (
+from aiomobilitydatabase.feeds._bounds import (
     Box,
     _interiors_meet,
     contains,

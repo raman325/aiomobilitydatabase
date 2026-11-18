@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from aiomobilitydatabase._catalog_csv import CatalogFeed, read_catalog
+from aiomobilitydatabase.feeds._catalog_csv import CatalogFeed, read_catalog
 from aiomobilitydatabase.models import (
     EntityType,
     GbfsFeed,
@@ -27,8 +27,8 @@ from aiomobilitydatabase.models import (
     Redirect,
 )
 
+from tests.feeds.public_catalog_data import export
 from tests.fixtures import BOUNDING_BOX, GBFS_FEED, GTFS_FEED, GTFS_RT_FEED
-from tests.public_catalog_data import export
 
 SLICE = Path(__file__).parent / "data" / "feeds_v2_slice.csv"
 
@@ -129,7 +129,6 @@ _NOT_EXPORTED = (
     "created_at",
     "external_ids",
     "official_updated_at",
-    "seasonal",
     "related_links",
     "locations",
     "latest_dataset",
@@ -150,9 +149,12 @@ _SOURCE_NOT_EXPORTED = (
 
 def _expected(model: Any) -> Any:
     fields = {f.name for f in dataclasses.fields(model)}
+    # seasonal isn't exported either: the model's default stands (R2: own models).
+    defaults = {"seasonal": False} if "seasonal" in fields else {}
     return dataclasses.replace(
         model,
         **dict.fromkeys(fields.intersection(_NOT_EXPORTED)),
+        **defaults,
         source_info=dataclasses.replace(
             model.source_info, **dict.fromkeys(_SOURCE_NOT_EXPORTED)
         ),

@@ -4,7 +4,7 @@ The columns are mobility-feed-api's ``export_csv`` (documented in its
 ``docs/SpreadsheetSchemaV2.md``). Each row becomes the model the catalog
 API returns for that feed, holding the values the export carries from the
 same database columns and nothing else (see
-:class:`~aiomobilitydatabase.public_catalog.MobilityDatabasePublicCatalog`).
+:class:`~aiomobilitydatabase.feeds.public_catalog.MobilityDatabasePublicCatalog`).
 """
 
 from __future__ import annotations
@@ -17,10 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
 
-from ._bounds import Box
-from ._numbers import ascii_number
-from ._vocab import vocab_or_none
-from .models import (
+from ..models import (
     BoundingBox,
     DataType,
     EntityType,
@@ -31,6 +28,9 @@ from .models import (
     Redirect,
     SourceInfo,
 )
+from ._bounds import Box
+from ._numbers import ascii_number
+from ._vocab import vocab_or_none
 
 type CatalogFeed = GtfsFeed | GtfsRtFeed | GbfsFeed
 
@@ -171,7 +171,7 @@ def _feed(feed_id: str, row: _Row, box: Box | None) -> CatalogFeed | None:
             redirects=_redirects(row),
             status=_status(row),
             official=_BOOLEANS.get(_cell(row, "is_official") or ""),
-            seasonal=None,  # not in the export
+            # seasonal: not in the export; the model's default stands (R2: own models)
             feed_name=_cell(row, "name"),
             note=_cell(row, "note"),
             bounding_box=_bounding_box(box),
@@ -186,7 +186,7 @@ def _feed(feed_id: str, row: _Row, box: Box | None) -> CatalogFeed | None:
             redirects=_redirects(row),
             status=_status(row),
             official=_BOOLEANS.get(_cell(row, "is_official") or ""),
-            seasonal=None,  # not in the export
+            # seasonal: not in the export; the model's default stands (R2: own models)
             feed_name=_cell(row, "name"),
             note=_cell(row, "note"),
             entity_types=_entity_types(row),

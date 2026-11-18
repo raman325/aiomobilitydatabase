@@ -1,1 +1,1 @@
-tests/data/*.csv -text
+tests/feeds/data/*.csv -text

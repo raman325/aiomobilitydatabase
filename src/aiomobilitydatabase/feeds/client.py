@@ -14,12 +14,12 @@ import aiohttp
 
 from ..client import MobilityDatabaseClient
 from ..exceptions import MobilityDatabaseError
-from ..public_catalog import MobilityDatabasePublicCatalog
 from ._extra import load_transit_handle
 from ._urls import require_caller_inputs
 from .const import DEFAULT_TIMEOUT_SECONDS
 from .gbfs import GbfsFeedHandle
 from .models import StaticBuildProgress
+from .public_catalog import MobilityDatabasePublicCatalog
 
 if TYPE_CHECKING:
     from .transit import TransitFeedHandle

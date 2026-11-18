@@ -1,8 +1,8 @@
 """Spec enumerations at the model boundary: unknown values become None.
 
-Shared by the GTFS-RT and GBFS layers and the public catalog (protobuf-free,
-so GBFS and the catalog keep working without the ``feeds`` extra), as the
-static side's ``_enum_or_none`` is for GTFS's integer vocabularies.
+Shared by the GTFS-RT and GBFS layers (protobuf-free, so GBFS keeps working
+without the ``feeds`` extra), as the static side's ``_enum_or_none`` is for
+GTFS's integer vocabularies.
 """
 
 from __future__ import annotations

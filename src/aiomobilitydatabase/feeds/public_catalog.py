@@ -3,39 +3,38 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
+from types import TracebackType
+from typing import Self
 
 import aiohttp
+from yarl import URL
 
-from ._bounds import Box, matches
-from ._catalog_csv import CatalogFeed, CatalogFormatError, CatalogRows, read_catalog
-from ._freshness import FreshnessCache, Response, Validators, request_fields
-from ._http import require_http_url, require_text
-from ._session import OwnedSession
-from ._transport import exchange
+from .._http import REQUEST_OPTIONS, URL_ERRORS, require_text
+from .._transport import Answer
 
 # Deliberate friend access: the argument checks are shared with the API
 # client so both answer a bad argument alike.
-from .client import (
+from ..client import (
     _require_catalog_session,
     _require_id,
     _text,
     _timeout_seconds,
     _typed,
 )
-from .const import DEFAULT_TIMEOUT_SECONDS, PUBLIC_CATALOG_URL
-from .exceptions import (
+from ..exceptions import (
     MobilityDatabaseApiError,
     MobilityDatabaseConnectionError,
     MobilityDatabaseNotFoundError,
     MobilityDatabaseRateLimitError,
 )
-from .models import (
+from ..models import (
     BoundingFilterMethod,
     EntityType,
     Feed,
@@ -43,6 +42,16 @@ from .models import (
     GtfsFeed,
     GtfsRtFeed,
 )
+from ._bounds import Box, matches
+from ._catalog_csv import CatalogFeed, CatalogFormatError, CatalogRows, read_catalog
+from ._freshness import (
+    FreshnessCache,
+    Response,
+    Validators,
+    header_fields,
+    request_fields,
+)
+from .const import DEFAULT_TIMEOUT_SECONDS, PUBLIC_CATALOG_URL
 
 # The API's paging bounds (mobility-feed-api, feeds_api.py: ``limit`` is
 # ``Query(N, ge=0, le=N)``, ``offset`` ``ge=0``): each endpoint's default
@@ -60,11 +69,72 @@ def _require_export_url(url: object) -> str:
     """
     if not isinstance(url, str):
         raise TypeError("url must be a str")
-    require_http_url(url, "url", query=True)
+    host: str | None = None
+    try:
+        parsed = URL(url)
+        host = parsed.host
+    except URL_ERRORS:
+        parsed = None
+    if parsed is None:  # outside the except: the error would quote the URL
+        raise ValueError("url is no URL")
+    if parsed.scheme not in ("http", "https") or not host:
+        raise ValueError("url must be an http(s) URL with a host")
+    if parsed.user is not None or parsed.raw_password is not None:
+        raise ValueError("url must not hold credentials")
+    if parsed.raw_fragment or "#" in url:
+        raise ValueError("url must not hold a fragment")
+    if parsed.scheme == "http" and not _is_loopback(host):
+        raise ValueError("url must be https")
     return url
 
 
-class MobilityDatabasePublicCatalog(OwnedSession):
+def _is_loopback(host: str) -> bool:
+    """Whether a host names this machine (where plain http stays local)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+async def _exchange(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    client_timeout: aiohttp.ClientTimeout,
+    headers: Mapping[str, str],
+) -> tuple[Answer, dict[str, tuple[str, ...]]]:
+    """GET the export whole, never following redirects; also its header fields.
+
+    The catalog client's :func:`~aiomobilitydatabase._transport.exchange`,
+    plus the header fields a cache keeps (R2 fetches as the feeds do).
+    """
+    if session.closed:
+        raise RuntimeError("the session is closed")  # the caller's, not the API's
+    try:
+        async with session.request(
+            "GET",
+            url,
+            timeout=client_timeout,
+            headers=headers,
+            **REQUEST_OPTIONS,
+        ) as resp:
+            body: bytes | None
+            try:
+                body = await resp.read()
+            except aiohttp.ClientPayloadError:
+                body = None
+            header = resp.headers.get("Content-Type", "")
+            media_type = header.split(";", 1)[0].strip(" \t").lower()
+            return Answer(resp.status, media_type, body), header_fields(resp.headers)
+    except Exception as err:  # the boundary: see _transport's docstring
+        failure = type(err).__name__
+    # Raised outside the except, so the original isn't even the context.
+    raise MobilityDatabaseConnectionError(f"Public catalog request failed ({failure})")
+
+
+class MobilityDatabasePublicCatalog:
     r"""The Mobility Database catalog's public export, without an account.
 
     Reads ``feeds_v2.csv`` (MobilityData regenerates it daily) and answers
@@ -75,7 +145,8 @@ class MobilityDatabasePublicCatalog(OwnedSession):
     - ``locations`` is always None, and there are no location filters: the
       export's location is usually the one extracted from the feed's stops,
       not the registered locations the API returns and filters on.
-    - ``seasonal`` is None (unknown): the export doesn't carry it.
+    - ``seasonal`` isn't in the export: it holds the model's default
+      (False), which says nothing about the feed.
     - ``get_gbfs_feeds`` filters on the system's bounding box (the API has
       no such filter) and has no ``system_id`` or ``version`` filter.
     - Results are ordered by provider, then id, by code point (the API's
@@ -156,6 +227,35 @@ class MobilityDatabasePublicCatalog(OwnedSession):
         self._timeout = aiohttp.ClientTimeout(total=seconds)
         self._cache: FreshnessCache[CatalogRows] = FreshnessCache()
 
+    async def __aenter__(self) -> Self:
+        """Enter the async context manager."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Exit the async context manager, closing owned resources."""
+        await self.close()
+
+    async def close(self) -> None:
+        """Close the underlying session if this catalog owns it. Idempotent."""
+        if (
+            self._owns_session
+            and self._session is not None
+            and not self._session.closed
+        ):
+            await self._session.close()
+            self._session = None
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """Return the session, lazily creating an owned one if needed."""
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
     async def _rows(self) -> CatalogRows:
         """Return the export, from the cache while fresh."""
         # No session yet: _fetch makes a plain one, whose request carries no
@@ -167,11 +267,9 @@ class MobilityDatabasePublicCatalog(OwnedSession):
     async def _fetch(self, *, validators: Validators | None) -> Response[CatalogRows]:
         """GET the export; conditional when ``validators`` is given."""
         requested_at = datetime.now(UTC)
-        answer = await exchange(
+        answer, fields = await _exchange(
             self._get_session(),
-            "GET",
             self._url,
-            what="Public catalog request",
             client_timeout=self._timeout,
             headers={} if validators is None else validators.request_headers(),
         )
@@ -179,7 +277,7 @@ class MobilityDatabasePublicCatalog(OwnedSession):
         if answer.status == HTTPStatus.NOT_MODIFIED and validators is not None:
             return Response(
                 value=None,
-                fields=answer.fields,
+                fields=fields,
                 requested_at=requested_at,
                 received_at=received_at,
                 url=self._url,
@@ -203,7 +301,7 @@ class MobilityDatabasePublicCatalog(OwnedSession):
         else:
             return Response(
                 value=rows,
-                fields=answer.fields,
+                fields=fields,
                 requested_at=requested_at,
                 received_at=received_at,
                 url=self._url,
