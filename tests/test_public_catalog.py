@@ -10,12 +10,12 @@ import re
 import socket
 import threading
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Sequence
 
 import aiohttp
 import pytest
 
-from aiomobilitydatabase import public_catalog
+from aiomobilitydatabase import BoundingFilterMethod, EntityType, public_catalog
 from aiomobilitydatabase._catalog_csv import CatalogRows
 from aiomobilitydatabase.exceptions import (
     MobilityDatabaseApiError,
@@ -23,6 +23,7 @@ from aiomobilitydatabase.exceptions import (
     MobilityDatabaseNotFoundError,
     MobilityDatabaseRateLimitError,
 )
+from aiomobilitydatabase.models import Feed
 from aiomobilitydatabase.public_catalog import (
     _GBFS_FEEDS_MAX_LIMIT,
     _GTFS_FEEDS_MAX_LIMIT,
@@ -31,7 +32,7 @@ from aiomobilitydatabase.public_catalog import (
 )
 
 from tests.mock_server import MockApi
-from tests.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, export
+from tests.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, box, export
 
 PATH = "/feeds_v2.csv"
 BODY = export(GTFS_ROW, GTFS_RT_ROW, GBFS_ROW)
@@ -492,3 +493,150 @@ async def test_a_wildcard_heavy_filter_runs_in_linear_time(
     feeds = await public.get_gtfs_feeds(producer_url="%_%_%_%_%_%_%_%_%#")
     assert time.perf_counter() - started < 0.5
     assert feeds == []
+
+
+FILTER_BODY = export(
+    {
+        **GTFS_ROW,
+        "id": "mdb-1",
+        "provider": "Alpha Transit",
+        "is_official": "True",
+        "urls.direct_download": "https://alpha.example.com/gtfs.zip",
+        **box("0", "1", "0", "1"),
+    },
+    {
+        **GTFS_ROW,
+        "id": "mdb-2",
+        "provider": "Beta Bus",
+        "is_official": "False",
+        "urls.direct_download": "https://beta.example.com/GTFS.zip",
+        **box("0", "10", "0", "10"),
+    },
+    {
+        **GTFS_ROW,
+        "id": "mdb-3",
+        "provider": "Gamma",
+        "is_official": "",
+        "urls.direct_download": "https://gamma.example.com/x.zip",
+        **box("20", "21", "20", "21"),
+    },
+    {**GTFS_ROW, "id": "mdb-4", "provider": "Delta", **box("", "", "", "")},
+    {**GTFS_RT_ROW, "id": "mdb-5", "entity_type": "vp"},
+    {**GTFS_RT_ROW, "id": "mdb-6", "entity_type": "sa|tu"},
+)
+
+
+@pytest.fixture
+async def filtered(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> MobilityDatabasePublicCatalog:
+    serve(mock_api, body=FILTER_BODY, headers={"Cache-Control": "max-age=3600"})
+    return public
+
+
+async def ids(feeds: Awaitable[Sequence[Feed]]) -> list[str]:
+    return [feed.id for feed in await feeds]
+
+
+async def test_a_trimmed_substring_provider_filters_in_provider_order(
+    filtered: MobilityDatabasePublicCatalog,
+) -> None:
+    assert await ids(filtered.get_gtfs_feeds(provider="  BETA ")) == ["mdb-2"]
+    assert await ids(filtered.get_gtfs_feeds(provider="ta")) == ["mdb-2", "mdb-4"]
+    # Provider, then id: Alpha, Beta, Delta, Gamma.
+    assert await ids(filtered.get_gtfs_feeds()) == ["mdb-1", "mdb-2", "mdb-4", "mdb-3"]
+
+
+async def test_producer_url_matches_the_substring_in_any_case(
+    filtered: MobilityDatabasePublicCatalog,
+) -> None:
+    assert await ids(filtered.get_gtfs_feeds(producer_url="gtfs.zip")) == [
+        "mdb-1",
+        "mdb-2",
+    ]
+
+
+async def test_is_official_false_keeps_false_and_unknown(
+    filtered: MobilityDatabasePublicCatalog,
+) -> None:
+    # mdb-4 keeps GTFS_ROW's "True".
+    assert await ids(filtered.get_gtfs_feeds(is_official=True)) == ["mdb-1", "mdb-4"]
+    assert await ids(filtered.get_gtfs_feeds(is_official=False)) == ["mdb-2", "mdb-3"]
+
+
+async def test_entity_types_match_any(filtered: MobilityDatabasePublicCatalog) -> None:
+    assert await ids(
+        filtered.get_gtfs_rt_feeds(entity_types=[EntityType.TRIP_UPDATES])
+    ) == ["mdb-6"]
+    assert await ids(
+        filtered.get_gtfs_rt_feeds(
+            entity_types=[EntityType.VEHICLE_POSITIONS, EntityType.SERVICE_ALERTS]
+        )
+    ) == ["mdb-5", "mdb-6"]
+
+
+async def test_bounding_filters_default_to_completely_enclosed(
+    filtered: MobilityDatabasePublicCatalog,
+) -> None:
+    # Reversed ranges: normalised to latitudes -1..5 and longitudes -1..5.
+    near = {"dataset_latitudes": (-1.0, 5.0), "dataset_longitudes": (5.0, -1.0)}
+    assert await ids(filtered.get_gtfs_feeds(**near)) == ["mdb-1"]
+    assert await ids(
+        filtered.get_gtfs_feeds(
+            **near, bounding_filter_method=BoundingFilterMethod.PARTIALLY_ENCLOSED
+        )
+    ) == ["mdb-2"]
+    # mdb-4 has no readable box: it matches no bounding filter, not even this.
+    assert await ids(
+        filtered.get_gtfs_feeds(
+            **near, bounding_filter_method=BoundingFilterMethod.DISJOINT
+        )
+    ) == ["mdb-3"]
+
+
+async def test_one_range_alone_filters_nothing(
+    filtered: MobilityDatabasePublicCatalog,
+) -> None:
+    assert len(await filtered.get_gtfs_feeds(dataset_latitudes=(0.0, 1.0))) == 4
+
+
+async def test_limit_and_offset_apply_after_filtering(
+    filtered: MobilityDatabasePublicCatalog,
+) -> None:
+    assert await ids(filtered.get_gtfs_feeds(is_official=False, offset=1, limit=1)) == [
+        "mdb-3"
+    ]
+    assert await ids(filtered.get_gtfs_feeds(limit=0)) == []
+
+
+async def test_gbfs_filters_on_the_system_box(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    serve(mock_api)
+    home = {"dataset_latitudes": (40.75, 40.76), "dataset_longitudes": (-73.99, -73.98)}
+    feeds = await public.get_gbfs_feeds(
+        **home, bounding_filter_method=BoundingFilterMethod.PARTIALLY_ENCLOSED
+    )
+    assert [feed.id for feed in feeds] == ["gbfs-citibike"]
+
+
+async def test_nan_bounds_raise_value_error_before_any_request(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    with pytest.raises(ValueError):
+        await public.get_gtfs_feeds(
+            dataset_latitudes=(math.nan, 1.0), dataset_longitudes=(0.0, 1.0)
+        )
+    assert mock_api.requests == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"limit": True}, {"provider": 7}, {"dataset_latitudes": (1.0,)}],
+)
+async def test_mistyped_arguments_raise_type_error(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog, kwargs: dict[str, object]
+) -> None:
+    with pytest.raises(TypeError):
+        await public.get_gtfs_feeds(**kwargs)  # type: ignore[arg-type]
+    assert mock_api.requests == []
