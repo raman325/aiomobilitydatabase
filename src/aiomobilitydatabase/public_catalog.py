@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from types import TracebackType
@@ -21,6 +23,7 @@ from ._transport import exchange
 from .client import (
     _is_loopback,
     _require_catalog_session,
+    _require_id,
     _text,
     _timeout_seconds,
     _typed,
@@ -30,6 +33,7 @@ from .exceptions import (
     MobilityDatabaseApiError,
     MobilityDatabaseConnectionError,
     MobilityDatabaseNotFoundError,
+    MobilityDatabaseRateLimitError,
 )
 from .models import (
     BoundingFilterMethod,
@@ -43,9 +47,9 @@ from .models import (
 # The API's paging bounds (mobility-feed-api, feeds_api.py: ``limit`` is
 # ``Query(N, ge=0, le=N)``, ``offset`` ``ge=0``): each endpoint's default
 # limit is also its largest.
-GTFS_FEEDS_MAX_LIMIT = 2500
-GTFS_RT_FEEDS_MAX_LIMIT = 1000
-GBFS_FEEDS_MAX_LIMIT = 500
+_GTFS_FEEDS_MAX_LIMIT = 2500
+_GTFS_RT_FEEDS_MAX_LIMIT = 1000
+_GBFS_FEEDS_MAX_LIMIT = 500
 
 
 def _require_export_url(url: object) -> str:
@@ -106,6 +110,13 @@ class MobilityDatabasePublicCatalog:
       1000 GTFS Realtime, 500 GBFS feeds) or below 0, or a negative
       ``offset``, raises ValueError before any request, where the API
       answers 422 (a :class:`MobilityDatabaseApiError`).
+    - ``provider`` and ``producer_url`` match as the API's ``ILIKE`` does
+      (see :func:`_ilike`), but compare case by Python's ``str.lower``,
+      where Postgres uses its locale's ``lower()``.
+    - The export's own status maps as the client's answers do, but for a
+      404: a missing export is a :class:`MobilityDatabaseApiError` (status
+      404), since :class:`MobilityDatabaseNotFoundError` means no such feed.
+      A 429 is a :class:`MobilityDatabaseRateLimitError`.
 
     The export is cached as HTTP allows (RFC 9111: ``max-age``, revalidated
     with its ETag), shared by concurrent callers, and parsed off the event
@@ -119,7 +130,16 @@ class MobilityDatabasePublicCatalog:
         url: str = PUBLIC_CATALOG_URL,
         request_timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        """Initialize. Performs no I/O."""
+        """Initialize. Performs no I/O.
+
+        Raises ``TypeError`` for a ``url`` that isn't a ``str`` or a
+        ``request_timeout`` that isn't a number, and ``ValueError`` for a
+        ``url`` the export can't be fetched from (see
+        :func:`_require_export_url`), a ``request_timeout`` that isn't a
+        finite positive number, or an injected session whose defaults would
+        change what the catalog sends: an ``auth``, a ``base_url``, a
+        credential default or a default header HTTP can't carry.
+        """
         self._url = _require_export_url(url)
         seconds = _timeout_seconds(request_timeout)
         if session is not None:
@@ -159,11 +179,11 @@ class MobilityDatabasePublicCatalog:
 
     async def _rows(self) -> CatalogRows:
         """Return the export, from the cache while fresh."""
-        return await self._cache.get(
-            self._url,
-            self._fetch,
-            request_fields=request_fields(self._get_session(), self._url, {}),
-        )
+        # No session yet: _fetch makes a plain one, whose request carries no
+        # controlled fields; a cache hit then needs no session at all.
+        session = self._session
+        fields = {} if session is None else request_fields(session, self._url, {})
+        return await self._cache.get(self._url, self._fetch, request_fields=fields)
 
     async def _fetch(self, *, validators: Validators | None) -> Response[CatalogRows]:
         """GET the export; conditional when ``validators`` is given."""
@@ -185,6 +205,9 @@ class MobilityDatabasePublicCatalog:
                 received_at=received_at,
                 url=self._url,
             )
+        if answer.status == HTTPStatus.TOO_MANY_REQUESTS:
+            raise MobilityDatabaseRateLimitError("Public catalog rate limit exceeded")
+        # A 404 stays an API error: NotFound means no such feed.
         if answer.status not in (
             HTTPStatus.OK,
             HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
@@ -211,17 +234,20 @@ class MobilityDatabasePublicCatalog:
     @_typed
     async def get_gtfs_feed(self, feed_id: str) -> GtfsFeed:
         """Get a single GTFS feed by ID."""
-        return _find(await self._rows(), feed_id, GtfsFeed)
+        key = _require_id(feed_id)  # as the client's, before any request
+        return _find(await self._rows(), key, GtfsFeed)
 
     @_typed
     async def get_gtfs_rt_feed(self, feed_id: str) -> GtfsRtFeed:
         """Get a single GTFS Realtime feed by ID."""
-        return _find(await self._rows(), feed_id, GtfsRtFeed)
+        key = _require_id(feed_id)  # as the client's, before any request
+        return _find(await self._rows(), key, GtfsRtFeed)
 
     @_typed
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeed:
         """Get a single GBFS feed by ID."""
-        return _find(await self._rows(), feed_id, GbfsFeed)
+        key = _require_id(feed_id)  # as the client's, before any request
+        return _find(await self._rows(), key, GbfsFeed)
 
     @_typed
     async def get_gtfs_feeds(
@@ -243,7 +269,7 @@ class MobilityDatabasePublicCatalog:
         query = _Query.of(
             limit=limit,
             offset=offset,
-            max_limit=GTFS_FEEDS_MAX_LIMIT,
+            max_limit=_GTFS_FEEDS_MAX_LIMIT,
             provider=provider,
             producer_url=producer_url,
             latitudes=dataset_latitudes,
@@ -271,7 +297,7 @@ class MobilityDatabasePublicCatalog:
         query = _Query.of(
             limit=limit,
             offset=offset,
-            max_limit=GTFS_RT_FEEDS_MAX_LIMIT,
+            max_limit=_GTFS_RT_FEEDS_MAX_LIMIT,
             provider=provider,
             producer_url=producer_url,
             entity_types=entity_types,
@@ -295,7 +321,7 @@ class MobilityDatabasePublicCatalog:
         query = _Query.of(
             limit=limit,
             offset=offset,
-            max_limit=GBFS_FEEDS_MAX_LIMIT,
+            max_limit=_GBFS_FEEDS_MAX_LIMIT,
             provider=provider,
             producer_url=producer_url,
             latitudes=dataset_latitudes,
@@ -314,37 +340,61 @@ def _find[F: CatalogFeed](rows: CatalogRows, feed_id: str, kind: type[F]) -> F:
     return feed
 
 
-def _needle(value: str | None) -> str | None:
+def _needle(value: str | None) -> re.Pattern[str] | None:
     """Return a string filter as the API normalizes it: trimmed; empty is none."""
     if value is None:
         return None
     trimmed = value.strip()
-    return trimmed.lower() if trimmed else None
+    return _ilike(trimmed) if trimmed else None
 
 
+def _ilike(value: str) -> re.Pattern[str]:
+    """Return the pattern the API's ``ILIKE`` filter matches, lower-cased.
+
+    fastapi-filter's ``__ilike`` wraps a value without ``%`` in ``%...%``
+    and takes one with ``%`` as given, anchored. Postgres then reads ``%``
+    as any run of characters, ``_`` as any one, and a backslash as escaping
+    the next character; a trailing lone backslash, an error there, is a
+    literal backslash here. The pattern matches a whole lower-cased string.
+    """
+    if "%" not in value:
+        value = f"%{value}%"
+    parts: list[str] = []
+    characters = iter(value.lower())
+    for character in characters:
+        if character == "\\":
+            parts.append(re.escape(next(characters, "\\")))
+        elif character == "%":
+            parts.append(".*")
+        elif character == "_":
+            parts.append(".")
+        else:
+            parts.append(re.escape(character))
+    return re.compile("".join(parts), re.DOTALL)
+
+
+def _like(pattern: re.Pattern[str] | None, value: str | None) -> bool:
+    """Whether a value passes a string filter (none: every value does).
+
+    NULL never matches ``ILIKE``: a feed without the value fails any filter.
+    """
+    if pattern is None:
+        return True
+    return value is not None and pattern.fullmatch(value.lower()) is not None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _Query:
-    """One list call's filters, checked before any request."""
+    """One list call's filters, checked before any request; see :meth:`of`."""
 
-    def __init__(
-        self,
-        *,
-        start: int,
-        stop: int,
-        provider: str | None,
-        producer_url: str | None,
-        box: Box | None,
-        method: BoundingFilterMethod,
-        is_official: bool | None,
-        entity_types: frozenset[EntityType] | None,
-    ) -> None:
-        self.start = start
-        self.stop = stop
-        self.provider = provider
-        self.producer_url = producer_url
-        self.box = box
-        self.method = method
-        self.is_official = is_official
-        self.entity_types = entity_types
+    start: int
+    stop: int
+    provider: re.Pattern[str] | None
+    producer_url: re.Pattern[str] | None
+    box: Box | None
+    method: BoundingFilterMethod
+    is_official: bool | None
+    entity_types: frozenset[EntityType] | None
 
     @classmethod
     def of(
@@ -400,15 +450,12 @@ class _Query:
         )
 
     def _keeps(self, feed: CatalogFeed) -> bool:
-        if (
-            self.provider is not None
-            and self.provider not in (feed.provider or "").lower()
+        source = feed.source_info
+        if not (
+            _like(self.provider, feed.provider)
+            and _like(self.producer_url, source.producer_url if source else None)
         ):
             return False
-        if self.producer_url is not None:
-            url = feed.source_info.producer_url if feed.source_info else None
-            if self.producer_url not in (url or "").lower():
-                return False
         # The API's is_official=False keeps False and unknown.
         if (
             self.is_official is not None
@@ -422,30 +469,23 @@ class _Query:
             and not self.entity_types.intersection(feed.entity_types or ())
         ):
             return False
-        return (
-            self.box is None
-            or not isinstance(feed, GtfsFeed | GbfsFeed)
-            or self._inside(feed, self.box)
-        )
+        box = self.box
+        # A GTFS Realtime feed has no box: the API has no such filter for it.
+        if box is None or not isinstance(feed, GtfsFeed | GbfsFeed):
+            return True
+        return self._inside(feed, box)
 
     def _inside(self, feed: GtfsFeed | GbfsFeed, box: Box) -> bool:
         """Whether the feed's bounding box passes the bounding filter."""
         bounds = feed.bounding_box
-        if (
-            bounds is None
-            or bounds.minimum_latitude is None
-            or bounds.maximum_latitude is None
-            or bounds.minimum_longitude is None
-            or bounds.maximum_longitude is None
-        ):
+        if bounds is None:
             return False
-        feed_box = Box(
-            bounds.minimum_latitude,
-            bounds.maximum_latitude,
-            bounds.minimum_longitude,
-            bounds.maximum_longitude,
-        )
-        return matches(self.method, feed_box, box)
+        low_lat, high_lat = bounds.minimum_latitude, bounds.maximum_latitude
+        low_lon, high_lon = bounds.minimum_longitude, bounds.maximum_longitude
+        # The export always has all four or none; the model allows either.
+        if low_lat is None or high_lat is None or low_lon is None or high_lon is None:
+            return False
+        return matches(self.method, Box(low_lat, high_lat, low_lon, high_lon), box)
 
     def select[F: CatalogFeed](self, feeds: Sequence[F]) -> list[F]:
         """Return the feeds that pass, then apply ``offset`` and ``limit``."""

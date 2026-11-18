@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import socket
 import threading
 from collections.abc import AsyncGenerator
 
@@ -16,11 +17,12 @@ from aiomobilitydatabase.exceptions import (
     MobilityDatabaseApiError,
     MobilityDatabaseConnectionError,
     MobilityDatabaseNotFoundError,
+    MobilityDatabaseRateLimitError,
 )
 from aiomobilitydatabase.public_catalog import (
-    GBFS_FEEDS_MAX_LIMIT,
-    GTFS_FEEDS_MAX_LIMIT,
-    GTFS_RT_FEEDS_MAX_LIMIT,
+    _GBFS_FEEDS_MAX_LIMIT,
+    _GTFS_FEEDS_MAX_LIMIT,
+    _GTFS_RT_FEEDS_MAX_LIMIT,
     MobilityDatabasePublicCatalog,
 )
 
@@ -78,15 +80,16 @@ async def test_a_stale_export_is_revalidated_with_its_etag(
     first = await public.get_gtfs_feeds()
     second = await public.get_gtfs_feeds()
     assert second == first
+    assert second[0] is first[0]  # the stored parse, not a new one
     assert mock_api.requests[1].headers["If-None-Match"] == '"v1"'
 
 
 async def test_concurrent_callers_share_one_fetch(
     mock_api: MockApi, public: MobilityDatabasePublicCatalog
 ) -> None:
-    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
+    serve(mock_api)  # not reusable: only sharing the one request answers all
     results = await asyncio.gather(*(public.get_gbfs_feeds() for _ in range(5)))
-    assert all(result == results[0] for result in results)
+    assert all(result[0] is results[0][0] for result in results)
     assert requests_to(mock_api) == 1
 
 
@@ -127,9 +130,17 @@ async def test_an_unreadable_export_raises_connection_error(
         await public.get_gtfs_feeds()
 
 
+def free_port() -> int:
+    """Return a loopback port nothing listens on (bound, then released)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port: int = probe.getsockname()[1]
+    return port
+
+
 async def test_a_network_failure_raises_connection_error() -> None:
     async with MobilityDatabasePublicCatalog(
-        url="http://127.0.0.1:9/feeds_v2.csv"
+        url=f"http://127.0.0.1:{free_port()}/feeds_v2.csv"
     ) as catalog:
         with pytest.raises(MobilityDatabaseConnectionError):
             await catalog.get_gtfs_feeds()
@@ -187,27 +198,27 @@ def gbfs_systems(count: int) -> bytes:
 async def test_the_default_limit_is_the_endpoints(
     mock_api: MockApi, public: MobilityDatabasePublicCatalog
 ) -> None:
-    serve(mock_api, body=gbfs_systems(GBFS_FEEDS_MAX_LIMIT + 1))
+    serve(mock_api, body=gbfs_systems(_GBFS_FEEDS_MAX_LIMIT + 1))
     feeds = await public.get_gbfs_feeds()
-    assert len(feeds) == GBFS_FEEDS_MAX_LIMIT
-    assert feeds[-1].id == f"gbfs-{GBFS_FEEDS_MAX_LIMIT - 1:04}"
+    assert len(feeds) == _GBFS_FEEDS_MAX_LIMIT
+    assert feeds[-1].id == f"gbfs-{_GBFS_FEEDS_MAX_LIMIT - 1:04}"
 
 
 async def test_the_largest_limit_is_taken(
     mock_api: MockApi, public: MobilityDatabasePublicCatalog
 ) -> None:
-    serve(mock_api, body=gbfs_systems(GBFS_FEEDS_MAX_LIMIT + 1))
-    feeds = await public.get_gbfs_feeds(limit=GBFS_FEEDS_MAX_LIMIT, offset=1)
-    assert len(feeds) == GBFS_FEEDS_MAX_LIMIT
+    serve(mock_api, body=gbfs_systems(_GBFS_FEEDS_MAX_LIMIT + 1))
+    feeds = await public.get_gbfs_feeds(limit=_GBFS_FEEDS_MAX_LIMIT, offset=1)
+    assert len(feeds) == _GBFS_FEEDS_MAX_LIMIT
     assert feeds[0].id == "gbfs-0001"
 
 
 @pytest.mark.parametrize(
     ("method", "largest"),
     [
-        ("get_gtfs_feeds", GTFS_FEEDS_MAX_LIMIT),
-        ("get_gtfs_rt_feeds", GTFS_RT_FEEDS_MAX_LIMIT),
-        ("get_gbfs_feeds", GBFS_FEEDS_MAX_LIMIT),
+        ("get_gtfs_feeds", _GTFS_FEEDS_MAX_LIMIT),
+        ("get_gtfs_rt_feeds", _GTFS_RT_FEEDS_MAX_LIMIT),
+        ("get_gbfs_feeds", _GBFS_FEEDS_MAX_LIMIT),
     ],
 )
 @pytest.mark.parametrize(
@@ -253,3 +264,165 @@ async def test_a_304_to_an_unconditional_request_raises_api_error(
     with pytest.raises(MobilityDatabaseApiError) as caught:
         await public.get_gtfs_feeds()
     assert caught.value.status == 304
+
+
+async def test_rate_limiting_raises_rate_limit_error(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    mock_api.get(PATH, status=429, body=b"slow down", content_type="text/plain")
+    with pytest.raises(MobilityDatabaseRateLimitError):
+        await public.get_gtfs_feeds()
+
+
+async def test_a_missing_export_is_an_api_error_not_a_missing_feed(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    mock_api.get(PATH, status=404, body=b"nope", content_type="text/plain")
+    with pytest.raises(MobilityDatabaseApiError) as caught:
+        await public.get_gtfs_feed("mdb-10")
+    assert not isinstance(caught.value, MobilityDatabaseNotFoundError)
+    assert caught.value.status == 404
+
+
+async def test_an_error_is_not_cached(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    mock_api.get(PATH, status=500, body=b"down", content_type="text/plain")
+    serve(mock_api)
+    with pytest.raises(MobilityDatabaseApiError):
+        await public.get_gtfs_feeds()
+    assert [feed.id for feed in await public.get_gtfs_feeds()] == ["mdb-10"]
+    assert requests_to(mock_api) == 2
+
+
+async def test_a_cancelled_caller_leaves_the_shared_fetch_running(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    serve(mock_api)
+    leaving = asyncio.create_task(public.get_gtfs_feeds())
+    staying = asyncio.create_task(public.get_gtfs_feeds())
+    await asyncio.sleep(0)  # both are waiting on the one fetch now
+    assert not leaving.done()
+    leaving.cancel()
+    assert [feed.id for feed in await staying] == ["mdb-10"]
+    assert leaving.cancelled()
+    assert requests_to(mock_api) == 1
+
+
+async def test_a_closed_injected_session_raises_runtime_error(
+    mock_api: MockApi,
+) -> None:
+    session = aiohttp.ClientSession()
+    await session.close()
+    catalog = MobilityDatabasePublicCatalog(session, url=mock_api.url(PATH))
+    with pytest.raises(RuntimeError):
+        await catalog.get_gtfs_feeds()
+    assert mock_api.requests == []
+
+
+@pytest.mark.parametrize(
+    "getter", ["get_gtfs_feed", "get_gtfs_rt_feed", "get_gbfs_feed"]
+)
+@pytest.mark.parametrize(
+    ("feed_id", "error"),
+    [
+        ("", ValueError),
+        (".", ValueError),
+        ("..", ValueError),
+        ("mdb-\ud800", ValueError),  # a lone surrogate is no text
+        (7, TypeError),
+    ],
+)
+async def test_an_id_the_client_rejects_is_rejected_before_any_request(
+    mock_api: MockApi,
+    public: MobilityDatabasePublicCatalog,
+    getter: str,
+    feed_id: object,
+    error: type[Exception],
+) -> None:
+    with pytest.raises(error):
+        await getattr(public, getter)(feed_id)
+    assert mock_api.requests == []
+
+
+def gbfs_by(provider: str, feed_id: str) -> dict[str, str]:
+    return {**GBFS_ROW, "id": feed_id, "provider": provider}
+
+
+MATCHING = export(
+    gbfs_by("Bay Area", "bay-area"),
+    gbfs_by("BAYWHEELS", "baywheels"),
+    gbfs_by("Metro_Bus", "metro-underscore"),
+    gbfs_by("MetroXBus", "metro-x"),
+    gbfs_by("50% Transit", "fifty"),
+    gbfs_by("Ends\\", "backslash"),
+    gbfs_by("", "no-provider"),
+)
+
+
+@pytest.mark.parametrize(
+    ("needle", "expected"),
+    [
+        ("bay", {"bay-area", "baywheels"}),  # a substring, any case
+        ("  BAY  ", {"bay-area", "baywheels"}),  # trimmed first
+        ("b%a", {"bay-area"}),  # with a %: as given, so anchored
+        ("metro_bus", {"metro-underscore", "metro-x"}),  # _: any one character
+        ("metro\\_bus", {"metro-underscore"}),  # \_: a literal _
+        ("50\\%%", {"fifty"}),  # \%: a literal %
+        ("\\%", set()),  # anchored: only a provider that is just "%"
+        ("e%\\", {"backslash"}),  # a trailing lone backslash: literal
+        (
+            "%",
+            {
+                "bay-area",
+                "baywheels",
+                "metro-underscore",
+                "metro-x",
+                "fifty",
+                "backslash",
+            },
+        ),
+        (
+            "   ",
+            {
+                "bay-area",
+                "baywheels",
+                "metro-underscore",
+                "metro-x",
+                "fifty",
+                "backslash",
+                "no-provider",
+            },
+        ),
+    ],
+)
+async def test_provider_matches_as_the_apis_ilike(
+    mock_api: MockApi,
+    public: MobilityDatabasePublicCatalog,
+    needle: str,
+    expected: set[str],
+) -> None:
+    serve(mock_api, body=MATCHING)
+    feeds = await public.get_gbfs_feeds(provider=needle)
+    assert {feed.id for feed in feeds} == expected
+
+
+async def test_producer_url_matches_as_the_apis_ilike(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
+    feeds = await public.get_gtfs_feeds(producer_url="EXAMPLE.COM/SUB_AY")
+    assert [feed.id for feed in feeds] == ["mdb-10"]
+    assert await public.get_gtfs_feeds(producer_url="%example.com") == []  # anchored
+    anchored = await public.get_gtfs_feeds(producer_url="https://%.zip")
+    assert [feed.id for feed in anchored] == ["mdb-10"]
+
+
+async def test_a_cache_hit_opens_no_session(mock_api: MockApi) -> None:
+    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
+    catalog = MobilityDatabasePublicCatalog(url=mock_api.url(PATH))
+    await catalog.get_gtfs_feeds()
+    await catalog.close()
+    assert [feed.id for feed in await catalog.get_gtfs_feeds()] == ["mdb-10"]
+    assert catalog._session is None
+    assert requests_to(mock_api) == 1
