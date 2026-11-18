@@ -392,6 +392,20 @@ def _as_bool(value: Any) -> bool | None:
     return None
 
 
+def _unreadable(row: Mapping[str, Any], read: Mapping[str, object]) -> tuple[str, ...]:
+    """Name the fields ``row`` states but that were read as None.
+
+    A field the row leaves out (or sets to JSON null) is absent, not
+    unreadable: only a value present yet unknown to this library -- an
+    enumeration value a newer GBFS adds, or no string at all -- is listed.
+    """
+    return tuple(
+        name
+        for name, value in read.items()
+        if value is None and row.get(name) is not None
+    )
+
+
 def _ttl_seconds(value: Any) -> float | None:
     """Read a document's ``ttl`` in seconds; None when it is unusable.
 
@@ -763,20 +777,33 @@ class GbfsFeedHandle:
 
     async def get_vehicle_types(self) -> list[GbfsVehicleType]:
         """Vehicle types, resolving the ids stations and vehicles reference."""
-        return [
-            GbfsVehicleType(
-                id=type_id,
-                form_factor=vocab_or_none(GbfsFormFactor, row.get("form_factor")),
-                propulsion_type=vocab_or_none(
-                    GbfsPropulsionType, row.get("propulsion_type")
-                ),
-                name=_localized(row.get("name")),
-                max_range_m=_number(row.get("max_range_meters")),
-                rider_capacity=_count(row.get("rider_capacity")),
+        types: list[GbfsVehicleType] = []
+        for row in await self._optional_rows("vehicle_types", "vehicle_types"):
+            type_id = _record_id(row.get("vehicle_type_id"))
+            if type_id is None:
+                continue
+            form_factor = vocab_or_none(GbfsFormFactor, row.get("form_factor"))
+            propulsion_type = vocab_or_none(
+                GbfsPropulsionType, row.get("propulsion_type")
             )
-            for row in await self._optional_rows("vehicle_types", "vehicle_types")
-            if (type_id := _record_id(row.get("vehicle_type_id"))) is not None
-        ]
+            types.append(
+                GbfsVehicleType(
+                    id=type_id,
+                    form_factor=form_factor,
+                    propulsion_type=propulsion_type,
+                    name=_localized(row.get("name")),
+                    max_range_m=_number(row.get("max_range_meters")),
+                    rider_capacity=_count(row.get("rider_capacity")),
+                    unreadable_fields=_unreadable(
+                        row,
+                        {
+                            "form_factor": form_factor,
+                            "propulsion_type": propulsion_type,
+                        },
+                    ),
+                )
+            )
+        return types
 
     async def get_pricing_plans(self) -> list[GbfsPricingPlan]:
         """Pricing plans, resolving a vehicle's ``pricing_plan_id``."""
@@ -810,7 +837,7 @@ class GbfsFeedHandle:
         return [
             GbfsAlert(
                 id=alert_id,
-                type=vocab_or_none(GbfsAlertType, row.get("type")),
+                type=(alert_type := vocab_or_none(GbfsAlertType, row.get("type"))),
                 summary=_localized(row.get("summary")),
                 description=_localized(row.get("description")),
                 url=_localized(row.get("url")) or None,
@@ -818,6 +845,7 @@ class GbfsFeedHandle:
                 region_ids=tuple(_id_list(row.get("region_ids"))),
                 last_updated=_reported_at(row.get("last_updated")),
                 active_periods=tuple(_alert_times(row.get("times"))),
+                unreadable_fields=_unreadable(row, {"type": alert_type}),
             )
             for row in await self._optional_rows("system_alerts", "alerts")
             if (alert_id := _record_id(row.get("alert_id"))) is not None

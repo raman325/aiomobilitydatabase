@@ -26,6 +26,7 @@ from aiomobilitydatabase.feeds.gbfs import (
     _languages,
     _record_id,
     _reported_at,
+    _unreadable,
 )
 from aiomobilitydatabase.feeds.geo import Circle
 from aiomobilitydatabase.feeds.models import (
@@ -917,6 +918,97 @@ def test_a_gbfs_enumeration_takes_its_spec_values_and_nothing_else(
         members |= {member.name: member for member in vocabulary}
     expected = members.get(value) if isinstance(value, str) else None
     assert vocab_or_none(vocabulary, value) is expected
+
+
+_ABSENT = object()  # the field left out of the row
+# What a row can state: a member, a value a newer GBFS might add, another
+# case or no string at all, JSON null, or nothing.
+_STATED = (
+    "bicycle",
+    "electric",
+    "station_closure",
+    "SYSTEM_CLOSURE",
+    "future_value",
+    "Bicycle",
+    "",
+    7,
+    True,
+    ["bicycle"],
+    {"x": 1},
+    None,
+    _ABSENT,
+)
+
+
+def _row(**fields: object) -> dict[str, object]:
+    return {name: value for name, value in fields.items() if value is not _ABSENT}
+
+
+@given(
+    values=st.dictionaries(
+        st.sampled_from(["form_factor", "propulsion_type", "type"]),
+        st.one_of(st.sampled_from(_STATED), st.text(max_size=12), st.integers()),
+    ),
+    vocabulary=st.sampled_from(_GBFS_VOCABULARIES),
+)
+def test_a_field_is_unreadable_exactly_when_stated_but_read_as_none(
+    values: dict[str, object],
+    vocabulary: type[GbfsFormFactor | GbfsPropulsionType | GbfsAlertType],
+) -> None:
+    """Left out or JSON null is absent; any other value read as None is a
+    value this library can't read, and only that is named."""
+    row = _row(**values)
+    read = {name: vocab_or_none(vocabulary, value) for name, value in row.items()}
+    read["max_range_meters"] = None  # read, but not in the row: absent
+    assert _unreadable(row, read) == tuple(
+        name
+        for name in read
+        if name in row and row[name] is not None and read[name] is None
+    )
+
+
+async def test_a_vehicle_type_or_alert_names_the_values_it_could_not_read(
+    mock_api: MockApi, feeds_client: MobilityFeedsClient
+) -> None:
+    """Every stated value through the handle: a member is read and never
+    named; a value read as None is named exactly when the row states it,
+    so None alone says the field was left out."""
+    _mock_catalog(mock_api)
+    types = copy.deepcopy(VEHICLE_TYPES)
+    types["data"]["vehicle_types"] = [
+        _row(vehicle_type_id=f"t{i}-{j}", form_factor=form, propulsion_type=power)
+        for i, form in enumerate(_STATED)
+        for j, power in enumerate(_STATED)
+    ]
+    alerts = copy.deepcopy(SYSTEM_ALERTS)
+    template = alerts["data"]["alerts"][0]
+    alerts["data"]["alerts"] = [
+        {**_row(**{**template, "type": kind}), "alert_id": f"a{i}"}
+        for i, kind in enumerate(_STATED)
+    ]
+    mock_api.get("/gbfs/vehicle_types.json", payload=types)
+    mock_api.get("/gbfs/system_alerts.json", payload=alerts)
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+
+    def expected(stated: object, read: object, name: str) -> tuple[str, ...]:
+        return (name,) if read is None and stated not in (None, _ABSENT) else ()
+
+    vehicle_types = await handle.get_vehicle_types()
+    assert len(vehicle_types) == len(_STATED) ** 2
+    for found in vehicle_types:
+        i, j = (int(part) for part in found.id[1:].split("-"))
+        form, power = _STATED[i], _STATED[j]
+        assert found.form_factor == vocab_or_none(GbfsFormFactor, form), found.id
+        assert found.propulsion_type == vocab_or_none(GbfsPropulsionType, power)
+        assert found.unreadable_fields == expected(
+            form, found.form_factor, "form_factor"
+        ) + expected(power, found.propulsion_type, "propulsion_type"), found.id
+    found_alerts = await handle.get_alerts()
+    assert len(found_alerts) == len(_STATED)
+    for alert in found_alerts:
+        kind = _STATED[int(alert.id[1:])]
+        assert alert.type == vocab_or_none(GbfsAlertType, kind), alert.id
+        assert alert.unreadable_fields == expected(kind, alert.type, "type"), alert.id
 
 
 def _gbfs_alert(

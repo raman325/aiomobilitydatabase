@@ -1296,7 +1296,9 @@ class GbfsVehicleType:
     Resolves the ``vehicle_type_id`` that stations and vehicles reference.
     ``form_factor``/``propulsion_type`` are the spec's enumerations; as
     with every enumeration here, a value this library doesn't know (GBFS
-    adds some across minor versions) is None.
+    adds some across minor versions) is None. ``unreadable_fields`` names
+    the ones the document states but with such a value: None there means
+    a value this library can't read, not one the document left out.
     """
 
     id: str
@@ -1305,6 +1307,7 @@ class GbfsVehicleType:
     name: str | None
     max_range_m: float | None
     rider_capacity: int | None
+    unreadable_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1339,8 +1342,9 @@ class GbfsAlert:
     Distinct from :class:`ServiceAlert`, which is GTFS-RT: this one scopes
     to GBFS stations and regions rather than routes and trips
     (:meth:`applies_to`). ``type`` is None for a value this library doesn't
-    know, as :attr:`GbfsVehicleType.form_factor` is. Each active period has
-    the start GBFS requires; its end is None when it is open-ended.
+    know, as :attr:`GbfsVehicleType.form_factor` is, and is then listed in
+    ``unreadable_fields``. Each active period has the start GBFS requires;
+    its end is None when it is open-ended.
     """
 
     id: str
@@ -1352,6 +1356,7 @@ class GbfsAlert:
     region_ids: tuple[str, ...]
     last_updated: datetime | None
     active_periods: tuple[tuple[datetime, datetime | None], ...]
+    unreadable_fields: tuple[str, ...] = ()
 
     def applies_to(
         self, *, station_id: str | None = None, region_id: str | None = None

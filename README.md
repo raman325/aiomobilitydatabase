@@ -542,7 +542,9 @@ Notes on direct mode:
   required), so an unpublished one — or a listed one answering `404`,
   which GBFS says is not an error — is `[]`. A vehicle type's
   `form_factor`/`propulsion_type` and an alert's `type` are enums, as the
-  GTFS-RT vocabularies are: a value newer than this library is `None`. An
+  GTFS-RT vocabularies are: a value newer than this library is `None`, and
+  its field is named in the record's `unreadable_fields`, so `None` alone
+  means the document left the field out. An
   alert has `applies_to(station_id=..., region_id=...)` (no stations or
   regions listed: the whole system) and `is_active(at)`, shaped like a
   GTFS-RT alert's.
