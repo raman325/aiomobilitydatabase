@@ -7,7 +7,6 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import partial
 from itertools import islice
 from typing import TYPE_CHECKING
 
@@ -26,7 +25,7 @@ from ._catalog_csv import (
     box_of,
     read_catalog,
 )
-from ._documents import cached_document, fetch_document
+from ._documents import cached_document
 from ._freshness import FreshnessCache
 from ._urls import redact
 from .exceptions import FeedParseError
@@ -41,7 +40,7 @@ if TYPE_CHECKING:
 _GTFS_FEEDS_MAX_LIMIT = 2500
 _GTFS_RT_FEEDS_MAX_LIMIT = 1000
 _GBFS_FEEDS_MAX_LIMIT = 500
-_CONTEXT = "public catalog URL"
+_HEURISTIC_LIFETIME = 3600.0  # seconds
 
 
 class PublicCatalog:
@@ -93,8 +92,9 @@ class PublicCatalog:
     GBFS limit only when it is truthy), where the GTFS lists return none.
 
     The export is fetched as the feeds layer fetches a GBFS document:
-    redirects followed, cached as HTTP allows (RFC 9111), shared by
-    concurrent callers, and parsed off the event loop. Errors are the feeds
+    redirects followed, cached as HTTP allows (RFC 9111; an hour when the
+    answer declares no freshness at all), shared by concurrent callers, and
+    parsed off the event loop. Errors are the feeds
     layer's: :class:`SourceConnectionError` when it can't be fetched (with
     the ``status`` of an error answer), :class:`FeedParseError` when it is
     no export -- or carries no GBFS feeds at all, for a GBFS lookup, which
@@ -104,38 +104,29 @@ class PublicCatalog:
     """
 
     def __init__(self, client: MobilityFeedsClient, url: str) -> None:
-        """Read the export at ``url`` on ``client``'s session. No I/O."""
+        """Read the export at ``url`` on ``client``'s session. No I/O.
+
+        ``url`` is one the client checked (an http(s) URL with a host).
+        """
         self._client = client
         self._url = url
-        self._cache: FreshnessCache[CatalogRows] = FreshnessCache()
-        self._closed = False
-
-    def _close(self) -> None:
-        """Refuse every later lookup: the client closed (see its close())."""
-        self._closed = True
+        # MobilityData regenerates the export daily: without declared
+        # freshness it is reused for an hour (RFC 9111 section 4.2.2), never
+        # past a declared lifetime, no-cache or no-store.
+        self._cache: FreshnessCache[CatalogRows] = FreshnessCache(
+            min_interval=_HEURISTIC_LIFETIME
+        )
 
     async def _rows(self) -> CatalogRows:
         """Return the export, from the cache while fresh."""
-        # Before anything asks the client for a session, which would open a
-        # new one nobody closes.
-        if self._closed:
-            raise RuntimeError("the client is closed")
         return await cached_document(
             self._cache,
             self._client,
             self._url,
             headers={},
-            context=_CONTEXT,
-            fetch=partial(
-                fetch_document,
-                self._client,
-                self._url,
-                None,
-                _CONTEXT,
-                label="Public catalog",
-                missing="an export",
-                parse=_read,
-            ),
+            label="Public catalog",
+            missing="an export",
+            parse=_read,
         )
 
     @_typed

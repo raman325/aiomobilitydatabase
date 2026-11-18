@@ -261,10 +261,12 @@ same-named fields mean, holding the API's values. GTFS: `id`, `provider`,
 `provider`, `feed_contact_email`, `source_info`, `redirects`, `bounding_box`,
 `bounding_box_generated_at`.
 
-The export is that of `base_url`'s environment (production, QA or DEV);
-another `base_url` needs `public_catalog_url=`. It is fetched like a GBFS
-document: redirects followed, cached as its HTTP headers allow, parsed off the
-event loop.
+The export is that of `base_url`'s environment (production or QA); another
+`base_url` needs `public_catalog_url=`, which must be an http(s) URL with a
+host (`ValueError` when the client is made). It is fetched like a GBFS
+document: redirects followed, cached as its HTTP headers allow (an hour when
+they declare no freshness: the export changes daily), parsed off the event
+loop.
 
 Filters are the API's, with these differences:
 

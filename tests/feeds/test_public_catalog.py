@@ -10,7 +10,8 @@ import re
 import socket
 import threading
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Sequence
+from dataclasses import dataclass
 
 import aiohttp
 import pytest
@@ -27,7 +28,6 @@ from aiomobilitydatabase.feeds import (
 )
 from aiomobilitydatabase.feeds._catalog_csv import CatalogRows, PublicFeed
 from aiomobilitydatabase.feeds.const import (
-    DEV_PUBLIC_CATALOG_URL,
     PROD_PUBLIC_CATALOG_URL,
     QA_PUBLIC_CATALOG_URL,
 )
@@ -42,6 +42,19 @@ from tests.mock_server import MockApi
 
 PATH = "/feeds_v2.csv"
 BODY = export(GTFS_ROW, GTFS_RT_ROW, GBFS_ROW)
+
+
+def gbfs_document(data: dict[str, object]) -> dict[str, object]:
+    """A GBFS document, never fresh (ttl 0): each read is a request."""
+    return {"last_updated": int(time.time()), "ttl": 0, "version": "2.3", "data": data}
+
+
+@dataclass
+class Clock:
+    now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
 def serve(
@@ -211,27 +224,29 @@ async def test_after_close_a_new_catalog_fetches_on_a_new_session(
     await client.close()
 
 
-@pytest.mark.parametrize(
-    "lookup",
-    [
-        lambda public: public.get_gtfs_feeds(),
-        lambda public: public.get_gtfs_rt_feed("mdb-20"),
-        lambda public: public.get_gbfs_feeds(),
-    ],
-)
-async def test_a_catalog_kept_past_close_raises_and_opens_no_session(
+async def test_a_catalog_kept_past_close_goes_on_as_a_gbfs_handle_does(
     mock_api: MockApi,
-    lookup: Callable[[PublicCatalog], Awaitable[object]],
 ) -> None:
-    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
+    """The feeds layer's handle convention: a handle kept past close() asks
+    the client for its session again, which opens a new owned one."""
+    serve(mock_api)
+    serve(mock_api)
+    feeds = [{"name": "system_information", "url": mock_api.url("/si.json")}]
+    for _ in range(3):
+        mock_api.get("/gbfs.json", payload=gbfs_document({"en": {"feeds": feeds}}))
+        mock_api.get("/si.json", payload=gbfs_document({"system_id": "citi"}))
     client = MobilityFeedsClient(public_catalog_url=mock_api.url(PATH))
+    handle = await client.get_gbfs_feed_from_url(mock_api.url("/gbfs.json"))
     kept = client.public_catalog
     await kept.get_gtfs_feeds()
+    await handle.get_system_info()
     await client.close()
-    with pytest.raises(RuntimeError, match="the client is closed"):
-        await lookup(kept)  # even with the export still fresh in its cache
-    assert client._session is None  # deliberate friend access: none opened
-    assert requests_to(mock_api) == 1
+    assert client._session is None  # deliberate friend access
+    assert (await handle.get_system_info()).system_id == "citi"
+    assert [feed.id for feed in await kept.get_gtfs_feeds()] == ["mdb-10"]
+    assert client._session is not None  # reopened, owned: close() closes it
+    await client.close()
+    assert client._session is None
 
 
 @pytest.mark.parametrize(
@@ -241,7 +256,6 @@ async def test_a_catalog_kept_past_close_raises_and_opens_no_session(
         (PROD_BASE_URL, PROD_PUBLIC_CATALOG_URL),
         (f"{PROD_BASE_URL}/", PROD_PUBLIC_CATALOG_URL),
         (QA_BASE_URL, QA_PUBLIC_CATALOG_URL),
-        (DEV_BASE_URL, DEV_PUBLIC_CATALOG_URL),
     ],
 )
 async def test_the_export_is_the_base_url_s_environment_s(
@@ -258,8 +272,13 @@ async def test_a_given_public_catalog_url_wins(mock_api: MockApi) -> None:
         assert client.public_catalog._url == mock_api.url(PATH)
 
 
-async def test_another_base_url_needs_a_public_catalog_url() -> None:
-    async with MobilityFeedsClient(base_url="https://catalog.example.com") as client:
+@pytest.mark.parametrize(
+    # DEV's export (dev-files.mobilitydatabase.org) answers 403: none known.
+    "base_url",
+    [DEV_BASE_URL, "https://catalog.example.com"],
+)
+async def test_another_base_url_needs_a_public_catalog_url(base_url: str) -> None:
+    async with MobilityFeedsClient(base_url=base_url) as client:
         with pytest.raises(ValueError, match="public_catalog_url"):
             client.public_catalog  # noqa: B018 - raises
     async with MobilityFeedsClient(
@@ -269,21 +288,61 @@ async def test_another_base_url_needs_a_public_catalog_url() -> None:
         assert given.public_catalog._url == "https://files.example.com/feeds_v2.csv"
 
 
-async def test_a_public_catalog_url_checks_as_a_gbfs_discovery_url() -> None:
-    # Credentials go as Basic auth, so a user-id with a colon can't.
-    url = "https://us%3Aer:pw@example.com/feeds_v2.csv"
-    async with MobilityFeedsClient(public_catalog_url=url) as client:
-        with pytest.raises(ValueError, match="colon"):
-            client.public_catalog  # noqa: B018 - raises
-
-
 @pytest.mark.parametrize(
-    "url", ["ftp://example.com/feeds.csv", "not a url", "file:///etc/passwd"]
+    ("url", "reason"),
+    [
+        ("ftp://example.com/feeds.csv", "unsupported URL scheme"),
+        ("file:///etc/passwd", "unsupported URL scheme"),
+        ("not a url", "unsupported URL scheme"),
+        ("https:///feeds_v2.csv", "no host"),
+        # Credentials go as Basic auth, so a user-id with a colon can't.
+        ("https://us%3Aer:pw@example.com/feeds_v2.csv", "colon"),
+        ("https://example.com/\ud800", "UTF-8"),
+    ],
 )
-async def test_an_unfetchable_url_is_refused_before_any_request(url: str) -> None:
-    async with MobilityFeedsClient(public_catalog_url=url) as client:
-        with pytest.raises(SourceConnectionError, match="public catalog URL"):
-            await client.public_catalog.get_gtfs_feeds()
+def test_an_unfetchable_public_catalog_url_raises_on_construction(
+    url: str, reason: str
+) -> None:
+    with pytest.raises(
+        ValueError, match=f"public_catalog_url can't be fetched.*{reason}"
+    ):
+        MobilityFeedsClient(public_catalog_url=url)
+
+
+def test_a_public_catalog_url_that_is_no_str_raises_type_error() -> None:
+    with pytest.raises(TypeError, match="public_catalog_url"):
+        MobilityFeedsClient(public_catalog_url=b"https://x.org/f.csv")  # type: ignore[arg-type]
+
+
+async def test_an_export_without_freshness_is_reused_for_an_hour(
+    mock_api: MockApi, public: PublicCatalog
+) -> None:
+    """The export is regenerated daily: RFC 9111's heuristic lifetime."""
+    clock = Clock()
+    public._cache._clock = clock  # deliberate friend access
+    serve(mock_api)  # no Cache-Control, Expires or validators
+    serve(mock_api)
+    await public.get_gtfs_feeds()
+    clock.now += 3599
+    await public.get_gtfs_feeds()
+    assert requests_to(mock_api) == 1
+    clock.now += 1
+    await public.get_gtfs_feeds()
+    assert requests_to(mock_api) == 2
+
+
+@pytest.mark.parametrize("declared", ["no-cache", "max-age=0", "no-store", "max-age=5"])
+async def test_a_declared_freshness_is_never_extended(
+    mock_api: MockApi, public: PublicCatalog, declared: str
+) -> None:
+    clock = Clock()
+    public._cache._clock = clock  # deliberate friend access
+    serve(mock_api, headers={"Cache-Control": declared})
+    serve(mock_api)
+    await public.get_gtfs_feeds()
+    clock.now += 10
+    await public.get_gtfs_feeds()
+    assert requests_to(mock_api) == 2
 
 
 async def test_a_redirect_is_followed_and_reused_only_as_its_hop_allows(

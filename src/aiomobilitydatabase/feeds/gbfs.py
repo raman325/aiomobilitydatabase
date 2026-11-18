@@ -7,13 +7,12 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 from .._http import CREDENTIAL_HEADERS
 from .._json import loads as json_loads
-from ._documents import cached_document, fetch_document
+from ._documents import cached_document
 from ._freshness import FreshnessCache
 from ._frozen import FrozenDict
 from ._language import is_preferred_language
@@ -636,27 +635,18 @@ class GbfsFeedHandle:
     async def _fetch_cached(self, url: str, context: str) -> dict[str, Any]:
         """One GBFS document, reused as long as the producer allows.
 
-        Fetched by :func:`._documents.fetch_document`; the cache derives the
-        document's freshness from it (see :func:`_document_lifetime`).
+        The cache derives the document's freshness from it (see
+        :func:`_document_lifetime`).
         """
-        _require_http_url(url, context)  # before _headers_for parses it
-        headers = self._headers_for(url)
+        _require_http_url(url, context)  # the one check, before _headers_for
         return await cached_document(
             self._docs,
             self._client,
             url,
-            headers=headers,
-            context=context,
-            fetch=partial(
-                fetch_document,
-                self._client,
-                url,
-                headers,
-                context,
-                label="GBFS endpoint",
-                missing="a document",
-                parse=_json_document,
-            ),
+            headers=self._headers_for(url),
+            label="GBFS endpoint",
+            missing="a document",
+            parse=_json_document,
         )
 
     async def get_system_info(self) -> GbfsSystemInfo:

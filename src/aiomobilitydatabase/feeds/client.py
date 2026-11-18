@@ -13,13 +13,12 @@ from typing import TYPE_CHECKING, Self
 import aiohttp
 
 from ..client import MobilityDatabaseClient
-from ..const import DEV_BASE_URL, PROD_BASE_URL, QA_BASE_URL
+from ..const import PROD_BASE_URL, QA_BASE_URL
 from ..exceptions import MobilityDatabaseError
 from ._extra import load_transit_handle
-from ._urls import require_caller_inputs
+from ._urls import require_caller_inputs, require_http_url_setting
 from .const import (
     DEFAULT_TIMEOUT_SECONDS,
-    DEV_PUBLIC_CATALOG_URL,
     PROD_PUBLIC_CATALOG_URL,
     QA_PUBLIC_CATALOG_URL,
 )
@@ -34,7 +33,6 @@ if TYPE_CHECKING:
 _PUBLIC_CATALOG_URLS = {
     PROD_BASE_URL: PROD_PUBLIC_CATALOG_URL,
     QA_BASE_URL: QA_PUBLIC_CATALOG_URL,
-    DEV_BASE_URL: DEV_PUBLIC_CATALOG_URL,
 }
 
 
@@ -68,8 +66,12 @@ class MobilityFeedsClient:
 
         ``public_catalog_url`` is the export :attr:`public_catalog` reads.
         By default it is the export of ``base_url``'s environment
-        (production, QA or DEV); with another ``base_url`` it must be given.
+        (production or QA); with another ``base_url`` it must be given. One
+        that isn't a ``str`` raises ``TypeError``, one no request can be made
+        to (not an http(s) URL with a host) ``ValueError``.
         """
+        if public_catalog_url is not None:
+            require_http_url_setting(public_catalog_url, "public_catalog_url")
         self._refresh_token = refresh_token
         self._session = session
         self._owns_session = session is None
@@ -98,10 +100,7 @@ class MobilityFeedsClient:
         if self._catalog is not None:
             await self._catalog.close()
             self._catalog = None
-        if self._public_catalog is not None:
-            # One kept past close() must not open a session nobody closes.
-            self._public_catalog._close()  # deliberate friend access
-            self._public_catalog = None
+        self._public_catalog = None
         if (
             self._owns_session
             and self._session is not None
@@ -152,9 +151,11 @@ class MobilityFeedsClient:
         GTFS, GTFS Realtime and GBFS lookups with :attr:`catalog`'s filters,
         answering with the export's own models: see :class:`PublicCatalog`.
         Raises ``ValueError`` when no ``public_catalog_url`` was given and
-        ``base_url`` is none of the catalog's environments, or for a
-        ``public_catalog_url`` :meth:`get_gbfs_feed_from_url` would refuse
-        (credentials that can't be sent).
+        ``base_url`` is neither production's nor QA's, or for an injected
+        session the feeds layer can't send through (as
+        :meth:`get_gbfs_feed_from_url` does). A catalog kept past
+        :meth:`close` goes on as a feed handle does, on the session
+        :meth:`close` leaves (a new owned one when it closed its own).
         """
         if self._public_catalog is None:
             url = self._public_catalog_url
@@ -167,7 +168,7 @@ class MobilityFeedsClient:
                         "no public catalog is known for this base_url: "
                         "pass public_catalog_url"
                     )
-            require_caller_inputs(self._get_session(), [url])
+            require_caller_inputs(self._get_session())
             self._public_catalog = PublicCatalog(self, url)
         return self._public_catalog
 

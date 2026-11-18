@@ -4,18 +4,19 @@ GBFS documents and the public catalog export are fetched alike: a GET
 through :func:`get_withholding` (redirects followed, conditional when the
 cache revalidates), any error status a :class:`SourceConnectionError`, and
 the body handed to a parser of the caller's, which raises
-:class:`FeedParseError` for a body it can't read.
+:class:`FeedParseError` for a body it can't read. The URL is the caller's
+to check (:func:`._urls._require_http_url`) before it gets here.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
+from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 from ._freshness import (
-    Fetch,
     FreshnessCache,
     Response,
     Validators,
@@ -24,33 +25,68 @@ from ._freshness import (
 )
 from ._freshness import hops as _hops
 from ._redirects import get_withholding, network
-from ._urls import _require_http_url, redact
+from ._urls import redact
 from .exceptions import SourceConnectionError
 
 if TYPE_CHECKING:
     from .client import MobilityFeedsClient
 
 
-async def fetch_document[T](
+type Parse[T] = Callable[[bytes, str | None], Awaitable[T]]
+
+
+async def cached_document[T](
+    cache: FreshnessCache[T],
     client: MobilityFeedsClient,
     url: str,
-    headers: Mapping[str, str] | None,
-    context: str,
+    *,
+    headers: Mapping[str, str],
+    label: str,
+    missing: str,
+    parse: Parse[T],
+) -> T:
+    """One document from ``cache``, fetched when it isn't fresh.
+
+    ``url`` has passed :func:`._urls._require_http_url`. ``headers`` go
+    with the request; ``label`` starts each status error's message and
+    ``missing`` names what a non-200 answer lacks ("a document").
+    ``parse`` gets the body and the redacted URL.
+    """
+    fetch = partial(
+        _fetch_document,
+        client,
+        url,
+        headers,
+        label=label,
+        missing=missing,
+        parse=parse,
+    )
+    return await cache.get(
+        url,
+        fetch,
+        request_fields=request_fields(
+            client._get_session(),  # deliberate friend access
+            url,
+            headers,
+        ),
+    )
+
+
+async def _fetch_document[T](
+    client: MobilityFeedsClient,
+    url: str,
+    headers: Mapping[str, str],
     *,
     label: str,
     missing: str,
-    parse: Callable[[bytes, str | None], Awaitable[T]],
-    validators: Validators | None = None,
+    parse: Parse[T],
+    validators: Validators | None,
 ) -> Response[T]:
     """GET one document on the client's session and parse it.
 
     With ``validators`` the request is conditional and a ``304`` comes back
-    with no value; a 304 to an unconditional request raises. ``context``
-    names the URL for :func:`_require_http_url`; ``label`` starts each
-    status error's message and ``missing`` names what a non-200 answer
-    lacks ("a document"). ``parse`` gets the body and the redacted URL.
+    with no value; a 304 to an unconditional request raises.
     """
-    _require_http_url(url, context)
     session = client._get_session()  # deliberate friend access
     requested_at = datetime.now(UTC)
     shown = redact(url)
@@ -58,7 +94,7 @@ async def fetch_document[T](
         session,
         url,
         params={},
-        headers=dict(headers) if headers else {},
+        headers=dict(headers),
         total=client.timeout_seconds,
         secret=None,
         conditional=None if validators is None else validators.request_headers(),
@@ -104,26 +140,4 @@ async def fetch_document[T](
         received_at=received_at,
         hops=hops,
         url=answered,
-    )
-
-
-async def cached_document[T](
-    cache: FreshnessCache[T],
-    client: MobilityFeedsClient,
-    url: str,
-    *,
-    headers: Mapping[str, str],
-    context: str,
-    fetch: Fetch[T],
-) -> T:
-    """One document from ``cache``, fetched by ``fetch`` when not fresh."""
-    _require_http_url(url, context)  # before request_fields parses it
-    return await cache.get(
-        url,
-        fetch,
-        request_fields=request_fields(
-            client._get_session(),  # deliberate friend access
-            url,
-            headers,
-        ),
     )
