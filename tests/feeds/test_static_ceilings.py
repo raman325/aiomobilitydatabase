@@ -274,6 +274,26 @@ def test_a_window_reaching_past_the_feed_reads_only_the_feed_s_days(
         index.close()
 
 
+def test_a_feed_whose_service_never_runs_reads_no_day(tmp_path: Path) -> None:
+    """No weekday set: no day has a service to run, so a window across all
+    of datetime's range reads none of them."""
+    index = _index(
+        tmp_path,
+        calendar="ALL,0,0,0,0,0,0,0,20260101,20261231\n",
+        stop_times=_TWO_STOPS,
+    )
+    try:
+        opens = datetime(1, 1, 3, tzinfo=UTC)
+        read, counting = _counting_reads(index)
+        with counting:
+            got = index.upcoming_departures(
+                ["S1"], None, opens, datetime(9999, 11, 30, tzinfo=UTC) - opens
+            )
+        assert (got, read) == ([], [])
+    finally:
+        index.close()
+
+
 async def test_a_board_opening_long_before_the_feed_starts_reads_its_days_only(
     tmp_path: Path,
 ) -> None:
