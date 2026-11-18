@@ -98,12 +98,12 @@ def _intersection(a: Box, b: Box) -> Box:
 
 
 def contains(a: Box, b: Box) -> bool:
-    """``ST_Contains(a, b)``: ``b`` within ``a``, and their interiors meet."""
+    """``ST_Contains(a, b)``: ``b`` covered by ``a``, and their interiors meet."""
     return covers(a, b) and _interiors_meet(a, b)
 
 
 def overlaps(a: Box, b: Box) -> bool:
-    """``ST_Overlaps(a, b)``: same dimension, interiors meet, neither within the other.
+    """``ST_Overlaps(a, b)``: same dimension, interiors meet, neither covers the other.
 
     The two must also meet in that dimension: crossing segments meet only
     in a point, so they do not overlap.
