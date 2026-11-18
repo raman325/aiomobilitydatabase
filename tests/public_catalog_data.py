@@ -38,9 +38,13 @@ HEADER = [
 
 
 def export(*rows: dict[str, str], header: list[str] | None = None) -> bytes:
-    """An export body: the header, then each row (missing cells empty)."""
-    out = io.StringIO()
-    writer = csv.DictWriter(out, header or HEADER, lineterminator="\n")
+    """An export body: the header, then each row (missing cells empty).
+
+    The csv module's defaults, as the export's: each record ends "\\r\\n",
+    and a newline inside a quoted cell stays as it is.
+    """
+    out = io.StringIO(newline="")
+    writer = csv.DictWriter(out, header or HEADER)
     writer.writeheader()
     for row in rows:
         writer.writerow(row)

@@ -42,7 +42,9 @@ _DIGITS = re.compile(r"[0-9]{1,9}")
 # A date-time as the export writes one (Python's str(datetime), an offset
 # optional), or with "T" and "Z". fromisoformat would also take a bare date
 # (midnight), the basic and week formats, 24:00 (the next day), and more
-# than six fraction digits (truncated).
+# than six fraction digits (truncated). Narrower than _payload._DATE_TIME,
+# which reads the API's JSON: the export is written by str(datetime), never
+# with a lowercase "t" or more than six fraction digits.
 _DATE_TIME = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])?"
@@ -116,7 +118,14 @@ def read_catalog(body: bytes) -> CatalogRows:
 
 
 def _order(feed: CatalogFeed) -> tuple[bool, str, str]:
-    """Order by provider, then id; a feed without a provider last (Postgres ASC)."""
+    """Order by provider, then id, each by code point; no provider last.
+
+    Not the API's order: it sorts by its database's en_US.UTF8 collation,
+    which sets case, punctuation and accents apart differently, so the
+    order -- and with it which feeds a limit/offset page holds -- can
+    differ. An empty provider is None here (sorted last), where Postgres
+    would sort its "" first.
+    """
     return (feed.provider is None, feed.provider or "", feed.id or "")
 
 
