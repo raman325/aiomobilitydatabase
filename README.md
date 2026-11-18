@@ -261,9 +261,19 @@ headers allow). It returns the catalog API's `GtfsFeed`, `GtfsRtFeed` and
 - **GBFS filters**: `get_gbfs_feeds` filters on each system's bounding box
   (the API has no such filter) and has no `system_id` or `version` filter.
 - **Ordering**: feeds are ordered by provider, then id, by code point; the
-  API uses its database's `en_US.UTF8` collation, so a `limit`/`offset` page
-  can hold different feeds. `entity_types` and `feed_references` are in the
-  export's order.
+  API's GTFS list uses its database's `en_US.UTF8` collation and its GBFS
+  list sets no order, so a `limit`/`offset` page can hold different feeds.
+  `entity_types` and `feed_references` are in the export's order.
+- **Published feeds only**: the export holds published feeds; the API's GBFS
+  list doesn't filter on publication, and its get-by-id endpoints may return
+  an unpublished feed to some accounts.
+- **GBFS pages**: the API's GBFS list applies `limit` to rows joined with
+  each system's versions and endpoints, so its pages can hold fewer feeds
+  than `limit`; here a page holds `limit` feeds.
+- **No GBFS rows yet**: while the export carries no GBFS rows at all (until
+  mobility-feed-api's GBFS export is deployed), `get_gbfs_feeds` and
+  `get_gbfs_feed` raise `MobilityDatabaseConnectionError` rather than answer
+  `[]` or not found.
 - **Empty values**: an empty cell is `None`, where the database may hold `""`
   and the API return it.
 - **Text filters**: `provider` and `producer_url` match as the API's `ILIKE`
@@ -277,7 +287,11 @@ headers allow). It returns the catalog API's `GtfsFeed`, `GtfsRtFeed` and
   depends on its GEOS version.
 - **Paging**: `limit` defaults to, and is at most, 2500 (GTFS), 1000 (GTFS
   Realtime) or 500 (GBFS); a `limit` out of range or a negative `offset`
-  raises `ValueError`, where the API answers 422.
+  raises `ValueError`, where the API answers 422. As in the API,
+  `get_gbfs_feeds(limit=0)` returns every system, where the GTFS lists
+  return none.
+- **Realtime list**: as in the API, `get_gtfs_rt_feeds` leaves out a feed
+  without entity types, which `get_gtfs_rt_feed` still returns.
 - **Errors**: a missing export (404) or a 401 is a `MobilityDatabaseApiError`
   (never `MobilityDatabaseNotFoundError`, which means no such feed); a 429 is
   a `MobilityDatabaseRateLimitError`.
@@ -815,7 +829,7 @@ each define their own subtree beneath it, so you can catch broadly
 
 | Exception | Layer | Meaning |
 | --- | --- | --- |
-| `MobilityDatabaseConnectionError` | catalog | Network failure, timeout, or invalid response body |
+| `MobilityDatabaseConnectionError` | catalog | Network failure, timeout, or invalid response body; from the public catalog also an export carrying no GBFS feeds, for a GBFS lookup |
 | `MobilityDatabaseAuthenticationError` | catalog | Invalid refresh token, or unauthorized after a token refresh |
 | `MobilityDatabaseNotFoundError` | catalog | Resource not found (404); the public catalog raises it only when no feed of the requested type has the id, never for a missing export |
 | `MobilityDatabaseRateLimitError` | catalog | Rate limited (429) |

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
 
+from ._bounds import Box
 from ._numbers import ascii_number
 from ._vocab import vocab_or_none
 from .models import (
@@ -66,12 +67,20 @@ class CatalogFormatError(ValueError):
 
 @dataclass(frozen=True)
 class CatalogRows:
-    """One export, read: each type's feeds in (provider, id) order, and by id."""
+    """One export, read: each type's feeds in (provider, id) order, and by id.
+
+    ``gtfs_rt_listed`` are the GTFS Realtime feeds the API's list returns:
+    those with an entity type (its query inner-joins them), one this
+    library doesn't know included. ``boxes`` holds each GTFS and GBFS
+    feed's bounding box, by id, for the bounding filters.
+    """
 
     gtfs: tuple[GtfsFeed, ...]
     gtfs_rt: tuple[GtfsRtFeed, ...]
     gbfs: tuple[GbfsFeed, ...]
     by_id: Mapping[str, CatalogFeed]
+    gtfs_rt_listed: tuple[GtfsRtFeed, ...]
+    boxes: Mapping[str, Box]
 
 
 def read_catalog(body: bytes) -> CatalogRows:
@@ -85,6 +94,8 @@ def read_catalog(body: bytes) -> CatalogRows:
     if text is None:
         raise CatalogFormatError("not UTF-8")
     feeds: dict[str, CatalogFeed] = {}
+    boxes: dict[str, Box] = {}
+    listed: set[str] = set()
     # strict: a stray or unclosed quote is an error, where the default reads
     # on -- joining text after a closing quote onto the cell, or swallowing
     # every later row into one unclosed cell.
@@ -97,9 +108,15 @@ def read_catalog(body: bytes) -> CatalogRows:
                 feed_id = _cell(row, "id")
                 if feed_id is None or feed_id in feeds:
                     continue
-                feed = _feed(feed_id, row)
-                if feed is not None:
-                    feeds[feed_id] = feed
+                box = _box(row)
+                feed = _feed(feed_id, row, box)
+                if feed is None:
+                    continue
+                feeds[feed_id] = feed
+                if box is not None and isinstance(feed, GtfsFeed | GbfsFeed):
+                    boxes[feed_id] = box
+                if isinstance(feed, GtfsRtFeed) and _split(row, "entity_type"):
+                    listed.add(feed_id)
         else:
             failure = "no id or data_type column"
     except csv.Error:
@@ -114,6 +131,12 @@ def read_catalog(body: bytes) -> CatalogRows:
         gtfs_rt=tuple(feed for feed in ordered if isinstance(feed, GtfsRtFeed)),
         gbfs=tuple(feed for feed in ordered if isinstance(feed, GbfsFeed)),
         by_id=MappingProxyType(feeds),
+        gtfs_rt_listed=tuple(
+            feed
+            for feed in ordered
+            if isinstance(feed, GtfsRtFeed) and feed.id in listed
+        ),
+        boxes=MappingProxyType(boxes),
     )
 
 
@@ -135,7 +158,7 @@ def _cell(row: _Row, name: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _feed(feed_id: str, row: _Row) -> CatalogFeed | None:
+def _feed(feed_id: str, row: _Row, box: Box | None) -> CatalogFeed | None:
     """Build the row's model, by data type; None for a type this library lacks."""
     data_type = _cell(row, "data_type")
     if data_type == DataType.GTFS:
@@ -151,7 +174,7 @@ def _feed(feed_id: str, row: _Row) -> CatalogFeed | None:
             seasonal=None,  # not in the export
             feed_name=_cell(row, "name"),
             note=_cell(row, "note"),
-            bounding_box=_bounding_box(row),
+            bounding_box=_bounding_box(box),
         )
     if data_type == DataType.GTFS_RT:
         return GtfsRtFeed(
@@ -177,7 +200,7 @@ def _feed(feed_id: str, row: _Row) -> CatalogFeed | None:
             feed_contact_email=_cell(row, "feed_contact_email"),
             source_info=_source_info(row),
             redirects=_redirects(row),
-            bounding_box=_bounding_box(row),
+            bounding_box=_bounding_box(box),
             bounding_box_generated_at=_naive_utc(
                 _cell(row, "location.bounding_box.extracted_on")
             ),
@@ -235,18 +258,25 @@ def _number(row: _Row, name: str) -> float | None:
     return None if cell is None else ascii_number(cell)
 
 
-def _bounding_box(row: _Row) -> BoundingBox | None:
+def _box(row: _Row) -> Box | None:
     """All four bounds, finite, each minimum at most its maximum; else None."""
     min_lat, max_lat, min_lon, max_lon = (_number(row, name) for name in _BOX)
     if min_lat is None or max_lat is None or min_lon is None or max_lon is None:
         return None
     if min_lat > max_lat or min_lon > max_lon:
         return None
+    return Box(min_lat, max_lat, min_lon, max_lon)
+
+
+def _bounding_box(box: Box | None) -> BoundingBox | None:
+    """Return the model's bounding box for a row's box."""
+    if box is None:
+        return None
     return BoundingBox(
-        minimum_latitude=min_lat,
-        maximum_latitude=max_lat,
-        minimum_longitude=min_lon,
-        maximum_longitude=max_lon,
+        minimum_latitude=box.minimum_latitude,
+        maximum_latitude=box.maximum_latitude,
+        minimum_longitude=box.minimum_longitude,
+        maximum_longitude=box.maximum_longitude,
     )
 
 

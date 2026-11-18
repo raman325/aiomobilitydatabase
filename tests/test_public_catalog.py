@@ -645,3 +645,89 @@ async def test_mistyped_arguments_raise_type_error(
     with pytest.raises(TypeError):
         await public.get_gtfs_feeds(**kwargs)  # type: ignore[arg-type]
     assert mock_api.requests == []
+
+
+CACHED = {"Cache-Control": "max-age=3600"}
+
+
+async def test_the_rt_list_leaves_out_feeds_without_entity_types(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    untyped = {**GTFS_RT_ROW, "id": "mdb-21", "entity_type": ""}
+    unknown = {**GTFS_RT_ROW, "id": "mdb-22", "entity_type": "xx"}
+    serve(mock_api, body=export(GTFS_RT_ROW, untyped, unknown), headers=CACHED)
+    # The API's list inner-joins the entity types; its getter doesn't.
+    feeds = await public.get_gtfs_rt_feeds()
+    assert [feed.id for feed in feeds] == ["mdb-20", "mdb-22"]
+    assert (await public.get_gtfs_rt_feed("mdb-21")).id == "mdb-21"
+
+
+async def test_a_gbfs_limit_of_0_is_no_limit(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    systems = ({**GBFS_ROW, "id": f"gbfs-{n:04}"} for n in range(501))
+    serve(mock_api, body=export(GTFS_ROW, GTFS_RT_ROW, *systems), headers=CACHED)
+    # The API's GBFS list applies a limit only when truthy; GTFS's take 0.
+    assert len(await public.get_gbfs_feeds(limit=0)) == 501
+    paged = await public.get_gbfs_feeds(limit=0, offset=1)
+    assert [feed.id for feed in paged][:1] == ["gbfs-0001"]
+    assert len(paged) == 500
+    assert await public.get_gtfs_feeds(limit=0) == []
+    assert await public.get_gtfs_rt_feeds(limit=0) == []
+
+
+async def test_an_export_without_gbfs_rows_raises_connection_error(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    serve(mock_api, body=export(GTFS_ROW, GTFS_RT_ROW), headers=CACHED)
+    message = "Public catalog export carries no GBFS feeds"
+    with pytest.raises(MobilityDatabaseConnectionError, match=message) as listed:
+        await public.get_gbfs_feeds()
+    with pytest.raises(MobilityDatabaseConnectionError, match=message) as got:
+        await public.get_gbfs_feed("gbfs-citibike")
+    assert listed.value.__context__ is None
+    assert got.value.__context__ is None
+    assert [feed.id for feed in await public.get_gtfs_feeds()] == ["mdb-10"]
+
+
+async def test_gbfs_filtered_to_nothing_is_empty(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    serve(mock_api, headers=CACHED)
+    assert await public.get_gbfs_feeds(provider="nobody") == []
+    with pytest.raises(MobilityDatabaseNotFoundError):
+        await public.get_gbfs_feed("gbfs-missing")
+
+
+@pytest.mark.parametrize("method", ["get_gtfs_feeds", "get_gbfs_feeds"])
+@pytest.mark.parametrize("both", [False, True])
+async def test_a_coordinate_past_float_raises_value_error_before_any_request(
+    mock_api: MockApi,
+    public: MobilityDatabasePublicCatalog,
+    method: str,
+    both: bool,
+) -> None:
+    ranges: dict[str, tuple[float, float]] = {"dataset_latitudes": (10**400, 1.0)}
+    if both:
+        ranges["dataset_longitudes"] = (1.0, 2.0)
+    with pytest.raises(
+        ValueError, match="a query parameter is no finite number"
+    ) as caught:
+        await getattr(public, method)(**ranges)
+    assert caught.value.__context__ is None
+    assert mock_api.requests == []
+
+
+@pytest.mark.parametrize(
+    "method", ["get_gtfs_feeds", "get_gtfs_rt_feeds", "get_gbfs_feeds"]
+)
+@pytest.mark.parametrize("name", ["provider", "producer_url"])
+async def test_a_text_filter_that_is_no_text_raises_before_any_request(
+    mock_api: MockApi,
+    public: MobilityDatabasePublicCatalog,
+    method: str,
+    name: str,
+) -> None:
+    with pytest.raises(ValueError, match="lone surrogate"):
+        await getattr(public, method)(**{name: "bike\ud800"})
+    assert mock_api.requests == []

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -18,7 +18,7 @@ from yarl import URL
 from ._bounds import Box, matches
 from ._catalog_csv import CatalogFeed, CatalogFormatError, CatalogRows, read_catalog
 from ._freshness import FreshnessCache, Response, Validators, request_fields
-from ._http import URL_ERRORS
+from ._http import URL_ERRORS, require_text
 from ._transport import exchange
 
 # Deliberate friend access: the argument checks are shared with the API
@@ -96,9 +96,21 @@ class MobilityDatabasePublicCatalog:
     - ``seasonal`` is None (unknown): the export doesn't carry it.
     - ``get_gbfs_feeds`` filters on the system's bounding box (the API has
       no such filter) and has no ``system_id`` or ``version`` filter.
-    - Results are ordered by provider, then id, by code point (the API
-      sorts by its database's collation); ``entity_types`` and
-      ``feed_references`` are in the export's order.
+    - Results are ordered by provider, then id, by code point (the API's
+      GTFS list sorts by its database's collation; its GBFS list sets no
+      order); ``entity_types`` and ``feed_references`` are in the export's
+      order.
+    - The export holds published feeds only: the API's GBFS list doesn't
+      filter on publication, and its get-by-id endpoints may return an
+      unpublished feed to some accounts.
+    - The API's GBFS list applies ``limit`` to its rows joined with each
+      system's versions and endpoints, so its pages can hold fewer feeds
+      than ``limit``; here a page holds ``limit`` feeds.
+    - An export without any GBFS rows (MobilityData's carries none until
+      its GBFS export, mobility-feed-api #1888, is deployed) can't say
+      whether a system exists: ``get_gbfs_feeds`` and ``get_gbfs_feed`` raise
+      :class:`MobilityDatabaseConnectionError` rather than answer ``[]`` or
+      not found. With GBFS rows present, no match is ``[]`` as in the API.
     - An empty cell is None: the export writes an empty string and a
       missing value alike, so where the database holds ``""`` the API
       returns ``""``.
@@ -124,6 +136,12 @@ class MobilityDatabasePublicCatalog:
       a 401 to :class:`MobilityDatabaseAuthenticationError`, and
       :class:`MobilityDatabaseNotFoundError` means no such feed). A 429 is a
       :class:`MobilityDatabaseRateLimitError`.
+
+    As the API, ``get_gtfs_rt_feeds`` leaves out a feed without entity
+    types (its query inner-joins them; a type this library doesn't know
+    still counts), which ``get_gtfs_rt_feed`` returns; and
+    ``get_gbfs_feeds(limit=0)`` returns every system (the API applies a
+    GBFS limit only when it is truthy), where the GTFS lists return none.
 
     The export is cached as HTTP allows (RFC 9111: ``max-age``, revalidated
     with its ETag), shared by concurrent callers, and parsed off the event
@@ -254,7 +272,9 @@ class MobilityDatabasePublicCatalog:
     async def get_gbfs_feed(self, feed_id: str) -> GbfsFeed:
         """Get a single GBFS feed by ID."""
         key = _require_id(feed_id)  # as the client's, before any request
-        return _find(await self._rows(), key, GbfsFeed)
+        rows = await self._rows()
+        _gbfs(rows)
+        return _find(rows, key, GbfsFeed)
 
     @_typed
     async def get_gtfs_feeds(
@@ -284,7 +304,8 @@ class MobilityDatabasePublicCatalog:
             method=bounding_filter_method,
             is_official=is_official,
         )
-        return query.select((await self._rows()).gtfs)
+        rows = await self._rows()
+        return query.select(rows.gtfs, rows.boxes)
 
     @_typed
     async def get_gtfs_rt_feeds(
@@ -310,7 +331,10 @@ class MobilityDatabasePublicCatalog:
             entity_types=entity_types,
             is_official=is_official,
         )
-        return query.select((await self._rows()).gtfs_rt)
+        # The API's list inner-joins the entity types: a feed without any
+        # isn't listed, though get_gtfs_rt_feed returns it.
+        rows = await self._rows()
+        return query.select(rows.gtfs_rt_listed, rows.boxes)
 
     @_typed
     async def get_gbfs_feeds(
@@ -334,8 +358,10 @@ class MobilityDatabasePublicCatalog:
             latitudes=dataset_latitudes,
             longitudes=dataset_longitudes,
             method=bounding_filter_method,
+            zero_is_no_limit=True,
         )
-        return query.select((await self._rows()).gbfs)
+        rows = await self._rows()
+        return query.select(_gbfs(rows), rows.boxes)
 
 
 def _find[F: CatalogFeed](rows: CatalogRows, feed_id: str, kind: type[F]) -> F:
@@ -347,11 +373,26 @@ def _find[F: CatalogFeed](rows: CatalogRows, feed_id: str, kind: type[F]) -> F:
     return feed
 
 
+def _gbfs(rows: CatalogRows) -> tuple[GbfsFeed, ...]:
+    """Return the export's GBFS feeds; raise when it carries none at all.
+
+    An export without a GBFS section (one written before mobility-feed-api
+    exported GBFS) can't tell whether a system exists: neither an empty
+    list nor NotFound would be true.
+    """
+    if not rows.gbfs:
+        raise MobilityDatabaseConnectionError(
+            "Public catalog export carries no GBFS feeds"
+        )
+    return rows.gbfs
+
+
 def _needle(value: str | None) -> re.Pattern[str] | None:
     """Return a string filter as the API normalizes it: trimmed; empty is none."""
     if value is None:
         return None
-    trimmed = value.strip()
+    # As the client's encoder: plain str text, else ValueError.
+    trimmed = require_text(str.__str__(value), "a query parameter").strip()
     return _ilike(trimmed) if trimmed else None
 
 
@@ -410,7 +451,7 @@ class _Query:
     """One list call's filters, checked before any request; see :meth:`of`."""
 
     start: int
-    stop: int
+    stop: int | None
     provider: re.Pattern[str] | None
     producer_url: re.Pattern[str] | None
     box: Box | None
@@ -432,10 +473,14 @@ class _Query:
         method: BoundingFilterMethod | None = None,
         is_official: bool | None = None,
         entity_types: Sequence[EntityType] | None = None,
+        zero_is_no_limit: bool = False,
     ) -> _Query:
         """Check a list call's filters and normalize them as the API does.
 
         ``max_limit`` is the endpoint's largest ``limit``, and its default.
+        ``zero_is_no_limit``: a ``limit`` of 0 returns every feed (the API's
+        GBFS list applies a limit only when it is truthy), where otherwise
+        it returns none (SQL's ``LIMIT 0``).
         """
         if limit is None:
             limit = max_limit
@@ -447,7 +492,7 @@ class _Query:
         # As the client, which encodes every given range: one alone is
         # checked too, though the API ignores it.
         for given in (latitudes, longitudes):
-            if given is not None and not all(math.isfinite(value) for value in given):
+            if given is not None and not _finite(given):
                 raise ValueError("a query parameter is no finite number")
         box = None
         # As the API: the box applies only with both ranges given.
@@ -462,7 +507,7 @@ class _Query:
             )
         return cls(
             start=start,
-            stop=start + limit,
+            stop=None if zero_is_no_limit and limit == 0 else start + limit,
             provider=_needle(provider),
             producer_url=_needle(producer_url),
             box=box,
@@ -471,7 +516,7 @@ class _Query:
             entity_types=frozenset(entity_types) if entity_types else None,
         )
 
-    def _keeps(self, feed: CatalogFeed) -> bool:
+    def _keeps(self, feed: CatalogFeed, boxes: Mapping[str, Box]) -> bool:
         source = feed.source_info
         if not (
             _like(self.provider, feed.provider)
@@ -493,22 +538,27 @@ class _Query:
             return False
         box = self.box
         # A GTFS Realtime feed has no box: the API has no such filter for it.
-        if box is None or not isinstance(feed, GtfsFeed | GbfsFeed):
+        if box is None or isinstance(feed, GtfsRtFeed):
             return True
-        return self._inside(feed, box)
+        # Every export feed has an id; the model allows None.
+        feed_box = None if feed.id is None else boxes.get(feed.id)
+        return feed_box is not None and matches(self.method, feed_box, box)
 
-    def _inside(self, feed: GtfsFeed | GbfsFeed, box: Box) -> bool:
-        """Whether the feed's bounding box passes the bounding filter."""
-        bounds = feed.bounding_box
-        if bounds is None:
-            return False
-        low_lat, high_lat = bounds.minimum_latitude, bounds.maximum_latitude
-        low_lon, high_lon = bounds.minimum_longitude, bounds.maximum_longitude
-        # The export always has all four or none; the model allows either.
-        if low_lat is None or high_lat is None or low_lon is None or high_lon is None:
-            return False
-        return matches(self.method, Box(low_lat, high_lat, low_lon, high_lon), box)
+    def select[F: CatalogFeed](
+        self, feeds: Sequence[F], boxes: Mapping[str, Box]
+    ) -> list[F]:
+        """Return the feeds that pass, then apply ``offset`` and ``limit``.
 
-    def select[F: CatalogFeed](self, feeds: Sequence[F]) -> list[F]:
-        """Return the feeds that pass, then apply ``offset`` and ``limit``."""
-        return [feed for feed in feeds if self._keeps(feed)][self.start : self.stop]
+        ``boxes`` are the feeds' bounding boxes by id (see
+        :class:`CatalogRows`).
+        """
+        kept = [feed for feed in feeds if self._keeps(feed, boxes)]
+        return kept[self.start : self.stop]
+
+
+def _finite(values: tuple[float, float]) -> bool:
+    """Whether both values are finite; an int past float's range is not."""
+    try:
+        return all(math.isfinite(value) for value in values)
+    except OverflowError:
+        return False

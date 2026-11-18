@@ -8,6 +8,7 @@ from datetime import datetime
 
 import pytest
 
+from aiomobilitydatabase._bounds import Box
 from aiomobilitydatabase._catalog_csv import CatalogFormatError, read_catalog
 from aiomobilitydatabase.models import (
     BoundingBox,
@@ -320,3 +321,31 @@ def test_a_nul_inside_a_cell_is_kept() -> None:
     body = b"id,data_type,provider\nmdb-1,gtfs,A\x00B\n"
     (feed,) = read_catalog(body).gtfs
     assert feed.provider == "A\x00B"
+
+
+def test_each_gtfs_and_gbfs_box_is_read_once_for_the_filters() -> None:
+    rows = read_catalog(
+        export(
+            GTFS_ROW,
+            GTFS_RT_ROW,
+            GBFS_ROW,
+            {**GTFS_ROW, "id": "mdb-11", **box("", "", "", "")},
+        )
+    )
+    assert dict(rows.boxes) == {
+        "mdb-10": Box(40.5, 40.9, -74.3, -73.7),
+        "gbfs-citibike": Box(40.6, 40.9, -74.1, -73.8),
+    }
+
+
+def test_the_rt_list_holds_feeds_with_an_entity_type_cell() -> None:
+    rows = read_catalog(
+        export(
+            GTFS_RT_ROW,
+            {**GTFS_RT_ROW, "id": "mdb-21", "entity_type": ""},
+            {**GTFS_RT_ROW, "id": "mdb-22", "entity_type": "xx"},
+        )
+    )
+    assert [feed.id for feed in rows.gtfs_rt] == ["mdb-20", "mdb-21", "mdb-22"]
+    # The API's list inner-joins the entity types; a type unknown here counts.
+    assert [feed.id for feed in rows.gtfs_rt_listed] == ["mdb-20", "mdb-22"]
