@@ -14,6 +14,7 @@ import aiohttp
 
 from ..client import MobilityDatabaseClient
 from ..exceptions import MobilityDatabaseError
+from ..public_catalog import MobilityDatabasePublicCatalog
 from ._extra import load_transit_handle
 from ._urls import require_caller_inputs
 from .const import DEFAULT_TIMEOUT_SECONDS
@@ -36,6 +37,8 @@ class MobilityFeedsClient:
     resolution, search, :attr:`catalog`); the direct-URL methods
     (:meth:`get_transit_feed_from_urls`, :meth:`get_gbfs_feed_from_url`)
     never touch the catalog and work on a tokenless client.
+    :attr:`public_catalog` reads the public catalog export and needs no
+    token either.
     """
 
     def __init__(
@@ -54,6 +57,7 @@ class MobilityFeedsClient:
         self._base_url = base_url
         self._timeout = request_timeout
         self._catalog: MobilityDatabaseClient | None = None
+        self._public_catalog: MobilityDatabasePublicCatalog | None = None
         self._cache_dir = Path(cache_dir) if cache_dir is not None else None
 
     async def __aenter__(self) -> Self:
@@ -74,6 +78,7 @@ class MobilityFeedsClient:
         if self._catalog is not None:
             await self._catalog.close()
             self._catalog = None
+        self._public_catalog = None  # never owns the shared session
         if (
             self._owns_session
             and self._session is not None
@@ -116,6 +121,20 @@ class MobilityFeedsClient:
                     request_timeout=self._timeout,
                 )
         return self._catalog
+
+    @property
+    def public_catalog(self) -> MobilityDatabasePublicCatalog:
+        """The catalog's public export (no token), on the shared session.
+
+        Same models and filters as :attr:`catalog`'s list and get methods
+        for GTFS, GTFS Realtime and GBFS, minus what the export doesn't
+        carry: see :class:`MobilityDatabasePublicCatalog`.
+        """
+        if self._public_catalog is None:
+            self._public_catalog = MobilityDatabasePublicCatalog(
+                self._get_session(), request_timeout=self._timeout
+            )
+        return self._public_catalog
 
     @property
     def timeout_seconds(self) -> float:

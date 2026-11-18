@@ -10,6 +10,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from aiomobilitydatabase import MobilityDatabasePublicCatalog
 from aiomobilitydatabase.const import PROD_BASE_URL
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 
@@ -329,3 +330,21 @@ def test_purging_every_feed_removes_each_feed_directory_and_nothing_else(
         assert not any(feed.exists() for feed in feeds)
         assert all(entry.is_symlink() or entry.is_file() for entry in kept)
         assert (outside / "keep").read_bytes() == b"x"
+
+
+async def test_public_catalog_needs_no_token_and_shares_the_session() -> None:
+    client = MobilityFeedsClient()
+    public = client.public_catalog
+    assert isinstance(public, MobilityDatabasePublicCatalog)
+    assert client.public_catalog is public
+    assert public._get_session() is client._get_session()  # deliberate friend access
+    await client.close()
+    assert client._session is None  # owned session closed
+
+
+async def test_public_catalog_never_closes_an_injected_session() -> None:
+    async with aiohttp.ClientSession() as session:
+        client = MobilityFeedsClient(session=session)
+        client.public_catalog  # noqa: B018 - creates it
+        await client.close()
+        assert not session.closed

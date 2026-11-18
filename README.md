@@ -245,6 +245,46 @@ Notes on direct mode:
 - Accessing `client.catalog` (or any catalog-backed method) on a tokenless
   client raises `MobilityDatabaseError`.
 
+### Public catalog (no account)
+
+`public_catalog` finds feeds without a refresh token, from the catalog's
+public export (`feeds_v2.csv`, regenerated daily and cached as its HTTP
+headers allow). It returns the catalog API's `GtfsFeed`, `GtfsRtFeed` and
+`GbfsFeed` with the API's filter semantics (`provider` and `producer_url`
+match as its `ILIKE` does) and the API's `limit` defaults and maxima (2500
+GTFS, 1000 GTFS Realtime, 500 GBFS), holding the values the export carries
+and `None` elsewhere. It has no location fields or filters (the export's
+location isn't the API's), and `seasonal` is `None` (unknown). The bounding
+filters test each feed's current bounding box, where the API's GTFS filter
+matches any of a feed's datasets, past ones included, so a feed whose
+coverage moved can differ; a query range with no extent (a single point or
+line) can differ too, since PostGIS's answer for one varies with its GEOS
+version. `get_gbfs_feeds` also filters on each system's bounding box:
+
+```python
+import asyncio
+
+from aiomobilitydatabase import BoundingFilterMethod
+from aiomobilitydatabase.feeds import MobilityFeedsClient
+
+
+async def main() -> None:
+    async with MobilityFeedsClient() as client:
+        systems = await client.public_catalog.get_gbfs_feeds(
+            dataset_latitudes=(40.75, 40.76),
+            dataset_longitudes=(-73.99, -73.98),
+            bounding_filter_method=BoundingFilterMethod.PARTIALLY_ENCLOSED,
+        )
+        url = systems[0].source_info.producer_url
+        bikes = await client.get_gbfs_feed_from_url(url)
+
+
+asyncio.run(main())
+```
+
+`MobilityDatabasePublicCatalog` can also be used on its own, without the
+feeds layer.
+
 ## How it works
 
 - **Scheduled arrivals for every feed**: the hosted GTFS zip is indexed into
