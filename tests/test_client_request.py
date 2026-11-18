@@ -1,7 +1,9 @@
 """Tests for _request() error mapping."""
 
+import aiohttp
 import pytest
 
+from aiomobilitydatabase._transport import exchange
 from aiomobilitydatabase.client import MobilityDatabaseClient
 from aiomobilitydatabase.exceptions import (
     MobilityDatabaseApiError,
@@ -98,3 +100,22 @@ async def test_network_error_after_token_maps_to_connection_error(
     client._base_url = "http://127.0.0.1:1"
     with pytest.raises(MobilityDatabaseConnectionError):
         await client.get_metadata()
+
+
+async def test_exchange_answer_carries_the_header_fields(mock_api: MockApi) -> None:
+    mock_api.get(
+        "/file.csv",
+        body=b"x",
+        content_type="text/csv",
+        headers={"ETag": '"v1"', "Cache-Control": "public, max-age=3600"},
+    )
+    async with aiohttp.ClientSession() as session:
+        answer = await exchange(
+            session,
+            "GET",
+            mock_api.url("/file.csv"),
+            what="Test request",
+            client_timeout=aiohttp.ClientTimeout(total=5),
+        )
+    assert answer.fields["etag"] == ('"v1"',)
+    assert answer.fields["cache-control"] == ("public, max-age=3600",)

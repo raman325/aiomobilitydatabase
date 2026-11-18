@@ -12,18 +12,20 @@ aiohttp to parse anything more.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
 
+from ._freshness import header_fields
 from ._http import REQUEST_OPTIONS
 from .exceptions import MobilityDatabaseConnectionError
 
 
 @dataclass(frozen=True)
 class Answer:
-    """A response, read whole: status, media type and body."""
+    """A response, read whole: status, media type, body and header fields."""
 
     status: int
     # The Content-Type's media type, lower-cased, parameters dropped; "" when
@@ -33,6 +35,9 @@ class Answer:
     # None when the body couldn't be read (a Content-Encoding its bytes
     # don't follow): the status still counts.
     body: bytes | None
+    # Lower-cased name -> values in the order received (see
+    # :func:`._freshness.header_fields`): what a cache keeps.
+    fields: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 async def exchange(
@@ -69,7 +74,7 @@ async def exchange(
                 body = None
             header = resp.headers.get("Content-Type", "")
             media_type = header.split(";", 1)[0].strip(" \t").lower()
-            return Answer(resp.status, media_type, body)
+            return Answer(resp.status, media_type, body, header_fields(resp.headers))
     except Exception as err:  # the boundary: see the module docstring
         failure = type(err).__name__
     # Raised outside the except, so the original isn't even the context:
