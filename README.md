@@ -817,7 +817,7 @@ each define their own subtree beneath it, so you can catch broadly
 | --- | --- | --- |
 | `MobilityDatabaseConnectionError` | catalog | Network failure, timeout, or invalid response body |
 | `MobilityDatabaseAuthenticationError` | catalog | Invalid refresh token, or unauthorized after a token refresh |
-| `MobilityDatabaseNotFoundError` | catalog | Resource not found (404); the public catalog raises it only for an unknown feed id, never for a missing export |
+| `MobilityDatabaseNotFoundError` | catalog | Resource not found (404); the public catalog raises it only when no feed of the requested type has the id, never for a missing export |
 | `MobilityDatabaseRateLimitError` | catalog | Rate limited (429) |
 | `MobilityDatabaseApiError` | catalog | Any other 4xx/5xx (carries `.status` and `.body`) |
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
