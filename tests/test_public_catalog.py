@@ -16,7 +16,12 @@ from aiomobilitydatabase.exceptions import (
     MobilityDatabaseConnectionError,
     MobilityDatabaseNotFoundError,
 )
-from aiomobilitydatabase.public_catalog import MobilityDatabasePublicCatalog
+from aiomobilitydatabase.public_catalog import (
+    GBFS_FEEDS_MAX_LIMIT,
+    GTFS_FEEDS_MAX_LIMIT,
+    GTFS_RT_FEEDS_MAX_LIMIT,
+    MobilityDatabasePublicCatalog,
+)
 
 from tests.mock_server import MockApi
 from tests.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, export
@@ -25,8 +30,10 @@ PATH = "/feeds_v2.csv"
 BODY = export(GTFS_ROW, GTFS_RT_ROW, GBFS_ROW)
 
 
-def serve(api: MockApi, body: bytes = BODY, **headers: str) -> None:
-    api.get(PATH, body=body, content_type="text/csv", headers=headers or None)
+def serve(
+    api: MockApi, body: bytes = BODY, headers: dict[str, str] | None = None
+) -> None:
+    api.get(PATH, body=body, content_type="text/csv", headers=headers)
 
 
 @pytest.fixture
@@ -54,7 +61,7 @@ async def test_it_reads_the_export_without_any_token(
 async def test_a_fresh_export_is_reused(
     mock_api: MockApi, public: MobilityDatabasePublicCatalog
 ) -> None:
-    serve(mock_api, **{"Cache-Control": "public, max-age=3600", "ETag": '"v1"'})
+    serve(mock_api, headers={"Cache-Control": "public, max-age=3600", "ETag": '"v1"'})
     await public.get_gtfs_feeds()
     await public.get_gtfs_rt_feeds()
     assert requests_to(mock_api) == 1
@@ -63,7 +70,7 @@ async def test_a_fresh_export_is_reused(
 async def test_a_stale_export_is_revalidated_with_its_etag(
     mock_api: MockApi, public: MobilityDatabasePublicCatalog
 ) -> None:
-    serve(mock_api, **{"Cache-Control": "max-age=0", "ETag": '"v1"'})
+    serve(mock_api, headers={"Cache-Control": "max-age=0", "ETag": '"v1"'})
     mock_api.get(
         PATH, status=304, headers={"ETag": '"v1"', "Cache-Control": "max-age=0"}
     )
@@ -76,7 +83,7 @@ async def test_a_stale_export_is_revalidated_with_its_etag(
 async def test_concurrent_callers_share_one_fetch(
     mock_api: MockApi, public: MobilityDatabasePublicCatalog
 ) -> None:
-    serve(mock_api, **{"Cache-Control": "max-age=3600"})
+    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
     results = await asyncio.gather(*(public.get_gbfs_feeds() for _ in range(5)))
     assert all(result == results[0] for result in results)
     assert requests_to(mock_api) == 1
@@ -130,7 +137,7 @@ async def test_a_network_failure_raises_connection_error() -> None:
 async def test_getters_find_a_feed_by_id_and_type(
     mock_api: MockApi, public: MobilityDatabasePublicCatalog
 ) -> None:
-    serve(mock_api, **{"Cache-Control": "max-age=3600"})
+    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
     assert (await public.get_gtfs_feed("mdb-10")).id == "mdb-10"
     assert (await public.get_gtfs_rt_feed("mdb-20")).id == "mdb-20"
     assert (await public.get_gbfs_feed("gbfs-citibike")).id == "gbfs-citibike"
@@ -170,3 +177,53 @@ def test_construction_checks_like_the_api_client() -> None:
         MobilityDatabasePublicCatalog(url=7)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         MobilityDatabasePublicCatalog(request_timeout=0)
+
+
+def gbfs_systems(count: int) -> bytes:
+    return export(*({**GBFS_ROW, "id": f"gbfs-{n:04}"} for n in range(count)))
+
+
+async def test_the_default_limit_is_the_endpoints(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    serve(mock_api, body=gbfs_systems(GBFS_FEEDS_MAX_LIMIT + 1))
+    feeds = await public.get_gbfs_feeds()
+    assert len(feeds) == GBFS_FEEDS_MAX_LIMIT
+    assert feeds[-1].id == f"gbfs-{GBFS_FEEDS_MAX_LIMIT - 1:04}"
+
+
+async def test_the_largest_limit_is_taken(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    serve(mock_api, body=gbfs_systems(GBFS_FEEDS_MAX_LIMIT + 1))
+    feeds = await public.get_gbfs_feeds(limit=GBFS_FEEDS_MAX_LIMIT, offset=1)
+    assert len(feeds) == GBFS_FEEDS_MAX_LIMIT
+    assert feeds[0].id == "gbfs-0001"
+
+
+@pytest.mark.parametrize(
+    ("method", "largest"),
+    [
+        ("get_gtfs_feeds", GTFS_FEEDS_MAX_LIMIT),
+        ("get_gtfs_rt_feeds", GTFS_RT_FEEDS_MAX_LIMIT),
+        ("get_gbfs_feeds", GBFS_FEEDS_MAX_LIMIT),
+    ],
+)
+@pytest.mark.parametrize(
+    "paging",
+    [{"limit": "past"}, {"limit": -1}, {"offset": -1}],
+)
+async def test_out_of_range_paging_raises_value_error_before_any_request(
+    mock_api: MockApi,
+    public: MobilityDatabasePublicCatalog,
+    method: str,
+    largest: int,
+    paging: dict[str, object],
+) -> None:
+    arguments = {
+        name: largest + 1 if value == "past" else value
+        for name, value in paging.items()
+    }
+    with pytest.raises(ValueError):
+        await getattr(public, method)(**arguments)
+    assert mock_api.requests == []

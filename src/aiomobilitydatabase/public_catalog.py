@@ -40,6 +40,13 @@ from .models import (
     GtfsRtFeed,
 )
 
+# The API's paging bounds (mobility-feed-api, feeds_api.py: ``limit`` is
+# ``Query(N, ge=0, le=N)``, ``offset`` ``ge=0``): each endpoint's default
+# limit is also its largest.
+GTFS_FEEDS_MAX_LIMIT = 2500
+GTFS_RT_FEEDS_MAX_LIMIT = 1000
+GBFS_FEEDS_MAX_LIMIT = 500
+
 
 def _require_export_url(url: object) -> str:
     """Return ``url`` if the export can be fetched from it; else raise.
@@ -49,6 +56,7 @@ def _require_export_url(url: object) -> str:
     """
     if not isinstance(url, str):
         raise TypeError("url must be a str")
+    host: str | None = None
     try:
         parsed = URL(url)
         host = parsed.host
@@ -94,6 +102,10 @@ class MobilityDatabasePublicCatalog:
       query range whose ends are equal) is the point or segment it covers;
       the API's answer for one depends on its GEOS version (see
       :mod:`._bounds`), so it may differ.
+    - A ``limit`` past the endpoint's maximum (also its default: 2500 GTFS,
+      1000 GTFS Realtime, 500 GBFS feeds) or below 0, or a negative
+      ``offset``, raises ValueError before any request, where the API
+      answers 422 (a :class:`MobilityDatabaseApiError`).
 
     The export is cached as HTTP allows (RFC 9111: ``max-age``, revalidated
     with its ETag), shared by concurrent callers, and parsed off the event
@@ -231,6 +243,7 @@ class MobilityDatabasePublicCatalog:
         query = _Query.of(
             limit=limit,
             offset=offset,
+            max_limit=GTFS_FEEDS_MAX_LIMIT,
             provider=provider,
             producer_url=producer_url,
             latitudes=dataset_latitudes,
@@ -258,6 +271,7 @@ class MobilityDatabasePublicCatalog:
         query = _Query.of(
             limit=limit,
             offset=offset,
+            max_limit=GTFS_RT_FEEDS_MAX_LIMIT,
             provider=provider,
             producer_url=producer_url,
             entity_types=entity_types,
@@ -281,6 +295,7 @@ class MobilityDatabasePublicCatalog:
         query = _Query.of(
             limit=limit,
             offset=offset,
+            max_limit=GBFS_FEEDS_MAX_LIMIT,
             provider=provider,
             producer_url=producer_url,
             latitudes=dataset_latitudes,
@@ -314,7 +329,7 @@ class _Query:
         self,
         *,
         start: int,
-        stop: int | None,
+        stop: int,
         provider: str | None,
         producer_url: str | None,
         box: Box | None,
@@ -337,6 +352,7 @@ class _Query:
         *,
         limit: int | None,
         offset: int | None,
+        max_limit: int,
         provider: str | None,
         producer_url: str | None,
         latitudes: tuple[float, float] | None = None,
@@ -345,9 +361,14 @@ class _Query:
         is_official: bool | None = None,
         entity_types: Sequence[EntityType] | None = None,
     ) -> _Query:
-        """Check a list call's filters and normalize them as the API does."""
-        if limit is not None and limit < 0:
-            raise ValueError("limit must not be negative")
+        """Check a list call's filters and normalize them as the API does.
+
+        ``max_limit`` is the endpoint's largest ``limit``, and its default.
+        """
+        if limit is None:
+            limit = max_limit
+        if not 0 <= limit <= max_limit:
+            raise ValueError(f"limit must be from 0 to {max_limit}")
         if offset is not None and offset < 0:
             raise ValueError("offset must not be negative")
         start = offset or 0
@@ -366,7 +387,7 @@ class _Query:
             )
         return cls(
             start=start,
-            stop=None if limit is None else start + limit,
+            stop=start + limit,
             provider=_needle(provider),
             producer_url=_needle(producer_url),
             box=box,
