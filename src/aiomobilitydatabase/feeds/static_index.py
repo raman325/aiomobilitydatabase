@@ -1137,6 +1137,34 @@ def _flex_stop_time(row: dict[str, str], stop_id: str | None) -> tuple[object, .
     )
 
 
+def _require_storable_repetitions(
+    trip_id: str,
+    template: Sequence[Sequence[Any]],
+    flex_template: Sequence[Sequence[Any]],
+    starts: Iterable[int],
+    anchor: int,
+) -> None:
+    """Refuse a frequency trip whose repetitions shift a time past storage.
+
+    Every time was storable as read, but a repetition adds its shift: one
+    past what SQLite stores fails the build here, in words, as an
+    unstorable cell does -- not as an OverflowError at INSERT.
+    """
+    times = [
+        *(secs for row in template for secs in row[1:3]),
+        *(secs for flex in flex_template for secs in flex[5:7]),
+    ]
+    latest = max((secs for secs in times if secs is not None), default=None)
+    last_start = max(starts, default=None)
+    if latest is None or last_start is None:
+        return
+    if latest + last_start - anchor > _SQLITE_INT_MAX:
+        raise _RefusedError(
+            f"frequency trip {trip_id!r}'s repetition starting at "
+            f"{last_start}s has times past what can be stored"
+        )
+
+
 def _shifted(secs: int | None, shift: int) -> int | None:
     """Move a template time onto a repetition; None before its day starts."""
     if secs is None or secs + shift < 0:
@@ -2106,6 +2134,9 @@ class StaticIndex:
                 while rep_start < end_secs:
                     starts.setdefault(rep_start, (exact_times, headway_secs))
                     rep_start += headway_secs
+            _require_storable_repetitions(
+                trip_id, template, flex_template, starts, anchor
+            )
             for rep_start, (exact_times, headway_secs) in sorted(starts.items()):
                 synthetic_id = repetition_trip_id(trip_id, rep_start)
                 if conn.execute(

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import inspect
 import math
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
@@ -36,6 +37,8 @@ from aiomobilitydatabase.models import (
     FeedStatus,
     GtfsFeed,
     GtfsRtFeed,
+    LocationType,
+    NoticeSeverity,
     SortOrder,
 )
 
@@ -594,3 +597,141 @@ def test_a_datetime_subclass_constructor_doesnt_run_while_encoding() -> None:
     assert encode_params({"downloaded_after": value}) == {
         "downloaded_after": "2023-12-31T19:00:00+00:00"
     }
+
+
+# --- Arguments of another type than the annotation -------------------------
+#
+# Each annotation the catalog methods use, read independently of the
+# client's checker: a new one fails test_every_annotation_has_an_oracle.
+
+
+def _plain_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _optional(accepts: Any) -> Any:
+    return lambda value: value is None or accepts(value)
+
+
+def _items(accepts: Any) -> Any:
+    return lambda value: isinstance(value, list | tuple) and all(map(accepts, value))
+
+
+def _member(enum_cls: type[StrEnum]) -> Any:
+    return lambda value: isinstance(value, enum_cls)
+
+
+_ORACLE: dict[str, Any] = {
+    "str": lambda value: isinstance(value, str),
+    "str | None": _optional(lambda value: isinstance(value, str)),
+    "int | None": _optional(_plain_int),
+    "bool | None": _optional(lambda value: isinstance(value, bool)),
+    "datetime | None": _optional(lambda value: isinstance(value, datetime)),
+    "list[str] | None": _optional(_items(lambda value: isinstance(value, str))),
+    "tuple[float, float] | None": _optional(
+        lambda value: (
+            isinstance(value, list | tuple)
+            and len(value) == 2
+            and all(map(_number, value))
+        )
+    ),
+    **{
+        f"{enum_cls.__name__} | None": _optional(_member(enum_cls))
+        for enum_cls in (
+            FeedStatus,
+            LocationType,
+            SortOrder,
+            BoundingFilterMethod,
+        )
+    },
+    **{
+        f"list[{enum_cls.__name__}] | None": _optional(_items(_member(enum_cls)))
+        for enum_cls in (DataType, EntityType, FeedStatus, NoticeSeverity)
+    },
+}
+
+
+def _catalog_parameters() -> list[tuple[str, str, str]]:
+    """(method, parameter, annotation as written) for every catalog method."""
+    found = []
+    for name, method in inspect.getmembers(
+        MobilityDatabaseClient, inspect.iscoroutinefunction
+    ):
+        if name.startswith("_") or name == "close":
+            continue
+        for parameter in inspect.signature(method).parameters.values():
+            if parameter.name != "self":
+                found.append((name, parameter.name, str(parameter.annotation)))
+    return found
+
+
+def test_every_annotation_has_an_oracle() -> None:
+    assert {annotation for _, _, annotation in _catalog_parameters()} <= set(_ORACLE)
+
+
+_ENUM_MEMBERS = [
+    *DataType,
+    *EntityType,
+    *FeedStatus,
+    *LocationType,
+    *NoticeSeverity,
+    *SortOrder,
+    *BoundingFilterMethod,
+]
+_SCALARS = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(-3, 3),
+    st.floats(-90, 90),
+    st.text(alphabet="abc", min_size=1, max_size=3),
+    st.binary(min_size=1, max_size=2),
+    st.just(datetime(2026, 1, 1, tzinfo=UTC)),
+    st.sampled_from(_ENUM_MEMBERS),
+)
+_ARGUMENTS = st.one_of(
+    _SCALARS,
+    st.lists(_SCALARS.filter(lambda value: value is not None), max_size=2),
+    st.tuples(st.floats(-90, 90), st.floats(-90, 90)),
+)
+
+
+@given(
+    target=st.sampled_from(_catalog_parameters()),
+    value=_ARGUMENTS,
+)
+@settings(max_examples=300, deadline=None)
+def test_an_argument_is_refused_exactly_when_its_type_is_not_the_annotated_one(
+    target: tuple[str, str, str], value: Any
+) -> None:
+    """limit=0.5, limit="abc" or provider=7 reached the API as a filter: an
+    argument outside its parameter's annotated type is the caller's
+    TypeError, raised before any request, and only such an argument is."""
+    method_name, name, annotation = target
+    accepted = _ORACLE[annotation](value)
+
+    async def scenario() -> BaseException | None:
+        client = MobilityDatabaseClient("t", base_url="http://127.0.0.1:9")
+        method = getattr(client, method_name)
+        arguments = {
+            parameter.name: "mdb-1"
+            for parameter in inspect.signature(method).parameters.values()
+            if parameter.default is inspect.Parameter.empty
+        }
+        try:
+            await method(**{**arguments, name: value})
+        except Exception as err:
+            return err
+        finally:
+            await client.close()
+        return None
+
+    outcome = asyncio.run(scenario())
+    if accepted:
+        assert not isinstance(outcome, TypeError), outcome
+    else:
+        assert isinstance(outcome, TypeError)
+        assert str(outcome).startswith(f"{name} must be {annotation}, not ")

@@ -5,20 +5,26 @@ import dataclasses
 import json
 import pickle
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from aiomobilitydatabase._json import loads as json_loads
 from aiomobilitydatabase.feeds._vocab import vocab_or_none
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.exceptions import FeedParseError, SourceConnectionError
 from aiomobilitydatabase.feeds.gbfs import (
     _alert_times,
+    _as_bool,
+    _count,
     _endpoints_from_discovery,
     _id_list,
     _iso_date,
+    _json_number,
     _languages,
+    _record_id,
     _reported_at,
 )
 from aiomobilitydatabase.feeds.geo import Circle
@@ -1009,3 +1015,91 @@ def test_gbfs_alert_activity_matches_its_periods(
     assert _gbfs_alert(active_periods=active_periods).is_active(_T0 + at * hour) is (
         expected
     )
+
+
+_LITERALS = st.one_of(
+    st.integers(-(2**64), 2**64).map(str),
+    st.integers(-(2**64), 2**64).map(lambda n: f"{n}.0"),
+    st.integers(0, 2**64).map(lambda n: f"{n}.0000000000000001"),
+    st.integers(0, 2**64).map(lambda n: f"{n}.5"),
+    st.integers(0, 10**6).map(lambda n: f"{n}e3"),
+    st.integers(1, 10**6).map(lambda n: f"{n}e-1"),
+    st.decimals(allow_nan=False, allow_infinity=False, places=3).map(str),
+)
+
+
+@given(literal=_LITERALS)
+def test_a_count_id_or_flag_is_read_from_the_number_as_written(literal: str) -> None:
+    """JSON has one number type, read as written: ``1.0000000000000001``
+    is no count though its double is 1.0, and ``9007199254740993.0`` is
+    that count and that id, though its double is 9007199254740992."""
+    try:
+        exact: Decimal | None = Decimal(literal)
+    except ArithmeticError:
+        exact = None
+    whole = exact is not None and exact == exact.to_integral_value()
+    value = json_loads(f"[{literal}]".encode(), parse_float=_json_number)[0]
+    number = int(exact) if whole and exact is not None else None
+    assert _count(value) == (number if number is not None and number >= 0 else None)
+    assert _as_bool(value) == ({0: False, 1: True}.get(number) if whole else None)
+    if whole:
+        assert _record_id(value) == str(number)
+    elif exact is not None and float(literal).is_integer():
+        assert _record_id(value) is None  # its digits aren't the double's
+
+
+@pytest.mark.parametrize(
+    ("literal", "count"),
+    [
+        ("1.0000000000000001", None),
+        ("9007199254740993.0", 9007199254740993),
+        ("2.0", 2),
+        ("2e0", 2),
+    ],
+)
+async def test_a_count_literal_reads_as_written_through_the_handle(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    literal: str,
+    count: int | None,
+) -> None:
+    _mock_catalog(mock_api)
+    mock_api.get("/gbfs/station_information.json", payload=STATION_INFO_23)
+    status = copy.deepcopy(STATION_STATUS_23)
+    station = status["data"]["stations"][0]
+    station["num_bikes_available"] = "@count"
+    body = json.dumps(status).replace('"@count"', literal)
+    mock_api.get(
+        "/gbfs/station_status.json", body=body.encode(), content_type="application/json"
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    by_id = {found.id: found for found in await handle.get_stations()}
+    assert by_id[station["station_id"]].bikes_available == count
+
+
+@pytest.mark.parametrize(
+    ("literal", "type_id"),
+    [
+        ("9007199254740993.0", "9007199254740993"),
+        ("7.0", "7"),
+        ("7.00000000000000001", None),
+    ],
+)
+async def test_a_numeric_vehicle_type_id_reads_as_written(
+    mock_api: MockApi,
+    feeds_client: MobilityFeedsClient,
+    literal: str,
+    type_id: str | None,
+) -> None:
+    _mock_catalog(mock_api)
+    types = copy.deepcopy(VEHICLE_TYPES)
+    first = types["data"]["vehicle_types"][0]
+    first["vehicle_type_id"] = "@id"
+    body = json.dumps(types).replace('"@id"', literal)
+    mock_api.get(
+        "/gbfs/vehicle_types.json", body=body.encode(), content_type="application/json"
+    )
+    handle = await feeds_client.get_gbfs_feed("gbfs-300")
+    ids = [found.id for found in await handle.get_vehicle_types()]
+    # The fixture's others keep their ids (one has none and is skipped).
+    assert ids == [*([type_id] if type_id is not None else []), "scooter"]
