@@ -7,28 +7,18 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 from .._http import CREDENTIAL_HEADERS
 from .._json import loads as json_loads
-from ._freshness import (
-    FreshnessCache,
-    Response,
-    Validators,
-    header_fields,
-    request_fields,
-)
-from ._freshness import hops as _hops
+from ._documents import cached_document
+from ._freshness import FreshnessCache
 from ._frozen import FrozenDict
 from ._language import is_preferred_language
 from ._numbers import ascii_number
-from ._redirects import get_withholding, network, same_origin
-from ._urls import (  # deliberate friend access: shared URL guard
-    _require_http_url,
-    redact,
-)
+from ._redirects import same_origin
+from ._urls import _require_http_url  # deliberate friend access: shared guard
 from ._vocab import vocab_or_none
 from .exceptions import FeedParseError, SourceConnectionError
 from .geo import Circle, in_circle
@@ -103,6 +93,21 @@ def _json_number(text: str) -> int | float:
 
 
 _MALFORMED = object()  # json_loads refused the body
+
+
+async def _json_document(raw: bytes, shown: str | None) -> dict[str, Any]:
+    """Read a GBFS JSON document and check its data envelope."""
+    try:
+        document = json_loads(raw, parse_float=_json_number)
+    except ValueError:
+        # Raised below, outside the except: a JSONDecodeError holds the
+        # whole body (.doc), and would ride along as the context.
+        document = _MALFORMED
+    if document is _MALFORMED:
+        raise FeedParseError("Malformed GBFS JSON", url=shown)
+    if not isinstance(document, dict) or "data" not in document:
+        raise FeedParseError("GBFS document missing data envelope", url=shown)
+    return document
 
 
 def _record_id(value: Any) -> str | None:
@@ -599,87 +604,6 @@ class GbfsFeedHandle:
                     raise
         return self._endpoints
 
-    @staticmethod
-    async def _fetch_json_document(
-        client: MobilityFeedsClient,
-        url: str,
-        headers: Mapping[str, str] | None,
-        context: str,
-        validators: Validators | None = None,
-    ) -> Response[dict[str, Any]]:
-        """GET one GBFS JSON document and validate its data envelope.
-
-        With ``validators`` the request is conditional and a ``304`` comes
-        back with no value; a 304 to an unconditional request raises. The
-        cache derives the document's freshness from it (see
-        :func:`_document_lifetime`).
-        """
-        _require_http_url(url, context)
-        session = client._get_session()  # deliberate friend access
-        requested_at = datetime.now(UTC)
-        shown = redact(url)
-        async with get_withholding(
-            session,
-            url,
-            params={},
-            headers=dict(headers) if headers else {},
-            total=client.timeout_seconds,
-            secret=None,
-            conditional=None if validators is None else validators.request_headers(),
-            conditional_url=None if validators is None else validators.url,
-        ) as (resp, history):
-            received_at = datetime.now(UTC)
-            fields = header_fields(resp.headers)
-            if resp.status == HTTPStatus.NOT_MODIFIED:
-                if validators is None:
-                    raise SourceConnectionError(
-                        "GBFS endpoint answered 304 to an unconditional request",
-                        status=int(HTTPStatus.NOT_MODIFIED),
-                        url=shown,
-                    )
-                return Response(
-                    value=None,
-                    fields=fields,
-                    requested_at=requested_at,
-                    received_at=received_at,
-                    hops=_hops(resp, history),
-                    url=str(resp.url),
-                )
-            if resp.status >= HTTPStatus.BAD_REQUEST:
-                raise SourceConnectionError(
-                    f"GBFS endpoint error {resp.status}", status=resp.status, url=shown
-                )
-            if resp.status not in (
-                HTTPStatus.OK,
-                HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
-            ):
-                raise SourceConnectionError(
-                    f"GBFS endpoint answered {resp.status} without a document",
-                    status=resp.status,
-                    url=shown,
-                )
-            raw = await network(resp.read(), url)
-            hops = _hops(resp, history)
-            answered = str(resp.url)
-        try:
-            document = json_loads(raw, parse_float=_json_number)
-        except ValueError:
-            # Raised below, outside the except: a JSONDecodeError holds the
-            # whole body (.doc), and would ride along as the context.
-            document = _MALFORMED
-        if document is _MALFORMED:
-            raise FeedParseError("Malformed GBFS JSON", url=shown)
-        if not isinstance(document, dict) or "data" not in document:
-            raise FeedParseError("GBFS document missing data envelope", url=shown)
-        return Response(
-            value=document,
-            fields=fields,
-            requested_at=requested_at,
-            received_at=received_at,
-            hops=hops,
-            url=answered,
-        )
-
     async def _document(
         self, name: str, endpoints: Mapping[str, str] | None = None
     ) -> dict[str, Any]:
@@ -709,17 +633,20 @@ class GbfsFeedHandle:
         return headers
 
     async def _fetch_cached(self, url: str, context: str) -> dict[str, Any]:
-        """One GBFS document, reused as long as the producer allows."""
-        _require_http_url(url, context)  # before request_fields parses it
-        headers = self._headers_for(url)
-        return await self._docs.get(
+        """One GBFS document, reused as long as the producer allows.
+
+        The cache derives the document's freshness from it (see
+        :func:`_document_lifetime`).
+        """
+        _require_http_url(url, context)  # the one check, before _headers_for
+        return await cached_document(
+            self._docs,
+            self._client,
             url,
-            partial(self._fetch_json_document, self._client, url, headers, context),
-            request_fields=request_fields(
-                self._client._get_session(),  # deliberate friend access
-                url,
-                headers,
-            ),
+            headers=self._headers_for(url),
+            label="GBFS endpoint",
+            missing="a document",
+            parse=_json_document,
         )
 
     async def get_system_info(self) -> GbfsSystemInfo:

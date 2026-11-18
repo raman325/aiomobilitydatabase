@@ -11,17 +11,54 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Self
 
 import aiohttp
+from yarl import URL
 
+from .._http import URL_ERRORS
 from ..client import MobilityDatabaseClient
+from ..const import PROD_BASE_URL
 from ..exceptions import MobilityDatabaseError
 from ._extra import load_transit_handle
-from ._urls import require_caller_inputs
-from .const import DEFAULT_TIMEOUT_SECONDS
+from ._urls import require_caller_inputs, require_http_url_setting
+from .const import DEFAULT_TIMEOUT_SECONDS, PROD_PUBLIC_CATALOG_URL
 from .gbfs import GbfsFeedHandle
 from .models import StaticBuildProgress
+from .public_catalog import PublicCatalog
 
 if TYPE_CHECKING:
     from .transit import TransitFeedHandle
+
+
+def _is_production(base_url: object) -> bool:
+    """Whether ``base_url`` names the production catalog API.
+
+    None (the catalog client's default), or the production URL compared
+    as a URL: scheme and host in any case, an explicit default port, and a
+    trailing slash are the same. Anything else, a URL that doesn't parse or
+    a non-``str`` included, is not (the catalog client checks base_url).
+    """
+    if base_url is None:
+        return True
+    if not isinstance(base_url, str):
+        return False
+    try:
+        given = _url_identity(URL(base_url))
+    except URL_ERRORS:
+        return False
+    return given == _url_identity(URL(PROD_BASE_URL))
+
+
+def _url_identity(url: URL) -> tuple[object, ...]:
+    """Return what :func:`_is_production` compares of a URL."""
+    return (
+        url.scheme.lower(),
+        (url.host or "").lower(),
+        url.port,  # the scheme's default when none is written
+        url.path.rstrip("/"),
+        url.raw_user,
+        url.raw_password,
+        url.raw_query_string,
+        url.raw_fragment,
+    )
 
 
 class MobilityFeedsClient:
@@ -36,6 +73,8 @@ class MobilityFeedsClient:
     resolution, search, :attr:`catalog`); the direct-URL methods
     (:meth:`get_transit_feed_from_urls`, :meth:`get_gbfs_feed_from_url`)
     never touch the catalog and work on a tokenless client.
+    :attr:`public_catalog` reads the public catalog export and needs no
+    token either.
     """
 
     def __init__(
@@ -46,14 +85,27 @@ class MobilityFeedsClient:
         cache_dir: Path | str | None = None,
         base_url: str | None = None,
         request_timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        public_catalog_url: str | None = None,
     ) -> None:
-        """Initialize the client. Performs no I/O."""
+        """Initialize the client. Performs no I/O.
+
+        ``public_catalog_url`` is the export :attr:`public_catalog` reads.
+        By default it is the production catalog's, when ``base_url`` is
+        production's (or None); with another ``base_url`` it must be given,
+        as only production's export is kept current. One that isn't a
+        ``str`` raises ``TypeError``, one no request can be made to (not an
+        http(s) URL with a host) ``ValueError``.
+        """
+        if public_catalog_url is not None:
+            require_http_url_setting(public_catalog_url, "public_catalog_url")
         self._refresh_token = refresh_token
         self._session = session
         self._owns_session = session is None
         self._base_url = base_url
         self._timeout = request_timeout
+        self._public_catalog_url = public_catalog_url
         self._catalog: MobilityDatabaseClient | None = None
+        self._public_catalog: PublicCatalog | None = None
         self._cache_dir = Path(cache_dir) if cache_dir is not None else None
 
     async def __aenter__(self) -> Self:
@@ -74,6 +126,7 @@ class MobilityFeedsClient:
         if self._catalog is not None:
             await self._catalog.close()
             self._catalog = None
+        self._public_catalog = None
         if (
             self._owns_session
             and self._session is not None
@@ -116,6 +169,32 @@ class MobilityFeedsClient:
                     request_timeout=self._timeout,
                 )
         return self._catalog
+
+    @property
+    def public_catalog(self) -> PublicCatalog:
+        """The catalog's public export (no token), on the shared session.
+
+        GTFS, GTFS Realtime and GBFS lookups with :attr:`catalog`'s filters,
+        answering with the export's own models: see :class:`PublicCatalog`.
+        Raises ``ValueError`` when no ``public_catalog_url`` was given and
+        ``base_url`` isn't production's, or for an injected
+        session the feeds layer can't send through (as
+        :meth:`get_gbfs_feed_from_url` does). A catalog kept past
+        :meth:`close` goes on as a feed handle does, on the session
+        :meth:`close` leaves (a new owned one when it closed its own).
+        """
+        if self._public_catalog is None:
+            url = self._public_catalog_url
+            if url is None:
+                if not _is_production(self._base_url):
+                    raise ValueError(
+                        "no public catalog is known for this base_url: "
+                        "pass public_catalog_url"
+                    )
+                url = PROD_PUBLIC_CATALOG_URL
+            require_caller_inputs(self._get_session())
+            self._public_catalog = PublicCatalog(self, url)
+        return self._public_catalog
 
     @property
     def timeout_seconds(self) -> float:

@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from enum import IntEnum, StrEnum
 from typing import Any
 
+from ..models import BoundingBox, EntityType, FeedStatus, Redirect, SourceInfo
 from ._frozen import FrozenDict
 
 
@@ -1427,3 +1428,73 @@ class StaticBuildProgress:
         if self.total_bytes:
             return min(1.0, self.done_bytes / self.total_bytes)
         return None
+
+
+@dataclass(frozen=True)
+class PublicGtfsFeed:
+    """A GTFS feed as the catalog's public export (``feeds_v2.csv``) has it.
+
+    Only the export's columns that mean exactly what the same-named fields
+    of the catalog API's :class:`~aiomobilitydatabase.models.GtfsFeed` mean,
+    under those names and types; nothing else (no ``seasonal``, no
+    ``locations``). A field the export leaves empty is None, and
+    ``source_info``'s fields the export lacks (the license's id, SPDX flag,
+    notes and tags, ``is_producer_url_unstable``) are None.
+    """
+
+    id: str
+    provider: str | None
+    feed_name: str | None
+    note: str | None
+    feed_contact_email: str | None
+    status: FeedStatus | None
+    official: bool | None
+    source_info: SourceInfo
+    redirects: tuple[Redirect, ...]
+    bounding_box: BoundingBox | None
+
+
+@dataclass(frozen=True)
+class PublicGtfsRtFeed:
+    """A GTFS Realtime feed as the catalog's public export has it.
+
+    Only the export's columns that mean exactly what the same-named fields
+    of the catalog API's :class:`~aiomobilitydatabase.models.GtfsRtFeed`
+    mean, under those names and types; nothing else (no ``seasonal``, no
+    ``locations``). Empty and missing values as :class:`PublicGtfsFeed`.
+    The order differs: the export sorts ``entity_types`` and puts active
+    ``feed_references`` first (keeping their order otherwise), where the
+    API returns both in its database's order.
+    """
+
+    id: str
+    provider: str | None
+    feed_name: str | None
+    note: str | None
+    feed_contact_email: str | None
+    status: FeedStatus | None
+    official: bool | None
+    source_info: SourceInfo
+    redirects: tuple[Redirect, ...]
+    entity_types: tuple[EntityType, ...]
+    feed_references: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PublicGbfsFeed:
+    """A GBFS feed (a bike, scooter or car sharing system) in the public export.
+
+    Only the export's columns that mean exactly what the same-named fields
+    of the catalog API's :class:`~aiomobilitydatabase.models.GbfsFeed` mean,
+    under those names and types; nothing else (no ``locations``).
+    ``bounding_box_generated_at`` is naive UTC, as the API returns it.
+    Empty and missing values as :class:`PublicGtfsFeed`.
+    """
+
+    id: str
+    provider: str | None
+    feed_contact_email: str | None
+    source_info: SourceInfo
+    redirects: tuple[Redirect, ...]
+    bounding_box: BoundingBox | None
+    bounding_box_generated_at: datetime | None

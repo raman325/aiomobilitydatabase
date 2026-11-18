@@ -164,23 +164,44 @@ def _require_http_url(url: str, context: str) -> None:
     stricter policy belongs to the consuming application. The message
     names the reason only; the URL, redacted, is the exception's ``url``.
     """
+    reason = http_url_problem(url)
+    if reason is not None:
+        raise SourceConnectionError(
+            f"Refusing to fetch {context}: {reason}", url=redact(url)
+        )
+
+
+def require_http_url_setting(url: object, name: str) -> None:
+    """Refuse a caller's URL setting as :func:`_require_http_url` would.
+
+    ``TypeError`` for a non-``str``, ``ValueError`` naming ``name`` and the
+    reason (never the URL) for one no request can be made to: so a
+    configuration error raises when it is made, not at the first fetch.
+    """
+    if not isinstance(url, str):
+        raise TypeError(f"{name} must be a str")
+    reason = http_url_problem(url)
+    if reason is not None:
+        raise ValueError(f"{name} can't be fetched: {reason}")
+
+
+def http_url_problem(url: str) -> str | None:
+    """Why no request can be made to ``url`` (None: one can).
+
+    UTF-8 text, an http(s) URL yarl parses, and what
+    :func:`require_requestable` asks: a host, sendable credentials.
+    """
     try:
         url.encode("utf-8")
     except UnicodeEncodeError:
-        reason = "the URL isn't UTF-8 text"
-    else:
-        try:
-            parsed = URL(url)
-            scheme = parsed.scheme.lower()
-            if scheme not in _ALLOWED_URL_SCHEMES:
-                reason = "unsupported URL scheme"  # the scheme is the source's text
-            else:
-                require_requestable(parsed)
-                return
-        except UnfetchableURLError as err:
-            reason = str(err)
-        except URL_ERRORS:
-            reason = "the URL doesn't parse"
-    raise SourceConnectionError(
-        f"Refusing to fetch {context}: {reason}", url=redact(url)
-    )
+        return "the URL isn't UTF-8 text"
+    try:
+        parsed = URL(url)
+        if parsed.scheme.lower() not in _ALLOWED_URL_SCHEMES:
+            return "unsupported URL scheme"  # the scheme is the source's text
+        require_requestable(parsed)
+    except UnfetchableURLError as err:
+        return str(err)
+    except URL_ERRORS:
+        return "the URL doesn't parse"
+    return None

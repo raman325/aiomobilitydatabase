@@ -318,6 +318,15 @@ def _quote_segment(segment: str) -> str:
     (``;``, ``,``, ``@``, ``:``, ``=``...) as the characters themselves.
     That is still one segment, which the API decodes to the same id.
     """
+    return quote(_require_id(segment), safe="")
+
+
+def _require_id(segment: str) -> str:
+    """Return an id as plain ``str`` text, or raise as :func:`_quote_segment`.
+
+    ``TypeError`` for a non-``str``; ``ValueError`` for ``""``, ``"."``,
+    ``".."`` (no path segment) and for text with a lone surrogate.
+    """
     if not isinstance(segment, str):
         raise TypeError(f"an id must be a str, not {type(segment).__name__}")
     # Its text, not a subclass's: an __eq__ or encode of its own would slip
@@ -325,7 +334,7 @@ def _quote_segment(segment: str) -> str:
     segment = str.__str__(segment)
     if segment in ("", ".", ".."):
         raise ValueError(f"{segment!r} cannot be sent as an id: it is no path segment")
-    return quote(require_text(segment, "an id"), safe="")
+    return require_text(segment, "an id")
 
 
 # What decoding a type-checked JSON value into a model can still raise:

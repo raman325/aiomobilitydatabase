@@ -44,7 +44,8 @@ access tokens automatically (including proactive refresh before expiry). Both
 the feeds client wraps a catalog client internally and shares its authentication.
 
 The token is only required for catalog operations: `MobilityFeedsClient`'s
-[direct-URL methods](#direct-urls-no-catalog-account) work without one.
+[direct-URL methods](#direct-urls-no-catalog-account) and its
+[`public_catalog`](#public-catalog-no-account) work without one.
 
 ## Quick start — catalog
 
@@ -244,6 +245,88 @@ Notes on direct mode:
   `transit.static_dataset` is `None` (there is no catalog metadata).
 - Accessing `client.catalog` (or any catalog-backed method) on a tokenless
   client raises `MobilityDatabaseError`.
+
+### Public catalog (no account)
+
+`client.public_catalog` finds GTFS, GTFS Realtime and GBFS feeds without a
+refresh token, from the catalog's public export (`feeds_v2.csv`, regenerated
+daily). It has the catalog client's lookups -- `get_gtfs_feeds`,
+`get_gtfs_rt_feeds`, `get_gbfs_feeds` and `get_gtfs_feed`, `get_gtfs_rt_feed`,
+`get_gbfs_feed` by id -- and answers with `PublicGtfsFeed`, `PublicGtfsRtFeed`
+and `PublicGbfsFeed`: only the export's columns that mean what the API's
+same-named fields mean, holding the API's values. GTFS: `id`, `provider`,
+`feed_name`, `note`, `feed_contact_email`, `status`, `official`,
+`source_info`, `redirects`, `bounding_box`; GTFS Realtime: the same without
+`bounding_box`, with `entity_types` and `feed_references`; GBFS: `id`,
+`provider`, `feed_contact_email`, `source_info`, `redirects`, `bounding_box`,
+`bounding_box_generated_at`.
+
+The export is production's, the only one kept current; with another
+`base_url`, pass `public_catalog_url=` (an http(s) URL with a host, else
+`ValueError` when the client is made). It is fetched like a GBFS
+document: redirects followed, cached as its HTTP headers allow (an hour when
+they declare no freshness: the export changes daily), parsed off the event
+loop.
+
+Filters are the API's, with these differences:
+
+- **No location filters**; `get_gbfs_feeds` filters on each system's
+  bounding box (the API has no such filter) and has no `system_id` or
+  `version` filter.
+- **Ordering**: by provider, then id, by code point; the API's GTFS list uses
+  its database's collation and its GTFS Realtime and GBFS lists set no order,
+  so a `limit`/`offset` page can hold different feeds. Within a feed, the
+  export sorts `entity_types` and puts active `feed_references` first, where
+  the API keeps its database's order.
+- **Bounding filters** test each feed's bounding box, where the API's GTFS
+  filter matches any of a feed's datasets, past ones included. Zero-extent
+  boxes (a single-stop feed's, or a point or line query range) may differ
+  too: the API's answer depends on its GEOS version.
+- **Published feeds only**: the API's GBFS list doesn't filter on
+  publication, and its get-by-id endpoints may return an unpublished feed to
+  some accounts. Its GBFS list also applies `limit` to rows joined with each
+  system's versions, so its pages can hold fewer feeds than `limit`.
+- **Text filters**: `provider` and `producer_url` match as the API's `ILIKE`,
+  comparing case with Python's `str.lower` where Postgres uses its locale's
+  `lower()`. As in the API, only the GTFS Realtime list strips them (empty:
+  no filter); the GTFS and GBFS lists take them as given, so `""` matches
+  every value but a missing one -- and a value the export leaves empty is
+  missing here, where the database may hold `""`.
+- **Paging**: `limit` defaults to, and is at most, 2500 (GTFS), 1000 (GTFS
+  Realtime) or 500 (GBFS); out of range, or a negative `offset`, raises
+  `ValueError` where the API answers 422.
+
+As in the API, `get_gbfs_feeds(limit=0)` returns every system (the GTFS lists
+return none), and `get_gtfs_rt_feeds` leaves out a feed without entity types,
+which `get_gtfs_rt_feed` still returns.
+
+Errors are the feeds layer's: `SourceConnectionError` (with `.status`) when
+the export can't be fetched, `FeedParseError` when it is no export -- or
+carries no GBFS feeds at all, for a GBFS lookup (until mobility-feed-api's
+GBFS export is deployed), since then no answer would be true. An id no feed
+of the asked type has is `MobilityDatabaseNotFoundError`.
+
+```python
+import asyncio
+
+from aiomobilitydatabase import BoundingFilterMethod
+from aiomobilitydatabase.feeds import MobilityFeedsClient
+
+
+async def main() -> None:
+    async with MobilityFeedsClient() as client:
+        systems = await client.public_catalog.get_gbfs_feeds(
+            dataset_latitudes=(40.75, 40.76),
+            dataset_longitudes=(-73.99, -73.98),
+            bounding_filter_method=BoundingFilterMethod.PARTIALLY_ENCLOSED,
+        )
+        if systems and (url := systems[0].source_info.producer_url):
+            bikes = await client.get_gbfs_feed_from_url(url)
+            print((await bikes.get_system_info()).name)
+
+
+asyncio.run(main())
+```
 
 ## How it works
 
@@ -755,13 +838,13 @@ each define their own subtree beneath it, so you can catch broadly
 | --- | --- | --- |
 | `MobilityDatabaseConnectionError` | catalog | Network failure, timeout, or invalid response body |
 | `MobilityDatabaseAuthenticationError` | catalog | Invalid refresh token, or unauthorized after a token refresh |
-| `MobilityDatabaseNotFoundError` | catalog | Resource not found (404) |
+| `MobilityDatabaseNotFoundError` | catalog | Resource not found (404); from `public_catalog`, no feed of the asked type has the id |
 | `MobilityDatabaseRateLimitError` | catalog | Rate limited (429) |
 | `MobilityDatabaseApiError` | catalog | Any other 4xx/5xx (carries `.status` and `.body`) |
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |
-| `SourceConnectionError` | feeds | Producer/GBFS endpoint unreachable or errored (`.status` when HTTP, `.url`) |
+| `SourceConnectionError` | feeds | Producer/GBFS endpoint or public catalog export unreachable or errored (`.status` when HTTP, `.url`) |
 | `SourceAuthenticationError` | feeds | Producer rejected the feed's `api_key` |
-| `FeedParseError` | feeds | Undecodable protobuf (a string field that isn't UTF-8 included), malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), a trip repeating a `stop_sequence`, a cached static index a query finds damaged, or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
+| `FeedParseError` | feeds | An unreadable public catalog export (or one without GBFS feeds, for a GBFS lookup), undecodable protobuf (a string field that isn't UTF-8 included), malformed GBFS JSON or envelope, unreadable GTFS zip, a GTFS row with fewer fields than its header (or a filled one past it), a trip repeating a `stop_sequence`, a cached static index a query finds damaged, or a malformed scalar in a structural GTFS column (stop coordinates included, as is one outside WGS84's ±90/±180 as written -- `90.000000000000001` is past the pole, though its nearest double is 90) |
 | `StaticDataUnavailableError` | feeds | Feed has no usable hosted static dataset (or, rarely and passingly, concurrent builds of another dataset kept replacing its index: retry later) |
 
 The GBFS and GTFS-RT parse paths are **total** with respect to this table:
