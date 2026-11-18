@@ -22,9 +22,9 @@ from hypothesis import strategies as st
 from yarl import URL
 
 from aiomobilitydatabase._freshness import FreshnessCache
+from aiomobilitydatabase._vocab import vocab_or_none
 from aiomobilitydatabase.feeds import _redirects as redirects_module
 from aiomobilitydatabase.feeds._redirects import _origin
-from aiomobilitydatabase.feeds._vocab import vocab_or_none
 from aiomobilitydatabase.feeds.exceptions import (
     FeedParseError,
     SourceAuthenticationError,
