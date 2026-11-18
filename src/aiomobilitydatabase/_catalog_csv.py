@@ -34,7 +34,7 @@ from .models import (
 type CatalogFeed = GtfsFeed | GtfsRtFeed | GbfsFeed
 
 _REQUIRED = ("id", "data_type")
-# The database's authentication_type ("0" to "3") as int() reads it: ASCII
+# The database's authentication_type (an enum, "0" to "2") as int() reads it: ASCII
 # digits only (int() also takes other scripts' digits, a sign, spaces and
 # "1_0"), and at most nine, well inside int()'s 4300-digit limit, past which
 # it raises ValueError.
