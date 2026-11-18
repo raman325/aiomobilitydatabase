@@ -98,7 +98,10 @@ class MobilityFeedsClient:
         if self._catalog is not None:
             await self._catalog.close()
             self._catalog = None
-        self._public_catalog = None  # its cache goes with the session
+        if self._public_catalog is not None:
+            # One kept past close() must not open a session nobody closes.
+            self._public_catalog._close()  # deliberate friend access
+            self._public_catalog = None
         if (
             self._owns_session
             and self._session is not None

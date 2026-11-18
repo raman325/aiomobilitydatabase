@@ -1462,6 +1462,9 @@ class PublicGtfsRtFeed:
     of the catalog API's :class:`~aiomobilitydatabase.models.GtfsRtFeed`
     mean, under those names and types; nothing else (no ``seasonal``, no
     ``locations``). Empty and missing values as :class:`PublicGtfsFeed`.
+    The order differs: the export sorts ``entity_types`` and puts active
+    ``feed_references`` first (keeping their order otherwise), where the
+    API returns both in its database's order.
     """
 
     id: str

@@ -5,10 +5,9 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from http import HTTPStatus
+from functools import partial
 from itertools import islice
 from typing import TYPE_CHECKING
 
@@ -18,23 +17,19 @@ from .._http import require_text
 # client so both answer a bad argument alike.
 from ..client import _require_id, _typed
 from ..exceptions import MobilityDatabaseNotFoundError
-from ..models import BoundingFilterMethod, EntityType
+from ..models import BoundingBox, BoundingFilterMethod, EntityType
 from ._bounds import Box, matches
-from ._catalog_csv import CatalogFormatError, CatalogRows, PublicFeed, read_catalog
-from ._freshness import (
-    FreshnessCache,
-    Response,
-    Validators,
-    header_fields,
-    request_fields,
+from ._catalog_csv import (
+    CatalogFormatError,
+    CatalogRows,
+    PublicFeed,
+    box_of,
+    read_catalog,
 )
-from ._freshness import hops as _hops
-from ._redirects import get_withholding, network
-from ._urls import (  # deliberate friend access: shared URL guard
-    _require_http_url,
-    redact,
-)
-from .exceptions import FeedParseError, SourceConnectionError
+from ._documents import cached_document, fetch_document
+from ._freshness import FreshnessCache
+from ._urls import redact
+from .exceptions import FeedParseError
 from .models import PublicGbfsFeed, PublicGtfsFeed, PublicGtfsRtFeed
 
 if TYPE_CHECKING:
@@ -63,8 +58,10 @@ class PublicCatalog:
       bounding box (the API has no such filter) with no ``system_id`` or
       ``version`` filter.
     - Results are ordered by provider, then id, by code point (the API's
-      GTFS list sorts by its database's collation; its GBFS list sets no
-      order), so a ``limit``/``offset`` page can hold other feeds.
+      GTFS list sorts by its database's collation; its GTFS Realtime and
+      GBFS lists set no order), so a ``limit``/``offset`` page can hold
+      other feeds. An RT feed's ``entity_types`` and ``feed_references``
+      are in the export's order (see :class:`~.models.PublicGtfsRtFeed`).
     - The bounding filters test the feed's bounding box; the API's GTFS
       filter matches a feed when any of its datasets' boxes (past ones too)
       passes. A box of zero width or height (a single-stop feed, or a query
@@ -80,7 +77,10 @@ class PublicCatalog:
       :func:`_ilike`), comparing case by Python's ``str.lower`` where
       Postgres uses its locale's ``lower()``; a value with ``%`` ending in
       a lone backslash (``e%\``) matches a literal backslash here, where the
-      API answers an error.
+      API answers an error. As the API, the GTFS Realtime list strips them
+      (empty: no filter), the GTFS and GBFS lists take them as given (``""``
+      matches every value but a missing one). A value the export leaves
+      empty is missing here, where the database may hold ``""``.
     - A ``limit`` past the endpoint's maximum (also its default: 2500 GTFS,
       1000 GTFS Realtime, 500 GBFS feeds) or below 0, or a negative
       ``offset``, raises ValueError before any request, where the API
@@ -108,89 +108,34 @@ class PublicCatalog:
         self._client = client
         self._url = url
         self._cache: FreshnessCache[CatalogRows] = FreshnessCache()
+        self._closed = False
+
+    def _close(self) -> None:
+        """Refuse every later lookup: the client closed (see its close())."""
+        self._closed = True
 
     async def _rows(self) -> CatalogRows:
         """Return the export, from the cache while fresh."""
-        _require_http_url(self._url, _CONTEXT)  # before request_fields parses it
-        return await self._cache.get(
+        # Before anything asks the client for a session, which would open a
+        # new one nobody closes.
+        if self._closed:
+            raise RuntimeError("the client is closed")
+        return await cached_document(
+            self._cache,
+            self._client,
             self._url,
-            self._fetch,
-            request_fields=request_fields(
-                self._client._get_session(),  # deliberate friend access
-                self._url,
-                {},
-            ),
-        )
-
-    async def _fetch(self, *, validators: Validators | None) -> Response[CatalogRows]:
-        """GET the export; conditional when ``validators`` is given.
-
-        As :meth:`GbfsFeedHandle._fetch_json_document`: a 304 comes back
-        with no value, and to an unconditional request raises.
-        """
-        url = self._url
-        _require_http_url(url, _CONTEXT)
-        session = self._client._get_session()  # deliberate friend access
-        requested_at = datetime.now(UTC)
-        shown = redact(url)
-        async with get_withholding(
-            session,
-            url,
-            params={},
             headers={},
-            total=self._client.timeout_seconds,
-            secret=None,
-            conditional=None if validators is None else validators.request_headers(),
-            conditional_url=None if validators is None else validators.url,
-        ) as (resp, history):
-            received_at = datetime.now(UTC)
-            fields = header_fields(resp.headers)
-            if resp.status == HTTPStatus.NOT_MODIFIED:
-                if validators is None:
-                    raise SourceConnectionError(
-                        "Public catalog answered 304 to an unconditional request",
-                        status=int(HTTPStatus.NOT_MODIFIED),
-                        url=shown,
-                    )
-                return Response(
-                    value=None,
-                    fields=fields,
-                    requested_at=requested_at,
-                    received_at=received_at,
-                    hops=_hops(resp, history),
-                    url=str(resp.url),
-                )
-            if resp.status >= HTTPStatus.BAD_REQUEST:
-                raise SourceConnectionError(
-                    f"Public catalog error {resp.status}", status=resp.status, url=shown
-                )
-            if resp.status not in (
-                HTTPStatus.OK,
-                HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
-            ):
-                raise SourceConnectionError(
-                    f"Public catalog answered {resp.status} without an export",
-                    status=resp.status,
-                    url=shown,
-                )
-            raw = await network(resp.read(), url)
-            hops = _hops(resp, history)
-            answered = str(resp.url)
-        try:
-            rows: CatalogRows | None = await asyncio.to_thread(read_catalog, raw)
-        except CatalogFormatError as err:
-            problem = str(err)
-            rows = None
-        if rows is None:
-            # Outside the except: nothing of the parse rides along.
-            raise FeedParseError(f"Public catalog unreadable: {problem}", url=shown)
-        return Response(
-            value=rows,
-            fields=fields,
-            requested_at=requested_at,
-            received_at=received_at,
-            hops=hops,
-            url=answered,
+            context=_CONTEXT,
+            fetch=partial(
+                fetch_document,
+                self._client,
+                self._url,
+                None,
+                _CONTEXT,
+                label="Public catalog",
+                missing="an export",
+                parse=_read,
+            ),
         )
 
     @_typed
@@ -240,9 +185,10 @@ class PublicCatalog:
             longitudes=dataset_longitudes,
             method=bounding_filter_method,
             is_official=is_official,
+            trimmed=False,
         )
         rows = await self._rows()
-        return query.select(rows.gtfs, rows.boxes)
+        return query.select(rows.gtfs)
 
     @_typed
     async def get_gtfs_rt_feeds(
@@ -267,11 +213,12 @@ class PublicCatalog:
             producer_url=producer_url,
             entity_types=entity_types,
             is_official=is_official,
+            trimmed=True,
         )
         # The API's list inner-joins the entity types: a feed without any
         # isn't listed, though get_gtfs_rt_feed returns it.
         rows = await self._rows()
-        return query.select(rows.gtfs_rt_listed, rows.boxes)
+        return query.select(rows.gtfs_rt_listed)
 
     @_typed
     async def get_gbfs_feeds(
@@ -296,9 +243,23 @@ class PublicCatalog:
             longitudes=dataset_longitudes,
             method=bounding_filter_method,
             zero_is_no_limit=True,
+            trimmed=False,
         )
         rows = await self._rows()
-        return query.select(_gbfs(rows, self._url), rows.boxes)
+        return query.select(_gbfs(rows, self._url))
+
+
+async def _read(raw: bytes, shown: str | None) -> CatalogRows:
+    """Read the export off the event loop; FeedParseError if it is none."""
+    try:
+        rows: CatalogRows | None = await asyncio.to_thread(read_catalog, raw)
+    except CatalogFormatError as err:
+        problem = str(err)
+        rows = None
+    if rows is None:
+        # Outside the except: nothing of the parse rides along.
+        raise FeedParseError(f"Public catalog unreadable: {problem}", url=shown)
+    return rows
 
 
 def _find[F: PublicFeed](rows: CatalogRows, feed_id: str, kind: type[F]) -> F:
@@ -324,13 +285,22 @@ def _gbfs(rows: CatalogRows, url: str) -> tuple[PublicGbfsFeed, ...]:
     return rows.gbfs
 
 
-def _needle(value: str | None) -> re.Pattern[str] | None:
-    """Return a string filter as the API normalizes it: trimmed; empty is none."""
+def _needle(value: str | None, *, trimmed: bool) -> re.Pattern[str] | None:
+    """Return a string filter as the endpoint passes it to ``ILIKE``.
+
+    ``trimmed``: stripped, and empty is no filter (the API's GTFS Realtime
+    filter normalizes so). Otherwise as given: ``""`` is ``ILIKE '%%'``,
+    which every value but a missing one matches, and spaces count.
+    """
     if value is None:
         return None
     # As the client's encoder: plain str text, else ValueError.
-    trimmed = require_text(str.__str__(value), "a query parameter").strip()
-    return _ilike(trimmed) if trimmed else None
+    text = require_text(str.__str__(value), "a query parameter")
+    if trimmed:
+        text = text.strip()
+        if not text:
+            return None
+    return _ilike(text)
 
 
 def _ilike(value: str) -> re.Pattern[str]:
@@ -411,10 +381,13 @@ class _Query:
         is_official: bool | None = None,
         entity_types: Sequence[EntityType] | None = None,
         zero_is_no_limit: bool = False,
+        trimmed: bool,
     ) -> _Query:
         """Check a list call's filters and normalize them as the API does.
 
         ``max_limit`` is the endpoint's largest ``limit``, and its default.
+        ``trimmed``: the endpoint strips its text filters (see
+        :func:`_needle`).
         ``zero_is_no_limit``: a ``limit`` of 0 returns every feed (the API's
         GBFS list applies a limit only when it is truthy), where otherwise
         it returns none (SQL's ``LIMIT 0``).
@@ -445,50 +418,51 @@ class _Query:
         return cls(
             start=start,
             stop=None if zero_is_no_limit and limit == 0 else start + limit,
-            provider=_needle(provider),
-            producer_url=_needle(producer_url),
+            provider=_needle(provider, trimmed=trimmed),
+            producer_url=_needle(producer_url, trimmed=trimmed),
             box=box,
             method=method or BoundingFilterMethod.COMPLETELY_ENCLOSED,
             is_official=is_official,
             entity_types=frozenset(entity_types) if entity_types else None,
         )
 
-    def _keeps(self, feed: PublicFeed, boxes: Mapping[str, Box]) -> bool:
-        source = feed.source_info
+    def _keeps(self, feed: PublicFeed) -> bool:
         if not (
             _like(self.provider, feed.provider)
-            and _like(self.producer_url, source.producer_url if source else None)
+            and _like(self.producer_url, feed.source_info.producer_url)
         ):
             return False
-        # The API's is_official=False keeps False and unknown.
-        if (
-            self.is_official is not None
-            and not isinstance(feed, PublicGbfsFeed)
-            and (feed.official is True) is not self.is_official
-        ):
-            return False
-        if (
-            self.entity_types is not None
-            and isinstance(feed, PublicGtfsRtFeed)
-            and not self.entity_types.intersection(feed.entity_types)
-        ):
-            return False
-        box = self.box
-        # A GTFS Realtime feed has no box: the API has no such filter for it.
-        if box is None or isinstance(feed, PublicGtfsRtFeed):
+        match feed:
+            case PublicGtfsFeed():
+                return self._official(feed.official) and self._within(feed.bounding_box)
+            case PublicGtfsRtFeed():
+                return self._official(feed.official) and self._typed_as(
+                    feed.entity_types
+                )
+            case PublicGbfsFeed():
+                return self._within(feed.bounding_box)
+
+    def _official(self, official: bool | None) -> bool:
+        """Whether the official flag passes; as the API, False keeps unknown too."""
+        return self.is_official is None or (official is True) is self.is_official
+
+    def _typed_as(self, entity_types: tuple[EntityType, ...]) -> bool:
+        """Whether the feed has any of the asked entity types."""
+        return self.entity_types is None or not self.entity_types.isdisjoint(
+            entity_types
+        )
+
+    def _within(self, bounding_box: BoundingBox | None) -> bool:
+        """Whether the box passes the bounding filter; no box passes none."""
+        if self.box is None:
             return True
-        feed_box = boxes.get(feed.id)
-        return feed_box is not None and matches(self.method, feed_box, box)
+        return bounding_box is not None and matches(
+            self.method, box_of(bounding_box), self.box
+        )
 
-    def select[F: PublicFeed](
-        self, feeds: Sequence[F], boxes: Mapping[str, Box]
-    ) -> list[F]:
-        """Return the feeds that pass, then apply ``offset`` and ``limit``.
-
-        ``boxes`` are the feeds' bounding boxes by id (see
-        :class:`CatalogRows`).
-        """
-        kept = (feed for feed in feeds if self._keeps(feed, boxes))
+    def select[F: PublicFeed](self, feeds: Sequence[F]) -> list[F]:
+        """Return the feeds that pass, then apply ``offset`` and ``limit``."""
+        kept = (feed for feed in feeds if self._keeps(feed))
         return list(islice(kept, self.start, self.stop))
 
 

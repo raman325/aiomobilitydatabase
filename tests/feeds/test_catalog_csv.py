@@ -18,6 +18,7 @@ from aiomobilitydatabase.feeds._catalog_csv import (
     CatalogRows,
     _Lines,
     _record_ends,
+    box_of,
     read_catalog,
 )
 from aiomobilitydatabase.models import (
@@ -356,18 +357,19 @@ def test_a_nul_inside_a_cell_is_kept() -> None:
     assert feed.provider == "A\x00B"
 
 
-def test_each_gtfs_and_gbfs_box_is_read_once_for_the_filters() -> None:
+def test_a_box_read_is_complete_for_the_filters() -> None:
     rows = read_catalog(
-        export(
-            GTFS_ROW,
-            GTFS_RT_ROW,
-            GBFS_ROW,
-            {**GTFS_ROW, "id": "mdb-11", **box("", "", "", "")},
-        )
+        export(GTFS_ROW, GBFS_ROW, {**GTFS_ROW, "id": "mdb-11", **box("1", "", "", "")})
     )
-    assert dict(rows.boxes) == {
+    boxes = {
+        feed.id: feed.bounding_box and box_of(feed.bounding_box)
+        for feed in rows.by_id.values()
+        if not isinstance(feed, PublicGtfsRtFeed)
+    }
+    assert boxes == {
         "mdb-10": Box(40.5, 40.9, -74.3, -73.7),
         "gbfs-citibike": Box(40.6, 40.9, -74.1, -73.8),
+        "mdb-11": None,  # a bound missing: no box at all
     }
 
 

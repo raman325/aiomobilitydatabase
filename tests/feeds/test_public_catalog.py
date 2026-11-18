@@ -10,7 +10,7 @@ import re
 import socket
 import threading
 import time
-from collections.abc import AsyncGenerator, Awaitable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
 import aiohttp
 import pytest
@@ -209,6 +209,29 @@ async def test_after_close_a_new_catalog_fetches_on_a_new_session(
     assert [feed.id for feed in await second.get_gtfs_feeds()] == ["mdb-10"]
     assert requests_to(mock_api) == 2  # the closed one's cache went with it
     await client.close()
+
+
+@pytest.mark.parametrize(
+    "lookup",
+    [
+        lambda public: public.get_gtfs_feeds(),
+        lambda public: public.get_gtfs_rt_feed("mdb-20"),
+        lambda public: public.get_gbfs_feeds(),
+    ],
+)
+async def test_a_catalog_kept_past_close_raises_and_opens_no_session(
+    mock_api: MockApi,
+    lookup: Callable[[PublicCatalog], Awaitable[object]],
+) -> None:
+    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
+    client = MobilityFeedsClient(public_catalog_url=mock_api.url(PATH))
+    kept = client.public_catalog
+    await kept.get_gtfs_feeds()
+    await client.close()
+    with pytest.raises(RuntimeError, match="the client is closed"):
+        await lookup(kept)  # even with the export still fresh in its cache
+    assert client._session is None  # deliberate friend access: none opened
+    assert requests_to(mock_api) == 1
 
 
 @pytest.mark.parametrize(
@@ -438,7 +461,7 @@ MATCHING = export(
     ("needle", "expected"),
     [
         ("bay", {"bay-area", "baywheels"}),  # a substring, any case
-        ("  BAY  ", {"bay-area", "baywheels"}),  # trimmed first
+        ("  BAY  ", set()),  # as given: GBFS's filter doesn't trim
         ("b%a", {"bay-area"}),  # with a %: as given, so anchored
         ("metro_bus", {"metro-underscore", "metro-x"}),  # _: any one character
         ("metro\\_bus", {"metro-underscore"}),  # \_: a literal _
@@ -456,8 +479,9 @@ MATCHING = export(
                 "backslash",
             },
         ),
-        (
-            "   ",
+        ("   ", set()),
+        (  # %%: every provider but a missing one
+            "",
             {
                 "bay-area",
                 "baywheels",
@@ -465,7 +489,6 @@ MATCHING = export(
                 "metro-x",
                 "fifty",
                 "backslash",
-                "no-provider",
             },
         ),
     ],
@@ -479,6 +502,48 @@ async def test_provider_matches_as_the_apis_ilike(
     serve(mock_api, body=MATCHING)
     feeds = await public.get_gbfs_feeds(provider=needle)
     assert {feed.id for feed in feeds} == expected
+
+
+TRIMMING = export(
+    {**GTFS_ROW, "id": "gtfs-bay", "provider": "Bay Area"},
+    {**GTFS_ROW, "id": "gtfs-none", "provider": ""},
+    {**GTFS_RT_ROW, "id": "rt-bay", "provider": "Bay Area"},
+    {**GTFS_RT_ROW, "id": "rt-none", "provider": ""},
+    {**GBFS_ROW, "id": "gbfs-bay", "provider": "Bay Area"},
+    {**GBFS_ROW, "id": "gbfs-none", "provider": ""},
+)
+
+
+@pytest.mark.parametrize(
+    ("method", "prefix", "trims"),
+    [
+        ("get_gtfs_feeds", "gtfs", False),
+        ("get_gtfs_rt_feeds", "rt", True),
+        ("get_gbfs_feeds", "gbfs", False),
+    ],
+)
+async def test_text_filters_are_trimmed_only_where_the_api_trims_them(
+    mock_api: MockApi, public: PublicCatalog, method: str, prefix: str, trims: bool
+) -> None:
+    """GtfsRtFeedFilter strips a text filter and drops an empty one; GTFS's
+    and GBFS's filters hand it to ILIKE as given."""
+    serve(mock_api, body=TRIMMING, headers=CACHED)
+
+    async def found(**kwargs: str) -> set[str]:
+        feeds = await getattr(public, method)(**kwargs)
+        return {feed.id.removeprefix(f"{prefix}-") for feed in feeds}
+
+    if trims:  # no filter, or the trimmed value
+        assert await found(provider="") == {"bay", "none"}
+        assert await found(provider="  ") == {"bay", "none"}
+        assert await found(provider="  Bay  ") == {"bay"}
+        assert await found(producer_url=" example.com ") == {"bay", "none"}
+    else:  # "" is '%%', which a missing value fails; spaces count
+        assert await found(provider="") == {"bay"}
+        assert await found(producer_url="") == {"bay", "none"}
+        assert await found(provider="  ") == set()
+        assert await found(provider="  Bay  ") == set()
+        assert await found(producer_url=" example.com ") == set()
 
 
 async def test_producer_url_matches_as_the_apis_ilike(
@@ -600,7 +665,7 @@ async def ids(feeds: Awaitable[Sequence[PublicFeed]]) -> list[str]:
 async def test_a_trimmed_substring_provider_filters_in_provider_order(
     filtered: PublicCatalog,
 ) -> None:
-    assert await ids(filtered.get_gtfs_feeds(provider="  BETA ")) == ["mdb-2"]
+    assert await ids(filtered.get_gtfs_feeds(provider="BETA")) == ["mdb-2"]
     assert await ids(filtered.get_gtfs_feeds(provider="ta")) == ["mdb-2", "mdb-4"]
     # Provider, then id: Alpha, Beta, Delta, Gamma.
     assert await ids(filtered.get_gtfs_feeds()) == ["mdb-1", "mdb-2", "mdb-4", "mdb-3"]

@@ -272,8 +272,10 @@ Filters are the API's, with these differences:
   bounding box (the API has no such filter) and has no `system_id` or
   `version` filter.
 - **Ordering**: by provider, then id, by code point; the API's GTFS list uses
-  its database's collation and its GBFS list sets no order, so a
-  `limit`/`offset` page can hold different feeds.
+  its database's collation and its GTFS Realtime and GBFS lists set no order,
+  so a `limit`/`offset` page can hold different feeds. Within a feed, the
+  export sorts `entity_types` and puts active `feed_references` first, where
+  the API keeps its database's order.
 - **Bounding filters** test each feed's bounding box, where the API's GTFS
   filter matches any of a feed's datasets, past ones included. Zero-extent
   boxes (a single-stop feed's, or a point or line query range) may differ
@@ -284,7 +286,10 @@ Filters are the API's, with these differences:
   system's versions, so its pages can hold fewer feeds than `limit`.
 - **Text filters**: `provider` and `producer_url` match as the API's `ILIKE`,
   comparing case with Python's `str.lower` where Postgres uses its locale's
-  `lower()`.
+  `lower()`. As in the API, only the GTFS Realtime list strips them (empty:
+  no filter); the GTFS and GBFS lists take them as given, so `""` matches
+  every value but a missing one -- and a value the export leaves empty is
+  missing here, where the database may hold `""`.
 - **Paging**: `limit` defaults to, and is at most, 2500 (GTFS), 1000 (GTFS
   Realtime) or 500 (GBFS); out of range, or a negative `offset`, raises
   `ValueError` where the API answers 422.
