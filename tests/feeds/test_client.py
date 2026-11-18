@@ -11,8 +11,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from aiomobilitydatabase.const import PROD_BASE_URL
+from aiomobilitydatabase.feeds import PublicCatalog
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
-from aiomobilitydatabase.feeds.public_catalog import MobilityDatabasePublicCatalog
 
 from tests.feeds.fixtures import TOKEN_RESPONSE
 from tests.mock_server import MockApi
@@ -332,13 +332,12 @@ def test_purging_every_feed_removes_each_feed_directory_and_nothing_else(
         assert (outside / "keep").read_bytes() == b"x"
 
 
-async def test_public_catalog_needs_no_token_and_shares_the_session() -> None:
+async def test_public_catalog_needs_no_token_and_is_built_on_the_client() -> None:
     client = MobilityFeedsClient(request_timeout=7.0)
     public = client.public_catalog
-    assert isinstance(public, MobilityDatabasePublicCatalog)
+    assert isinstance(public, PublicCatalog)
     assert client.public_catalog is public
-    assert public._timeout.total == 7.0  # deliberate friend access
-    assert public._get_session() is client._get_session()  # deliberate friend access
+    assert public._client is client  # deliberate friend access: its session, timeout
     await client.close()
     assert client._session is None  # owned session closed
     assert client.public_catalog is not public  # a new one after close()

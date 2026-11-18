@@ -69,6 +69,7 @@ from .models import (
     VehicleStopStatus,
     WheelchairAccess,
 )
+from .public_catalog import PublicCatalog
 
 if TYPE_CHECKING:
     from .transit import TransitFeedHandle
@@ -120,6 +121,7 @@ __all__ = [
     "OnDemandService",
     "OnDemandWindow",
     "PickupDropOffType",
+    "PublicCatalog",
     "PublicGbfsFeed",
     "PublicGtfsFeed",
     "PublicGtfsRtFeed",

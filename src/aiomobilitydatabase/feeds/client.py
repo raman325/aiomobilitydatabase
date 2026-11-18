@@ -13,16 +13,29 @@ from typing import TYPE_CHECKING, Self
 import aiohttp
 
 from ..client import MobilityDatabaseClient
+from ..const import DEV_BASE_URL, PROD_BASE_URL, QA_BASE_URL
 from ..exceptions import MobilityDatabaseError
 from ._extra import load_transit_handle
 from ._urls import require_caller_inputs
-from .const import DEFAULT_TIMEOUT_SECONDS
+from .const import (
+    DEFAULT_TIMEOUT_SECONDS,
+    DEV_PUBLIC_CATALOG_URL,
+    PROD_PUBLIC_CATALOG_URL,
+    QA_PUBLIC_CATALOG_URL,
+)
 from .gbfs import GbfsFeedHandle
 from .models import StaticBuildProgress
-from .public_catalog import MobilityDatabasePublicCatalog
+from .public_catalog import PublicCatalog
 
 if TYPE_CHECKING:
     from .transit import TransitFeedHandle
+
+# Each catalog environment's public export, by its API base_url.
+_PUBLIC_CATALOG_URLS = {
+    PROD_BASE_URL: PROD_PUBLIC_CATALOG_URL,
+    QA_BASE_URL: QA_PUBLIC_CATALOG_URL,
+    DEV_BASE_URL: DEV_PUBLIC_CATALOG_URL,
+}
 
 
 class MobilityFeedsClient:
@@ -49,15 +62,22 @@ class MobilityFeedsClient:
         cache_dir: Path | str | None = None,
         base_url: str | None = None,
         request_timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        public_catalog_url: str | None = None,
     ) -> None:
-        """Initialize the client. Performs no I/O."""
+        """Initialize the client. Performs no I/O.
+
+        ``public_catalog_url`` is the export :attr:`public_catalog` reads.
+        By default it is the export of ``base_url``'s environment
+        (production, QA or DEV); with another ``base_url`` it must be given.
+        """
         self._refresh_token = refresh_token
         self._session = session
         self._owns_session = session is None
         self._base_url = base_url
         self._timeout = request_timeout
+        self._public_catalog_url = public_catalog_url
         self._catalog: MobilityDatabaseClient | None = None
-        self._public_catalog: MobilityDatabasePublicCatalog | None = None
+        self._public_catalog: PublicCatalog | None = None
         self._cache_dir = Path(cache_dir) if cache_dir is not None else None
 
     async def __aenter__(self) -> Self:
@@ -78,7 +98,7 @@ class MobilityFeedsClient:
         if self._catalog is not None:
             await self._catalog.close()
             self._catalog = None
-        self._public_catalog = None  # never owns the shared session
+        self._public_catalog = None  # its cache goes with the session
         if (
             self._owns_session
             and self._session is not None
@@ -123,17 +143,29 @@ class MobilityFeedsClient:
         return self._catalog
 
     @property
-    def public_catalog(self) -> MobilityDatabasePublicCatalog:
+    def public_catalog(self) -> PublicCatalog:
         """The catalog's public export (no token), on the shared session.
 
-        The filters of :attr:`catalog`'s list and get methods for GTFS, GTFS
-        Realtime and GBFS (GBFS gaining the bounding filter), answering with
-        the export's own models: see :class:`MobilityDatabasePublicCatalog`.
+        GTFS, GTFS Realtime and GBFS lookups with :attr:`catalog`'s filters,
+        answering with the export's own models: see :class:`PublicCatalog`.
+        Raises ``ValueError`` when no ``public_catalog_url`` was given and
+        ``base_url`` is none of the catalog's environments, or for a
+        ``public_catalog_url`` :meth:`get_gbfs_feed_from_url` would refuse
+        (credentials that can't be sent).
         """
         if self._public_catalog is None:
-            self._public_catalog = MobilityDatabasePublicCatalog(
-                self._get_session(), request_timeout=self._timeout
-            )
+            url = self._public_catalog_url
+            if url is None:
+                base_url = PROD_BASE_URL if self._base_url is None else self._base_url
+                if isinstance(base_url, str):
+                    url = _PUBLIC_CATALOG_URLS.get(base_url.rstrip("/"))
+                if url is None:
+                    raise ValueError(
+                        "no public catalog is known for this base_url: "
+                        "pass public_catalog_url"
+                    )
+            require_caller_inputs(self._get_session(), [url])
+            self._public_catalog = PublicCatalog(self, url)
         return self._public_catalog
 
     @property

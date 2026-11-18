@@ -1,39 +1,23 @@
-"""Token-free catalog lookups from the Mobility Database's public export."""
+"""Token-free feed lookups from the Mobility Database's public catalog export."""
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
-from types import TracebackType
-from typing import Self
+from itertools import islice
+from typing import TYPE_CHECKING
 
-import aiohttp
-from yarl import URL
-
-from .._http import REQUEST_OPTIONS, URL_ERRORS, require_text
-from .._transport import Answer
+from .._http import require_text
 
 # Deliberate friend access: the argument checks are shared with the API
 # client so both answer a bad argument alike.
-from ..client import (
-    _require_catalog_session,
-    _require_id,
-    _text,
-    _timeout_seconds,
-    _typed,
-)
-from ..exceptions import (
-    MobilityDatabaseApiError,
-    MobilityDatabaseConnectionError,
-    MobilityDatabaseNotFoundError,
-    MobilityDatabaseRateLimitError,
-)
+from ..client import _require_id, _typed
+from ..exceptions import MobilityDatabaseNotFoundError
 from ..models import BoundingFilterMethod, EntityType
 from ._bounds import Box, matches
 from ._catalog_csv import CatalogFormatError, CatalogRows, PublicFeed, read_catalog
@@ -44,8 +28,17 @@ from ._freshness import (
     header_fields,
     request_fields,
 )
-from .const import DEFAULT_TIMEOUT_SECONDS, PUBLIC_CATALOG_URL
+from ._freshness import hops as _hops
+from ._redirects import get_withholding, network
+from ._urls import (  # deliberate friend access: shared URL guard
+    _require_http_url,
+    redact,
+)
+from .exceptions import FeedParseError, SourceConnectionError
 from .models import PublicGbfsFeed, PublicGtfsFeed, PublicGtfsRtFeed
+
+if TYPE_CHECKING:
+    from .client import MobilityFeedsClient
 
 # The API's paging bounds (mobility-feed-api, feeds_api.py: ``limit`` is
 # ``Query(N, ge=0, le=N)``, ``offset`` ``ge=0``): each endpoint's default
@@ -53,136 +46,45 @@ from .models import PublicGbfsFeed, PublicGtfsFeed, PublicGtfsRtFeed
 _GTFS_FEEDS_MAX_LIMIT = 2500
 _GTFS_RT_FEEDS_MAX_LIMIT = 1000
 _GBFS_FEEDS_MAX_LIMIT = 500
+_CONTEXT = "public catalog URL"
 
 
-def _require_export_url(url: object) -> str:
-    """Return ``url`` if the export can be fetched from it; else raise.
-
-    An http(s) URL with a host, no credentials and no fragment. Plain http
-    only on loopback: the export decides which feed URLs a caller fetches.
-    """
-    if not isinstance(url, str):
-        raise TypeError("url must be a str")
-    host: str | None = None
-    try:
-        parsed = URL(url)
-        host = parsed.host
-    except URL_ERRORS:
-        parsed = None
-    if parsed is None:  # outside the except: the error would quote the URL
-        raise ValueError("url is no URL")
-    if parsed.scheme not in ("http", "https") or not host:
-        raise ValueError("url must be an http(s) URL with a host")
-    if parsed.user is not None or parsed.raw_password is not None:
-        raise ValueError("url must not hold credentials")
-    if parsed.raw_fragment or "#" in url:
-        raise ValueError("url must not hold a fragment")
-    if parsed.scheme == "http" and not _is_loopback(host):
-        raise ValueError("url must be https")
-    return url
-
-
-def _is_loopback(host: str) -> bool:
-    """Whether a host names this machine (where plain http stays local)."""
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-async def _exchange(
-    session: aiohttp.ClientSession,
-    url: str,
-    *,
-    client_timeout: aiohttp.ClientTimeout,
-    headers: Mapping[str, str],
-) -> tuple[Answer, dict[str, tuple[str, ...]]]:
-    """GET the export whole, never following redirects; also its header fields.
-
-    The catalog client's :func:`~aiomobilitydatabase._transport.exchange`,
-    plus the header fields a cache keeps (R2 fetches as the feeds do).
-    """
-    if session.closed:
-        raise RuntimeError("the session is closed")  # the caller's, not the API's
-    try:
-        async with session.request(
-            "GET",
-            url,
-            timeout=client_timeout,
-            headers=headers,
-            **REQUEST_OPTIONS,
-        ) as resp:
-            body: bytes | None
-            try:
-                body = await resp.read()
-            except aiohttp.ClientPayloadError:
-                body = None
-            header = resp.headers.get("Content-Type", "")
-            media_type = header.split(";", 1)[0].strip(" \t").lower()
-            return Answer(resp.status, media_type, body), header_fields(resp.headers)
-    except Exception as err:  # the boundary: see _transport's docstring
-        failure = type(err).__name__
-    # Raised outside the except, so the original isn't even the context.
-    raise MobilityDatabaseConnectionError(f"Public catalog request failed ({failure})")
-
-
-class MobilityDatabasePublicCatalog:
+class PublicCatalog:
     r"""The Mobility Database catalog's public export, without an account.
 
-    Reads ``feeds_v2.csv`` (MobilityData regenerates it daily) into
+    Obtain it as :attr:`MobilityFeedsClient.public_catalog`. It reads
+    ``feeds_v2.csv`` (MobilityData regenerates it daily) into
     :class:`~.models.PublicGtfsFeed`, :class:`~.models.PublicGtfsRtFeed`
-    and :class:`~.models.PublicGbfsFeed`: the export's columns that mean
-    what the catalog API's same-named fields mean, each holding the value
-    the API returns for the same feed. The methods take the API client's
-    names, parameters and filter semantics, with these differences:
+    and :class:`~.models.PublicGbfsFeed` -- the export's columns that mean
+    what the catalog API's same-named fields mean -- and filters as the API
+    client's same-named methods do, with these differences:
 
-    - There are no location filters: the export's location is usually the
-      one extracted from the feed's stops, not the registered locations the
-      API filters on (and the models have no ``locations``).
-    - ``get_gbfs_feeds`` filters on the system's bounding box (the API has
-      no such filter) and has no ``system_id`` or ``version`` filter.
+    - No location filters, and ``get_gbfs_feeds`` filters on the system's
+      bounding box (the API has no such filter) with no ``system_id`` or
+      ``version`` filter.
     - Results are ordered by provider, then id, by code point (the API's
       GTFS list sorts by its database's collation; its GBFS list sets no
-      order); ``entity_types`` and ``feed_references`` are in the export's
-      order.
+      order), so a ``limit``/``offset`` page can hold other feeds.
+    - The bounding filters test the feed's bounding box; the API's GTFS
+      filter matches a feed when any of its datasets' boxes (past ones too)
+      passes. A box of zero width or height (a single-stop feed, or a query
+      range whose ends are equal) may differ too: the API's answer depends
+      on its GEOS version (see :mod:`._bounds`).
     - The export holds published feeds only: the API's GBFS list doesn't
       filter on publication, and its get-by-id endpoints may return an
-      unpublished feed to some accounts.
-    - The API's GBFS list applies ``limit`` to its rows joined with each
-      system's versions and endpoints, so its pages can hold fewer feeds
-      than ``limit``; here a page holds ``limit`` feeds.
-    - An export without any GBFS rows (MobilityData's carries none until
-      its GBFS export, mobility-feed-api #1888, is deployed) can't say
-      whether a system exists: ``get_gbfs_feeds`` and ``get_gbfs_feed`` raise
-      :class:`MobilityDatabaseConnectionError` rather than answer ``[]`` or
-      not found. With GBFS rows present, no match is ``[]`` as in the API.
-    - An empty cell is None: the export writes an empty string and a
-      missing value alike, so where the database holds ``""`` the API
-      returns ``""``.
-    - The bounding filters test the feed's bounding box, the one the API
-      returns. The API's GTFS filter instead matches a feed when any of its
-      datasets' boxes (past ones too) passes, so a feed whose coverage moved
-      can differ. A box of zero width or height (a single-stop feed, or a
-      query range whose ends are equal) is the point or segment it covers;
-      the API's answer for one depends on its GEOS version (see
-      :mod:`._bounds`), so it may differ.
+      unpublished feed to some accounts. The API's GBFS list applies
+      ``limit`` to its rows joined with each system's versions and
+      endpoints, so its pages can hold fewer feeds; here a page holds
+      ``limit`` feeds.
+    - ``provider`` and ``producer_url`` match as the API's ``ILIKE`` (see
+      :func:`_ilike`), comparing case by Python's ``str.lower`` where
+      Postgres uses its locale's ``lower()``; a value with ``%`` ending in
+      a lone backslash (``e%\``) matches a literal backslash here, where the
+      API answers an error.
     - A ``limit`` past the endpoint's maximum (also its default: 2500 GTFS,
       1000 GTFS Realtime, 500 GBFS feeds) or below 0, or a negative
       ``offset``, raises ValueError before any request, where the API
-      answers 422 (a :class:`MobilityDatabaseApiError`).
-    - ``provider`` and ``producer_url`` match as the API's ``ILIKE`` does
-      (see :func:`_ilike`), but compare case by Python's ``str.lower``,
-      where Postgres uses its locale's ``lower()``. A value with ``%`` that
-      ends in a lone backslash (``e%\``) matches a literal backslash here,
-      where the API answers an error.
-    - The export's own status maps as the client's answers do, but for a
-      404 and a 401: a missing export (404) or a 401 is a
-      :class:`MobilityDatabaseApiError` with that status (the client maps
-      a 401 to :class:`MobilityDatabaseAuthenticationError`, and
-      :class:`MobilityDatabaseNotFoundError` means no such feed). A 429 is a
-      :class:`MobilityDatabaseRateLimitError`.
+      answers 422.
 
     As the API, ``get_gtfs_rt_feeds`` leaves out a feed without entity
     types (its query inner-joins them; a type this library doesn't know
@@ -190,117 +92,106 @@ class MobilityDatabasePublicCatalog:
     ``get_gbfs_feeds(limit=0)`` returns every system (the API applies a
     GBFS limit only when it is truthy), where the GTFS lists return none.
 
-    The export is cached as HTTP allows (RFC 9111: ``max-age``, revalidated
-    with its ETag), shared by concurrent callers, and parsed off the event
-    loop. Session handling follows :class:`MobilityDatabaseClient`.
+    The export is fetched as the feeds layer fetches a GBFS document:
+    redirects followed, cached as HTTP allows (RFC 9111), shared by
+    concurrent callers, and parsed off the event loop. Errors are the feeds
+    layer's: :class:`SourceConnectionError` when it can't be fetched (with
+    the ``status`` of an error answer), :class:`FeedParseError` when it is
+    no export -- or carries no GBFS feeds at all, for a GBFS lookup, which
+    then can't say whether a system exists (MobilityData's carries none
+    until mobility-feed-api #1888 is deployed). An id no feed of the asked
+    type has is :class:`MobilityDatabaseNotFoundError`, as in the API.
     """
 
-    def __init__(
-        self,
-        session: aiohttp.ClientSession | None = None,
-        *,
-        url: str = PUBLIC_CATALOG_URL,
-        request_timeout: float = DEFAULT_TIMEOUT_SECONDS,
-    ) -> None:
-        """Initialize. Performs no I/O.
-
-        Raises ``TypeError`` for a ``url`` that isn't a ``str`` or a
-        ``request_timeout`` that isn't a number, and ``ValueError`` for a
-        ``url`` the export can't be fetched from (see
-        :func:`_require_export_url`), a ``request_timeout`` that isn't a
-        finite positive number, or an injected session whose defaults would
-        change what the catalog sends: an ``auth``, a ``base_url``, a
-        credential default or a default header HTTP can't carry.
-        """
-        self._url = _require_export_url(url)
-        seconds = _timeout_seconds(request_timeout)
-        if session is not None:
-            _require_catalog_session(session)
-        self._session = session
-        self._owns_session = session is None
-        self._timeout = aiohttp.ClientTimeout(total=seconds)
+    def __init__(self, client: MobilityFeedsClient, url: str) -> None:
+        """Read the export at ``url`` on ``client``'s session. No I/O."""
+        self._client = client
+        self._url = url
         self._cache: FreshnessCache[CatalogRows] = FreshnessCache()
-
-    async def __aenter__(self) -> Self:
-        """Enter the async context manager."""
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        """Exit the async context manager, closing owned resources."""
-        await self.close()
-
-    async def close(self) -> None:
-        """Close the underlying session if this catalog owns it. Idempotent."""
-        if (
-            self._owns_session
-            and self._session is not None
-            and not self._session.closed
-        ):
-            await self._session.close()
-            self._session = None
-
-    def _get_session(self) -> aiohttp.ClientSession:
-        """Return the session, lazily creating an owned one if needed."""
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
 
     async def _rows(self) -> CatalogRows:
         """Return the export, from the cache while fresh."""
-        # No session yet: _fetch makes a plain one, whose request carries no
-        # controlled fields; a cache hit then needs no session at all.
-        session = self._session
-        fields = {} if session is None else request_fields(session, self._url, {})
-        return await self._cache.get(self._url, self._fetch, request_fields=fields)
+        _require_http_url(self._url, _CONTEXT)  # before request_fields parses it
+        return await self._cache.get(
+            self._url,
+            self._fetch,
+            request_fields=request_fields(
+                self._client._get_session(),  # deliberate friend access
+                self._url,
+                {},
+            ),
+        )
 
     async def _fetch(self, *, validators: Validators | None) -> Response[CatalogRows]:
-        """GET the export; conditional when ``validators`` is given."""
+        """GET the export; conditional when ``validators`` is given.
+
+        As :meth:`GbfsFeedHandle._fetch_json_document`: a 304 comes back
+        with no value, and to an unconditional request raises.
+        """
+        url = self._url
+        _require_http_url(url, _CONTEXT)
+        session = self._client._get_session()  # deliberate friend access
         requested_at = datetime.now(UTC)
-        answer, fields = await _exchange(
-            self._get_session(),
-            self._url,
-            client_timeout=self._timeout,
-            headers={} if validators is None else validators.request_headers(),
-        )
-        received_at = datetime.now(UTC)
-        if answer.status == HTTPStatus.NOT_MODIFIED and validators is not None:
-            return Response(
-                value=None,
-                fields=fields,
-                requested_at=requested_at,
-                received_at=received_at,
-                url=self._url,
-            )
-        if answer.status == HTTPStatus.TOO_MANY_REQUESTS:
-            raise MobilityDatabaseRateLimitError("Public catalog rate limit exceeded")
-        # A 404 stays an API error: NotFound means no such feed.
-        if answer.status not in (
-            HTTPStatus.OK,
-            HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
-        ):
-            raise MobilityDatabaseApiError(answer.status, _text(answer))
-        if answer.body is None:
-            raise MobilityDatabaseConnectionError(
-                "Public catalog's body couldn't be read"
-            )
+        shown = redact(url)
+        async with get_withholding(
+            session,
+            url,
+            params={},
+            headers={},
+            total=self._client.timeout_seconds,
+            secret=None,
+            conditional=None if validators is None else validators.request_headers(),
+            conditional_url=None if validators is None else validators.url,
+        ) as (resp, history):
+            received_at = datetime.now(UTC)
+            fields = header_fields(resp.headers)
+            if resp.status == HTTPStatus.NOT_MODIFIED:
+                if validators is None:
+                    raise SourceConnectionError(
+                        "Public catalog answered 304 to an unconditional request",
+                        status=int(HTTPStatus.NOT_MODIFIED),
+                        url=shown,
+                    )
+                return Response(
+                    value=None,
+                    fields=fields,
+                    requested_at=requested_at,
+                    received_at=received_at,
+                    hops=_hops(resp, history),
+                    url=str(resp.url),
+                )
+            if resp.status >= HTTPStatus.BAD_REQUEST:
+                raise SourceConnectionError(
+                    f"Public catalog error {resp.status}", status=resp.status, url=shown
+                )
+            if resp.status not in (
+                HTTPStatus.OK,
+                HTTPStatus.NON_AUTHORITATIVE_INFORMATION,
+            ):
+                raise SourceConnectionError(
+                    f"Public catalog answered {resp.status} without an export",
+                    status=resp.status,
+                    url=shown,
+                )
+            raw = await network(resp.read(), url)
+            hops = _hops(resp, history)
+            answered = str(resp.url)
         try:
-            rows = await asyncio.to_thread(read_catalog, answer.body)
+            rows: CatalogRows | None = await asyncio.to_thread(read_catalog, raw)
         except CatalogFormatError as err:
             problem = str(err)
-        else:
-            return Response(
-                value=rows,
-                fields=fields,
-                requested_at=requested_at,
-                received_at=received_at,
-                url=self._url,
-            )
-        raise MobilityDatabaseConnectionError(f"Public catalog unreadable: {problem}")
+            rows = None
+        if rows is None:
+            # Outside the except: nothing of the parse rides along.
+            raise FeedParseError(f"Public catalog unreadable: {problem}", url=shown)
+        return Response(
+            value=rows,
+            fields=fields,
+            requested_at=requested_at,
+            received_at=received_at,
+            hops=hops,
+            url=answered,
+        )
 
     @_typed
     async def get_gtfs_feed(self, feed_id: str) -> PublicGtfsFeed:
@@ -319,7 +210,7 @@ class MobilityDatabasePublicCatalog:
         """Get a single GBFS feed by ID."""
         key = _require_id(feed_id)  # as the client's, before any request
         rows = await self._rows()
-        _gbfs(rows)
+        _gbfs(rows, self._url)
         return _find(rows, key, PublicGbfsFeed)
 
     @_typed
@@ -407,7 +298,7 @@ class MobilityDatabasePublicCatalog:
             zero_is_no_limit=True,
         )
         rows = await self._rows()
-        return query.select(_gbfs(rows), rows.boxes)
+        return query.select(_gbfs(rows, self._url), rows.boxes)
 
 
 def _find[F: PublicFeed](rows: CatalogRows, feed_id: str, kind: type[F]) -> F:
@@ -419,7 +310,7 @@ def _find[F: PublicFeed](rows: CatalogRows, feed_id: str, kind: type[F]) -> F:
     return feed
 
 
-def _gbfs(rows: CatalogRows) -> tuple[PublicGbfsFeed, ...]:
+def _gbfs(rows: CatalogRows, url: str) -> tuple[PublicGbfsFeed, ...]:
     """Return the export's GBFS feeds; raise when it carries none at all.
 
     An export without a GBFS section (one written before mobility-feed-api
@@ -427,8 +318,8 @@ def _gbfs(rows: CatalogRows) -> tuple[PublicGbfsFeed, ...]:
     list nor NotFound would be true.
     """
     if not rows.gbfs:
-        raise MobilityDatabaseConnectionError(
-            "Public catalog export carries no GBFS feeds"
+        raise FeedParseError(
+            "Public catalog export carries no GBFS feeds", url=redact(url)
         )
     return rows.gbfs
 
@@ -597,8 +488,8 @@ class _Query:
         ``boxes`` are the feeds' bounding boxes by id (see
         :class:`CatalogRows`).
         """
-        kept = [feed for feed in feeds if self._keeps(feed, boxes)]
-        return kept[self.start : self.stop]
+        kept = (feed for feed in feeds if self._keeps(feed, boxes))
+        return list(islice(kept, self.start, self.stop))
 
 
 def _finite(values: tuple[float, float]) -> bool:

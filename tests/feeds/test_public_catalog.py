@@ -1,4 +1,4 @@
-"""MobilityDatabasePublicCatalog: fetching, caching, errors, filters."""
+"""The public catalog: fetching, caching, errors, filters."""
 
 from __future__ import annotations
 
@@ -16,19 +16,25 @@ import aiohttp
 import pytest
 
 from aiomobilitydatabase import BoundingFilterMethod, EntityType
-from aiomobilitydatabase.exceptions import (
-    MobilityDatabaseApiError,
-    MobilityDatabaseConnectionError,
-    MobilityDatabaseNotFoundError,
-    MobilityDatabaseRateLimitError,
+from aiomobilitydatabase.const import DEV_BASE_URL, PROD_BASE_URL, QA_BASE_URL
+from aiomobilitydatabase.exceptions import MobilityDatabaseNotFoundError
+from aiomobilitydatabase.feeds import (
+    FeedParseError,
+    MobilityFeedsClient,
+    PublicCatalog,
+    SourceConnectionError,
+    public_catalog,
 )
-from aiomobilitydatabase.feeds import public_catalog
 from aiomobilitydatabase.feeds._catalog_csv import CatalogRows, PublicFeed
+from aiomobilitydatabase.feeds.const import (
+    DEV_PUBLIC_CATALOG_URL,
+    PROD_PUBLIC_CATALOG_URL,
+    QA_PUBLIC_CATALOG_URL,
+)
 from aiomobilitydatabase.feeds.public_catalog import (
     _GBFS_FEEDS_MAX_LIMIT,
     _GTFS_FEEDS_MAX_LIMIT,
     _GTFS_RT_FEEDS_MAX_LIMIT,
-    MobilityDatabasePublicCatalog,
 )
 
 from tests.feeds.public_catalog_data import GBFS_ROW, GTFS_ROW, GTFS_RT_ROW, box, export
@@ -45,11 +51,14 @@ def serve(
 
 
 @pytest.fixture
-async def public(
-    mock_api: MockApi,
-) -> AsyncGenerator[MobilityDatabasePublicCatalog, None]:
-    async with MobilityDatabasePublicCatalog(url=mock_api.url(PATH)) as catalog:
-        yield catalog
+async def client(mock_api: MockApi) -> AsyncGenerator[MobilityFeedsClient, None]:
+    async with MobilityFeedsClient(public_catalog_url=mock_api.url(PATH)) as feeds:
+        yield feeds
+
+
+@pytest.fixture
+async def public(client: MobilityFeedsClient) -> PublicCatalog:
+    return client.public_catalog
 
 
 def requests_to(api: MockApi) -> int:
@@ -57,7 +66,7 @@ def requests_to(api: MockApi) -> int:
 
 
 async def test_it_reads_the_export_without_any_token(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api)
     feeds = await public.get_gbfs_feeds()
@@ -67,7 +76,7 @@ async def test_it_reads_the_export_without_any_token(
 
 
 async def test_a_fresh_export_is_reused(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api, headers={"Cache-Control": "public, max-age=3600", "ETag": '"v1"'})
     await public.get_gtfs_feeds()
@@ -76,7 +85,7 @@ async def test_a_fresh_export_is_reused(
 
 
 async def test_a_stale_export_is_revalidated_with_its_etag(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api, headers={"Cache-Control": "max-age=0", "ETag": '"v1"'})
     mock_api.get(
@@ -90,7 +99,7 @@ async def test_a_stale_export_is_revalidated_with_its_etag(
 
 
 async def test_concurrent_callers_share_one_fetch(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api)  # not reusable: only sharing the one request answers all
     results = await asyncio.gather(*(public.get_gbfs_feeds() for _ in range(5)))
@@ -100,7 +109,7 @@ async def test_concurrent_callers_share_one_fetch(
 
 async def test_parsing_runs_off_the_event_loop(
     mock_api: MockApi,
-    public: MobilityDatabasePublicCatalog,
+    public: PublicCatalog,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     threads: list[threading.Thread] = []
@@ -117,22 +126,30 @@ async def test_parsing_runs_off_the_event_loop(
     assert threads[0] is not threading.main_thread()
 
 
-@pytest.mark.parametrize("status", [404, 500, 302])
-async def test_an_error_status_raises_api_error(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog, status: int
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 204, 302])
+async def test_a_status_without_an_export_raises_source_connection_error(
+    mock_api: MockApi, public: PublicCatalog, status: int
 ) -> None:
+    # As a GBFS document's: any error status (401/403 too), or no document.
     mock_api.get(PATH, status=status, body=b"nope", content_type="text/plain")
-    with pytest.raises(MobilityDatabaseApiError) as caught:
-        await public.get_gtfs_feeds()
+    with pytest.raises(SourceConnectionError) as caught:
+        await public.get_gtfs_feed("mdb-10")
     assert caught.value.status == status
+    assert caught.value.url == mock_api.url(PATH)
 
 
-async def test_an_unreadable_export_raises_connection_error(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+@pytest.mark.parametrize(
+    "body",
+    [b"provider\nA\n", b"\xff\xfe", b'id,data_type\nmdb-1,"gtfs"x\n'],
+)
+async def test_an_unreadable_export_raises_feed_parse_error(
+    mock_api: MockApi, public: PublicCatalog, body: bytes
 ) -> None:
-    serve(mock_api, body=b"provider\nA\n")
-    with pytest.raises(MobilityDatabaseConnectionError, match="Public catalog"):
+    serve(mock_api, body=body)
+    with pytest.raises(FeedParseError, match="Public catalog unreadable") as caught:
         await public.get_gtfs_feeds()
+    assert caught.value.url == mock_api.url(PATH)
+    assert caught.value.__context__ is None
 
 
 def free_port() -> int:
@@ -143,16 +160,15 @@ def free_port() -> int:
     return port
 
 
-async def test_a_network_failure_raises_connection_error() -> None:
-    async with MobilityDatabasePublicCatalog(
-        url=f"http://127.0.0.1:{free_port()}/feeds_v2.csv"
-    ) as catalog:
-        with pytest.raises(MobilityDatabaseConnectionError):
-            await catalog.get_gtfs_feeds()
+async def test_a_network_failure_raises_source_connection_error() -> None:
+    url = f"http://127.0.0.1:{free_port()}/feeds_v2.csv"
+    async with MobilityFeedsClient(public_catalog_url=url) as client:
+        with pytest.raises(SourceConnectionError):
+            await client.public_catalog.get_gtfs_feeds()
 
 
 async def test_getters_find_a_feed_by_id_and_type(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api, headers={"Cache-Control": "max-age=3600"})
     assert (await public.get_gtfs_feed("mdb-10")).id == "mdb-10"
@@ -164,36 +180,105 @@ async def test_getters_find_a_feed_by_id_and_type(
         await public.get_gtfs_feed("mdb-404")
 
 
-async def test_an_injected_session_is_used_and_not_closed(mock_api: MockApi) -> None:
+async def test_the_client_s_injected_session_is_used_and_not_closed(
+    mock_api: MockApi,
+) -> None:
     serve(mock_api)
     async with aiohttp.ClientSession() as session:
-        async with MobilityDatabasePublicCatalog(
-            session, url=mock_api.url(PATH)
-        ) as catalog:
-            await catalog.get_gtfs_feeds()
+        client = MobilityFeedsClient(
+            session=session, public_catalog_url=mock_api.url(PATH)
+        )
+        public = client.public_catalog
+        await public.get_gtfs_feeds()
+        assert client._get_session() is session  # deliberate friend access
+        await client.close()
         assert not session.closed
 
 
+async def test_after_close_a_new_catalog_fetches_on_a_new_session(
+    mock_api: MockApi,
+) -> None:
+    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
+    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
+    client = MobilityFeedsClient(public_catalog_url=mock_api.url(PATH))
+    first = client.public_catalog
+    await first.get_gtfs_feeds()
+    await client.close()
+    second = client.public_catalog
+    assert second is not first
+    assert [feed.id for feed in await second.get_gtfs_feeds()] == ["mdb-10"]
+    assert requests_to(mock_api) == 2  # the closed one's cache went with it
+    await client.close()
+
+
 @pytest.mark.parametrize(
-    "url",
+    ("base_url", "expected"),
     [
-        "ftp://example.com/feeds.csv",
-        "http://example.com/feeds_v2.csv",  # plain http off loopback
-        "https://user:pw@example.com/feeds_v2.csv",
-        "https://example.com/feeds_v2.csv#x",
-        "not a url",
+        (None, PROD_PUBLIC_CATALOG_URL),
+        (PROD_BASE_URL, PROD_PUBLIC_CATALOG_URL),
+        (f"{PROD_BASE_URL}/", PROD_PUBLIC_CATALOG_URL),
+        (QA_BASE_URL, QA_PUBLIC_CATALOG_URL),
+        (DEV_BASE_URL, DEV_PUBLIC_CATALOG_URL),
     ],
 )
-def test_an_unusable_url_raises_value_error(url: str) -> None:
-    with pytest.raises(ValueError):
-        MobilityDatabasePublicCatalog(url=url)
+async def test_the_export_is_the_base_url_s_environment_s(
+    base_url: str | None, expected: str
+) -> None:
+    async with MobilityFeedsClient(base_url=base_url) as client:
+        assert client.public_catalog._url == expected  # deliberate friend access
 
 
-def test_construction_checks_like_the_api_client() -> None:
-    with pytest.raises(TypeError):
-        MobilityDatabasePublicCatalog(url=7)  # type: ignore[arg-type]
-    with pytest.raises(ValueError):
-        MobilityDatabasePublicCatalog(request_timeout=0)
+async def test_a_given_public_catalog_url_wins(mock_api: MockApi) -> None:
+    async with MobilityFeedsClient(
+        base_url=QA_BASE_URL, public_catalog_url=mock_api.url(PATH)
+    ) as client:
+        assert client.public_catalog._url == mock_api.url(PATH)
+
+
+async def test_another_base_url_needs_a_public_catalog_url() -> None:
+    async with MobilityFeedsClient(base_url="https://catalog.example.com") as client:
+        with pytest.raises(ValueError, match="public_catalog_url"):
+            client.public_catalog  # noqa: B018 - raises
+    async with MobilityFeedsClient(
+        base_url="https://catalog.example.com",
+        public_catalog_url="https://files.example.com/feeds_v2.csv",
+    ) as given:
+        assert given.public_catalog._url == "https://files.example.com/feeds_v2.csv"
+
+
+async def test_a_public_catalog_url_checks_as_a_gbfs_discovery_url() -> None:
+    # Credentials go as Basic auth, so a user-id with a colon can't.
+    url = "https://us%3Aer:pw@example.com/feeds_v2.csv"
+    async with MobilityFeedsClient(public_catalog_url=url) as client:
+        with pytest.raises(ValueError, match="colon"):
+            client.public_catalog  # noqa: B018 - raises
+
+
+@pytest.mark.parametrize(
+    "url", ["ftp://example.com/feeds.csv", "not a url", "file:///etc/passwd"]
+)
+async def test_an_unfetchable_url_is_refused_before_any_request(url: str) -> None:
+    async with MobilityFeedsClient(public_catalog_url=url) as client:
+        with pytest.raises(SourceConnectionError, match="public catalog URL"):
+            await client.public_catalog.get_gtfs_feeds()
+
+
+async def test_a_redirect_is_followed_and_reused_only_as_its_hop_allows(
+    mock_api: MockApi, public: PublicCatalog
+) -> None:
+    moved = "/moved/feeds_v2.csv"
+    cached = {"Cache-Control": "max-age=3600"}
+    # A 302 without freshness of its own can't be reused: the next call asks
+    # again, though the export it led to is fresh.
+    mock_api.get(PATH, status=302, headers={"Location": mock_api.url(moved)})
+    mock_api.get(moved, body=BODY, content_type="text/csv", headers=cached)
+    assert [feed.id for feed in await public.get_gtfs_feeds()] == ["mdb-10"]
+    mock_api.get(PATH, status=301, headers={"Location": mock_api.url(moved), **cached})
+    mock_api.get(moved, body=BODY, content_type="text/csv", headers=cached)
+    assert [feed.id for feed in await public.get_gtfs_feeds()] == ["mdb-10"]
+    # Now both the 301 and the export are fresh: no request at all.
+    assert [feed.id for feed in await public.get_gtfs_feeds()] == ["mdb-10"]
+    assert [request.path for request in mock_api.requests] == [PATH, moved] * 2
 
 
 def gbfs_systems(count: int) -> bytes:
@@ -201,7 +286,7 @@ def gbfs_systems(count: int) -> bytes:
 
 
 async def test_the_default_limit_is_the_endpoints(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api, body=gbfs_systems(_GBFS_FEEDS_MAX_LIMIT + 1))
     feeds = await public.get_gbfs_feeds()
@@ -210,7 +295,7 @@ async def test_the_default_limit_is_the_endpoints(
 
 
 async def test_the_largest_limit_is_taken(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api, body=gbfs_systems(_GBFS_FEEDS_MAX_LIMIT + 1))
     feeds = await public.get_gbfs_feeds(limit=_GBFS_FEEDS_MAX_LIMIT, offset=1)
@@ -232,7 +317,7 @@ async def test_the_largest_limit_is_taken(
 )
 async def test_out_of_range_paging_raises_value_error_before_any_request(
     mock_api: MockApi,
-    public: MobilityDatabasePublicCatalog,
+    public: PublicCatalog,
     method: str,
     largest: int,
     paging: dict[str, object],
@@ -251,7 +336,7 @@ async def test_out_of_range_paging_raises_value_error_before_any_request(
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
 async def test_a_lone_non_finite_range_raises_value_error_before_any_request(
     mock_api: MockApi,
-    public: MobilityDatabasePublicCatalog,
+    public: PublicCatalog,
     method: str,
     name: str,
     bad: float,
@@ -266,7 +351,7 @@ async def test_a_lone_non_finite_range_raises_value_error_before_any_request(
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
 async def test_non_finite_values_in_both_ranges_raise_value_error_before_any_request(
     mock_api: MockApi,
-    public: MobilityDatabasePublicCatalog,
+    public: PublicCatalog,
     method: str,
     bad: float,
 ) -> None:
@@ -277,46 +362,26 @@ async def test_non_finite_values_in_both_ranges_raise_value_error_before_any_req
     assert mock_api.requests == []
 
 
-async def test_a_304_to_an_unconditional_request_raises_api_error(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+async def test_a_304_to_an_unconditional_request_raises(
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     mock_api.get(PATH, status=304, headers={"ETag": '"v1"'})
-    with pytest.raises(MobilityDatabaseApiError) as caught:
+    with pytest.raises(SourceConnectionError) as caught:
         await public.get_gtfs_feeds()
     assert caught.value.status == 304
 
 
-async def test_rate_limiting_raises_rate_limit_error(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
-) -> None:
-    mock_api.get(PATH, status=429, body=b"slow down", content_type="text/plain")
-    with pytest.raises(MobilityDatabaseRateLimitError):
-        await public.get_gtfs_feeds()
-
-
-async def test_a_missing_export_is_an_api_error_not_a_missing_feed(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
-) -> None:
-    mock_api.get(PATH, status=404, body=b"nope", content_type="text/plain")
-    with pytest.raises(MobilityDatabaseApiError) as caught:
-        await public.get_gtfs_feed("mdb-10")
-    assert not isinstance(caught.value, MobilityDatabaseNotFoundError)
-    assert caught.value.status == 404
-
-
-async def test_an_error_is_not_cached(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
-) -> None:
+async def test_an_error_is_not_cached(mock_api: MockApi, public: PublicCatalog) -> None:
     mock_api.get(PATH, status=500, body=b"down", content_type="text/plain")
     serve(mock_api)
-    with pytest.raises(MobilityDatabaseApiError):
+    with pytest.raises(SourceConnectionError):
         await public.get_gtfs_feeds()
     assert [feed.id for feed in await public.get_gtfs_feeds()] == ["mdb-10"]
     assert requests_to(mock_api) == 2
 
 
 async def test_a_cancelled_caller_leaves_the_shared_fetch_running(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api)
     leaving = asyncio.create_task(public.get_gtfs_feeds())
@@ -327,17 +392,6 @@ async def test_a_cancelled_caller_leaves_the_shared_fetch_running(
     assert [feed.id for feed in await staying] == ["mdb-10"]
     assert leaving.cancelled()
     assert requests_to(mock_api) == 1
-
-
-async def test_a_closed_injected_session_raises_runtime_error(
-    mock_api: MockApi,
-) -> None:
-    session = aiohttp.ClientSession()
-    await session.close()
-    catalog = MobilityDatabasePublicCatalog(session, url=mock_api.url(PATH))
-    with pytest.raises(RuntimeError):
-        await catalog.get_gtfs_feeds()
-    assert mock_api.requests == []
 
 
 @pytest.mark.parametrize(
@@ -355,7 +409,7 @@ async def test_a_closed_injected_session_raises_runtime_error(
 )
 async def test_an_id_the_client_rejects_is_rejected_before_any_request(
     mock_api: MockApi,
-    public: MobilityDatabasePublicCatalog,
+    public: PublicCatalog,
     getter: str,
     feed_id: object,
     error: type[Exception],
@@ -418,7 +472,7 @@ MATCHING = export(
 )
 async def test_provider_matches_as_the_apis_ilike(
     mock_api: MockApi,
-    public: MobilityDatabasePublicCatalog,
+    public: PublicCatalog,
     needle: str,
     expected: set[str],
 ) -> None:
@@ -428,7 +482,7 @@ async def test_provider_matches_as_the_apis_ilike(
 
 
 async def test_producer_url_matches_as_the_apis_ilike(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api, headers={"Cache-Control": "max-age=3600"})
     feeds = await public.get_gtfs_feeds(producer_url="EXAMPLE.COM/SUB_AY")
@@ -436,16 +490,6 @@ async def test_producer_url_matches_as_the_apis_ilike(
     assert await public.get_gtfs_feeds(producer_url="%example.com") == []  # anchored
     anchored = await public.get_gtfs_feeds(producer_url="https://%.zip")
     assert [feed.id for feed in anchored] == ["mdb-10"]
-
-
-async def test_a_cache_hit_opens_no_session(mock_api: MockApi) -> None:
-    serve(mock_api, headers={"Cache-Control": "max-age=3600"})
-    catalog = MobilityDatabasePublicCatalog(url=mock_api.url(PATH))
-    await catalog.get_gtfs_feeds()
-    await catalog.close()
-    assert [feed.id for feed in await catalog.get_gtfs_feeds()] == ["mdb-10"]
-    assert catalog._session is None
-    assert requests_to(mock_api) == 1
 
 
 def reference_ilike(value: str) -> re.Pattern[str]:
@@ -498,7 +542,7 @@ def test_ilike_matches_the_plain_translation_on_random_pairs() -> None:
 
 
 async def test_a_wildcard_heavy_filter_runs_in_linear_time(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     long_url = "https://example.com/" + "a" * 2000
     row = {**GTFS_ROW, "urls.direct_download": long_url}
@@ -506,7 +550,9 @@ async def test_a_wildcard_heavy_filter_runs_in_linear_time(
     await public.get_gtfs_feeds()  # fetched and parsed outside the timing
     started = time.perf_counter()
     feeds = await public.get_gtfs_feeds(producer_url="%_%_%_%_%_%_%_%_%#")
-    assert time.perf_counter() - started < 0.5
+    # Milliseconds when linear. The backtracking translation (%: .*) tries
+    # some 2000^9 splits here -- far past this generous bound on any machine.
+    assert time.perf_counter() - started < 5
     assert feeds == []
 
 
@@ -542,9 +588,7 @@ FILTER_BODY = export(
 
 
 @pytest.fixture
-async def filtered(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
-) -> MobilityDatabasePublicCatalog:
+async def filtered(mock_api: MockApi, public: PublicCatalog) -> PublicCatalog:
     serve(mock_api, body=FILTER_BODY, headers={"Cache-Control": "max-age=3600"})
     return public
 
@@ -554,7 +598,7 @@ async def ids(feeds: Awaitable[Sequence[PublicFeed]]) -> list[str]:
 
 
 async def test_a_trimmed_substring_provider_filters_in_provider_order(
-    filtered: MobilityDatabasePublicCatalog,
+    filtered: PublicCatalog,
 ) -> None:
     assert await ids(filtered.get_gtfs_feeds(provider="  BETA ")) == ["mdb-2"]
     assert await ids(filtered.get_gtfs_feeds(provider="ta")) == ["mdb-2", "mdb-4"]
@@ -563,7 +607,7 @@ async def test_a_trimmed_substring_provider_filters_in_provider_order(
 
 
 async def test_producer_url_matches_the_substring_in_any_case(
-    filtered: MobilityDatabasePublicCatalog,
+    filtered: PublicCatalog,
 ) -> None:
     assert await ids(filtered.get_gtfs_feeds(producer_url="gtfs.zip")) == [
         "mdb-1",
@@ -572,14 +616,14 @@ async def test_producer_url_matches_the_substring_in_any_case(
 
 
 async def test_is_official_false_keeps_false_and_unknown(
-    filtered: MobilityDatabasePublicCatalog,
+    filtered: PublicCatalog,
 ) -> None:
     # mdb-4 keeps GTFS_ROW's "True".
     assert await ids(filtered.get_gtfs_feeds(is_official=True)) == ["mdb-1", "mdb-4"]
     assert await ids(filtered.get_gtfs_feeds(is_official=False)) == ["mdb-2", "mdb-3"]
 
 
-async def test_entity_types_match_any(filtered: MobilityDatabasePublicCatalog) -> None:
+async def test_entity_types_match_any(filtered: PublicCatalog) -> None:
     assert await ids(
         filtered.get_gtfs_rt_feeds(entity_types=[EntityType.TRIP_UPDATES])
     ) == ["mdb-6"]
@@ -591,7 +635,7 @@ async def test_entity_types_match_any(filtered: MobilityDatabasePublicCatalog) -
 
 
 async def test_bounding_filters_default_to_completely_enclosed(
-    filtered: MobilityDatabasePublicCatalog,
+    filtered: PublicCatalog,
 ) -> None:
     # Reversed ranges: normalised to latitudes -1..5 and longitudes -1..5.
     near = {"dataset_latitudes": (-1.0, 5.0), "dataset_longitudes": (5.0, -1.0)}
@@ -610,13 +654,13 @@ async def test_bounding_filters_default_to_completely_enclosed(
 
 
 async def test_one_range_alone_filters_nothing(
-    filtered: MobilityDatabasePublicCatalog,
+    filtered: PublicCatalog,
 ) -> None:
     assert len(await filtered.get_gtfs_feeds(dataset_latitudes=(0.0, 1.0))) == 4
 
 
 async def test_limit_and_offset_apply_after_filtering(
-    filtered: MobilityDatabasePublicCatalog,
+    filtered: PublicCatalog,
 ) -> None:
     assert await ids(filtered.get_gtfs_feeds(is_official=False, offset=1, limit=1)) == [
         "mdb-3"
@@ -625,7 +669,7 @@ async def test_limit_and_offset_apply_after_filtering(
 
 
 async def test_gbfs_filters_on_the_system_box(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api)
     home = {"dataset_latitudes": (40.75, 40.76), "dataset_longitudes": (-73.99, -73.98)}
@@ -640,7 +684,7 @@ async def test_gbfs_filters_on_the_system_box(
     [{"limit": True}, {"provider": 7}, {"dataset_latitudes": (1.0,)}],
 )
 async def test_mistyped_arguments_raise_type_error(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog, kwargs: dict[str, object]
+    mock_api: MockApi, public: PublicCatalog, kwargs: dict[str, object]
 ) -> None:
     with pytest.raises(TypeError):
         await public.get_gtfs_feeds(**kwargs)  # type: ignore[arg-type]
@@ -651,7 +695,7 @@ CACHED = {"Cache-Control": "max-age=3600"}
 
 
 async def test_the_rt_list_leaves_out_feeds_without_entity_types(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     untyped = {**GTFS_RT_ROW, "id": "mdb-21", "entity_type": ""}
     unknown = {**GTFS_RT_ROW, "id": "mdb-22", "entity_type": "xx"}
@@ -663,7 +707,7 @@ async def test_the_rt_list_leaves_out_feeds_without_entity_types(
 
 
 async def test_a_gbfs_limit_of_0_is_no_limit(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     systems = ({**GBFS_ROW, "id": f"gbfs-{n:04}"} for n in range(501))
     serve(mock_api, body=export(GTFS_ROW, GTFS_RT_ROW, *systems), headers=CACHED)
@@ -676,22 +720,23 @@ async def test_a_gbfs_limit_of_0_is_no_limit(
     assert await public.get_gtfs_rt_feeds(limit=0) == []
 
 
-async def test_an_export_without_gbfs_rows_raises_connection_error(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+async def test_an_export_without_gbfs_rows_raises_feed_parse_error(
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api, body=export(GTFS_ROW, GTFS_RT_ROW), headers=CACHED)
     message = "Public catalog export carries no GBFS feeds"
-    with pytest.raises(MobilityDatabaseConnectionError, match=message) as listed:
+    with pytest.raises(FeedParseError, match=message) as listed:
         await public.get_gbfs_feeds()
-    with pytest.raises(MobilityDatabaseConnectionError, match=message) as got:
+    with pytest.raises(FeedParseError, match=message) as got:
         await public.get_gbfs_feed("gbfs-citibike")
+    assert listed.value.url == mock_api.url(PATH)
     assert listed.value.__context__ is None
     assert got.value.__context__ is None
     assert [feed.id for feed in await public.get_gtfs_feeds()] == ["mdb-10"]
 
 
 async def test_gbfs_filtered_to_nothing_is_empty(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+    mock_api: MockApi, public: PublicCatalog
 ) -> None:
     serve(mock_api, headers=CACHED)
     assert await public.get_gbfs_feeds(provider="nobody") == []
@@ -703,7 +748,7 @@ async def test_gbfs_filtered_to_nothing_is_empty(
 @pytest.mark.parametrize("both", [False, True])
 async def test_a_coordinate_past_float_raises_value_error_before_any_request(
     mock_api: MockApi,
-    public: MobilityDatabasePublicCatalog,
+    public: PublicCatalog,
     method: str,
     both: bool,
 ) -> None:
@@ -724,7 +769,7 @@ async def test_a_coordinate_past_float_raises_value_error_before_any_request(
 @pytest.mark.parametrize("name", ["provider", "producer_url"])
 async def test_a_text_filter_that_is_no_text_raises_before_any_request(
     mock_api: MockApi,
-    public: MobilityDatabasePublicCatalog,
+    public: PublicCatalog,
     method: str,
     name: str,
 ) -> None:
