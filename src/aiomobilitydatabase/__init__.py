@@ -1,7 +1,7 @@
 """Async Python client for the Mobility Database catalog API."""
 
 from .client import MobilityDatabaseClient
-from .const import PUBLIC_CATALOG_URL, __version__
+from .const import __version__
 from .exceptions import (
     MobilityDatabaseApiError,
     MobilityDatabaseAuthenticationError,
@@ -70,7 +70,6 @@ from .models import (
 from .public_catalog import MobilityDatabasePublicCatalog
 
 __all__ = [
-    "PUBLIC_CATALOG_URL",
     "AccessToken",
     "BasicFeed",
     "BoundingBox",

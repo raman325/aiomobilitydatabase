@@ -333,13 +333,16 @@ def test_purging_every_feed_removes_each_feed_directory_and_nothing_else(
 
 
 async def test_public_catalog_needs_no_token_and_shares_the_session() -> None:
-    client = MobilityFeedsClient()
+    client = MobilityFeedsClient(request_timeout=7.0)
     public = client.public_catalog
     assert isinstance(public, MobilityDatabasePublicCatalog)
     assert client.public_catalog is public
+    assert public._timeout.total == 7.0  # deliberate friend access
     assert public._get_session() is client._get_session()  # deliberate friend access
     await client.close()
     assert client._session is None  # owned session closed
+    assert client.public_catalog is not public  # a new one after close()
+    await client.close()
 
 
 async def test_public_catalog_never_closes_an_injected_session() -> None:

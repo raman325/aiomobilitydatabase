@@ -7,7 +7,6 @@ def test_public_exports() -> None:
     for name in (
         "MobilityDatabaseClient",
         "MobilityDatabasePublicCatalog",
-        "PUBLIC_CATALOG_URL",
         "Feed",
         "GtfsFeed",
         "GtfsRtFeed",

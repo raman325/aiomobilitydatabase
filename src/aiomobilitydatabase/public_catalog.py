@@ -20,6 +20,9 @@ from ._catalog_csv import CatalogFeed, CatalogFormatError, CatalogRows, read_cat
 from ._freshness import FreshnessCache, Response, Validators, request_fields
 from ._http import URL_ERRORS
 from ._transport import exchange
+
+# Deliberate friend access: the argument checks are shared with the API
+# client so both answer a bad argument alike.
 from .client import (
     _is_loopback,
     _require_catalog_session,
@@ -116,9 +119,11 @@ class MobilityDatabasePublicCatalog:
       ends in a lone backslash (``e%\``) matches a literal backslash here,
       where the API answers an error.
     - The export's own status maps as the client's answers do, but for a
-      404: a missing export is a :class:`MobilityDatabaseApiError` (status
-      404), since :class:`MobilityDatabaseNotFoundError` means no such feed.
-      A 429 is a :class:`MobilityDatabaseRateLimitError`.
+      404 and a 401: a missing export (404) or a 401 is a
+      :class:`MobilityDatabaseApiError` with that status (the client maps
+      a 401 to :class:`MobilityDatabaseAuthenticationError`, and
+      :class:`MobilityDatabaseNotFoundError` means no such feed). A 429 is a
+      :class:`MobilityDatabaseRateLimitError`.
 
     The export is cached as HTTP allows (RFC 9111: ``max-age``, revalidated
     with its ETag), shared by concurrent callers, and parsed off the event

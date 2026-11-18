@@ -44,7 +44,8 @@ access tokens automatically (including proactive refresh before expiry). Both
 the feeds client wraps a catalog client internally and shares its authentication.
 
 The token is only required for catalog operations: `MobilityFeedsClient`'s
-[direct-URL methods](#direct-urls-no-catalog-account) work without one.
+[direct-URL methods](#direct-urls-no-catalog-account) and its
+[`public_catalog`](#public-catalog-no-account) work without one.
 
 ## Quick start — catalog
 
@@ -250,16 +251,36 @@ Notes on direct mode:
 `public_catalog` finds feeds without a refresh token, from the catalog's
 public export (`feeds_v2.csv`, regenerated daily and cached as its HTTP
 headers allow). It returns the catalog API's `GtfsFeed`, `GtfsRtFeed` and
-`GbfsFeed` with the API's filter semantics (`provider` and `producer_url`
-match as its `ILIKE` does) and the API's `limit` defaults and maxima (2500
-GTFS, 1000 GTFS Realtime, 500 GBFS), holding the values the export carries
-and `None` elsewhere. It has no location fields or filters (the export's
-location isn't the API's), and `seasonal` is `None` (unknown). The bounding
-filters test each feed's current bounding box, where the API's GTFS filter
-matches any of a feed's datasets, past ones included, so a feed whose
-coverage moved can differ; a query range with no extent (a single point or
-line) can differ too, since PostGIS's answer for one varies with its GEOS
-version. `get_gbfs_feeds` also filters on each system's bounding box:
+`GbfsFeed` with the API's filters, holding the values the export carries and
+`None` elsewhere. What differs from the API:
+
+- **Locations**: `locations` is always `None` and there are no location
+  filters (the export's location is usually the one extracted from the feed's
+  stops, not the registered locations the API returns and filters on).
+- **Seasonal**: `seasonal` is `None` (unknown).
+- **GBFS filters**: `get_gbfs_feeds` filters on each system's bounding box
+  (the API has no such filter) and has no `system_id` or `version` filter.
+- **Ordering**: feeds are ordered by provider, then id, by code point; the
+  API uses its database's `en_US.UTF8` collation, so a `limit`/`offset` page
+  can hold different feeds. `entity_types` and `feed_references` are in the
+  export's order.
+- **Empty values**: an empty cell is `None`, where the database may hold `""`
+  and the API return it.
+- **Text filters**: `provider` and `producer_url` match as the API's `ILIKE`
+  does, but compare case with Python's `str.lower` where Postgres uses its
+  locale's `lower()`. A value with `%` that ends in a lone backslash
+  matches a literal backslash here, where the API errors.
+- **Bounding filters**: they test each feed's current bounding box, where the
+  API's GTFS filter matches any of a feed's datasets, past ones included, so a
+  feed whose coverage moved can differ. Zero-extent boxes (a single-stop
+  feed's, or a point or line query range) may differ too: the API's answer
+  depends on its GEOS version.
+- **Paging**: `limit` defaults to, and is at most, 2500 (GTFS), 1000 (GTFS
+  Realtime) or 500 (GBFS); a `limit` out of range or a negative `offset`
+  raises `ValueError`, where the API answers 422.
+- **Errors**: a missing export (404) or a 401 is a `MobilityDatabaseApiError`
+  (never `MobilityDatabaseNotFoundError`, which means no such feed); a 429 is
+  a `MobilityDatabaseRateLimitError`.
 
 ```python
 import asyncio
@@ -275,8 +296,9 @@ async def main() -> None:
             dataset_longitudes=(-73.99, -73.98),
             bounding_filter_method=BoundingFilterMethod.PARTIALLY_ENCLOSED,
         )
-        url = systems[0].source_info.producer_url
-        bikes = await client.get_gbfs_feed_from_url(url)
+        if systems and (info := systems[0].source_info) and info.producer_url:
+            bikes = await client.get_gbfs_feed_from_url(info.producer_url)
+            print((await bikes.get_system_info()).name)
 
 
 asyncio.run(main())
@@ -795,7 +817,7 @@ each define their own subtree beneath it, so you can catch broadly
 | --- | --- | --- |
 | `MobilityDatabaseConnectionError` | catalog | Network failure, timeout, or invalid response body |
 | `MobilityDatabaseAuthenticationError` | catalog | Invalid refresh token, or unauthorized after a token refresh |
-| `MobilityDatabaseNotFoundError` | catalog | Resource not found (404) |
+| `MobilityDatabaseNotFoundError` | catalog | Resource not found (404); the public catalog raises it only for an unknown feed id, never for a missing export |
 | `MobilityDatabaseRateLimitError` | catalog | Rate limited (429) |
 | `MobilityDatabaseApiError` | catalog | Any other 4xx/5xx (carries `.status` and `.body`) |
 | `MobilityFeedsError` | feeds | Base class for all feeds errors (subclasses `MobilityDatabaseError`) |

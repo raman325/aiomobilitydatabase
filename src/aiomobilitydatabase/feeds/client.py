@@ -127,8 +127,8 @@ class MobilityFeedsClient:
         """The catalog's public export (no token), on the shared session.
 
         Same models and filters as :attr:`catalog`'s list and get methods
-        for GTFS, GTFS Realtime and GBFS, minus what the export doesn't
-        carry: see :class:`MobilityDatabasePublicCatalog`.
+        for GTFS, GTFS Realtime and GBFS (GBFS gaining the bounding filter),
+        minus what the export doesn't carry: see :class:`MobilityDatabasePublicCatalog`.
         """
         if self._public_catalog is None:
             self._public_catalog = MobilityDatabasePublicCatalog(

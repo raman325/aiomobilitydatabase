@@ -262,6 +262,21 @@ async def test_a_lone_non_finite_range_raises_value_error_before_any_request(
     assert mock_api.requests == []
 
 
+@pytest.mark.parametrize("method", ["get_gtfs_feeds", "get_gbfs_feeds"])
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+async def test_non_finite_values_in_both_ranges_raise_value_error_before_any_request(
+    mock_api: MockApi,
+    public: MobilityDatabasePublicCatalog,
+    method: str,
+    bad: float,
+) -> None:
+    with pytest.raises(ValueError, match="a query parameter is no finite number"):
+        await getattr(public, method)(
+            dataset_latitudes=(bad, 1.0), dataset_longitudes=(0.0, 1.0)
+        )
+    assert mock_api.requests == []
+
+
 async def test_a_304_to_an_unconditional_request_raises_api_error(
     mock_api: MockApi, public: MobilityDatabasePublicCatalog
 ) -> None:
@@ -618,16 +633,6 @@ async def test_gbfs_filters_on_the_system_box(
         **home, bounding_filter_method=BoundingFilterMethod.PARTIALLY_ENCLOSED
     )
     assert [feed.id for feed in feeds] == ["gbfs-citibike"]
-
-
-async def test_nan_bounds_raise_value_error_before_any_request(
-    mock_api: MockApi, public: MobilityDatabasePublicCatalog
-) -> None:
-    with pytest.raises(ValueError):
-        await public.get_gtfs_feeds(
-            dataset_latitudes=(math.nan, 1.0), dataset_longitudes=(0.0, 1.0)
-        )
-    assert mock_api.requests == []
 
 
 @pytest.mark.parametrize(
