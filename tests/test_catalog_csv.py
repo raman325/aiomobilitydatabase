@@ -140,16 +140,10 @@ def test_extracted_on_is_read_only_as_a_full_date_time(
         ({"status": "retired"}, {"status": None}),
         ({"is_official": "yes"}, {"official": None}),
         ({"is_official": ""}, {"official": None}),
-        ({"urls.authentication_type": "two"}, {"authentication_type": None}),
-        ({"urls.authentication_type": "+1"}, {"authentication_type": None}),
         ({"location.bounding_box.minimum_latitude": "nan"}, {"bounding_box": None}),
         ({"location.bounding_box.maximum_longitude": ""}, {"bounding_box": None}),
         ({"location.bounding_box.minimum_latitude": "1_0"}, {"bounding_box": None}),
         (box("41", "40", "-74", "-73"), {"bounding_box": None}),
-        (
-            box("-95", "95", "-200", "200"),
-            {"bounding_box": BoundingBox(-95.0, 95.0, -200.0, 200.0)},
-        ),
         (
             {"name": "", "note": "", "provider": ""},
             {"feed_name": None, "note": None, "provider": None},
@@ -161,12 +155,40 @@ def test_values_this_library_can_t_read_are_none(
 ) -> None:
     (feed,) = read_catalog(export({**GTFS_ROW, **cells})).gtfs
     for name, value in expected.items():
-        actual = (
-            feed.source_info.authentication_type
-            if name == "authentication_type" and feed.source_info is not None
-            else getattr(feed, name)
-        )
-        assert actual == value, name
+        assert getattr(feed, name) == value, name
+
+
+def test_a_box_past_the_earth_s_ranges_is_kept_as_the_api_returns_it() -> None:
+    row = {**GTFS_ROW, **box("-95", "95", "-200", "200")}
+    (feed,) = read_catalog(export(row)).gtfs
+    assert feed.bounding_box == BoundingBox(-95.0, 95.0, -200.0, 200.0)
+
+
+@pytest.mark.parametrize(
+    ("cell", "expected"),
+    [
+        ("0", 0),
+        ("3", 3),
+        ("007", 7),
+        ("123456789", 123456789),
+        ("", None),
+        ("two", None),
+        ("+1", None),
+        ("-1", None),
+        ("1.0", None),
+        (" 1", None),
+        ("\u0661", None),  # Arabic-Indic one, which int() reads as 1
+        ("1234567890", None),
+        # Past int()'s 4300-digit limit, which raises a bare ValueError.
+        ("1" * 5000, None),
+    ],
+)
+def test_authentication_type_is_read_only_as_ascii_digits(
+    cell: str, expected: int | None
+) -> None:
+    (feed,) = read_catalog(export({**GTFS_ROW, "urls.authentication_type": cell})).gtfs
+    assert feed.source_info is not None
+    assert feed.source_info.authentication_type == expected
 
 
 def test_unknown_entity_types_are_left_out() -> None:

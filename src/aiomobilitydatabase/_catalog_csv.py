@@ -33,7 +33,11 @@ from .models import (
 type CatalogFeed = GtfsFeed | GtfsRtFeed | GbfsFeed
 
 _REQUIRED = ("id", "data_type")
-_DIGITS = re.compile(r"[0-9]+")
+# The database's authentication_type ("0" to "3") as int() reads it: ASCII
+# digits only (int() also takes other scripts' digits, a sign, spaces and
+# "1_0"), and at most nine, well inside int()'s 4300-digit limit, past which
+# it raises ValueError.
+_DIGITS = re.compile(r"[0-9]{1,9}")
 # A decimal number as the export writes one (Python's float repr): no
 # underscores, padding, NaN or infinity, which float() would also take.
 _DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
