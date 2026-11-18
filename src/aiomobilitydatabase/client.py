@@ -13,8 +13,7 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from http import HTTPStatus
-from types import TracebackType
-from typing import Any, Final, Self
+from typing import Any, Final
 from urllib.parse import quote
 
 import aiohttp
@@ -23,6 +22,7 @@ from mashumaro import DataClassDictMixin
 from ._http import require_http_url, require_session, require_text
 from ._json import loads as json_loads
 from ._payload import mismatch
+from ._session import OwnedSession
 from ._transport import Answer, exchange
 from .const import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -398,7 +398,7 @@ def encode_params(params: dict[str, Any]) -> dict[str, str | tuple[str, ...]]:
     }
 
 
-class MobilityDatabaseClient:
+class MobilityDatabaseClient(OwnedSession):
     """Async client for the Mobility Database catalog API.
 
     If ``session`` is not provided, the client lazily creates its own
@@ -437,35 +437,6 @@ class MobilityDatabaseClient:
         self._access_token: str | None = None
         self._token_expiration: datetime | None = None
         self._token_lock = asyncio.Lock()
-
-    async def __aenter__(self) -> Self:
-        """Enter the async context manager."""
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        """Exit the async context manager, closing owned resources."""
-        await self.close()
-
-    async def close(self) -> None:
-        """Close the underlying session if this client owns it. Idempotent."""
-        if (
-            self._owns_session
-            and self._session is not None
-            and not self._session.closed
-        ):
-            await self._session.close()
-            self._session = None
-
-    def _get_session(self) -> aiohttp.ClientSession:
-        """Return the session, lazily creating an owned one if needed."""
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
 
     def _token_needs_refresh(self) -> bool:
         """Return True if there is no token or it is at/near expiration."""

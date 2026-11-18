@@ -9,8 +9,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
-from types import TracebackType
-from typing import Self
 
 import aiohttp
 
@@ -18,6 +16,7 @@ from ._bounds import Box, matches
 from ._catalog_csv import CatalogFeed, CatalogFormatError, CatalogRows, read_catalog
 from ._freshness import FreshnessCache, Response, Validators, request_fields
 from ._http import require_http_url, require_text
+from ._session import OwnedSession
 from ._transport import exchange
 
 # Deliberate friend access: the argument checks are shared with the API
@@ -65,7 +64,7 @@ def _require_export_url(url: object) -> str:
     return url
 
 
-class MobilityDatabasePublicCatalog:
+class MobilityDatabasePublicCatalog(OwnedSession):
     r"""The Mobility Database catalog's public export, without an account.
 
     Reads ``feeds_v2.csv`` (MobilityData regenerates it daily) and answers
@@ -156,34 +155,6 @@ class MobilityDatabasePublicCatalog:
         self._owns_session = session is None
         self._timeout = aiohttp.ClientTimeout(total=seconds)
         self._cache: FreshnessCache[CatalogRows] = FreshnessCache()
-
-    async def __aenter__(self) -> Self:
-        """Enter the async context manager."""
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        """Exit the async context manager, closing owned resources."""
-        await self.close()
-
-    async def close(self) -> None:
-        """Close the session if this catalog owns it. Idempotent."""
-        if (
-            self._owns_session
-            and self._session is not None
-            and not self._session.closed
-        ):
-            await self._session.close()
-            self._session = None
-
-    def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
 
     async def _rows(self) -> CatalogRows:
         """Return the export, from the cache while fresh."""
