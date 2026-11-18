@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import typing
 from datetime import UTC, datetime
 from typing import Any
 
@@ -77,3 +78,10 @@ async def test_search_filters_on_the_seal(
     await client.search_feeds(has_seal=True)
     search = next(r for r in mock_api.requests if r.path == "/v1/search")
     assert search.query == {"has_seal": "true"}
+
+
+def test_seasonal_may_be_unknown_but_the_api_may_not_send_null() -> None:
+    assert typing.get_type_hints(Feed)["seasonal"] == bool | None
+    assert GtfsFeed(id="x", seasonal=None).seasonal is None
+    with pytest.raises(MobilityDatabaseConnectionError, match="seasonal"):
+        _one(GtfsFeed, {**GTFS_FEED, "seasonal": None})
