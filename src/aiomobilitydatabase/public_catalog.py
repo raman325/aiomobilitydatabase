@@ -372,11 +372,14 @@ class _Query:
         if offset is not None and offset < 0:
             raise ValueError("offset must not be negative")
         start = offset or 0
+        # As the client, which encodes every given range: one alone is
+        # checked too, though the API ignores it.
+        for given in (latitudes, longitudes):
+            if given is not None and not all(math.isfinite(value) for value in given):
+                raise ValueError("a query parameter is no finite number")
         box = None
         # As the API: the box applies only with both ranges given.
         if latitudes is not None and longitudes is not None:
-            if not all(math.isfinite(value) for value in (*latitudes, *longitudes)):
-                raise ValueError("a query parameter is no finite number")
             (lat_a, lat_b), (lon_a, lon_b) = latitudes, longitudes
             # PostGIS builds the same rectangle from either order.
             box = Box(

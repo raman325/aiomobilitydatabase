@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 from collections.abc import AsyncGenerator
 
@@ -227,3 +228,28 @@ async def test_out_of_range_paging_raises_value_error_before_any_request(
     with pytest.raises(ValueError):
         await getattr(public, method)(**arguments)
     assert mock_api.requests == []
+
+
+@pytest.mark.parametrize("method", ["get_gtfs_feeds", "get_gbfs_feeds"])
+@pytest.mark.parametrize("name", ["dataset_latitudes", "dataset_longitudes"])
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+async def test_a_lone_non_finite_range_raises_value_error_before_any_request(
+    mock_api: MockApi,
+    public: MobilityDatabasePublicCatalog,
+    method: str,
+    name: str,
+    bad: float,
+) -> None:
+    # The client encodes every given parameter, so one range alone is checked.
+    with pytest.raises(ValueError, match="a query parameter is no finite number"):
+        await getattr(public, method)(**{name: (bad, 1.0)})
+    assert mock_api.requests == []
+
+
+async def test_a_304_to_an_unconditional_request_raises_api_error(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    mock_api.get(PATH, status=304, headers={"ETag": '"v1"'})
+    with pytest.raises(MobilityDatabaseApiError) as caught:
+        await public.get_gtfs_feeds()
+    assert caught.value.status == 304
