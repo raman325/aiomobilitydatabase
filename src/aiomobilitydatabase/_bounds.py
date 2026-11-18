@@ -8,6 +8,13 @@ is ``ST_Disjoint(feed, query)``. These are the same OGC predicates for
 closed axis-aligned rectangles. A degenerate rectangle (zero width or
 height) is the segment or point it covers: its interior is its relative
 interior (the open segment, or the point), its dimension 1 or 0.
+
+For boxes with area these match PostGIS exactly. The API stores a
+degenerate box as a flat (zero-area) POLYGON, which GEOS reports invalid;
+PostGIS's answers for one vary with the GEOS version, with whether it has
+prepared (cached) the query geometry yet, and with the ring's starting
+vertex. No stable rule reproduces them, so here such a box is the point
+set it covers, and its results may differ from the API's.
 """
 
 from __future__ import annotations
