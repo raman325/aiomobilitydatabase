@@ -80,7 +80,7 @@ def _require_export_url(url: object) -> str:
 
 
 class MobilityDatabasePublicCatalog:
-    """The Mobility Database catalog's public export, without an account.
+    r"""The Mobility Database catalog's public export, without an account.
 
     Reads ``feeds_v2.csv`` (MobilityData regenerates it daily) and answers
     with the catalog API's own models and filter semantics. A field holds
@@ -112,7 +112,9 @@ class MobilityDatabasePublicCatalog:
       answers 422 (a :class:`MobilityDatabaseApiError`).
     - ``provider`` and ``producer_url`` match as the API's ``ILIKE`` does
       (see :func:`_ilike`), but compare case by Python's ``str.lower``,
-      where Postgres uses its locale's ``lower()``.
+      where Postgres uses its locale's ``lower()``. A value with ``%`` that
+      ends in a lone backslash (``e%\``) matches a literal backslash here,
+      where the API answers an error.
     - The export's own status maps as the client's answers do, but for a
       404: a missing export is a :class:`MobilityDatabaseApiError` (status
       404), since :class:`MobilityDatabaseNotFoundError` means no such feed.
@@ -355,22 +357,35 @@ def _ilike(value: str) -> re.Pattern[str]:
     and takes one with ``%`` as given, anchored. Postgres then reads ``%``
     as any run of characters, ``_`` as any one, and a backslash as escaping
     the next character; a trailing lone backslash, an error there, is a
-    literal backslash here. The pattern matches a whole lower-cased string.
+    literal backslash here. The pattern matches a whole lower-cased string
+    (``fullmatch``).
+
+    Not ``%`` as ``.*``: a few of those backtrack exponentially over a long
+    value. The ``%`` split the value into fixed-width segments (literals and
+    ``_``); the first must start the string and the last end it, and each
+    one between is taken at its first occurrence after the previous -- an
+    atomic lazy group, never revisited. The first occurrence is always
+    right: it leaves the most string for the rest. Linear in the value.
     """
     if "%" not in value:
         value = f"%{value}%"
-    parts: list[str] = []
+    segments: list[list[str]] = [[]]
     characters = iter(value.lower())
     for character in characters:
         if character == "\\":
-            parts.append(re.escape(next(characters, "\\")))
+            segments[-1].append(re.escape(next(characters, "\\")))
         elif character == "%":
-            parts.append(".*")
+            segments.append([])
         elif character == "_":
-            parts.append(".")
+            segments[-1].append(".")
         else:
-            parts.append(re.escape(character))
-    return re.compile("".join(parts), re.DOTALL)
+            segments[-1].append(re.escape(character))
+    texts = ["".join(segment) for segment in segments]
+    if len(texts) == 1:  # every % escaped (a\%): the whole string
+        return re.compile(texts[0], re.DOTALL)
+    first, *middle, last = texts
+    between = "".join(f"(?>.*?{segment})" for segment in middle)
+    return re.compile(f"{first}{between}.*{last}", re.DOTALL)
 
 
 def _like(pattern: re.Pattern[str] | None, value: str | None) -> bool:

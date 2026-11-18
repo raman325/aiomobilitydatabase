@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import math
+import random
+import re
 import socket
 import threading
+import time
 from collections.abc import AsyncGenerator
 
 import aiohttp
@@ -426,3 +430,65 @@ async def test_a_cache_hit_opens_no_session(mock_api: MockApi) -> None:
     assert [feed.id for feed in await catalog.get_gtfs_feeds()] == ["mdb-10"]
     assert catalog._session is None
     assert requests_to(mock_api) == 1
+
+
+def reference_ilike(value: str) -> re.Pattern[str]:
+    """The plain translation (%: .*, _: .), exponential but evidently right."""
+    if "%" not in value:
+        value = f"%{value}%"
+    parts: list[str] = []
+    characters = iter(value.lower())
+    for character in characters:
+        if character == "\\":
+            parts.append(re.escape(next(characters, "\\")))
+        else:
+            parts.append({"%": ".*", "_": "."}.get(character) or re.escape(character))
+    return re.compile("".join(parts), re.DOTALL)
+
+
+ALPHABET = "ab%_\\\n"
+
+
+def short_texts(longest: int) -> list[str]:
+    return [
+        "".join(letters)
+        for length in range(longest + 1)
+        for letters in itertools.product(ALPHABET, repeat=length)
+    ]
+
+
+def test_ilike_matches_the_plain_translation_on_every_short_pair() -> None:
+    texts = short_texts(3)
+    for needle in short_texts(4):
+        fast, plain = public_catalog._ilike(needle), reference_ilike(needle)
+        for text in texts:
+            assert bool(fast.fullmatch(text)) == bool(plain.fullmatch(text)), (
+                needle,
+                text,
+            )
+
+
+def test_ilike_matches_the_plain_translation_on_random_pairs() -> None:
+    chance = random.Random(20261118)
+    for _ in range(3000):
+        needle = "".join(chance.choices(ALPHABET, k=chance.randint(0, 8)))
+        fast, plain = public_catalog._ilike(needle), reference_ilike(needle)
+        for _ in range(10):
+            text = "".join(chance.choices(ALPHABET, k=chance.randint(0, 12)))
+            assert bool(fast.fullmatch(text)) == bool(plain.fullmatch(text)), (
+                needle,
+                text,
+            )
+
+
+async def test_a_wildcard_heavy_filter_runs_in_linear_time(
+    mock_api: MockApi, public: MobilityDatabasePublicCatalog
+) -> None:
+    long_url = "https://example.com/" + "a" * 2000
+    row = {**GTFS_ROW, "urls.direct_download": long_url}
+    serve(mock_api, body=export(row), headers={"Cache-Control": "max-age=3600"})
+    await public.get_gtfs_feeds()  # fetched and parsed outside the timing
+    started = time.perf_counter()
+    feeds = await public.get_gtfs_feeds(producer_url="%_%_%_%_%_%_%_%_%#")
+    assert time.perf_counter() - started < 0.5
+    assert feeds == []
