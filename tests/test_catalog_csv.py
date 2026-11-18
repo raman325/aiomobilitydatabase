@@ -167,6 +167,31 @@ def test_a_box_past_the_earth_s_ranges_is_kept_as_the_api_returns_it() -> None:
 @pytest.mark.parametrize(
     ("cell", "expected"),
     [
+        ("40.5", 40.5),
+        ("4.05e1", 40.5),
+        # The shared ASCII-number reader allows surrounding spaces and tabs,
+        # which the export never writes.
+        (" 40.5\t", 40.5),
+        ("inf", None),
+        ("1e999", None),  # no finite double
+        ("\u0664\u0660", None),  # Arabic-Indic 40
+        ("40,5", None),
+    ],
+)
+def test_a_bound_is_read_only_as_a_finite_ascii_number(
+    cell: str, expected: float | None
+) -> None:
+    row = {**GTFS_ROW, "location.bounding_box.minimum_latitude": cell}
+    (feed,) = read_catalog(export(row)).gtfs
+    if expected is None:
+        assert feed.bounding_box is None
+    else:
+        assert feed.bounding_box == BoundingBox(expected, 40.9, -74.3, -73.7)
+
+
+@pytest.mark.parametrize(
+    ("cell", "expected"),
+    [
         ("0", 0),
         ("3", 3),
         ("007", 7),

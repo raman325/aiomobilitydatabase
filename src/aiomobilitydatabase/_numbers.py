@@ -1,4 +1,4 @@
-"""The one reading of a number written as text, shared by every feed parser."""
+"""The one reading of a number written as text: the feeds' and the catalog's."""
 
 from __future__ import annotations
 

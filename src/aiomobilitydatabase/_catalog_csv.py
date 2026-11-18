@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import csv
 import io
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
 
+from ._numbers import ascii_number
+from ._vocab import vocab_or_none
 from .models import (
     BoundingBox,
     DataType,
@@ -38,9 +39,6 @@ _REQUIRED = ("id", "data_type")
 # "1_0"), and at most nine, well inside int()'s 4300-digit limit, past which
 # it raises ValueError.
 _DIGITS = re.compile(r"[0-9]{1,9}")
-# A decimal number as the export writes one (Python's float repr): no
-# underscores, padding, NaN or infinity, which float() would also take.
-_DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 # A date-time as the export writes one (Python's str(datetime), an offset
 # optional), or with "T" and "Z". fromisoformat would also take a bare date
 # (midnight), the basic and week formats, 24:00 (the next day), and more
@@ -191,10 +189,8 @@ def _source_info(row: _Row) -> SourceInfo:
 
 
 def _status(row: _Row) -> FeedStatus | None:
-    try:
-        return FeedStatus(_cell(row, "status") or "")
-    except ValueError:
-        return None
+    """Read the status; one this library doesn't know is None."""
+    return vocab_or_none(FeedStatus, _cell(row, "status"))
 
 
 def _split(row: _Row, name: str) -> tuple[str, ...]:
@@ -203,13 +199,9 @@ def _split(row: _Row, name: str) -> tuple[str, ...]:
 
 
 def _entity_types(row: _Row) -> tuple[EntityType, ...]:
-    known = []
-    for name in _split(row, "entity_type"):
-        try:
-            known.append(EntityType(name))
-        except ValueError:
-            continue
-    return tuple(known)
+    """Read the entity types, leaving out any this library doesn't know."""
+    types = (vocab_or_none(EntityType, name) for name in _split(row, "entity_type"))
+    return tuple(entity for entity in types if entity is not None)
 
 
 def _redirects(row: _Row) -> tuple[Redirect, ...]:
@@ -228,16 +220,15 @@ def _redirects(row: _Row) -> tuple[Redirect, ...]:
     )
 
 
-def _number(value: str | None) -> float | None:
-    if value is None or not _DECIMAL.fullmatch(value):
-        return None
-    number = float(value)
-    return number if math.isfinite(number) else None
+def _number(row: _Row, name: str) -> float | None:
+    """Read a finite ASCII number (see :func:`._numbers.ascii_number`)."""
+    cell = _cell(row, name)
+    return None if cell is None else ascii_number(cell)
 
 
 def _bounding_box(row: _Row) -> BoundingBox | None:
     """All four bounds, finite, each minimum at most its maximum; else None."""
-    min_lat, max_lat, min_lon, max_lon = (_number(_cell(row, name)) for name in _BOX)
+    min_lat, max_lat, min_lon, max_lon = (_number(row, name) for name in _BOX)
     if min_lat is None or max_lat is None or min_lon is None or max_lon is None:
         return None
     if min_lat > max_lat or min_lon > max_lon:
