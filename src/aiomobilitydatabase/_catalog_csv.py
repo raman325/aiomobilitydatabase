@@ -75,15 +75,20 @@ def read_catalog(body: bytes) -> CatalogRows:
     try:
         text: str | None = body.decode("utf-8-sig")
     except UnicodeDecodeError:
+        # Raised below, outside the except: the error's .object holds the
+        # whole body, and would ride along as the new error's __context__.
         text = None
     if text is None:
         raise CatalogFormatError("not UTF-8")
     feeds: dict[str, CatalogFeed] = {}
-    reader = csv.DictReader(io.StringIO(text, newline=""), restval="")
+    # strict: a stray or unclosed quote is an error, where the default reads
+    # on -- joining text after a closing quote onto the cell, or swallowing
+    # every later row into one unclosed cell.
+    reader = csv.DictReader(io.StringIO(text, newline=""), restval="", strict=True)
+    failure: str | None = None
     try:
         columns = reader.fieldnames or ()
-        complete = all(name in columns for name in _REQUIRED)
-        if complete:
+        if all(name in columns for name in _REQUIRED):
             for row in reader:
                 feed_id = _cell(row, "id")
                 if feed_id is None or feed_id in feeds:
@@ -91,13 +96,14 @@ def read_catalog(body: bytes) -> CatalogRows:
                 feed = _feed(feed_id, row)
                 if feed is not None:
                     feeds[feed_id] = feed
+        else:
+            failure = "no id or data_type column"
     except csv.Error:
-        # Raised below: the error quotes the line it failed on.
-        complete = None
-    if complete is None:
-        raise CatalogFormatError("not CSV")
-    if not complete:
-        raise CatalogFormatError("no id or data_type column")
+        failure = "not CSV"
+    if failure is not None:
+        # Outside the except, as everywhere in this library: nothing of the
+        # csv.Error is chained onto the new one.
+        raise CatalogFormatError(failure)
     ordered = sorted(feeds.values(), key=_order)
     return CatalogRows(
         gtfs=tuple(feed for feed in ordered if isinstance(feed, GtfsFeed)),

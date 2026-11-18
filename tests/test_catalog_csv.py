@@ -243,8 +243,33 @@ def test_missing_optional_columns_read_as_empty() -> None:
         b"id,data_type\n"
         + b"x" * (csv.field_size_limit() + 1)
         + b",gtfs\n",  # csv.Error
+        # An unclosed quote would otherwise swallow every later row.
+        b'id,data_type,provider\nmdb-1,gtfs,"A\nmdb-2,gtfs,B\n',
+        # Text after a closing quote would otherwise be joined onto the cell.
+        b'id,data_type\n"mdb-1"x,gtfs\n',
     ],
 )
 def test_a_body_that_is_no_export_raises(body: bytes) -> None:
-    with pytest.raises(CatalogFormatError):
+    with pytest.raises(CatalogFormatError) as caught:
         read_catalog(body)
+    # Nothing of the decode or CSV error (which can hold the body) rides along.
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+def test_cells_past_the_header_are_ignored() -> None:
+    body = b"id,data_type,provider\nmdb-1,gtfs,A,extra,more\n"
+    (feed,) = read_catalog(body).gtfs
+    assert (feed.id, feed.provider) == ("mdb-1", "A")
+
+
+def test_a_short_row_reads_its_missing_cells_as_empty() -> None:
+    body = b"id,data_type,provider,name\nmdb-1,gtfs\n"
+    (feed,) = read_catalog(body).gtfs
+    assert (feed.provider, feed.feed_name) == (None, None)
+
+
+def test_a_nul_inside_a_cell_is_kept() -> None:
+    body = b"id,data_type,provider\nmdb-1,gtfs,A\x00B\n"
+    (feed,) = read_catalog(body).gtfs
+    assert feed.provider == "A\x00B"
