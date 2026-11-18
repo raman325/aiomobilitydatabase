@@ -105,6 +105,36 @@ def test_an_offset_extracted_on_is_converted_to_utc() -> None:
 
 
 @pytest.mark.parametrize(
+    ("cell", "expected"),
+    [
+        ("2025-02-03 04:05:06", datetime(2025, 2, 3, 4, 5, 6)),
+        ("2025-02-03 04:05:06.872037+00:00", datetime(2025, 2, 3, 4, 5, 6, 872037)),
+        ("2025-02-03T04:05:06Z", datetime(2025, 2, 3, 4, 5, 6)),
+        ("2025-02-03T06:05:06.5+02:00", datetime(2025, 2, 3, 4, 5, 6, 500000)),
+        ("2025-02-03", None),  # a bare date: fromisoformat reads midnight
+        ("2025-02-03 04:05", None),
+        ("2025-02-03 24:00:00", None),  # fromisoformat rolls to the next day
+        ("2025-02-03 04:05:60", None),
+        ("2025-02-03 04:05:06.1234567", None),  # fromisoformat truncates
+        ("2025-02-03t04:05:06z", None),
+        ("20250203T040506", None),
+        ("2025-W06-1 04:05:06", None),
+        ("2025-02-03 04:05:06+0200", None),
+        ("2025-02-03 04:05:06+24:00", None),
+        ("٢٠٢٥-02-03 04:05:06", None),  # Arabic-Indic digits
+        ("2025-02-30 04:05:06", None),
+        (" 2025-02-03 04:05:06", None),
+    ],
+)
+def test_extracted_on_is_read_only_as_a_full_date_time(
+    cell: str, expected: datetime | None
+) -> None:
+    row = {**GBFS_ROW, "location.bounding_box.extracted_on": cell}
+    (feed,) = read_catalog(export(row)).gbfs
+    assert feed.bounding_box_generated_at == expected
+
+
+@pytest.mark.parametrize(
     ("cells", "expected"),
     [
         ({"status": "retired"}, {"status": None}),

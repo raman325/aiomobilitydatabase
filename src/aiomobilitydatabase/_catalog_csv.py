@@ -37,6 +37,14 @@ _DIGITS = re.compile(r"[0-9]+")
 # A decimal number as the export writes one (Python's float repr): no
 # underscores, padding, NaN or infinity, which float() would also take.
 _DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+# A date-time as the export writes one (Python's str(datetime), an offset
+# optional), or with "T" and "Z". fromisoformat would also take a bare date
+# (midnight), the basic and week formats, 24:00 (the next day), and more
+# than six fraction digits (truncated).
+_DATE_TIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+    r"(?:\.[0-9]{1,6})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])?"
+)
 _BOX = (
     "location.bounding_box.minimum_latitude",
     "location.bounding_box.maximum_latitude",
@@ -236,8 +244,9 @@ def _naive_utc(value: str | None) -> datetime | None:
     """Read a date-time as the API returns this column: naive, in UTC.
 
     The database column has no zone; the export marks it ``+00:00``.
+    Anything but a full date-time (see ``_DATE_TIME``) is None.
     """
-    if value is None:
+    if value is None or not _DATE_TIME.fullmatch(value):
         return None
     try:
         moment = datetime.fromisoformat(value)
