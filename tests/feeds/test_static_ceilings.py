@@ -3,8 +3,11 @@
 import zipfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 
 from aiomobilitydatabase.feeds.client import MobilityFeedsClient
 from aiomobilitydatabase.feeds.models import ArrivalsQuery
@@ -205,6 +208,119 @@ async def test_handles_answer_promptly_for_calendars_running_forever(
                 end=datetime.max.replace(tzinfo=UTC) - timedelta(days=1),
             )
             assert [row.trip_id for row in far] == ["T1"]
+        finally:
+            handle.close()
+
+
+_WEEK = "ALL,1,1,1,1,1,1,1,20260105,20260111\n"
+_WEEK_DAYS = [date(2026, 1, 5) + timedelta(days=k) for k in range(7)]
+
+
+def _counting_reads(index: StaticIndex) -> tuple[list[date], object]:
+    """Record each service day the index reads, through active_service_ids."""
+    read: list[date] = []
+    active = index.active_service_ids
+
+    def counted(service_date: date) -> set[str]:
+        read.append(service_date)
+        return active(service_date)
+
+    return read, patch.object(index, "active_service_ids", counted)
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    before=st.integers(min_value=0, max_value=730_000),
+    after=st.integers(min_value=0, max_value=2_000_000),
+)
+@example(before=739_000, after=0)  # from 0001-01-03, as close as start may be
+@example(before=0, after=2_914_000)  # to 9999-11-30
+def test_a_window_reaching_past_the_feed_reads_only_the_feed_s_days(
+    tmp_path_factory: pytest.TempPathFactory, before: int, after: int
+) -> None:
+    """A week of service read through a window opening ``before`` days ahead
+    of it and closing ``after`` days past it: every run in the week, and
+    only the week's days (and a day of margin each side) read -- never one
+    per day of the window."""
+    index = _index(
+        tmp_path_factory.mktemp("feed"), calendar=_WEEK, stop_times=_TWO_STOPS
+    )
+    try:
+        # Clamped to the range a window may span (see _utc_window).
+        opens = datetime.combine(
+            date.fromordinal(max(_WEEK_DAYS[0].toordinal() - before, 3)),
+            datetime.min.time(),
+            UTC,
+        )
+        closes = datetime.combine(
+            date.fromordinal(
+                min(
+                    _WEEK_DAYS[-1].toordinal() + after + 1,
+                    date(9999, 11, 30).toordinal(),
+                )
+            ),
+            datetime.min.time(),
+            UTC,
+        )
+        read, counting = _counting_reads(index)
+        with counting:
+            got = index.upcoming_departures(["S1"], None, opens, closes - opens)
+        assert [dep.departure for dep in got] == [
+            datetime.combine(day, datetime.min.time(), UTC) + timedelta(hours=8)
+            for day in _WEEK_DAYS
+        ]
+        assert len(read) <= len(_WEEK_DAYS) + 2
+    finally:
+        index.close()
+
+
+def test_a_feed_whose_service_never_runs_reads_no_day(tmp_path: Path) -> None:
+    """No weekday set: no day has a service to run, so a window across all
+    of datetime's range reads none of them."""
+    index = _index(
+        tmp_path,
+        calendar="ALL,0,0,0,0,0,0,0,20260101,20261231\n",
+        stop_times=_TWO_STOPS,
+    )
+    try:
+        opens = datetime(1, 1, 3, tzinfo=UTC)
+        read, counting = _counting_reads(index)
+        with counting:
+            got = index.upcoming_departures(
+                ["S1"], None, opens, datetime(9999, 11, 30, tzinfo=UTC) - opens
+            )
+        assert (got, read) == ([], [])
+    finally:
+        index.close()
+
+
+async def test_a_board_opening_long_before_the_feed_starts_reads_its_days_only(
+    tmp_path: Path,
+) -> None:
+    """Hegelator 1678: a start at 0001-01-03 before a feed starting in 2026
+    once read every service day between them, one by one."""
+    index = _index(tmp_path, calendar=_WEEK, stop_times=_TWO_STOPS)
+    read, counting = _counting_reads(index)
+    async with MobilityFeedsClient() as client:
+        handle = TransitFeedHandle(
+            client,
+            None,
+            [],
+            index,
+            None,
+            direct=_DirectUrls(static_url="https://e.com/g.zip", headers=None),
+        )
+        try:
+            with counting:
+                [board] = await handle.get_scheduled_departures(
+                    [ArrivalsQuery(["S1"], limit=2)],
+                    start=datetime(1, 1, 3, tzinfo=UTC),
+                )
+            assert [row.scheduled_departure for row in board] == [
+                datetime(2026, 1, 5, 8, tzinfo=UTC),
+                datetime(2026, 1, 6, 8, tzinfo=UTC),
+            ]
+            assert len(read) < 100
         finally:
             handle.close()
 
