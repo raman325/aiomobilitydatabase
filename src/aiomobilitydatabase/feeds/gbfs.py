@@ -11,16 +11,16 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
-from .._http import CREDENTIAL_HEADERS
-from .._json import loads as json_loads
-from ._freshness import (
+from .._freshness import (
     FreshnessCache,
     Response,
     Validators,
     header_fields,
     request_fields,
 )
-from ._freshness import hops as _hops
+from .._freshness import hops as _hops
+from .._http import CREDENTIAL_HEADERS
+from .._json import loads as json_loads
 from ._frozen import FrozenDict
 from ._language import is_preferred_language
 from ._numbers import ascii_number

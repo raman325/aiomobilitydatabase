@@ -1,6 +1,6 @@
-"""HTTP freshness for producer fetches: RFC 9111 lifetimes plus a shared cache.
+"""HTTP freshness for fetches: RFC 9111 lifetimes plus a shared cache.
 
-Both realtime (GTFS-RT) and GBFS fetches go through :class:`FreshnessCache`.
+Realtime (GTFS-RT), GBFS and public-catalog fetches go through :class:`FreshnessCache`.
 It answers from a stored parse while it is fresh, revalidates with
 ETag/Last-Modified once it lapses, and shares one request between
 concurrent callers. Semantics are
